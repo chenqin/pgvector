@@ -26,6 +26,8 @@ Only fixed-dimension `vector` with L2 is registered, up to 2,000 dimensions. NUL
 | [annplan.c](../src/annplan.c) | Opt-in filtered upper-path hook, whitelist, normal predicate/sort costing |
 | [anncustom.c](../src/anncustom.c) | Predicate child plan, exact eligible-vector scoring, bounded sort, EXPLAIN |
 | [annbuild.c](../src/annbuild.c) | Table-AM build callback, main/init forks, build WAL |
+| [annfrozen.c](../src/annfrozen.c) | [Frozen indexes](ann-frozen-index.md): guard trigger, `ann_freeze`, page arrays, key-ordered build, `ann_frozen_info`, `ann_frozen_keys` |
+| [annexport.c](../src/annexport.c) | `ann_index_export`: a frozen index's pages as a worker index directory |
 | [anninsert.c](../src/anninsert.c) | Tuple formation, insertion locks, FSM hints, generic WAL |
 | [annscan.c](../src/annscan.c) | Ordered heap-TID scan, rescan, spillable tuplesort |
 | [annutils.c](../src/annutils.c) | Type/schema resolution, dimension/page validation, metapage creation |

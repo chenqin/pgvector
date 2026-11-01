@@ -529,8 +529,8 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("%u of %u pages of table \"%s\" are not frozen",
 						blocks - frozen, blocks, RelationGetRelationName(heap)),
-				 errhint("Run VACUUM (FREEZE) on the table, then create the index. Rows committed with "
-						 "synchronous_commit = off may need a second VACUUM once their commit is flushed.")));
+				 errhint("Run VACUUM (FREEZE) on the table again, then create the index. VACUUM leaves pages "
+						 "unfrozen while other sessions hold them, or until asynchronous commits are flushed.")));
 	return guard;
 }
 

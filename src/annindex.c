@@ -247,6 +247,7 @@ static void
 CheckGeneration(const AnnIndexInfo *info)
 {
 	Oid			am = get_am_oid("ann", false);
+	List	   *names;
 	Relation	heap;
 	List	   *indexes;
 	ListCell   *lc;
@@ -258,11 +259,12 @@ CheckGeneration(const AnnIndexInfo *info)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("ann index directory has a generation but no source table")));
-	heap = table_openrv(makeRangeVarFromNameList(stringToQualifiedNameList(info->source
+	names = stringToQualifiedNameList(info->source
 #if PG_VERSION_NUM >= 160000
-																		   ,NULL
+									  ,NULL
 #endif
-														)), AccessShareLock);
+		);
+	heap = table_openrv(makeRangeVarFromNameList(names), AccessShareLock);
 	indexes = RelationGetIndexList(heap);
 	foreach(lc, indexes)
 	{
