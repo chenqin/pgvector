@@ -516,6 +516,9 @@ ParseManifest(AnnIndexFile *file)
 			file->quant = strcmp(text, "nvfp4") == 0 ? ANN_QUANT_NVFP4 : ANN_QUANT_FP8;
 		else if (strcmp(key, "shards") == 0 && sscanf(line, "%*s %llu", &a) == 1 && a <= ANN_INDEX_MAX_SHARDS)
 			continue;
+		else if (strcmp(key, "generation") == 0 && sscanf(line, "%*s %16s", file->generation) == 1 &&
+				 strlen(file->generation) == 16 && strspn(file->generation, "0123456789abcdef") == 16)
+			continue;
 		else if (strcmp(key, "shard") == 0 &&
 				 sscanf(line, "%*s %llu %llu %llu %255s", &a, &b, &c, text) == 4 &&
 				 a == file->nshards && file->nshards < ANN_INDEX_MAX_SHARDS &&

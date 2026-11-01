@@ -1321,3 +1321,33 @@ CREATE FUNCTION ann_bitmap_search(name text, query vector, k integer, filter tex
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 10;
 
 COMMENT ON FUNCTION ann_bitmap_search(text, vector, integer, text) IS 'filtered search with a filter stored in ann_filter_bitmap and cached on the GPU nodes';
+
+-- frozen indexes: forward and inverted pages over an immutable table
+
+CREATE FUNCTION ann_frozen_guard() RETURNS trigger
+	AS 'MODULE_PATHNAME' LANGUAGE C;
+
+COMMENT ON FUNCTION ann_frozen_guard() IS 'trigger function that keeps a table frozen for ann indexes';
+
+CREATE FUNCTION ann_freeze(rel regclass) RETURNS boolean
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION ann_freeze(regclass) IS 'refuse further changes to a table so frozen ann indexes can be built on it; false if already frozen';
+
+CREATE FUNCTION ann_frozen_info(index regclass, OUT generation text, OUT rows bigint, OUT dimensions integer,
+	OUT key_column text, OUT attributes text[], OUT distinct_values bigint[], OUT pages bigint) RETURNS record
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+COMMENT ON FUNCTION ann_frozen_info(regclass) IS 'generation, rows, columns and size of a frozen ann index';
+
+CREATE FUNCTION ann_frozen_keys(index regclass, attribute text, attribute_values integer[]) RETURNS SETOF bigint
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE ROWS 1000;
+
+COMMENT ON FUNCTION ann_frozen_keys(regclass, text, integer[]) IS 'keys of the rows whose attribute is one of the values, from a frozen ann index''s inverted pages';
+
+CREATE FUNCTION ann_index_export(index regclass, path text) RETURNS bigint
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION ann_index_export(regclass, text) IS 'write a frozen ann index''s rows as an index directory for scripts/ann/build_cuvs_index.py --from-export';
+
+REVOKE ALL ON FUNCTION ann_index_export(regclass, text) FROM PUBLIC;

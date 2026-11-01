@@ -14,6 +14,8 @@ python3 scripts/ann/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \
     --key id --vector embedding --out /data/ann/docs --dtype float16
 ```
 
+To build from a [frozen index](ann-frozen-index.md) instead of reading the table, export it with `SELECT ann_index_export('docs_ann', '/data/ann/docs-export')` and pass `--from-export /data/ann/docs-export` in place of `--dsn`, `--table`, `--key`, `--vector` and `--attribute`.
+
 ```sql
 -- postgresql.conf: ann.worker_socket = '/tmp/ann.sock'
 SELECT ann_index_load('docs', '/data/ann/docs');          -- superuser; returns rows loaded
@@ -33,7 +35,7 @@ JOIN docs d USING (id) ORDER BY s.distance;
 
 | File | Content |
 | --- | --- |
-| `manifest` | Text `key value` lines: `pgvector-ann-index 1`, `dimensions`, `rows`, `metric l2`, `dtype float32\|float16`, `source schema.table`, `shards N`, then `shard i first rows file` per shard. Written last, so partial builds are never loadable. |
+| `manifest` | Text `key value` lines: `pgvector-ann-index 1`, `dimensions`, `rows`, `metric l2`, `dtype float32\|float16`, `source schema.table`, `shards N`, then `shard i first rows file` per shard, and `generation G` for directories built from a [frozen index](ann-frozen-index.md) export. Written last, so partial builds are never loadable. |
 | `vectors.nvfp4`, `scales.e4m3`, `vectors.e4m3`, `rowscale.f32` | Optional (`--quantize nvfp4\|fp8`): a 4-bit or 8-bit copy of the vectors for the [Blackwell module](ann-blackwell.md), listed in the manifest as `quant nvfp4` or `quant fp8`. |
 | `attr-COLUMN.i32` | Optional (`--attribute COLUMN`): one little-endian int32 per row in key order, listed in the manifest as `attribute COLUMN file`. See [filters resolved on the GPU node](ann-gpu-filters.md). |
 | `keys.i64` | `rows` strictly increasing little-endian int64 table keys. Global ordinal *i* is the *i*-th smallest key. |
@@ -42,7 +44,7 @@ JOIN docs d USING (id) ORDER BY s.distance;
 
 Shards are contiguous key ranges, so mapping a key to its shard is a binary search, and shard results never overlap. The worker validates the manifest, file sizes, key order, and each shard's dimensions and row count before registering the index.
 
-**Immutability.** A directory is never modified, and the builder refuses a non-empty output directory. `ann_index_load` compares the source table's current row count with the manifest and refuses a stale index. After a table changes, build a new directory and load it under a new name. Joining results back to the table drops deleted keys, but rows added after the build are invisible. A loaded name stays until the worker restarts.
+**Immutability.** A directory is never modified, and the builder refuses a non-empty output directory. `ann_index_load` compares the source table's current row count with the manifest and refuses a stale index. Directories built with `--from-export` from a [frozen index](ann-frozen-index.md) carry its generation, a hash of every key, vector and attribute value, and load only while the table has a frozen `ann` index with that generation. After a table changes, build a new directory and load it under a new name. Joining results back to the table drops deleted keys, but rows added after the build are invisible. A loaded name stays until the worker restarts.
 
 ## Search execution
 
@@ -114,6 +116,7 @@ The extension never links CUDA: it talks to the worker over a Unix socket, so th
 | `test/ann/test_index.py` | CPU worker; `ANN_PG_DSN` for the SQL tests | File format, corrupt files, sharded tree merge against brute force, filters (unknown keys, duplicates), protocol errors. Through SQL: ANN and hybrid results equal to `ORDER BY <->`, joins, empty/NULL filters, unavailable worker, stale-index refusal, superuser-only load. |
 | `test/ann/test_cuvs_index.py` | `ANN_CUVS_TEST=1`, GPU, cuVS Python | Builder output for FP32 and FP16; recall ≥ 0.9 for ANN and filtered CAGRA (`--gather-limit 0`); filtered results stay within the filter; the GPU gather scan over 4 shards, with keys missing from the index, equal to SQL in ids, order and distances; exact route equal to SQL; exact distances. |
 | `test/ann/test_cuvs_gathered.py` | `ANN_CUVS_TEST=1`, GPU | GPU brute force for the pipelined CustomScan route. |
+| `test/ann/test_frozen.py` | `ANN_PG_DSN`; `ANN_CUVS_TEST=1` for `FrozenCuvsTests` | Frozen indexes, their export, `--from-export` builds and generation-checked loads; see the [guide](ann-frozen-index.md#tests). |
 
 ```sh
 make -C ann check

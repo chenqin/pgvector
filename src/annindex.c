@@ -1,8 +1,10 @@
 #include "postgres.h"
 
+#include "access/table.h"
 #include "ann.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
+#include "commands/defrem.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"
 #include "fmgr.h"
@@ -46,6 +48,7 @@ typedef struct AnnIndexInfo
 	char		source[256];
 	char		key[64];
 	char		vector[64];
+	char		generation[17]; /* frozen index the files came from, or "-" */
 } AnnIndexInfo;
 
 /* Catalog row: where an index's vectors live on this host. */
@@ -144,12 +147,18 @@ ParseInfo(const char *reply, AnnIndexInfo *info)
 {
 	unsigned long long rows;
 
+	const char *generation;
+
 	strcpy(info->key, "-");
 	strcpy(info->vector, "-");
+	strcpy(info->generation, "-");
 	if (sscanf(reply, "rows %llu dimensions %*u shards %*u dtype %*s source %255s key %63s vector %63s",
 			   &rows, info->source, info->key, info->vector) < 2)
 		elog(ERROR, "unexpected ann worker reply: %s", reply);
 	info->rows = rows;
+	if ((generation = strstr(reply, " generation ")) != NULL &&
+		sscanf(generation, " generation %16s", info->generation) != 1)
+		elog(ERROR, "unexpected ann worker reply: %s", reply);
 }
 
 /* Schema-qualified catalog name, in the extension's schema. */
@@ -227,6 +236,58 @@ CheckSource(const AnnIndexInfo *info)
 				 errmsg("ann index is stale: %s has " INT64_FORMAT " rows, index has " UINT64_FORMAT,
 						info->source, count, info->rows),
 				 errhint("Rebuild the index with scripts/ann/build_cuvs_index.py.")));
+}
+
+/*
+ * Files exported from a frozen index carry its generation: require a frozen
+ * ann index on the source table with the same content, so the GPU index and
+ * this host's table hold the same rows in the same order.
+ */
+static void
+CheckGeneration(const AnnIndexInfo *info)
+{
+	Oid			am = get_am_oid("ann", false);
+	List	   *names;
+	Relation	heap;
+	List	   *indexes;
+	ListCell   *lc;
+	bool		found = false;
+
+	if (strcmp(info->generation, "-") == 0)
+		return;
+	if (strcmp(info->source, "-") == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ann index directory has a generation but no source table")));
+	names = stringToQualifiedNameList(info->source
+#if PG_VERSION_NUM >= 160000
+									  ,NULL
+#endif
+		);
+	heap = table_openrv(makeRangeVarFromNameList(names), AccessShareLock);
+	indexes = RelationGetIndexList(heap);
+	foreach(lc, indexes)
+	{
+		Relation	index = index_open(lfirst_oid(lc), AccessShareLock);
+
+		if (index->rd_rel->relam == am && index->rd_index->indisvalid)
+		{
+			AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, true);
+
+			found = meta != NULL &&
+				strcmp(psprintf("%016llx", (unsigned long long) meta->generation), info->generation) == 0;
+		}
+		index_close(index, AccessShareLock);
+		if (found)
+			break;
+	}
+	table_close(heap, AccessShareLock);
+	if (!found)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ann index directory generation %s matches no frozen ann index of %s",
+						info->generation, info->source),
+				 errhint("Export the table's frozen index again with ann_index_export and rebuild the directory.")));
 }
 
 /* Record where the index's rows live, so this host can route exact scans. */
@@ -324,6 +385,7 @@ ann_index_load(PG_FUNCTION_ARGS)
 	CheckWorker(ok, status, name);
 	ParseInfo(reply, &info);
 	CheckSource(&info);
+	CheckGeneration(&info);
 	RecordCatalog(fcinfo, name, &info);
 
 	/* Freshly started nodes have no bitmaps: cache the stored ones. */
@@ -358,6 +420,7 @@ ann_index_attach(PG_FUNCTION_ARGS)
 	CheckWorker(ok, status, name);
 	ParseInfo(reply, &info);
 	CheckSource(&info);
+	CheckGeneration(&info);
 	RecordCatalog(fcinfo, name, &info);
 
 	/* Freshly started nodes have no bitmaps: cache the stored ones. */

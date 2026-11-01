@@ -118,6 +118,7 @@ struct AnnIndexFile
 	char		key[64];		/* key column name in source, or empty */
 	char		vector[64];		/* vector column name in source, or empty */
 	char		dtype[16];		/* CAGRA dataset type: float32 or float16 */
+	char		generation[17]; /* frozen index content hash, or empty */
 	uint32_t	dimensions;
 	uint64_t	rows;
 	uint32_t	nshards;

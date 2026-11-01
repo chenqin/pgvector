@@ -9,13 +9,71 @@
 #define vacuum_delay_point() vacuum_delay_point(false)
 #endif
 
+/*
+ * Frozen indexes never move a row's ordinal. A deleted row (possible only if
+ * someone dropped the guard trigger) keeps its ordinal with an invalid TID,
+ * which scans skip, so VACUUM can safely reuse its heap slot.
+ */
+IndexBulkDeleteResult *
+AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+					IndexBulkDeleteCallback callback, void *callback_state)
+{
+	Relation	index = info->index;
+	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
+
+	if (!stats)
+		stats = palloc0_object(IndexBulkDeleteResult);
+	stats->num_index_tuples = 0;
+	for (BlockNumber p = 0; p < meta->tids.pages; p++)
+	{
+		Buffer		buf;
+		Page		page;
+		GenericXLogState *state;
+		ItemPointerData *tids;
+		uint32		count = p + 1 < meta->tids.pages ? meta->tids.perPage :
+			(uint32) (meta->tids.count - (uint64) p * meta->tids.perPage);
+		bool		changed = false;
+
+		vacuum_delay_point();
+		buf = ReadBufferExtended(index, MAIN_FORKNUM, meta->tids.start + p, RBM_NORMAL, info->strategy);
+		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		AnnCheckPage(BufferGetPage(buf));
+		state = GenericXLogStart(index);
+		page = GenericXLogRegisterBuffer(state, buf, 0);
+		tids = (ItemPointerData *) PageGetContents(page);
+		for (uint32 i = 0; i < count; i++)
+		{
+			if (!ItemPointerIsValid(&tids[i]))
+				continue;
+			if (callback(&tids[i], callback_state))
+			{
+				ItemPointerSetInvalid(&tids[i]);
+				changed = true;
+				stats->tuples_removed++;
+			}
+			else
+				stats->num_index_tuples++;
+		}
+		if (changed)
+			GenericXLogFinish(state);
+		else
+			GenericXLogAbort(state);
+		UnlockReleaseBuffer(buf);
+	}
+	pfree(meta);
+	return stats;
+}
+
 IndexBulkDeleteResult *
 annbulkdelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 			  IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	index = info->index;
-	BlockNumber blocks = RelationGetNumberOfBlocks(index);
+	BlockNumber blocks;
 
+	if (AnnIsFrozen(index))
+		return AnnFrozenBulkDelete(info, stats, callback, callback_state);
+	blocks = RelationGetNumberOfBlocks(index);
 	if (!stats)
 		stats = palloc0_object(IndexBulkDeleteResult);
 	/* A later bulk-delete cycle rescans survivors; do not count them twice. */

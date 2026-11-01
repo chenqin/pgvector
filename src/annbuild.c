@@ -28,8 +28,15 @@ IndexBuildResult *
 annbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	AnnBuildState buildstate = {0};
-	IndexBuildResult *result = palloc0_object(IndexBuildResult);
+	IndexBuildResult *result;
 
+	if (AnnFrozenOption(index))
+		return AnnFrozenBuild(heap, index, indexInfo);
+	if (indexInfo->ii_NumIndexAttrs != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("INCLUDE columns of ann indexes require frozen = true")));
+	result = palloc0_object(IndexBuildResult);
 	AnnInitMetaPage(index, MAIN_FORKNUM);
 	buildstate.tmpCtx = AllocSetContextCreate(CurrentMemoryContext, "Ann build temporary context", ALLOCSET_DEFAULT_SIZES);
 	result->heap_tuples = table_index_build_scan(heap, index, indexInfo, true, true,

@@ -3,6 +3,7 @@
 #include <math.h>
 
 #include "access/amvalidate.h"
+#include "access/reloptions.h"
 #include "ann.h"
 #include "catalog/pg_type_d.h"
 #include "commands/vacuum.h"
@@ -60,6 +61,44 @@ annproperty(Oid index_oid, int attno, IndexAMProperty prop, const char *propname
 	return true;
 }
 
+static relopt_kind ann_relopt_kind;
+
+void
+AnnInitOptions(void)
+{
+	ann_relopt_kind = add_reloption_kind();
+	add_bool_reloption(ann_relopt_kind, "frozen",
+					   "Build an immutable index with forward and inverted pages",
+					   false, AccessExclusiveLock);
+}
+
+static bytea *
+annoptions(Datum reloptions, bool validate)
+{
+	static const relopt_parse_elt tab[] = {
+		{"frozen", RELOPT_TYPE_BOOL, offsetof(AnnOptions, frozen)},
+	};
+
+	return (bytea *) build_reloptions(reloptions, validate, ann_relopt_kind,
+									  sizeof(AnnOptions), tab, lengthof(tab));
+}
+
+/* The reloption decides how a build lays out pages; the metapage records it. */
+bool
+AnnFrozenOption(Relation index)
+{
+	AnnOptions *options = (AnnOptions *) index->rd_options;
+
+	return options && options->frozen;
+}
+
+/* Frozen pages hold every column, so index-only scans can return them all. */
+static bool
+anncanreturn(Relation index, int attno)
+{
+	return AnnIsFrozen(index);
+}
+
 /*
  * Register only implemented access-method capabilities.
  */
@@ -73,6 +112,7 @@ annhandler(PG_FUNCTION_ARGS)
 	amroutine->amsupport = ANN_NPROCS;
 	amroutine->amcanorderbyop = true;
 	amroutine->amoptionalkey = true;
+	amroutine->amcaninclude = true;
 	amroutine->amparallelvacuumoptions = VACUUM_OPTION_PARALLEL_BULKDEL;
 	amroutine->amkeytype = InvalidOid;
 	amroutine->ambuild = annbuild;
@@ -80,7 +120,9 @@ annhandler(PG_FUNCTION_ARGS)
 	amroutine->aminsert = anninsert;
 	amroutine->ambulkdelete = annbulkdelete;
 	amroutine->amvacuumcleanup = annvacuumcleanup;
+	amroutine->amcanreturn = anncanreturn;
 	amroutine->amcostestimate = anncostestimate;
+	amroutine->amoptions = annoptions;
 	amroutine->amproperty = annproperty;
 	amroutine->amvalidate = annvalidate;
 	amroutine->ambeginscan = annbeginscan;
