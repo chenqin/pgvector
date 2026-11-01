@@ -63,6 +63,8 @@ SELECT * FROM ann_attribute_search('docs', $1, 10, 'tenant', ARRAY[7]);
 
 After the build, `aminsert` refuses every insert ("cannot insert into frozen ann index"), even if the guard is dropped. To change the table: `DROP INDEX`, `DROP TRIGGER ann_frozen_guard ON docs`, write, then freeze, vacuum and build again. That gives a new generation, and the old GPU directory no longer loads.
 
+**Dump and restore.** `pg_dump` writes indexes before triggers, and restores load rows with plain `COPY`, so restoring a frozen table's `CREATE INDEX` fails: the guard doesn't exist yet and no page is frozen. The guard is restored right after it. Then run `VACUUM (FREEZE)` and the `CREATE INDEX` again; the generation is the same, so existing GPU directories still load. The guard is per table: a partitioned table needs `ann_freeze` and a frozen index on each partition.
+
 If the guard is dropped and rows are deleted anyway, VACUUM doesn't move any ordinal: it overwrites the deleted rows' TIDs with an invalid TID, and scans skip them, so heap slots can be reused safely. The GPU index still holds those rows until it is rebuilt, and joins back to the table drop them, as for any loaded index.
 
 ## Page layout
