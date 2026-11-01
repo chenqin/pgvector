@@ -527,6 +527,32 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 						 RelationGetRelationName(heap))));
 	blocks = RelationGetNumberOfBlocks(heap);
 	visibilitymap_count(heap, &visible, &frozen);
+
+	/*
+	 * Bulk loads extend the table ahead of use, leaving all-zero pages that
+	 * VACUUM never marks; they hold no rows, so they count as frozen.
+	 */
+	if (frozen < blocks)
+	{
+		Buffer		vmbuf = InvalidBuffer;
+		BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
+
+		for (BlockNumber blkno = 0; blkno < blocks && frozen < blocks; blkno++)
+		{
+			Buffer		buf;
+
+			if (VM_ALL_FROZEN(heap, blkno, &vmbuf))
+				continue;
+			buf = ReadBufferExtended(heap, MAIN_FORKNUM, blkno, RBM_NORMAL, strategy);
+			LockBuffer(buf, BUFFER_LOCK_SHARE);
+			if (PageIsNew(BufferGetPage(buf)))
+				frozen++;
+			UnlockReleaseBuffer(buf);
+		}
+		if (BufferIsValid(vmbuf))
+			ReleaseBuffer(vmbuf);
+		FreeAccessStrategy(strategy);
+	}
 	if (frozen < blocks)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

@@ -54,10 +54,17 @@ class FrozenTests(unittest.TestCase):
                             FROM generate_series({rows}, 1, -1) i""")
         if freeze:
             self.assertTrue(self.value(f"SELECT ann_freeze('{table}')"))
-            self.db.execute(f'VACUUM (FREEZE) {table}')
+            self.vacuum(table)
         if index:
             self.db.execute(f'CREATE INDEX {table}_ann ON {table} USING ann (emb vector_l2_ops) '
                             'INCLUDE (id, tenant, category) WITH (frozen = true)')
+
+    def vacuum(self, table):
+        """VACUUM (FREEZE) until every page is all-visible: pages other sessions hold stay unfrozen."""
+        for _ in range(5):
+            self.db.execute(f'VACUUM (FREEZE) {table}')
+            if self.value(f"SELECT relallvisible = relpages FROM pg_class WHERE oid = '{table}'::regclass"):
+                return
 
     def value(self, statement, params=None):
         return self.db.execute(statement, params).fetchone()[0]
@@ -74,13 +81,16 @@ class FrozenTests(unittest.TestCase):
     def ordered(self, columns, predicate, query, limit, index):
         statement = (f'SELECT {columns}, emb <-> %s::vector AS d FROM docs WHERE {predicate} '
                      f'ORDER BY emb <-> %s::vector, id LIMIT {limit}')
+        # The access method's own scans; the frozen route is tested separately.
+        self.db.execute('SET ann.enable_frozen_search = off')
         self.db.execute('SET enable_seqscan = ' + ('off' if index else 'on'))
         for setting in ['enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan']:
             self.db.execute(f'SET {setting} = ' + ('on' if index else 'off'))
         try:
             return self.db.execute(statement, (query, query)).fetchall(), self.plan(statement, (query, query))
         finally:
-            for setting in ['enable_seqscan', 'enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan']:
+            for setting in ['enable_seqscan', 'enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan',
+                            'ann.enable_frozen_search']:
                 self.db.execute(f'RESET {setting}')
 
     def test_contract(self):
@@ -197,6 +207,198 @@ class FrozenTests(unittest.TestCase):
             expected, _ = self.ordered('id, tenant', 'true', query, 40, False)
             self.assertEqual(actual, expected)
         self.assertEqual(self.value("SELECT rows FROM ann_frozen_info('docs_ann')"), ROWS)
+
+    FILTERS = ['tenant = 3', 'tenant <> 3', 'category IS NULL', 'category IS NOT NULL', 'tenant IN (1, 2, 99)',
+               'tenant NOT IN (1, 2)', 'tenant NOT IN (1, NULL)', 'tenant = ANY(ARRAY[]::int[])',
+               'tenant <> ALL(ARRAY[]::int[])', 'tenant BETWEEN 3 AND 7 AND category > 2',
+               'NOT (tenant < 5 OR category = 1)', 'tenant > 100000000000', 'category < 3 OR tenant = 12',
+               'NOT (category = 2)', 'NOT (category IN (1, 2) AND tenant >= 6)', '6 > category',
+               'tenant >= -5 AND tenant < 2::bigint', 'category = 2::smallint OR category IS NULL', 'true', 'false']
+
+    def bitmap_rows(self, bitmap):
+        """Keys of the rows a bitmap over ordinals selects (keys are 5, 10, ...)."""
+        return [(i + 1) * 5 for i in range(len(bitmap) * 8) if bitmap[i // 8] >> (i % 8) & 1]
+
+    def assert_filter(self, index, predicate):
+        eligible, bitmap = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                           (index, predicate)).fetchone()
+        expected = [row[0] for row in self.db.execute(f'SELECT id FROM docs WHERE {predicate} ORDER BY id')]
+        self.assertEqual(self.bitmap_rows(bytes(bitmap)), expected, predicate)
+        self.assertEqual(eligible, len(expected), predicate)
+        return bytes(bitmap)
+
+    def test_predicates_match_sql(self):
+        self.create()
+        self.db.execute('CREATE INDEX docs_bits ON docs USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, tenant, category) WITH (frozen = true, bitset_min = 0)')
+        for predicate in self.FILTERS:
+            self.assertEqual(self.assert_filter('docs_ann', predicate), self.assert_filter('docs_bits', predicate))
+        for predicate in ['body = $$x$$', 'tenant = random()::int', 'tenant + 1 = 3']:
+            self.assertIn('not a predicate over the INCLUDE attributes',
+                          self.error('SELECT * FROM ann_frozen_filter(%s, %s)', ('docs_ann', predicate)))
+
+    def route(self, predicate, query, limit, route=True):
+        statement = (f'SELECT id, tenant, emb <-> %s::vector AS d FROM docs WHERE {predicate} '
+                     f'ORDER BY emb <-> %s::vector LIMIT {limit}')
+        self.db.execute('SET ann.enable_frozen_search = ' + ('on' if route else 'off'))
+        self.db.execute('SET enable_indexscan = ' + ('on' if route else 'off'))
+        self.db.execute('SET enable_indexonlyscan = ' + ('on' if route else 'off'))
+        try:
+            rows = self.db.execute(statement, (query, query)).fetchall()
+            plan = self.plan(statement, (query, query))
+        finally:
+            for setting in ['ann.enable_frozen_search', 'enable_indexscan', 'enable_indexonlyscan']:
+                self.db.execute(f'RESET {setting}')
+        return rows, plan
+
+    def test_frozen_route_matches_sql(self):
+        self.create()
+        rng = random.Random(5)
+        for predicate in self.FILTERS:
+            query = str([rng.uniform(-50, 50), rng.uniform(-40, 40), rng.uniform(-30, 30), rng.uniform(0, 5)])
+            actual, plan = self.route(predicate, query, 25)
+            expected, _ = self.route(predicate, query, 25, route=False)
+            self.assertEqual(actual, expected, predicate)
+            if predicate not in ('true', 'false'):
+                self.assertIn('AnnFrozenSearch', plan, predicate)
+                self.assertIn('Heap Fetches: 0', plan, predicate)
+        # Columns outside the index come from the heap.
+        rows = self.db.execute("SELECT id, body FROM docs WHERE tenant = 4 ORDER BY emb <-> '[1,2,3,4]' "
+                               'LIMIT 5').fetchall()
+        self.assertEqual([row[1] for row in rows], [f'row {row[0] // 5}' for row in rows])
+        # A parameterized LIMIT starts from 100 rows and refills.
+        results = []
+        for setting in ['on', 'off']:
+            self.db.execute(f'SET ann.enable_frozen_search = {setting}')
+            self.db.execute('SET plan_cache_mode = force_generic_plan')
+            self.db.execute('PREPARE nearest(int, vector, int) AS SELECT id FROM docs WHERE tenant <> $1 '
+                            'ORDER BY emb <-> $2 LIMIT $3')
+            results.append([row[0] for row in self.db.execute("EXECUTE nearest(3, '[5,5,5,1]', 700)")])
+            self.db.execute('DEALLOCATE nearest')
+        self.assertEqual(len(results[0]), 700)
+        self.assertEqual(results[0], results[1])
+        self.db.execute('RESET ann.enable_frozen_search')
+        # Unsupported predicates keep ordinary plans.
+        plan = self.plan("SELECT id FROM docs WHERE body = 'row 7' ORDER BY emb <-> '[1,2,3,4]' LIMIT 3")
+        self.assertNotIn('AnnFrozenSearch', plan)
+
+    def test_partition_base_and_delta(self):
+        self.create(table='base', index=False)
+        self.db.execute('CREATE TABLE parts (id bigint, tenant int, category smallint, body text, emb vector(4)) '
+                        'PARTITION BY RANGE (id)')
+        self.db.execute('CREATE TABLE delta PARTITION OF parts DEFAULT')
+        self.db.execute(f'ALTER TABLE parts ATTACH PARTITION base FOR VALUES FROM (0) TO ({5 * ROWS + 1})')
+        self.db.execute('CREATE INDEX base_ann ON base USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, tenant, category) WITH (frozen = true)')
+        # New rows land in the delta; the frozen base refuses them.
+        self.db.execute(f"""INSERT INTO parts SELECT {5 * ROWS} + i, i % 13, (i % 7)::smallint, 'new ' || i,
+                               ARRAY[cos(i) * 50, sin(i * 1.1) * 40, cos(i * 0.3) * 30, i % 5]::vector
+                           FROM generate_series(1, 400) i""")
+        self.assertIn('cannot insert into frozen ann index',
+                      self.error("INSERT INTO parts VALUES (1, 1, 1, '', '[1,2,3,4]')"))
+        for predicate in ['tenant = 3', 'category IN (1, 2) AND tenant < 9', 'true']:
+            statement = f"SELECT id FROM parts WHERE {predicate} ORDER BY emb <-> '[3,1,4,1]' LIMIT 30"
+            plan = self.plan(statement)
+            self.assertIn('AnnFrozenSearch', plan)
+            self.assertIn('Merge Append', plan)
+            actual = [row[0] for row in self.db.execute(statement)]
+            self.db.execute('SET ann.enable_frozen_search = off')
+            expected = [row[0] for row in self.db.execute(statement)]
+            self.db.execute('RESET ann.enable_frozen_search')
+            self.assertEqual(actual, expected, predicate)
+
+    def load(self, server, name, table='docs'):
+        export = os.path.join(self.directory.name, name + '-export')
+        path = os.path.join(self.directory.name, name)
+        self.db.execute('SELECT ann_index_export(%s, %s)', (f'{table}_ann', export))
+        subprocess.run([sys.executable, BUILD, '--from-export', export, '--out', path, '--no-cagra'],
+                       check=True, capture_output=True)
+        self.db.execute('SET ann.worker_socket = %s' % self.sql.Literal(server.path).as_string(self.db))
+        self.db.execute('SELECT ann_index_load(%s, %s)', (name, path))
+
+    def test_worker_route_and_bitmap_identity(self):
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            name = 'frozen_' + uuid.uuid4().hex[:8]
+            self.load(server, name)
+            # The worker's evaluation from its postings equals the pages', word for word.
+            for predicate in self.FILTERS:
+                worker = self.db.execute('SELECT eligible, bitmap FROM ann_index_filter(%s, %s)',
+                                         (name, predicate)).fetchone()
+                pages = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                        ('docs_ann', predicate)).fetchone()
+                self.assertEqual((worker[0], bytes(worker[1])), (pages[0], bytes(pages[1])), predicate)
+            rng = random.Random(9)
+            for predicate in self.FILTERS[:12]:
+                query = str([rng.uniform(-50, 50), rng.uniform(-40, 40), rng.uniform(-30, 30), 2])
+                actual, plan = self.route(predicate, query, 20)
+                expected, _ = self.route(predicate, query, 20, route=False)
+                self.assertEqual([row[:2] for row in actual], [row[:2] for row in expected], predicate)
+                self.assertIn(f'GPU worker "{name}"', plan, predicate)
+            # Stored filters over INCLUDE attributes build from the pages, with generation ids.
+            self.assertEqual(self.value('SELECT ann_filter_bitmap_build(%s, %s)', (name, 'tenant IN (2, 5)')),
+                             self.value('SELECT count(*) FROM docs WHERE tenant IN (2, 5)'))
+            hits = self.db.execute('SELECT id FROM ann_bitmap_search(%s, %s, 5, %s) ORDER BY distance, id',
+                                   (name, '[1,2,3,4]', 'tenant IN (2, 5)')).fetchall()
+            expected = self.db.execute("SELECT id FROM docs WHERE tenant IN (2, 5) "
+                                       "ORDER BY emb <-> '[1,2,3,4]', id LIMIT 5").fetchall()
+            self.assertEqual(hits, expected)
+        finally:
+            server.close()
+
+    def test_generation_mismatch_and_switch(self):
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            first = 'gen1_' + uuid.uuid4().hex[:8]
+            self.load(server, first)
+            # A catalog naming another generation: tagged requests are refused.
+            self.db.execute("UPDATE ann_index_catalog SET generation = '0123456789abcdef' WHERE name = %s",
+                            (first,))
+            other = self.psycopg.connect(DSN, autocommit=True)
+            try:
+                other.execute('SET ann.worker_socket = %s' % self.sql.Literal(server.path).as_string(other))
+                other.execute(f'SET search_path = {self.schema}, public')
+                with self.assertRaises(self.psycopg.Error) as caught:
+                    other.execute("SELECT * FROM ann_attribute_search(%s, '[1,2,3,4]', 3, 'tenant', ARRAY[1])",
+                                  (first,))
+                self.assertIn('another generation', str(caught.exception))
+                # The frozen route finds no worker of its generation: the pages answer.
+                plan = '\n'.join(row[0] for row in other.execute(
+                    "EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id FROM docs WHERE tenant = 1 "
+                    "ORDER BY emb <-> '[1,2,3,4]' LIMIT 3"))
+                self.assertIn('from index pages', plan)
+            finally:
+                other.close()
+            self.db.execute('UPDATE ann_index_catalog SET generation = (SELECT generation FROM '
+                            "ann_frozen_info('docs_ann')) WHERE name = %s", (first,))
+
+            # A new generation: the base absorbs new rows, is frozen, exported and loaded under a
+            # new name; the route follows the generation of the table it scans.
+            self.db.execute('CREATE TABLE docs2 AS SELECT * FROM docs')
+            self.db.execute("INSERT INTO docs2 VALUES (99995, 1, 1, 'new', '[1,2,3,4]')")
+            self.db.execute("SELECT ann_freeze('docs2')")
+            self.vacuum('docs2')
+            self.db.execute('CREATE INDEX docs2_ann ON docs2 USING ann (emb vector_l2_ops) '
+                            'INCLUDE (id, tenant, category) WITH (frozen = true)')
+            second = 'gen2_' + uuid.uuid4().hex[:8]
+            self.load(server, second, table='docs2')
+            plan = self.plan("SELECT id FROM docs2 WHERE tenant = 1 ORDER BY emb <-> '[1,2,3,4]' LIMIT 3")
+            self.assertIn(f'GPU worker "{second}"', plan)
+            self.assertEqual(self.value("SELECT id FROM docs2 WHERE tenant = 1 ORDER BY emb <-> '[1,2,3,4]' "
+                                        'LIMIT 1'), 99995)
+            # Retiring the old generation's table drops its index and guard.
+            self.db.execute('DROP TABLE docs')
+            self.assertEqual(self.value(f"SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                                        f"JOIN pg_namespace n ON n.oid = c.relnamespace "
+                                        f"WHERE n.nspname = '{self.schema}' AND c.relname = 'docs'"), 0)
+        finally:
+            server.close()
 
     def export(self, name):
         path = os.path.join(self.directory.name, name)
