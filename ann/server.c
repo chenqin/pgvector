@@ -5,6 +5,7 @@
 
 #include "server.h"
 #include "indexfile.h"
+#include "filter.h"
 #include "rdma.h"
 
 #include <errno.h>
@@ -58,6 +59,7 @@ typedef struct Job
 	Connection *connection;
 	int			rdma;			/* reply over RDMA, as requested */
 	uint16_t	operation;
+	uint32_t	flags;			/* operation 22 flags */
 	uint64_t	request;
 	unsigned char *payload;
 	uint64_t	charge;
@@ -111,6 +113,9 @@ typedef struct Service
 	uint64_t	grouped_jobs;	/* jobs in those groups */
 	uint64_t	held;			/* pickups that found only jobs whose filter
 								 * enough lanes were already on */
+	uint64_t	predicate_hits; /* operation 22 programs found cached */
+	uint64_t	predicate_evaluations;
+	uint64_t	predicate_eval_us;	/* time spent evaluating them */
 	uint32_t	blockedWaiters; /* lanes waiting for a filter to free up */
 	uint32_t	activeLanes;	/* lanes working on cached filters */
 	FilterEntry *filters[ANN_FILTER_BUCKETS];
@@ -294,11 +299,17 @@ Finish(Service *service, Job *job)
 
 	if (job->kind == JOB_INDEX)
 	{
-		/* u32 count, u32 route, then (i64 key, f32 distance) per hit */
+		/*
+		 * u32 count, u32 route, then (i64 key, f32 distance) per hit;
+		 * operation 22 adds u64 eligible rows after the route, and with
+		 * ANN_PREDICATE_ORDINALS returns ordinals instead of keys.
+		 */
+		size_t		head = job->operation == ANN_OP_INDEX_SEARCH_PREDICATE ? 16 : 8;
+
 		job->job.status = job->index.status;
 		if (job->index.status == ANN_OK)
 		{
-			size = 8 + (size_t) job->index.nresults * 12;
+			size = head + (size_t) job->index.nresults * 12;
 			data = malloc(size);
 			if (data == NULL)
 				job->job.status = ANN_NOMEM;
@@ -306,13 +317,33 @@ Finish(Service *service, Job *job)
 			{
 				Write(data, job->index.nresults, 4);
 				Write(data + 4, job->index.route, 4);
+				if (head == 16)
+					Write(data + 8, job->bitmap ? job->bitmap->count : 0, 8);
 				for (uint32_t i = 0; i < job->index.nresults; i++)
 				{
 					uint32_t	bits;
+					uint64_t	id = (uint64_t) job->index.results[i].key;
 
+					if ((job->flags & ANN_PREDICATE_ORDINALS) && job->bitmapFile)
+					{
+						const int64_t *keys = job->bitmapFile->keys;
+						uint64_t	low = 0,
+									high = job->bitmapFile->rows;
+
+						while (low < high)
+						{
+							uint64_t	middle = low + (high - low) / 2;
+
+							if (keys[middle] < job->index.results[i].key)
+								low = middle + 1;
+							else
+								high = middle;
+						}
+						id = low;
+					}
 					memcpy(&bits, &job->index.results[i].distance, sizeof(bits));
-					Write(data + 8 + (size_t) i * 12, (uint64_t) job->index.results[i].key, 8);
-					Write(data + 16 + (size_t) i * 12, bits, 4);
+					Write(data + head + (size_t) i * 12, id, 8);
+					Write(data + head + 8 + (size_t) i * 12, bits, 4);
 				}
 			}
 		}
@@ -1348,6 +1379,11 @@ PutBitmap(const unsigned char *payload, uint32_t size)
 	return status;
 }
 
+static AnnStatus SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t request,
+								 unsigned char *payload, uint32_t size, AnnIndexFile *file,
+								 AnnIndexBitmap *bitmap, const char *name, uint32_t dimensions,
+								 uint32_t k, size_t offset, uint16_t operation, uint32_t flags);
+
 /*
  * Cached bitmap search payload: u32 name length, name, u32 dimensions, k,
  * u64 filter id; FP32 query. ANN_MISSING when the id is not cached here, so
@@ -1357,7 +1393,6 @@ static AnnStatus
 SubmitCached(Service *service, Connection *connection, int rdma, uint64_t request,
 			 unsigned char *payload, uint32_t size)
 {
-	Job		   *job;
 	AnnIndexFile *file;
 	AnnIndexBitmap *bitmap;
 	char		name[ANN_INDEX_NAME_MAX + 1];
@@ -1389,6 +1424,22 @@ SubmitCached(Service *service, Connection *connection, int rdma, uint64_t reques
 	AnnIndexPut(file);
 	if (bitmap == NULL)
 		return ANN_MISSING;
+	return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
+						   dimensions, k, offset, ANN_OP_INDEX_SEARCH_CACHED, 0);
+}
+
+/*
+ * Queue a search over a cached bitmap (a pushed filter or a predicate's
+ * result), whose reference the job takes over. The query starts at offset.
+ */
+static AnnStatus
+SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t request,
+				unsigned char *payload, uint32_t size, AnnIndexFile *file, AnnIndexBitmap *bitmap,
+				const char *name, uint32_t dimensions, uint32_t k, size_t offset, uint16_t operation,
+				uint32_t flags)
+{
+	Job		   *job;
+
 	job = calloc(1, sizeof(*job));
 	if (job == NULL || (job->index.results = malloc(sizeof(AnnIndexHit) * k)) == NULL)
 	{
@@ -1441,7 +1492,8 @@ SubmitCached(Service *service, Connection *connection, int rdma, uint64_t reques
 	job->bitmapFile = file;
 	job->bitmap = bitmap;
 	job->connection = connection;
-	job->operation = ANN_OP_INDEX_SEARCH_CACHED;
+	job->operation = operation;
+	job->flags = flags;
 	job->rdma = rdma;
 	job->request = request;
 	job->payload = payload;
@@ -1452,6 +1504,192 @@ SubmitCached(Service *service, Connection *connection, int rdma, uint64_t reques
 	AnnIndexBitmapRelease(file, bitmap);
 	free(job);
 	return ANN_OVERLOADED;
+}
+
+static uint64_t
+MicrosecondsSince(const struct timespec *start)
+{
+	struct timespec now;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t) (now.tv_sec - start->tv_sec) * 1000000 +
+		(uint64_t) ((now.tv_nsec - start->tv_nsec) / 1000);
+}
+
+/*
+ * A predicate's rows as a cached bitmap: found under the program's hash, or
+ * evaluated over the attribute columns and cached (dropping the oldest
+ * predicate result past --predicate-cache). Returns a referenced bitmap.
+ */
+static AnnStatus
+PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
+				AnnIndexBitmap **result)
+{
+	uint64_t	id = AnnFilterHash(program, size);
+	size_t		nwords = ((size_t) file->rows + 31) / 32;
+	uint32_t   *words;
+	uint64_t	count;
+	int			code;
+	AnnStatus	status;
+	struct timespec start;
+
+	if ((*result = AnnIndexBitmapGet(file, id)) != NULL)
+	{
+		(void) pthread_mutex_lock(&service->mutex);
+		service->predicate_hits++;
+		(void) pthread_mutex_unlock(&service->mutex);
+		return ANN_OK;
+	}
+	if ((words = malloc(nwords * 4 + 4)) == NULL)
+		return ANN_NOMEM;
+	(void) clock_gettime(CLOCK_MONOTONIC, &start);
+	code = AnnIndexEvaluate(file, program, size, words, &count);
+	if (code != ANN_FILTER_OK)
+	{
+		free(words);
+		return code == ANN_FILTER_NO_MEMORY ? ANN_NOMEM : code == ANN_FILTER_UNKNOWN_BITMAP ? ANN_MISSING :
+			ANN_INVALID;
+	}
+
+	/* Keep rows for every filter a scan may take; see SubmitCached. */
+	status = AnnIndexPredicatePut(file, id, words, nwords, file->device == NULL ? UINT64_MAX :
+								  AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
+								  AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit);
+	free(words);
+	(void) pthread_mutex_lock(&service->mutex);
+	service->predicate_evaluations++;
+	service->predicate_eval_us += MicrosecondsSince(&start);
+	(void) pthread_mutex_unlock(&service->mutex);
+	if (status != ANN_OK)
+		return status;
+	if ((*result = AnnIndexBitmapGet(file, id)) == NULL)
+		return ANN_BACKEND_ERROR;
+	return ANN_OK;
+}
+
+/*
+ * Predicate search payload: u32 name length, name, u32 dimensions, k,
+ * flags, program length, the program (ann/filter.h); FP32 query. The rows
+ * are cached under the program's hash, so repeated predicates share one
+ * evaluation and are grouped like cached bitmaps.
+ */
+static AnnStatus
+SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t request,
+				unsigned char *payload, uint32_t size)
+{
+	AnnIndexFile *file;
+	AnnIndexBitmap *bitmap;
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint32_t	nameLength,
+				dimensions,
+				k,
+				flags,
+				programLength;
+	size_t		offset;
+	AnnStatus	status;
+
+	if (service->backend->search_index == NULL)
+		return ANN_UNSUPPORTED;
+	if (size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
+		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size < 20 + (uint64_t) nameLength ||
+		memchr(payload + 4, '\0', nameLength))
+		return ANN_INVALID;
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
+	offset = 4 + nameLength;
+	dimensions = (uint32_t) Read(payload + offset, 4);
+	k = (uint32_t) Read(payload + offset + 4, 4);
+	flags = (uint32_t) Read(payload + offset + 8, 4);
+	programLength = (uint32_t) Read(payload + offset + 12, 4);
+	offset += 16;
+	if (dimensions == 0 || dimensions > ANN_MAX_DIM || k == 0 || k > 10000 ||
+		(uint64_t) size != offset + (uint64_t) programLength + (uint64_t) dimensions * 4 ||
+		!AnnFilterCheck(payload + offset, programLength))
+		return ANN_INVALID;
+	if ((file = AnnIndexGet(name)) == NULL)
+		return ANN_STALE;
+	status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap);
+	AnnIndexPut(file);
+	if (status != ANN_OK)
+		return status;
+	return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
+						   dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+}
+
+/*
+ * Predicate evaluation payload: u32 name length, name, then the program.
+ * Reply: u64 eligible rows, then the bitmap as u32 words. Comparing it with
+ * PostgreSQL's evaluation from its frozen pages proves both agree.
+ */
+static AnnStatus
+EvaluatePredicate(Service *service, const unsigned char *payload, uint32_t size,
+				  unsigned char **reply, size_t *replyLength)
+{
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint32_t	nameLength;
+	AnnIndexFile *file;
+	AnnIndexBitmap *bitmap;
+	AnnStatus	status;
+	size_t		nwords;
+
+	*reply = NULL;
+	*replyLength = 0;
+	if (size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
+		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size <= 4 + (uint64_t) nameLength ||
+		memchr(payload + 4, '\0', nameLength) ||
+		!AnnFilterCheck(payload + 4 + nameLength, size - 4 - nameLength))
+		return ANN_INVALID;
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
+	if ((file = AnnIndexGet(name)) == NULL)
+		return ANN_STALE;
+	status = PredicateBitmap(service, file, payload + 4 + nameLength, size - 4 - nameLength, &bitmap);
+	if (status == ANN_OK)
+	{
+		nwords = ((size_t) file->rows + 31) / 32;
+		if ((*reply = malloc(8 + nwords * 4)) == NULL)
+			status = ANN_NOMEM;
+		else
+		{
+			Write(*reply, bitmap->count, 8);
+			for (size_t w = 0; w < nwords; w++)
+				Write(*reply + 8 + w * 4, bitmap->words[w], 4);
+			*replyLength = 8 + nwords * 4;
+		}
+		AnnIndexBitmapRelease(file, bitmap);
+	}
+	AnnIndexPut(file);
+	return status;
+}
+
+/*
+ * Requests that carry a generation in their header (PostgreSQL sets it for
+ * indexes exported from a frozen index) must name the loaded one.
+ */
+static AnnStatus
+CheckGeneration(uint16_t operation, const unsigned char *payload, uint32_t size, uint64_t generation)
+{
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint32_t	nameLength;
+	AnnIndexFile *file;
+	AnnStatus	status = ANN_OK;
+
+	if (generation == 0 ||
+		(operation != ANN_OP_INDEX_SEARCH && operation != ANN_OP_INDEX_SEARCH_PACKED &&
+		 operation != ANN_OP_INDEX_SEARCH_MATCH && operation != ANN_OP_INDEX_SEARCH_BITMAP &&
+		 operation != ANN_OP_INDEX_SEARCH_CACHED && operation != ANN_OP_INDEX_SEARCH_PREDICATE &&
+		 operation != ANN_OP_INDEX_PREDICATE && operation != ANN_OP_BITMAP_PUT) ||
+		size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
+		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size < 4 + (uint64_t) nameLength)
+		return ANN_OK;
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
+	if ((file = AnnIndexGet(name)) == NULL)
+		return ANN_OK;			/* the operation reports it missing */
+	if (file->generationValue != generation)
+		status = ANN_GENERATION;
+	AnnIndexPut(file);
+	return status;
 }
 
 /*
@@ -1488,7 +1726,7 @@ LoadIndex(Service *service, const unsigned char *payload, uint32_t size,
 	if (file == NULL)
 		return ANN_BACKEND_ERROR;
 	written = snprintf(reply, replySize, "rows %llu dimensions %u shards %u dtype %s source %s key %s vector %s "
-					   "quant %s quant_scan %s generation %s",
+					   "quant %s quant_scan %s generation %s predicates on",
 					   (unsigned long long) file->rows, file->dimensions, file->nshards,
 					   file->dtype, file->source[0] ? file->source : "-",
 					   file->key[0] ? file->key : "-", file->vector[0] ? file->vector : "-",
@@ -1515,7 +1753,8 @@ DescribeIndex(const unsigned char *payload, uint32_t size, char *reply, size_t r
 		return ANN_STALE;
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	written = snprintf(reply, replySize, "rows %llu dimensions %u shards %u dtype %s source %s key %s vector %s "
-					   "quant %s quant_scan %s bitmaps %llu bitmap_bytes %llu bitmap_device_bytes %llu generation %s",
+					   "quant %s quant_scan %s bitmaps %llu bitmap_bytes %llu bitmap_device_bytes %llu generation %s "
+					   "predicates on",
 					   (unsigned long long) file->rows, file->dimensions, file->nshards,
 					   file->dtype, file->source[0] ? file->source : "-",
 					   file->key[0] ? file->key : "-", file->vector[0] ? file->vector : "-",
@@ -1620,6 +1859,7 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 	Connection *connection = NULL;
 	uint16_t	operation;
 	uint64_t	request;
+	uint64_t	generation;
 	uint32_t	length;
 	unsigned char *payload;
 	AnnStatus	status;
@@ -1648,12 +1888,17 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 	}
 	operation = (uint16_t) Read(frame + 6, 2);
 	request = Read(frame + 8, 8);
+	generation = Read(frame + 16, 8);
 	payload = malloc(length ? length : 1);
 	if (payload)
 		memcpy(payload, frame + 32, length);
 	free(frame);
 	if (payload == NULL)
 		status = ANN_NOMEM;
+	else if ((status = CheckGeneration(operation, payload, length, generation)) != ANN_OK)
+		;
+	else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
+		status = SubmitPredicate(service, connection, 1, request, payload, length);
 	else if (operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED)
 		status = SubmitIndex(service, connection, 1, operation, request, payload, length);
 	else if (operation == ANN_OP_INDEX_SEARCH_MATCH)
@@ -1696,6 +1941,7 @@ Reader(void *argument)
 		unsigned char *payload;
 		uint16_t	operation;
 		uint64_t	request;
+		uint64_t	generation;
 		uint32_t	length;
 		AnnStatus	status;
 
@@ -1705,6 +1951,7 @@ Reader(void *argument)
 			break;
 		operation = (uint16_t) Read(header + 6, 2);
 		request = Read(header + 8, 8);
+		generation = Read(header + 16, 8);
 		payload = malloc(length ? length : 1);
 		if (payload == NULL || !ReadFull(connection->fd, payload, length))
 		{
@@ -1731,6 +1978,12 @@ Reader(void *argument)
 				(void) setsockopt(connection->fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
 			}
 			Reply(connection, operation, request, ANN_OK, NULL, 0);
+			continue;
+		}
+		if ((status = CheckGeneration(operation, payload, length, generation)) != ANN_OK)
+		{
+			free(payload);
+			Reply(connection, operation, request, status, NULL, 0);
 			continue;
 		}
 		if (connection->remote &&
@@ -1774,7 +2027,8 @@ Reader(void *argument)
 								"{\"jobs\":%llu,\"batches\":%llu,\"max_batch\":%llu,\"rows\":%llu,"
 								"\"rejected\":%llu,\"failed\":%llu,\"pending_bytes\":%llu,\"device_jobs\":%llu,"
 								"\"rdma_frames\":%llu,\"rdma_fallbacks\":%llu,\"rdma_lanes\":%d,"
-								"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu}",
+								"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu,\"predicate_hits\":%llu,"
+								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu}",
 								(unsigned long long) service->jobs, (unsigned long long) service->batches,
 								(unsigned long long) service->max_batch, (unsigned long long) service->rows,
 								(unsigned long long) service->rejected, (unsigned long long) service->failed,
@@ -1783,7 +2037,10 @@ Reader(void *argument)
 													  service->backend->device_jobs() : 0),
 								(unsigned long long) service->rdma_frames, (unsigned long long) rdmaFallbacks,
 								rdmaLanes, (unsigned long long) service->groups,
-								(unsigned long long) service->grouped_jobs, (unsigned long long) service->held);
+								(unsigned long long) service->grouped_jobs, (unsigned long long) service->held,
+								(unsigned long long) service->predicate_hits,
+								(unsigned long long) service->predicate_evaluations,
+								(unsigned long long) service->predicate_eval_us);
 			(void) pthread_mutex_unlock(&service->mutex);
 			Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 				  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);
@@ -1815,6 +2072,22 @@ Reader(void *argument)
 			if (status == ANN_PENDING)
 				continue;
 			Reply(connection, operation, request, status, NULL, 0);
+		}
+		else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
+		{
+			status = SubmitPredicate(service, connection, 0, request, payload, length);
+			if (status == ANN_PENDING)
+				continue;
+			Reply(connection, operation, request, status, NULL, 0);
+		}
+		else if (operation == ANN_OP_INDEX_PREDICATE)
+		{
+			unsigned char *bitmap = NULL;
+			size_t		bitmapLength = 0;
+
+			status = EvaluatePredicate(service, payload, length, &bitmap, &bitmapLength);
+			Reply(connection, operation, request, status, bitmap, bitmapLength);
+			free(bitmap);
 		}
 		else if (operation == ANN_OP_BITMAP_PUT)
 			Reply(connection, operation, request, PutBitmap(payload, length), NULL, 0);

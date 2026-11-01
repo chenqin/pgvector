@@ -359,7 +359,7 @@ static void
 PutHeader(char *header, uint16 operation, uint64 request, uint32 length)
 {
 	uint16		version = 1;
-	uint64		generation = 0;
+	uint64		generation = ann_request_generation;
 
 	memcpy(header, "PVAN", 4);
 	memcpy(header + 4, &version, 2);

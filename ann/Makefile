@@ -20,20 +20,23 @@ batching.o: batching.c batching.h backend.h
 cpu.o: cpu.c backend.h indexfile.h
 	$(CC) $(CFLAGS) -c cpu.c -o $@
 
-indexfile.o: indexfile.c indexfile.h backend.h
+indexfile.o: indexfile.c indexfile.h backend.h filter.h
 	$(CC) $(CFLAGS) -pthread -c indexfile.c -o $@
 
-libannbatch.a: batching.o cpu.o indexfile.o
-	$(AR) rcs $@ batching.o cpu.o indexfile.o
+filter.o: filter.c filter.h
+	$(CC) $(CFLAGS) -c filter.c -o $@
 
-ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c batching.h backend.h
-	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c -lm -o $@
+libannbatch.a: batching.o cpu.o indexfile.o filter.o
+	$(AR) rcs $@ batching.o cpu.o indexfile.o filter.o
 
-ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c batching.h backend.h
-	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c -lm -o $@
+ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
+	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c -lm -o $@
 
-WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c rdma.c
-WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h rdma.h
+ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
+	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c -lm -o $@
+
+WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c filter.c rdma.c
+WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h filter.h rdma.h
 
 # USE_RDMA=1 enables RDMA search frames over InfiniBand/RoCE verbs
 # (rdma-core); RDMA_PREFIX locates libibverbs if it is not in /usr.
@@ -82,7 +85,7 @@ check-postgres: ann-worker
 
 clean:
 	rm -f ann-worker
-	rm -f batching.o cpu.o indexfile.o libannbatch.a ann-batch-tests
+	rm -f batching.o cpu.o indexfile.o filter.o libannbatch.a ann-batch-tests
 	rm -f ann-batch-bench
 	rm -rf ann-batch-bench.dSYM
 	rm -rf ann-batch-tests.dSYM

@@ -1255,7 +1255,8 @@ CREATE TABLE ann_index_catalog (
 	key_column name NOT NULL,
 	vector_column name NOT NULL,
 	rows bigint NOT NULL,
-	loaded_at timestamptz NOT NULL DEFAULT now()
+	loaded_at timestamptz NOT NULL DEFAULT now(),
+	generation text
 );
 
 COMMENT ON TABLE ann_index_catalog IS 'source tables of loaded ann indexes, recorded by ann_index_load and ann_index_attach';
@@ -1351,3 +1352,15 @@ CREATE FUNCTION ann_index_export(index regclass, path text) RETURNS bigint
 COMMENT ON FUNCTION ann_index_export(regclass, text) IS 'write a frozen ann index''s rows as an index directory for scripts/ann/build_cuvs_index.py --from-export';
 
 REVOKE ALL ON FUNCTION ann_index_export(regclass, text) FROM PUBLIC;
+
+COMMENT ON COLUMN ann_index_catalog.generation IS 'generation of the frozen ann index the loaded files were exported from';
+
+CREATE FUNCTION ann_frozen_filter(index regclass, filter text, OUT eligible bigint, OUT bitmap bytea) RETURNS record
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT STABLE;
+
+COMMENT ON FUNCTION ann_frozen_filter(regclass, text) IS 'rows of a filter over a frozen ann index''s INCLUDE attributes, from its postings and bitset pages';
+
+CREATE FUNCTION ann_index_filter(name text, filter text, OUT eligible bigint, OUT bitmap bytea) RETURNS record
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION ann_index_filter(text, text) IS 'rows of a filter over an exported frozen index''s attributes, evaluated on the GPU node';

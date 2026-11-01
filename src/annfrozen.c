@@ -5,6 +5,7 @@
 #include "access/visibilitymap.h"
 #include "access/xloginsert.h"
 #include "ann.h"
+#include "ann/filter.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type_d.h"
@@ -305,8 +306,8 @@ AnnArrayUnlockPage(AnnArrayReader *reader)
 }
 
 /* Copy elements first .. first + n - 1 to out. */
-static void
-ReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *out)
+void
+AnnArrayReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *out)
 {
 	const AnnArray *array = reader->array;
 	char	   *target = out;
@@ -330,7 +331,7 @@ ReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *out)
 void
 AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out)
 {
-	ReadRange(reader, element, 1, out);
+	AnnArrayReadRange(reader, element, 1, out);
 }
 
 void
@@ -352,7 +353,7 @@ AnnIsFrozen(Relation index)
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	AnnCheckMetaPage(BufferGetPage(buf));
-	frozen = AnnPageGetMeta(BufferGetPage(buf))->version == ANN_FROZEN_VERSION;
+	frozen = AnnVersionFrozen(AnnPageGetMeta(BufferGetPage(buf))->version);
 	UnlockReleaseBuffer(buf);
 	return frozen;
 }
@@ -368,14 +369,15 @@ AnnFrozenGetMeta(Relation index, bool missingOk)
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	AnnCheckMetaPage(page);
-	if (AnnPageGetMeta(page)->version == ANN_FROZEN_VERSION)
+	if (AnnVersionFrozen(AnnPageGetMeta(page)->version))
 	{
 		AnnFrozenMetaData *stored = AnnPageGetFrozen(page);
+		bool		bitsets = AnnPageGetMeta(page)->version == ANN_FROZEN_VERSION;
 
 		if (stored->ncolumns > ANN_FROZEN_MAX_COLUMNS)
 			ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED), errmsg("invalid frozen ann index metapage")));
-		meta = palloc(AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
-		memcpy(meta, stored, AnnFrozenMetaSize(stored->ncolumns));
+		meta = palloc0(AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
+		memcpy(meta, stored, bitsets ? AnnFrozenMetaSize(stored->ncolumns) : AnnFrozenMetaSizeV2(stored->ncolumns));
 	}
 	UnlockReleaseBuffer(buf);
 	if (meta == NULL && !missingOk)
@@ -401,6 +403,7 @@ typedef struct FrozenBuildState
 {
 	int			dims;
 	int			ncolumns;		/* INCLUDE columns after the key */
+	int			bitsetMin;		/* reloption: bitset pages from this many rows */
 	Oid			keyType;
 	TupleDesc	sortDesc;
 	TupleTableSlot *slot;
@@ -539,7 +542,8 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
  * value, then the distinct values and where each one's postings start.
  */
 static void
-WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, uint64 rows)
+WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, AnnFrozenBitsets *bitsets,
+			  int64 bitsetMin, uint64 rows)
 {
 	ArrayWriter postings;
 	ArrayWriter writer;
@@ -598,6 +602,54 @@ WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, uin
 		memcpy(WriterNext(&writer), &start, sizeof(uint32));
 	}
 	WriterEnd(&writer);
+
+	/*
+	 * Bitset pages for the values holding at least bitsetMin rows, from the
+	 * postings just written; their positions follow.
+	 */
+	InitArray(&bitsets->words, sizeof(uint32), 0);
+	WriterBegin(&writer, index, &bitsets->words, false);
+	{
+		size_t		nwords = (rows + 31) / 32;
+		uint32	   *words = MemoryContextAllocHuge(CurrentMemoryContext, Max(nwords, 1) * sizeof(uint32));
+		uint32	   *codes = palloc(sizeof(uint32) * Max(nvalues, 1));
+		uint32	   *chunk = palloc(sizeof(uint32) * 8192);
+		uint32		ncodes = 0;
+		AnnArrayReader reader;
+
+		AnnArrayReaderInit(&reader, index, &column->postings, NULL);
+		for (uint64 v = 0; v < nvalues; v++)
+		{
+			uint64		first = starts[v];
+			uint64		end = v + 1 < nvalues ? starts[v + 1] : position;
+
+			if (end - first < (uint64) bitsetMin)
+				continue;
+			memset(words, 0, nwords * sizeof(uint32));
+			for (uint64 at = first; at < end; at += 8192)
+			{
+				uint64		n = Min(end - at, 8192);
+
+				CHECK_FOR_INTERRUPTS();
+				AnnArrayReadRange(&reader, at, n, chunk);
+				for (uint64 i = 0; i < n; i++)
+					words[chunk[i] / 32] |= (uint32) 1 << (chunk[i] % 32);
+			}
+			for (size_t w = 0; w < nwords; w++)
+				memcpy(WriterNext(&writer), &words[w], sizeof(uint32));
+			codes[ncodes++] = (uint32) v;
+		}
+		AnnArrayReaderEnd(&reader);
+		WriterEnd(&writer);
+		InitArray(&bitsets->codes, sizeof(uint32), 0);
+		WriterBegin(&writer, index, &bitsets->codes, false);
+		for (uint32 i = 0; i < ncodes; i++)
+			memcpy(WriterNext(&writer), &codes[i], sizeof(uint32));
+		WriterEnd(&writer);
+		pfree(words);
+		pfree(codes);
+		pfree(chunk);
+	}
 	pfree(values);
 	pfree(starts);
 }
@@ -687,7 +739,8 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	meta->generation = hash_bytes_extended((const unsigned char *) &ordinal, sizeof(ordinal), hash);
 	for (int c = 0; c < bs->ncolumns; c++)
 	{
-		WritePostings(index, sorts[c], &meta->columns[c], ordinal);
+		WritePostings(index, sorts[c], &meta->columns[c], &AnnFrozenGetBitsets(meta)[c],
+					  bs->bitsetMin < 0 ? Max(ordinal / 32, 1) : Max(bs->bitsetMin, 1), ordinal);
 		tuplesort_end(sorts[c]);
 	}
 }
@@ -728,6 +781,7 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	guard = CheckFrozenTable(heap, index, indexInfo);
 	AnnInitMetaPage(index, MAIN_FORKNUM);
 	bs.dims = TupleDescAttr(indexDesc, 0)->atttypmod;
+	bs.bitsetMin = index->rd_options ? ((AnnOptions *) index->rd_options)->bitsetMin : -1;
 	bs.ncolumns = indexDesc->natts - 2;
 	bs.keyType = TupleDescAttr(indexDesc, 1)->atttypid;
 	bs.sortDesc = CreateTemplateTupleDesc(3 + bs.ncolumns);
@@ -763,6 +817,235 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	if (RelationNeedsWAL(index))
 		log_newpage_range(index, MAIN_FORKNUM, 0, RelationGetNumberOfBlocks(index), true);
 	MemoryContextDelete(bs.tmpCtx);
+	return result;
+}
+
+/* Frozen pages as an ann/filter.h source. */
+typedef struct FrozenSource
+{
+	Relation	index;
+	const AnnFrozenMetaData *meta;
+	const AnnFrozenBitsets *bitsets;
+	const char *names[ANN_FROZEN_MAX_COLUMNS];
+	AnnArrayReader dict[ANN_FROZEN_MAX_COLUMNS];
+	AnnArrayReader offsets[ANN_FROZEN_MAX_COLUMNS];
+	AnnArrayReader postings[ANN_FROZEN_MAX_COLUMNS];
+	AnnArrayReader codes[ANN_FROZEN_MAX_COLUMNS];
+	AnnArrayReader words[ANN_FROZEN_MAX_COLUMNS];
+} FrozenSource;
+
+static int
+SourceColumn(void *arg, const char *name)
+{
+	FrozenSource *source = arg;
+
+	for (uint32 c = 0; c < source->meta->ncolumns; c++)
+		if (strcmp(source->names[c], name) == 0)
+			return (int) c;
+	return -1;
+}
+
+static uint64_t
+SourceCount(void *arg, int column)
+{
+	return ((FrozenSource *) arg)->meta->columns[column].dict.count;
+}
+
+static int32_t
+SourceValue(void *arg, int column, uint64_t i)
+{
+	int32		value;
+
+	AnnArrayRead(&((FrozenSource *) arg)->dict[column], i, &value);
+	return value;
+}
+
+static uint64_t
+SourceStart(void *arg, int column, uint64_t i)
+{
+	uint32		start;
+
+	AnnArrayRead(&((FrozenSource *) arg)->offsets[column], i, &start);
+	return start;
+}
+
+static int
+SourcePostings(void *arg, int column, uint64_t first, uint64_t n, uint32_t *out)
+{
+	CHECK_FOR_INTERRUPTS();
+	AnnArrayReadRange(&((FrozenSource *) arg)->postings[column], first, n, out);
+	return 1;
+}
+
+static int
+SourceBitset(void *arg, int column, uint64_t i, uint32_t *words)
+{
+	FrozenSource *source = arg;
+	const AnnFrozenBitsets *bitsets = &source->bitsets[column];
+	uint64		nwords = (source->meta->rows + 31) / 32;
+	int64		low = 0;
+	int64		high = (int64) bitsets->codes.count - 1;
+
+	while (low <= high)
+	{
+		int64		middle = low + (high - low) / 2;
+		uint32		code;
+
+		AnnArrayRead(&source->codes[column], middle, &code);
+		if (code == i)
+		{
+			AnnArrayReadRange(&source->words[column], (uint64) middle * nwords, nwords, words);
+			return 1;
+		}
+		if (code < i)
+			low = middle + 1;
+		else
+			high = middle - 1;
+	}
+	return 0;
+}
+
+static void *
+SourceAlloc(void *arg, size_t size)
+{
+	return MemoryContextAllocHuge(CurrentMemoryContext, size);
+}
+
+static void
+SourceRelease(void *arg, void *pointer)
+{
+	pfree(pointer);
+}
+
+/*
+ * Evaluate a predicate program over the frozen pages: the same evaluator,
+ * over the same ordinals, as the worker. Returns an ANN_FILTER_* code.
+ */
+int
+AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned char *program,
+				  size_t size, uint32 *words, uint64 *count)
+{
+	FrozenSource *state = palloc0(sizeof(FrozenSource));
+	AnnFilterSource source;
+	int			code;
+
+	state->index = index;
+	state->meta = meta;
+	state->bitsets = AnnFrozenGetBitsets(meta);
+	for (uint32 c = 0; c < meta->ncolumns; c++)
+	{
+		state->names[c] = AnnFrozenColumnName(index, 3 + c);
+		AnnArrayReaderInit(&state->dict[c], index, &meta->columns[c].dict, NULL);
+		AnnArrayReaderInit(&state->offsets[c], index, &meta->columns[c].offsets, NULL);
+		AnnArrayReaderInit(&state->postings[c], index, &meta->columns[c].postings, NULL);
+		AnnArrayReaderInit(&state->codes[c], index, &state->bitsets[c].codes, NULL);
+		AnnArrayReaderInit(&state->words[c], index, &state->bitsets[c].words, NULL);
+	}
+	memset(&source, 0, sizeof(source));
+	source.arg = state;
+	source.rows = meta->rows;
+	source.column = SourceColumn;
+	source.count = SourceCount;
+	source.value = SourceValue;
+	source.start = SourceStart;
+	source.postings = SourcePostings;
+	source.bitset = SourceBitset;
+	source.alloc = SourceAlloc;
+	source.release = SourceRelease;
+	code = AnnFilterEvaluate(&source, program, size, words, count);
+	for (uint32 c = 0; c < meta->ncolumns; c++)
+	{
+		AnnArrayReaderEnd(&state->dict[c]);
+		AnnArrayReaderEnd(&state->offsets[c]);
+		AnnArrayReaderEnd(&state->postings[c]);
+		AnnArrayReaderEnd(&state->codes[c]);
+		AnnArrayReaderEnd(&state->words[c]);
+	}
+	pfree(state);
+	return code;
+}
+
+void
+AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const char *program,
+						 size_t size, uint32 *words, uint64 *count)
+{
+	int			code = AnnFrozenEvaluate(index, meta, (const unsigned char *) program, size, words, count);
+
+	if (code == ANN_FILTER_UNKNOWN_COLUMN)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_COLUMN),
+				 errmsg("predicate names a column that is not an INCLUDE attribute of \"%s\"",
+						RelationGetRelationName(index))));
+	if (code == ANN_FILTER_UNKNOWN_BITMAP)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("stored filter ids in predicates are evaluated on GPU nodes only")));
+	if (code != ANN_FILTER_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid ann predicate program (code %d)", code)));
+}
+
+/* Ordinal of a key (binary search over the key pages), or -1. */
+int64
+AnnFrozenKeyOrdinal(Relation index, const AnnFrozenMetaData *meta, int64 key)
+{
+	AnnArrayReader reader;
+	int64		low = 0;
+	int64		high = (int64) meta->keys.count - 1;
+	int64		found = -1;
+
+	AnnArrayReaderInit(&reader, index, &meta->keys, NULL);
+	while (low <= high)
+	{
+		int64		middle = low + (high - low) / 2;
+		int64		value;
+
+		AnnArrayRead(&reader, middle, &value);
+		if (value == key)
+		{
+			found = middle;
+			break;
+		}
+		if (value < key)
+			low = middle + 1;
+		else
+			high = middle - 1;
+	}
+	AnnArrayReaderEnd(&reader);
+	return found;
+}
+
+/*
+ * The table's valid frozen ann index, opened, with this generation (any
+ * generation when 0); NULL if there is none.
+ */
+Relation
+AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode)
+{
+	Oid			am = get_am_oid("ann", false);
+	Relation	heap = table_open(relid, AccessShareLock);
+	List	   *indexes = RelationGetIndexList(heap);
+	ListCell   *lc;
+	Relation	result = NULL;
+
+	foreach(lc, indexes)
+	{
+		Relation	index = index_open(lfirst_oid(lc), lockmode);
+
+		if (index->rd_rel->relam == am && index->rd_index->indisvalid)
+		{
+			AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, true);
+
+			if (meta && (generation == 0 || meta->generation == generation))
+			{
+				result = index;
+				break;
+			}
+		}
+		index_close(index, lockmode);
+	}
+	table_close(heap, AccessShareLock);
 	return result;
 }
 
@@ -945,9 +1228,9 @@ ann_frozen_keys(PG_FUNCTION_ARGS)
 
 			if (code < 0)
 				continue;
-			ReadRange(&offsets, code, 2, range);
+			AnnArrayReadRange(&offsets, code, 2, range);
 			if (pass == 1)
-				ReadRange(&postings, range[0], range[1] - range[0], ordinals + filled);
+				AnnArrayReadRange(&postings, range[0], range[1] - range[0], ordinals + filled);
 			filled += range[1] - range[0];
 		}
 		if (pass == 0)
@@ -987,4 +1270,42 @@ ann_frozen_keys(PG_FUNCTION_ARGS)
 	rsinfo->setResult = store;
 	rsinfo->setDesc = tupdesc;
 	return (Datum) 0;
+}
+
+/*
+ * ann_frozen_filter(index, filter): rows of a filter over the index's
+ * INCLUDE attributes, evaluated from its postings and bitset pages, as
+ * (eligible rows, bitmap over ordinals).
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_filter);
+Datum
+ann_frozen_filter(PG_FUNCTION_ARGS)
+{
+	Relation	index = OpenFrozenIndex(PG_GETARG_OID(0));
+	char	   *filter = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
+	AnnPredicateColumns columns;
+	StringInfoData program;
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+	size_t		nwords = (meta->rows + 31) / 32;
+	bytea	   *bitmap = palloc(VARHDRSZ + nwords * 4);
+	uint64		eligible;
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	AnnPredicateColumnsInit(index, &columns);
+	initStringInfo(&program);
+	if (!AnnPredicateFromText(index->rd_index->indrelid, filter, &columns, &program))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("filter \"%s\" is not a predicate over the INCLUDE attributes of \"%s\"",
+						filter, RelationGetRelationName(index))));
+	SET_VARSIZE(bitmap, VARHDRSZ + nwords * 4);
+	AnnFrozenEvaluateOrError(index, meta, program.data, program.len, (uint32 *) VARDATA(bitmap), &eligible);
+	index_close(index, AccessShareLock);
+	values[0] = Int64GetDatum((int64) eligible);
+	values[1] = PointerGetDatum(bitmap);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
 }

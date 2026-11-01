@@ -5,16 +5,19 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "access/htup_details.h"
 #include "portability/instr_time.h"
 #include "miscadmin.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
 #include "utils/regproc.h"
+#include "utils/rel.h"
 #include "utils/tuplestore.h"
 #include "vector.h"
 
@@ -33,13 +36,6 @@
 #define ANN_LOAD_TIMEOUT_MS (30 * 60 * 1000)
 #define ANN_KEY_FETCH 65536
 
-/* Statuses shared with ann/backend.h. */
-#define ANN_STATUS_OK 0
-#define ANN_STATUS_INVALID 1
-#define ANN_STATUS_UNSUPPORTED 2
-#define ANN_STATUS_STALE 3
-#define ANN_STATUS_OVERLOADED 7
-#define ANN_STATUS_MISSING 11
 
 /* What the worker reports for a loaded index. */
 typedef struct AnnIndexInfo
@@ -57,6 +53,7 @@ typedef struct AnnCatalogEntry
 	char	   *source;			/* quoted relation name */
 	char	   *key;			/* quoted column names */
 	char	   *vector;
+	uint64		generation;		/* frozen index generation, 0 if none */
 } AnnCatalogEntry;
 
 static void
@@ -78,8 +75,8 @@ CheckName(text *name)
 }
 
 /* Networked GPU nodes when configured, otherwise the local worker socket. */
-static bool
-IndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs,
+bool
+AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs,
 		  uint32 *status, char **reply, uint32 *replyLength)
 {
 	instr_time	start;
@@ -137,6 +134,11 @@ CheckWorker(bool ok, uint32 status, const char *name)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("ann worker backend does not serve loaded indexes")));
+	if (status == ANN_STATUS_GENERATION)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ann index \"%s\" on the GPU nodes is another generation than this host's catalog", name),
+				 errhint("Run ann_index_load or ann_index_attach for the current export.")));
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("ann worker rejected the request for index \"%s\" (status %u)", name, status)));
@@ -187,12 +189,15 @@ static int64 PushAllBitmaps(FunctionCallInfo fcinfo, const char *name);
  * GPU nodes share cached bitmaps instead of overwriting each other's.
  */
 static int64
-FilterId(const char *name, const char *filter)
+FilterId(const char *name, uint64 generation, const char *filter)
 {
 	StringInfoData key;
 
 	initStringInfo(&key);
 	appendBinaryStringInfo(&key, name, strlen(name) + 1);
+	/* Files of a frozen index: a rebuilt table gets new ids. */
+	if (generation != 0)
+		appendBinaryStringInfo(&key, (char *) &generation, sizeof(generation));
 	appendStringInfoString(&key, filter);
 	return (int64) hash_bytes_extended((const unsigned char *) key.data, key.len, 0x616e6e5f62697473);
 }
@@ -290,12 +295,124 @@ CheckGeneration(const AnnIndexInfo *info)
 				 errhint("Export the table's frozen index again with ann_index_export and rebuild the directory.")));
 }
 
+/*
+ * Generation of each loaded index name, as this backend last read it from
+ * the catalog. Requests carry it; a node serving another generation answers
+ * ANN_STATUS_GENERATION, and the entry is read again.
+ */
+typedef struct GenerationEntry
+{
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint64		generation;
+} GenerationEntry;
+
+static HTAB *generations = NULL;
+
+/* Whether the catalog has its generation column (0.9.1 and later). */
+static bool
+CatalogHasGeneration(FunctionCallInfo fcinfo)
+{
+	bool		found;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute(psprintf("SELECT 1 FROM pg_attribute WHERE attrelid = '%s'::regclass "
+							 "AND attname = 'generation' AND NOT attisdropped", CatalogName(fcinfo)),
+					true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann index catalog");
+	found = SPI_processed == 1;
+	SPI_finish();
+	return found;
+}
+
+static uint64
+ParseGeneration(const char *text)
+{
+	return text && strlen(text) == 16 ? strtou64(text, NULL, 16) : 0;
+}
+
+static uint64
+CachedGeneration(FunctionCallInfo fcinfo, const char *name, bool refresh)
+{
+	GenerationEntry *entry;
+	bool		found;
+	Oid			types[1] = {TEXTOID};
+	Datum		values[1];
+	uint64		generation = 0;
+
+	if (generations == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = ANN_INDEX_NAME_MAX + 1;
+		ctl.entrysize = sizeof(GenerationEntry);
+		generations = hash_create("ann index generations", 64, &ctl, HASH_ELEM | HASH_STRINGS);
+	}
+	entry = hash_search(generations, name, HASH_FIND, NULL);
+	if (entry && !refresh)
+		return entry->generation;
+	values[0] = CStringGetTextDatum(name);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	/* to_jsonb tolerates a catalog from before the generation column. */
+	if (SPI_execute_with_args(psprintf("SELECT to_jsonb(c) ->> 'generation' FROM %s c WHERE name = $1",
+									   CatalogName(fcinfo)),
+							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann index catalog");
+	if (SPI_processed == 1)
+		generation = ParseGeneration(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+	SPI_finish();
+	entry = hash_search(generations, name, HASH_ENTER, &found);
+	entry->generation = generation;
+	return generation;
+}
+
+/*
+ * IndexCall for a named index, tagged with its generation. When the nodes
+ * serve another generation, the catalog is read again and the call retried
+ * once. Returns the generation used in *used.
+ */
+static bool
+TaggedCall(FunctionCallInfo fcinfo, const char *name, uint16 operation, const char *payload, size_t length,
+		   int timeoutMs, uint32 *status, char **reply, uint32 *replyLength, uint64 *used)
+{
+	uint64		generation = CachedGeneration(fcinfo, name, false);
+	bool		ok = false;
+
+	for (int attempt = 0; attempt < 2; attempt++)
+	{
+		uint64		fresh;
+
+		ann_request_generation = generation;
+		PG_TRY();
+		{
+			ok = AnnIndexCall(operation, payload, length, timeoutMs, status, reply, replyLength);
+		}
+		PG_FINALLY();
+		{
+			ann_request_generation = 0;
+		}
+		PG_END_TRY();
+		if (!ok || *status != ANN_STATUS_GENERATION || attempt == 1)
+			break;
+		fresh = CachedGeneration(fcinfo, name, true);
+		if (fresh == generation)
+			break;
+		generation = fresh;
+	}
+	if (used)
+		*used = generation;
+	return ok;
+}
+
 /* Record where the index's rows live, so this host can route exact scans. */
 static void
 RecordCatalog(FunctionCallInfo fcinfo, const char *name, const AnnIndexInfo *info)
 {
-	Oid			types[5] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, INT8OID};
-	Datum		values[5];
+	Oid			types[6] = {TEXTOID, TEXTOID, TEXTOID, TEXTOID, INT8OID, TEXTOID};
+	Datum		values[6];
+	char		nulls[6] = {' ', ' ', ' ', ' ', ' ', ' '};
+	bool		generation = CatalogHasGeneration(fcinfo);
 
 	if (strcmp(info->source, "-") == 0 || strcmp(info->key, "-") == 0 || strcmp(info->vector, "-") == 0)
 		return;
@@ -304,16 +421,26 @@ RecordCatalog(FunctionCallInfo fcinfo, const char *name, const AnnIndexInfo *inf
 	values[2] = CStringGetTextDatum(info->key);
 	values[3] = CStringGetTextDatum(info->vector);
 	values[4] = Int64GetDatum((int64) info->rows);
+	values[5] = CStringGetTextDatum(info->generation);
+	if (strcmp(info->generation, "-") == 0)
+		nulls[5] = 'n';
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute_with_args(psprintf("INSERT INTO %s (name, source, key_column, vector_column, rows) "
+	if (SPI_execute_with_args(generation ?
+							  psprintf("INSERT INTO %s (name, source, key_column, vector_column, rows, generation) "
+									   "VALUES ($1, $2::regclass, $3, $4, $5, $6) ON CONFLICT (name) DO UPDATE "
+									   "SET source = EXCLUDED.source, key_column = EXCLUDED.key_column, "
+									   "vector_column = EXCLUDED.vector_column, rows = EXCLUDED.rows, "
+									   "generation = EXCLUDED.generation, loaded_at = now()", CatalogName(fcinfo)) :
+							  psprintf("INSERT INTO %s (name, source, key_column, vector_column, rows) "
 									   "VALUES ($1, $2::regclass, $3, $4, $5) ON CONFLICT (name) DO UPDATE "
 									   "SET source = EXCLUDED.source, key_column = EXCLUDED.key_column, "
 									   "vector_column = EXCLUDED.vector_column, rows = EXCLUDED.rows, "
 									   "loaded_at = now()", CatalogName(fcinfo)),
-							  5, types, values, NULL, false, 0) != SPI_OK_INSERT)
+							  generation ? 6 : 5, types, values, nulls, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not record ann index \"%s\"", name);
 	SPI_finish();
+	(void) CachedGeneration(fcinfo, name, true);
 }
 
 static bool
@@ -326,8 +453,8 @@ LookupCatalog(FunctionCallInfo fcinfo, const char *name, AnnCatalogEntry *entry)
 	values[0] = CStringGetTextDatum(name);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute_with_args(psprintf("SELECT source::text, key_column::text, vector_column::text "
-									   "FROM %s WHERE name = $1", CatalogName(fcinfo)),
+	if (SPI_execute_with_args(psprintf("SELECT source::text, key_column::text, vector_column::text, "
+									   "to_jsonb(c) ->> 'generation' FROM %s c WHERE name = $1", CatalogName(fcinfo)),
 							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the ann index catalog");
 	found = SPI_processed == 1;
@@ -338,6 +465,7 @@ LookupCatalog(FunctionCallInfo fcinfo, const char *name, AnnCatalogEntry *entry)
 		entry->source = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 		entry->key = pstrdup(quote_identifier(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2)));
 		entry->vector = pstrdup(quote_identifier(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3)));
+		entry->generation = ParseGeneration(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4));
 		MemoryContextSwitchTo(old);
 	}
 	SPI_finish();
@@ -416,7 +544,7 @@ ann_index_attach(PG_FUNCTION_ARGS)
 	bool		ok;
 
 	RequireSuperuser("attach");
-	ok = IndexCall(ANN_OP_INDEX_INFO, name, strlen(name), 0, &status, &reply, &replyLength);
+	ok = AnnIndexCall(ANN_OP_INDEX_INFO, name, strlen(name), 0, &status, &reply, &replyLength);
 	CheckWorker(ok, status, name);
 	ParseInfo(reply, &info);
 	CheckSource(&info);
@@ -532,8 +660,8 @@ StoreHits(bool ok, uint32 status, const char *name, const char *reply, uint32 re
  * filtered. Keys travel as a zigzag varint first key and varint gaps.
  */
 static void
-SearchGpu(const char *name, Vector *query, int32 k, bool filtered, const int64 *keys, int nkeys,
-		  TupleDesc tupdesc, Tuplestorestate *store)
+SearchGpu(FunctionCallInfo fcinfo, const char *name, Vector *query, int32 k, bool filtered,
+		  const int64 *keys, int nkeys, TupleDesc tupdesc, Tuplestorestate *store)
 {
 	StringInfoData payload;
 	StringInfoData packed;
@@ -559,7 +687,8 @@ SearchGpu(const char *name, Vector *query, int32 k, bool filtered, const int64 *
 	Put32(&payload, packed.len);
 	appendBinaryStringInfo(&payload, (char *) query->x, sizeof(float) * query->dim);
 	appendBinaryStringInfo(&payload, packed.data, packed.len);
-	ok = IndexCall(ANN_OP_INDEX_SEARCH_PACKED, payload.data, payload.len, 0, &status, &reply, &replyLength);
+	ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_SEARCH_PACKED, payload.data, payload.len, 0, &status, &reply,
+					&replyLength, NULL);
 	StoreHits(ok, status, name, reply, replyLength, tupdesc, store);
 }
 
@@ -673,7 +802,7 @@ ann_index_search(PG_FUNCTION_ARGS)
 			return (Datum) 0;
 		}
 	}
-	SearchGpu(name, PG_GETARG_VECTOR_P(1), k, filtered, keys, nkeys, tupdesc, store);
+	SearchGpu(fcinfo, name, PG_GETARG_VECTOR_P(1), k, filtered, keys, nkeys, tupdesc, store);
 	return (Datum) 0;
 }
 
@@ -848,7 +977,7 @@ ann_hybrid_search(PG_FUNCTION_ARGS)
 		return (Datum) 0;
 	}
 	nkeys = SortKeys(keys, nkeys);
-	SearchGpu(name, PG_GETARG_VECTOR_P(1), k, true, keys, nkeys, tupdesc, store);
+	SearchGpu(fcinfo, name, PG_GETARG_VECTOR_P(1), k, true, keys, nkeys, tupdesc, store);
 	return (Datum) 0;
 }
 
@@ -917,7 +1046,8 @@ ann_attribute_search(PG_FUNCTION_ARGS)
 	Put32(&payload, nvalues);
 	appendBinaryStringInfo(&payload, values.data, values.len);
 	appendBinaryStringInfo(&payload, (char *) query->x, sizeof(float) * query->dim);
-	ok = IndexCall(ANN_OP_INDEX_SEARCH_MATCH, payload.data, payload.len, 0, &status, &reply, &replyLength);
+	ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_SEARCH_MATCH, payload.data, payload.len, 0, &status, &reply,
+					&replyLength, NULL);
 	StoreHits(ok, status, name, reply, replyLength, tupdesc, store);
 	return (Datum) 0;
 }
@@ -929,7 +1059,7 @@ ann_attribute_search(PG_FUNCTION_ARGS)
  * (PG_UINT32_MAX when unreachable).
  */
 static int
-PushBitmap(const char *name, int64 id, bytea *bitmap, int *failed, uint32 *status)
+PushBitmap(const char *name, uint64 generation, int64 id, bytea *bitmap, int *failed, uint32 *status)
 {
 	StringInfoData payload;
 	char	   *reply = NULL;
@@ -943,15 +1073,24 @@ PushBitmap(const char *name, int64 id, bytea *bitmap, int *failed, uint32 *statu
 	Put32(&payload, VARSIZE_ANY_EXHDR(bitmap) / 4);
 	appendBinaryStringInfo(&payload, VARDATA_ANY(bitmap), VARSIZE_ANY_EXHDR(bitmap));
 	*status = PG_UINT32_MAX;
-	if (AnnRemoteConfigured())
-		accepted = AnnRemoteBroadcastEach(ANN_OP_BITMAP_PUT, payload.data, payload.len, ANN_BITMAP_TIMEOUT_MS,
-										  failed, status);
-	else
+	ann_request_generation = generation;
+	PG_TRY();
 	{
-		accepted = AnnWorkerCall(ANN_OP_BITMAP_PUT, payload.data, payload.len, ANN_BITMAP_TIMEOUT_MS,
-								 status, &reply, &replyLength) && *status == ANN_STATUS_OK;
-		*failed = !accepted;
+		if (AnnRemoteConfigured())
+			accepted = AnnRemoteBroadcastEach(ANN_OP_BITMAP_PUT, payload.data, payload.len, ANN_BITMAP_TIMEOUT_MS,
+											  failed, status);
+		else
+		{
+			accepted = AnnWorkerCall(ANN_OP_BITMAP_PUT, payload.data, payload.len, ANN_BITMAP_TIMEOUT_MS,
+									 status, &reply, &replyLength) && *status == ANN_STATUS_OK;
+			*failed = !accepted;
+		}
 	}
+	PG_FINALLY();
+	{
+		ann_request_generation = 0;
+	}
+	PG_END_TRY();
 	pfree(payload.data);
 	return accepted;
 }
@@ -971,11 +1110,12 @@ PushAllBitmaps(FunctionCallInfo fcinfo, const char *name)
 	int64		failed = 0;
 	int			nodeFailures;
 	uint32		status = 0;
+	uint64		generation = CachedGeneration(fcinfo, name, true);
 
 	values[0] = CStringGetTextDatum(name);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	plan = SPI_prepare(psprintf("SELECT id, bitmap FROM %s WHERE index_name = $1 ORDER BY id",
+	plan = SPI_prepare(psprintf("SELECT id, bitmap, filter FROM %s WHERE index_name = $1 ORDER BY id",
 								BitmapTableName(fcinfo)), 1, types);
 	if (plan == NULL)
 		elog(ERROR, "could not read ann filter bitmaps");
@@ -989,7 +1129,14 @@ PushAllBitmaps(FunctionCallInfo fcinfo, const char *name)
 		if (SPI_processed == 0)
 			break;
 		id = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull));
-		if (PushBitmap(name, id,
+
+		/* Bitmaps built for another generation would select other rows. */
+		if (id != FilterId(name, generation, SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3)))
+		{
+			SPI_freetuptable(SPI_tuptable);
+			continue;
+		}
+		if (PushBitmap(name, generation, id,
 					   DatumGetByteaPP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2, &isnull)),
 					   &nodeFailures, &status) > 0)
 			pushed++;
@@ -1006,6 +1153,43 @@ PushAllBitmaps(FunctionCallInfo fcinfo, const char *name)
 						(long long) failed, name, (int) status),
 				 errhint("Searches push missing bitmaps on demand; ann_filter_bitmap_push retries all.")));
 	return pushed;
+}
+
+/*
+ * For files exported from a frozen index, a filter over its INCLUDE
+ * attributes is evaluated from the index's postings and bitset pages, in
+ * the ordinals the GPU node uses, instead of by a SQL scan of the table.
+ * Returns false when the filter needs SQL.
+ */
+static bool
+FrozenBitmap(const char *source, uint64 generation, const char *filter, bytea **bitmap, uint64 *eligible)
+{
+	Oid			relid;
+	Relation	index;
+	AnnFrozenMetaData *meta;
+	AnnPredicateColumns columns;
+	StringInfoData program;
+	size_t		nwords;
+
+	if (generation == 0)
+		return false;
+	relid = DatumGetObjectId(DirectFunctionCall1(regclassin, CStringGetDatum(source)));
+	if ((index = AnnFrozenIndexOf(relid, generation, AccessShareLock)) == NULL)
+		return false;
+	AnnPredicateColumnsInit(index, &columns);
+	initStringInfo(&program);
+	if (!AnnPredicateFromText(relid, filter, &columns, &program))
+	{
+		index_close(index, AccessShareLock);
+		return false;
+	}
+	meta = AnnFrozenGetMeta(index, false);
+	nwords = (meta->rows + 31) / 32;
+	*bitmap = palloc(VARHDRSZ + nwords * 4);
+	SET_VARSIZE(*bitmap, VARHDRSZ + nwords * 4);
+	AnnFrozenEvaluateOrError(index, meta, program.data, program.len, (uint32 *) VARDATA(*bitmap), eligible);
+	index_close(index, AccessShareLock);
+	return true;
 }
 
 /*
@@ -1036,6 +1220,7 @@ ann_filter_bitmap_build(PG_FUNCTION_ARGS)
 	int64		id;
 	bool		ok;
 	int			failures;
+	uint64		generation;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1046,6 +1231,9 @@ ann_filter_bitmap_build(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("ann index \"%s\" is not in this database's catalog", name),
 				 errhint("Run ann_index_load or ann_index_attach on this host.")));
+	generation = CachedGeneration(fcinfo, name, true);
+	if (FrozenBitmap(entry.source, generation, filter, &bitmap, &eligible))
+		goto store;
 	keys = CollectKeys(&entry, filter, &nkeys);
 	nkeys = SortKeys(keys, nkeys);
 	initStringInfo(&packed);
@@ -1062,7 +1250,8 @@ ann_filter_bitmap_build(PG_FUNCTION_ARGS)
 	Put32(&payload, nkeys);
 	Put32(&payload, packed.len);
 	appendBinaryStringInfo(&payload, packed.data, packed.len);
-	ok = IndexCall(ANN_OP_INDEX_BITMAP, payload.data, payload.len, 0, &status, &reply, &replyLength);
+	ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_BITMAP, payload.data, payload.len, 0, &status, &reply,
+					&replyLength, NULL);
 	CheckWorker(ok, status, name);
 	if (replyLength < 8 || (replyLength - 8) % 4 != 0)
 		elog(ERROR, "malformed ann worker bitmap reply");
@@ -1071,11 +1260,12 @@ ann_filter_bitmap_build(PG_FUNCTION_ARGS)
 	SET_VARSIZE(bitmap, VARHDRSZ + replyLength - 8);
 	memcpy(VARDATA(bitmap), reply + 8, replyLength - 8);
 
+store:
 	values[0] = CStringGetTextDatum(name);
 	values[1] = CStringGetTextDatum(filter);
 	values[2] = Int64GetDatum((int64) eligible);
 	values[3] = PointerGetDatum(bitmap);
-	id = FilterId(name, filter);
+	id = FilterId(name, generation, filter);
 	values[4] = Int64GetDatum(id);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
@@ -1088,7 +1278,7 @@ ann_filter_bitmap_build(PG_FUNCTION_ARGS)
 	SPI_finish();
 
 	/* The row is the source of truth; searches push it again if needed. */
-	PushBitmap(name, id, bitmap, &failures, &status);
+	PushBitmap(name, generation, id, bitmap, &failures, &status);
 	if (failures)
 		ereport(WARNING,
 				(errmsg("could not cache ann filter bitmap %lld on every GPU node (worker status %d)",
@@ -1142,6 +1332,7 @@ ann_bitmap_search(PG_FUNCTION_ARGS)
 	int64		id = 0;
 	bool		ok;
 	bool		found;
+	uint64		generation = 0;
 
 	InitResult(fcinfo, &tupdesc, &store);
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(3))
@@ -1179,7 +1370,14 @@ ann_bitmap_search(PG_FUNCTION_ARGS)
 	Put32(&payload, k);
 	appendBinaryStringInfo(&payload, (char *) &id, sizeof(id));
 	appendBinaryStringInfo(&payload, (char *) query->x, sizeof(float) * query->dim);
-	ok = IndexCall(ANN_OP_INDEX_SEARCH_CACHED, payload.data, payload.len, 0, &status, &reply, &replyLength);
+	ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_SEARCH_CACHED, payload.data, payload.len, 0, &status, &reply,
+					&replyLength, &generation);
+	if (id != FilterId(name, generation, filter))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("ann filter bitmap for index \"%s\" and filter \"%s\" was built for another generation",
+						name, filter),
+				 errhint("Run ann_filter_bitmap_build again.")));
 	if (ok && status == ANN_STATUS_MISSING)
 	{
 		Oid			idType[1] = {INT8OID};
@@ -1195,7 +1393,7 @@ ann_bitmap_search(PG_FUNCTION_ARGS)
 		{
 			bool		isnull;
 
-			pushed = PushBitmap(name, id,
+			pushed = PushBitmap(name, generation, id,
 								DatumGetByteaPP(SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1, &isnull)),
 								&failures, &pushStatus) > 0;
 		}
@@ -1205,7 +1403,8 @@ ann_bitmap_search(PG_FUNCTION_ARGS)
 					(errcode(ERRCODE_CONNECTION_FAILURE),
 					 errmsg("could not push ann filter bitmap %lld to the GPU nodes (worker status %d)",
 							(long long) id, (int) pushStatus)));
-		ok = IndexCall(ANN_OP_INDEX_SEARCH_CACHED, payload.data, payload.len, 0, &status, &reply, &replyLength);
+		ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_SEARCH_CACHED, payload.data, payload.len, 0, &status,
+						&reply, &replyLength, NULL);
 	}
 	if (ok && status == ANN_STATUS_MISSING)
 		ereport(ERROR,
@@ -1213,4 +1412,105 @@ ann_bitmap_search(PG_FUNCTION_ARGS)
 				 errmsg("ann filter bitmap %lld is not cached on the GPU node", (long long) id)));
 	StoreHits(ok, status, name, reply, replyLength, tupdesc, store);
 	return (Datum) 0;
+}
+
+/* (eligible, bitmap) as a composite result. */
+static Datum
+FilterResult(FunctionCallInfo fcinfo, uint64 eligible, bytea *bitmap)
+{
+	TupleDesc	tupdesc;
+	Datum		values[2];
+	bool		nulls[2] = {false, false};
+
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	values[0] = Int64GetDatum((int64) eligible);
+	values[1] = PointerGetDatum(bitmap);
+	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/*
+ * ann_index_filter(name, filter): the rows the GPU node selects for a filter
+ * over the attributes of an index exported from a frozen index, evaluated
+ * there (operation 23) from its own postings. ann_frozen_filter evaluates
+ * the same program from the frozen pages; the bitmaps are equal.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_index_filter);
+Datum
+ann_index_filter(PG_FUNCTION_ARGS)
+{
+	const char *name = CheckName(PG_GETARG_TEXT_PP(0));
+	char	   *filter = text_to_cstring(PG_GETARG_TEXT_PP(1));
+	AnnCatalogEntry entry;
+	Oid			relid;
+	Relation	index;
+	AnnPredicateColumns columns;
+	StringInfoData program;
+	StringInfoData payload;
+	uint32		status = 0;
+	char	   *reply = NULL;
+	uint32		replyLength;
+	uint64		eligible;
+	bytea	   *bitmap;
+
+	if (!LookupCatalog(fcinfo, name, &entry) || entry.generation == 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("ann index \"%s\" is not an export of a frozen index in this database's catalog", name)));
+	relid = DatumGetObjectId(DirectFunctionCall1(regclassin, CStringGetDatum(entry.source)));
+	if ((index = AnnFrozenIndexOf(relid, entry.generation, AccessShareLock)) == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s has no frozen ann index with the generation of \"%s\"", entry.source, name)));
+	AnnPredicateColumnsInit(index, &columns);
+	index_close(index, AccessShareLock);
+	initStringInfo(&program);
+	if (!AnnPredicateFromText(relid, filter, &columns, &program))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("filter \"%s\" is not a predicate over the index's INCLUDE attributes", filter)));
+	initStringInfo(&payload);
+	Put32(&payload, strlen(name));
+	appendBinaryStringInfo(&payload, name, strlen(name));
+	appendBinaryStringInfo(&payload, program.data, program.len);
+	CheckWorker(TaggedCall(fcinfo, name, ANN_OP_INDEX_PREDICATE, payload.data, payload.len, 0, &status, &reply,
+						   &replyLength, NULL), status, name);
+	if (replyLength < 8 || (replyLength - 8) % 4 != 0)
+		elog(ERROR, "malformed ann worker predicate reply");
+	memcpy(&eligible, reply, sizeof(eligible));
+	bitmap = palloc(VARHDRSZ + replyLength - 8);
+	SET_VARSIZE(bitmap, VARHDRSZ + replyLength - 8);
+	memcpy(VARDATA(bitmap), reply + 8, replyLength - 8);
+	return FilterResult(fcinfo, eligible, bitmap);
+}
+
+/*
+ * Name of the loaded index exported from a table's frozen index with this
+ * generation, the most recently loaded one, or NULL. Read from the catalog
+ * in the extension's schema.
+ */
+char *
+AnnCatalogNameFor(Oid relid, uint64 generation)
+{
+	Oid			types[2] = {OIDOID, TEXTOID};
+	Datum		values[2];
+	char	   *name = NULL;
+	char	   *schema = get_namespace_name(get_extension_schema(get_extension_oid("vector", false)));
+	MemoryContext caller = CurrentMemoryContext;
+
+	values[0] = ObjectIdGetDatum(relid);
+	values[1] = CStringGetTextDatum(psprintf("%016llx", (unsigned long long) generation));
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("SELECT name FROM %s.ann_index_catalog c WHERE source = $1 "
+									   "AND to_jsonb(c) ->> 'generation' = $2 ORDER BY loaded_at DESC LIMIT 1",
+									   quote_identifier(schema)),
+							  2, types, values, NULL, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+	{
+		char	   *found = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+		name = MemoryContextStrdup(caller, found);
+	}
+	SPI_finish();
+	return name;
 }

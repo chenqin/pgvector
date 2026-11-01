@@ -70,6 +70,9 @@ AnnInitOptions(void)
 	add_bool_reloption(ann_relopt_kind, "frozen",
 					   "Build an immutable index with forward and inverted pages",
 					   false, AccessExclusiveLock);
+	add_int_reloption(ann_relopt_kind, "bitset_min",
+					  "Values of an attribute with at least this many rows get bitset pages (-1: rows / 32)",
+					  -1, -1, INT_MAX, AccessExclusiveLock);
 }
 
 static bytea *
@@ -77,6 +80,7 @@ annoptions(Datum reloptions, bool validate)
 {
 	static const relopt_parse_elt tab[] = {
 		{"frozen", RELOPT_TYPE_BOOL, offsetof(AnnOptions, frozen)},
+		{"bitset_min", RELOPT_TYPE_INT, offsetof(AnnOptions, bitsetMin)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, ann_relopt_kind,

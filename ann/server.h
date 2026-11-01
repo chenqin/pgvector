@@ -18,6 +18,11 @@
 #define ANN_OP_INDEX_SEARCH_BITMAP 19
 #define ANN_OP_BITMAP_PUT 20
 #define ANN_OP_INDEX_SEARCH_CACHED 21
+#define ANN_OP_INDEX_SEARCH_PREDICATE 22
+#define ANN_OP_INDEX_PREDICATE 23
+
+/* Operation 22 flags. */
+#define ANN_PREDICATE_ORDINALS 1	/* reply with ordinals instead of keys */
 
 typedef struct AnnServeOptions
 {

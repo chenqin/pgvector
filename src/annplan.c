@@ -161,6 +161,7 @@ AnnInit(void)
 							 NULL, &ann_enable_filtered_search, false, PGC_USERSET, 0,
 							 NULL, NULL, NULL);
 	AnnInitOptions();
+	AnnFrozenScanInit();
 	AnnWorkerInit();
 	AnnRemoteInit();
 	RegisterCustomScanMethods(&AnnCustomScanMethods);

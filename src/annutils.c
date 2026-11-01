@@ -49,7 +49,7 @@ AnnCheckMetaPage(Page page)
 	AnnCheckPage(page);
 	meta = AnnPageGetMeta(page);
 	if (meta->magicNumber != ANN_MAGIC_NUMBER ||
-		(meta->version != ANN_VERSION && meta->version != ANN_FROZEN_VERSION) ||
+		(meta->version != ANN_VERSION && !AnnVersionFrozen(meta->version)) ||
 		meta->dimensions < 1 || meta->dimensions > ANN_MAX_DIM)
 		ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED), errmsg("invalid ann index metapage")));
 }

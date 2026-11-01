@@ -72,6 +72,9 @@ AnnRemoteBroadcastEach(uint16 operation, const char *payload, size_t length, int
  * by process ID so backends spread across nodes. A failed node is skipped
  * and the next one tried. Requests are synchronous: one outstanding at most.
  */
+/* Set around calls for indexes exported from a frozen index; see ann.h. */
+uint64		ann_request_generation = 0;
+
 static int	remoteFd = -1;
 static int	remoteNode = -1;
 static uint64 remoteRequest = 1;
@@ -295,7 +298,7 @@ RdmaOperation(uint16 operation)
 {
 	return operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED ||
 		operation == ANN_OP_INDEX_SEARCH_MATCH || operation == ANN_OP_INDEX_SEARCH_BITMAP ||
-		operation == ANN_OP_INDEX_SEARCH_CACHED;
+		operation == ANN_OP_INDEX_SEARCH_CACHED || operation == ANN_OP_INDEX_SEARCH_PREDICATE;
 }
 
 /* Reap the previous send's completion before reusing the send buffer. */
@@ -631,7 +634,7 @@ static void
 PutHeader(char *header, uint16 operation, uint64 request, uint32 length)
 {
 	uint16		version = 1;
-	uint64		generation = 0;
+	uint64		generation = ann_request_generation;
 	uint32		status = 0;
 
 	memcpy(header, "PVAN", 4);

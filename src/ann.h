@@ -15,7 +15,9 @@
 
 #define ANN_MAGIC_NUMBER 0xA991A991
 #define ANN_VERSION 1			/* mutable layout: index tuples */
-#define ANN_FROZEN_VERSION 2	/* frozen layout: arrays by ordinal */
+#define ANN_FROZEN_VERSION 3	/* frozen layout: arrays by ordinal, with
+								 * bitset pages (version 2 has none) */
+#define AnnVersionFrozen(version) ((version) == 2 || (version) == ANN_FROZEN_VERSION)
 #define ANN_PAGE_ID 0xFF92
 #define ANN_METAPAGE_BLKNO 0
 #define ANN_MAX_DIM 2000
@@ -42,6 +44,8 @@ typedef struct AnnOptions
 {
 	int32		vl_len_;		/* varlena header (do not touch directly!) */
 	bool		frozen;			/* build the immutable layout */
+	int			bitsetMin;		/* values with more rows get bitset pages; -1
+								 * for rows / 32 */
 } AnnOptions;
 
 /*
@@ -70,6 +74,13 @@ typedef struct AnnFrozenColumn
 	AnnArray	offsets;		/* uint32 per value plus one: its postings */
 } AnnFrozenColumn;
 
+/* Prebuilt bitsets of a column's most frequent values (version 3). */
+typedef struct AnnFrozenBitsets
+{
+	AnnArray	codes;			/* uint32 distinct-value positions, ascending */
+	AnnArray	words;			/* (rows + 31) / 32 uint32 words per code */
+} AnnFrozenBitsets;
+
 typedef struct AnnFrozenMetaData
 {
 	uint64		rows;
@@ -86,8 +97,12 @@ typedef struct AnnFrozenMetaData
 #define ANN_FROZEN_NULL PG_INT32_MIN
 #define AnnPageGetFrozen(page) \
 	((AnnFrozenMetaData *) ((char *) PageGetContents(page) + MAXALIGN(sizeof(AnnMetaPageData))))
-#define AnnFrozenMetaSize(ncolumns) \
+#define AnnFrozenMetaSizeV2(ncolumns) \
 	(offsetof(AnnFrozenMetaData, columns) + (ncolumns) * sizeof(AnnFrozenColumn))
+#define AnnFrozenMetaSize(ncolumns) \
+	(AnnFrozenMetaSizeV2(ncolumns) + (ncolumns) * sizeof(AnnFrozenBitsets))
+/* The bitset directory follows the columns. */
+#define AnnFrozenGetBitsets(meta) ((AnnFrozenBitsets *) &(meta)->columns[(meta)->ncolumns])
 
 /* Sequential reads of an array, one pinned page at a time. */
 typedef struct AnnArrayReader
@@ -156,6 +171,50 @@ void		AnnArrayUnlockPage(AnnArrayReader *reader);
 void		AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out);
 void		AnnArrayReaderEnd(AnnArrayReader *reader);
 const char *AnnFrozenColumnName(Relation index, int column);
+void		AnnArrayReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *out);
+int			AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned char *program,
+							  size_t size, uint32 *words, uint64 *count);
+void		AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const char *program,
+									 size_t size, uint32 *words, uint64 *count);
+int64		AnnFrozenKeyOrdinal(Relation index, const AnnFrozenMetaData *meta, int64 key);
+
+/* Predicates over a frozen index's attribute columns (annpred.c). */
+typedef struct AnnPredicateColumns
+{
+	int			ncolumns;
+	AttrNumber	attnos[INDEX_MAX_KEYS]; /* table columns */
+	char	   *names[INDEX_MAX_KEYS];
+} AnnPredicateColumns;
+
+void		AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns);
+bool		AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *columns);
+void		AnnPredicateBuild(List *clauses, Index varno, const AnnPredicateColumns *columns,
+							  PlanState *parent, ExprContext *econtext, StringInfo program);
+bool		AnnPredicateFromText(Oid relid, const char *filter, const AnnPredicateColumns *columns,
+								 StringInfo program);
+Relation	AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode);
+
+/* Statuses shared with ann/backend.h. */
+#define ANN_STATUS_OK 0
+#define ANN_STATUS_INVALID 1
+#define ANN_STATUS_UNSUPPORTED 2
+#define ANN_STATUS_STALE 3
+#define ANN_STATUS_OVERLOADED 7
+#define ANN_STATUS_MISSING 11
+#define ANN_STATUS_GENERATION 12
+
+#define ANN_OP_INDEX_SEARCH_PREDICATE 22
+#define ANN_OP_INDEX_PREDICATE 23
+#define ANN_PREDICATE_ORDINALS 1
+
+bool		AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs,
+						 uint32 *status, char **reply, uint32 *replyLength);
+char	   *AnnCatalogNameFor(Oid relid, uint64 generation);
+
+/* Generation sent in request headers; 0 for untagged requests. */
+extern uint64 ann_request_generation;
+extern bool ann_enable_frozen_search;
+void		AnnFrozenScanInit(void);
 IndexBulkDeleteResult *AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 										   IndexBulkDeleteCallback callback, void *callback_state);
 

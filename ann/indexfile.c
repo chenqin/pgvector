@@ -4,6 +4,7 @@
 #endif
 
 #include "indexfile.h"
+#include "filter.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -15,7 +16,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 1024};
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
 
 typedef struct Entry
@@ -433,6 +434,127 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t
 	return ANN_OK;
 }
 
+/* Attribute columns and cached bitmaps as an ann/filter.h source. */
+static int
+SourceColumn(void *arg, const char *name)
+{
+	AnnIndexFile *file = arg;
+
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		if (strcmp(file->attributes[a].name, name) == 0)
+			return (int) a;
+	return -1;
+}
+
+static uint64_t
+SourceCount(void *arg, int column)
+{
+	return ((AnnIndexFile *) arg)->attributes[column].nvalues;
+}
+
+static int32_t
+SourceValue(void *arg, int column, uint64_t i)
+{
+	return ((AnnIndexFile *) arg)->attributes[column].postings[i].value;
+}
+
+static uint64_t
+SourceStart(void *arg, int column, uint64_t i)
+{
+	AnnIndexFile *file = arg;
+	const AnnIndexAttribute *attribute = &file->attributes[column];
+
+	return i < attribute->nvalues ? attribute->postings[i].offset : file->rows;
+}
+
+static int
+SourcePostings(void *arg, int column, uint64_t first, uint64_t n, uint32_t *out)
+{
+	const AnnIndexAttribute *attribute = &((AnnIndexFile *) arg)->attributes[column];
+
+	for (uint64_t i = 0; i < n; i++)
+		out[i] = (uint32_t) attribute->ordinals[first + i];
+	return 1;
+}
+
+static int
+SourceBitmap(void *arg, uint64_t id, uint32_t *words)
+{
+	AnnIndexFile *file = arg;
+	AnnIndexBitmap *bitmap = AnnIndexBitmapGet(file, id);
+
+	if (bitmap == NULL)
+		return 0;
+	memcpy(words, bitmap->words, ((size_t) file->rows + 31) / 32 * 4);
+	AnnIndexBitmapRelease(file, bitmap);
+	return 1;
+}
+
+int
+AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
+				 uint32_t *words, uint64_t *count)
+{
+	AnnFilterSource source;
+
+	memset(&source, 0, sizeof(source));
+	source.arg = file;
+	source.rows = file->rows;
+	source.column = SourceColumn;
+	source.count = SourceCount;
+	source.value = SourceValue;
+	source.start = SourceStart;
+	source.postings = SourcePostings;
+	source.bitmap = SourceBitmap;
+	return AnnFilterEvaluate(&source, program, size, words, count);
+}
+
+AnnStatus
+AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords, uint64_t expandLimit)
+{
+	AnnStatus	status = AnnIndexBitmapPut(file, id, words, nwords, expandLimit);
+	uint64_t	evicted = 0;
+	int			evict = 0;
+	uint32_t	limit = AnnIndexConfig.predicate_cache ? AnnIndexConfig.predicate_cache : 1;
+
+	if (status != ANN_OK)
+		return status;
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	if (file->predicates == NULL)
+		file->predicates = calloc(limit, sizeof(uint64_t));
+	if (file->predicates)
+	{
+		if (file->npredicates == limit)
+		{
+			evicted = file->predicates[file->predicateNext];
+			evict = evicted != id;
+		}
+		else
+			file->npredicates++;
+		file->predicates[file->predicateNext] = id;
+		file->predicateNext = (file->predicateNext + 1) % limit;
+	}
+	if (evict)
+	{
+		AnnIndexBitmap **link;
+
+		for (link = &file->bitmaps[evicted % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
+			if ((*link)->id == evicted)
+			{
+				AnnIndexBitmap *old = *link;
+
+				*link = old->next;
+				file->nbitmaps--;
+				file->bitmapBytes -= BitmapBytes(file, old);
+				file->bitmapDeviceBytes -= old->deviceBytes;
+				(void) pthread_mutex_unlock(&file->bitmapMutex);
+				AnnIndexBitmapRelease(file, old);
+				return ANN_OK;
+			}
+	}
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	return ANN_OK;
+}
+
 AnnIndexBitmap *
 AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id)
 {
@@ -518,7 +640,7 @@ ParseManifest(AnnIndexFile *file)
 			continue;
 		else if (strcmp(key, "generation") == 0 && sscanf(line, "%*s %16s", file->generation) == 1 &&
 				 strlen(file->generation) == 16 && strspn(file->generation, "0123456789abcdef") == 16)
-			continue;
+			file->generationValue = strtoull(file->generation, NULL, 16);
 		else if (strcmp(key, "shard") == 0 &&
 				 sscanf(line, "%*s %llu %llu %llu %255s", &a, &b, &c, text) == 4 &&
 				 a == file->nshards && file->nshards < ANN_INDEX_MAX_SHARDS &&
@@ -657,6 +779,7 @@ AnnIndexFileClose(AnnIndexFile *file)
 			FreeBitmap(file, bitmap);
 		}
 	(void) pthread_mutex_destroy(&file->bitmapMutex);
+	free(file->predicates);
 	free(file);
 }
 

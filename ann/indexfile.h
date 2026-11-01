@@ -119,6 +119,7 @@ struct AnnIndexFile
 	char		vector[64];		/* vector column name in source, or empty */
 	char		dtype[16];		/* CAGRA dataset type: float32 or float16 */
 	char		generation[17]; /* frozen index content hash, or empty */
+	uint64_t	generationValue;	/* the same as a number, 0 if none */
 	uint32_t	dimensions;
 	uint64_t	rows;
 	uint32_t	nshards;
@@ -140,6 +141,10 @@ struct AnnIndexFile
 	uint64_t	nbitmaps;
 	uint64_t	bitmapBytes;
 	uint64_t	bitmapDeviceBytes;
+	uint64_t   *predicates;		/* ids of cached predicate results, a ring
+								 * of predicate_cache entries */
+	uint32_t	npredicates;
+	uint32_t	predicateNext;
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
 	size_t		keysBytes;		/* mapped or reserved bytes, for munmap */
@@ -174,6 +179,7 @@ typedef struct AnnIndexOptions
 								 * by the backend, read by the scheduler */
 	int			quantized_scan; /* scan quantized copies on Blackwell GPUs */
 	uint32_t	quant_slack;	/* extra candidates re-scored in FP32 */
+	uint32_t	predicate_cache;	/* predicate results kept per index */
 } AnnIndexOptions;
 
 extern AnnIndexOptions AnnIndexConfig;
@@ -182,6 +188,21 @@ const char *AnnIndexQuantName(int quant);
 
 AnnStatus	AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result);
 void		AnnIndexFileClose(AnnIndexFile *file);
+
+/*
+ * Evaluate a predicate program (ann/filter.h) over the index's attribute
+ * columns and cached bitmaps into words ((rows + 31) / 32 of them).
+ * Returns an ANN_FILTER_* code.
+ */
+int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
+							 uint32_t *words, uint64_t *count);
+
+/*
+ * Cache a predicate's result under its id like a pushed bitmap; the oldest
+ * predicate result is dropped once predicate_cache of them are cached.
+ */
+AnnStatus	AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords,
+								 uint64_t expandLimit);
 
 /* Registry of loaded indexes; lookups take a reference released by Put. */
 AnnStatus	AnnIndexRegister(AnnIndexFile *file);

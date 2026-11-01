@@ -1,10 +1,10 @@
 EXTENSION = vector
-EXTVERSION = 0.9.0
+EXTVERSION = 0.9.1
 
 MODULE_big = vector
 DATA = $(wildcard sql/*--*--*.sql)
 DATA_built = sql/$(EXTENSION)--$(EXTVERSION).sql
-OBJS = src/ann.o src/anncustom.o src/annindex.o src/annremote.o src/annplan.o src/annbuild.o src/annexport.o src/annfrozen.o src/anninsert.o src/annscan.o src/annutils.o src/annvacuum.o src/annworker.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
+OBJS = src/ann.o src/anncustom.o src/annindex.o src/annremote.o src/annplan.o src/annbuild.o src/annexport.o src/annfrozen.o src/anninsert.o src/annscan.o src/annutils.o src/annvacuum.o src/annworker.o src/annpred.o src/annfrozenscan.o ann/filter.o src/bitutils.o src/bitvec.o src/halfutils.o src/halfvec.o src/hnsw.o src/hnswbuild.o src/hnswinsert.o src/hnswscan.o src/hnswutils.o src/hnswvacuum.o src/ivfbuild.o src/ivfflat.o src/ivfinsert.o src/ivfkmeans.o src/ivfscan.o src/ivfutils.o src/ivfvacuum.o src/sparsevec.o src/vector.o
 HEADERS = src/halfvec.h src/sparsevec.h src/vector.h
 
 TESTS = $(wildcard test/sql/*.sql)
