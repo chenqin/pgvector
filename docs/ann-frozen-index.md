@@ -10,7 +10,7 @@ A frozen `ann` index is built once from a table that can no longer change. In on
 
 The GPU worker already numbers rows by key rank (`keys.i64` is sorted), so the export is byte-for-byte what `scripts/ann/build_cuvs_index.py` writes from SQL, and a filter evaluated on either side selects the same bits. A content hash (the generation) in the index and in the exported manifest lets `ann_index_load` prove that the GPU index and the table hold the same rows.
 
-This implements phases 1 and 2 and the inverted pages of phase 3 of the [plan](ann-immutable-indexes-plan.md). Not yet: the shared predicate evaluator for `AND`/`OR`/ranges, operation 22, prebuilt bitset pages, ordinals in worker replies, and the frozen-base-plus-delta union.
+This implements phases 1 and 2 and the inverted pages of phase 3 of the [plan](ann-immutable-indexes-plan.md). Not yet: the shared predicate evaluator for `AND`/`OR`/ranges, operation 22, prebuilt bitset pages, ordinals in worker replies, and, as a todo for later, phase 4's frozen-base-plus-delta union (until then a changed table is refrozen and rebuilt).
 
 ## Usage
 

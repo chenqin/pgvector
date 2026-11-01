@@ -124,7 +124,9 @@ Files: `src/annbuild.c` (postings, per-code bitsets), new `ann/filter.c`/`filter
 
 Gates: for every predicate shape in the whitelist, PostgreSQL's bitset equals the worker's word for word on the 7-shard CPU fixture and on `bench10m`; results equal exact SQL on every route, as `test_cuvs_index.py` checks today; `ann_filter_bitmap_build` on `bench10m` (10M rows) drops from seconds (heap scan) to a cost proportional to the selected rows: an equality, IN or range comes from prebuilt bitsets or postings (under 1 ms for a 1% filter, a few ms for 10%), an AND of two bitsets is 154 pages of word operations (under 1 ms), and only a column without postings falls back to walking its 4,902 attribute pages (5–20 ms); filtered QPS on one and eight B200s is unchanged within noise, since the GPU routes don't change; grouping statistics show operation-22 searches grouping by program hash.
 
-### Phase 4: delta union and generation switch
+### Phase 4: delta union and generation switch (todo)
+
+Deferred until phases 1–3 are complete; until then, a table that changes is refrozen and rebuilt as a new generation.
 
 Files: `src/annplan.c` (union of frozen base and hot partition under one `ORDER BY … LIMIT`), `src/annremote.c` (generation in request headers, `ANN_GENERATION` retry after reload), docs.
 
