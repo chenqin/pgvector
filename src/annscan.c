@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "ann.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_type_d.h"
@@ -19,6 +20,15 @@ typedef struct AnnScanOpaqueData
 	TupleTableSlot *output;
 	Tuplesortstate *sortstate;
 	MemoryContext tmpCtx;
+
+	/* Frozen indexes: arrays by ordinal, and the tuple returned to IOS. */
+	AnnFrozenMetaData *meta;
+	AnnArrayReader tids;
+	AnnArrayReader keys;
+	AnnArrayReader vectors;
+	AnnArrayReader *columns;
+	Vector	   *vector;
+	MemoryContext tupleCtx;
 } AnnScanOpaqueData;
 
 typedef AnnScanOpaqueData *AnnScanOpaque;
@@ -75,6 +85,8 @@ GetScanItems(IndexScanDesc scan)
 								  PointerGetDatum(DatumGetVector(value)), query);
 			so->input->tts_isnull[1] = false;
 			so->input->tts_values[1] = PointerGetDatum(&tuple->t_tid);
+			so->input->tts_isnull[2] = false;
+			so->input->tts_values[2] = Int64GetDatum(0);
 			ExecStoreVirtualTuple(so->input);
 			MemoryContextSwitchTo(oldCtx);
 			tuplesort_puttupleslot(so->sortstate, so->input);
@@ -84,6 +96,94 @@ GetScanItems(IndexScanDesc scan)
 		UnlockReleaseBuffer(buf);
 	}
 	tuplesort_performsort(so->sortstate);
+}
+
+/*
+ * Frozen indexes: score the vector pages in ordinal order. Rows keep their
+ * ordinal through the sort; TIDs and returned columns are read afterwards.
+ */
+static void
+GetFrozenScanItems(IndexScanDesc scan)
+{
+	AnnScanOpaque so = scan->opaque;
+	Relation	index = scan->indexRelation;
+	const AnnArray *array = &so->meta->vectors;
+	Datum		query = scan->orderByData[0].sk_argument;
+	bool		queryIsNull = (scan->orderByData[0].sk_flags & SK_ISNULL) != 0;
+	BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
+	double	   *distances = palloc(sizeof(double) * array->perPage);
+	ItemPointerData none;
+	AnnArrayReader reader;
+
+	ItemPointerSetInvalid(&none);
+	AnnArrayReaderInit(&reader, index, array, strategy);
+	for (BlockNumber p = 0; p < array->pages; p++)
+	{
+		uint32		count;
+		char	   *data;
+		MemoryContext oldCtx;
+
+		CHECK_FOR_INTERRUPTS();
+		data = AnnArrayLockPage(&reader, p, &count);
+		oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+		for (uint32 j = 0; j < count && !queryIsNull; j++)
+			distances[j] = DatumGetFloat8(FunctionCall2Coll(so->procinfo, index->rd_indcollation[0],
+															PointerGetDatum(data + (size_t) j * array->width),
+															query));
+		MemoryContextSwitchTo(oldCtx);
+		AnnArrayUnlockPage(&reader);
+		for (uint32 j = 0; j < count; j++)
+		{
+			ExecClearTuple(so->input);
+			so->input->tts_isnull[0] = queryIsNull;
+			so->input->tts_values[0] = queryIsNull ? (Datum) 0 : Float8GetDatum(distances[j]);
+			so->input->tts_isnull[1] = false;
+			so->input->tts_values[1] = PointerGetDatum(&none);
+			so->input->tts_isnull[2] = false;
+			so->input->tts_values[2] = Int64GetDatum((int64) p * array->perPage + j);
+			ExecStoreVirtualTuple(so->input);
+			tuplesort_puttupleslot(so->sortstate, so->input);
+			ExecClearTuple(so->input);
+		}
+		MemoryContextReset(so->tmpCtx);
+	}
+	AnnArrayReaderEnd(&reader);
+	FreeAccessStrategy(strategy);
+	pfree(distances);
+	tuplesort_performsort(so->sortstate);
+}
+
+/* Every index column of one row, as the heap tuple index-only scans read. */
+static void
+ReturnColumns(IndexScanDesc scan, uint64 ordinal)
+{
+	AnnScanOpaque so = scan->opaque;
+	TupleDesc	desc = RelationGetDescr(scan->indexRelation);
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS] = {0};
+	Oid			type = TupleDescAttr(desc, 1)->atttypid;
+	int64		key;
+	MemoryContext oldCtx;
+
+	MemoryContextReset(so->tupleCtx);
+	oldCtx = MemoryContextSwitchTo(so->tupleCtx);
+	AnnArrayRead(&so->vectors, ordinal, so->vector);
+	values[0] = PointerGetDatum(so->vector);
+	AnnArrayRead(&so->keys, ordinal, &key);
+	values[1] = type == INT2OID ? Int16GetDatum((int16) key) :
+		type == INT4OID ? Int32GetDatum((int32) key) : Int64GetDatum(key);
+	for (uint32 c = 0; c < so->meta->ncolumns; c++)
+	{
+		int32		value;
+
+		AnnArrayRead(&so->columns[c], ordinal, &value);
+		isnull[2 + c] = value == ANN_FROZEN_NULL;
+		values[2 + c] = TupleDescAttr(desc, 2 + c)->atttypid == INT2OID ?
+			Int16GetDatum((int16) value) : Int32GetDatum(value);
+	}
+	scan->xs_hitup = heap_form_tuple(desc, values, isnull);
+	scan->xs_hitupdesc = desc;
+	MemoryContextSwitchTo(oldCtx);
 }
 
 IndexScanDesc
@@ -99,9 +199,10 @@ annbeginscan(Relation index, int nkeys, int norderbys)
 	so->first = true;
 	so->procinfo = index_getprocinfo(index, 1, ANN_DISTANCE_PROC);
 	so->tmpCtx = AllocSetContextCreate(CurrentMemoryContext, "Ann scan temporary context", ALLOCSET_DEFAULT_SIZES);
-	so->tupdesc = CreateTemplateTupleDesc(2);
+	so->tupdesc = CreateTemplateTupleDesc(3);
 	TupleDescInitEntry(so->tupdesc, 1, "distance", FLOAT8OID, -1, 0);
 	TupleDescInitEntry(so->tupdesc, 2, "heaptid", TIDOID, -1, 0);
+	TupleDescInitEntry(so->tupdesc, 3, "ordinal", INT8OID, -1, 0);
 #if PG_VERSION_NUM >= 190000
 	TupleDescFinalize(so->tupdesc);
 #endif
@@ -109,6 +210,19 @@ annbeginscan(Relation index, int nkeys, int norderbys)
 	so->output = MakeSingleTupleTableSlot(so->tupdesc, &TTSOpsMinimalTuple);
 	so->sortstate = tuplesort_begin_heap(so->tupdesc, 1, attNums, operators, collations,
 										 nullsFirst, work_mem, NULL, false);
+	so->meta = AnnFrozenGetMeta(index, true);
+	if (so->meta)
+	{
+		AnnArrayReaderInit(&so->tids, index, &so->meta->tids, NULL);
+		AnnArrayReaderInit(&so->keys, index, &so->meta->keys, NULL);
+		AnnArrayReaderInit(&so->vectors, index, &so->meta->vectors, NULL);
+		so->columns = palloc(sizeof(AnnArrayReader) * Max(so->meta->ncolumns, 1));
+		for (uint32 c = 0; c < so->meta->ncolumns; c++)
+			AnnArrayReaderInit(&so->columns[c], index, &so->meta->columns[c].values, NULL);
+		so->vector = palloc(so->meta->vectors.width);
+		so->tupleCtx = AllocSetContextCreate(CurrentMemoryContext, "Ann scan tuple context",
+											 ALLOCSET_DEFAULT_SIZES);
+	}
 	scan->opaque = so;
 	return scan;
 }
@@ -143,14 +257,35 @@ anngettuple(IndexScanDesc scan, ScanDirection dir)
 		if (!IsMVCCSnapshot(scan->xs_snapshot))
 			elog(ERROR, "non-MVCC snapshots are not supported with ann");
 		pgstat_count_index_scan(scan->indexRelation);
-		GetScanItems(scan);
+		if (so->meta)
+			GetFrozenScanItems(scan);
+		else
+			GetScanItems(scan);
 		so->first = false;
 	}
-	if (!tuplesort_gettupleslot(so->sortstate, true, false, so->output, NULL))
-		return false;
-	value = slot_getattr(so->output, 2, &isnull);
-	Assert(!isnull);
-	scan->xs_heaptid = *DatumGetItemPointer(value);
+	for (;;)
+	{
+		int64		ordinal;
+
+		if (!tuplesort_gettupleslot(so->sortstate, true, false, so->output, NULL))
+			return false;
+		if (!so->meta)
+		{
+			value = slot_getattr(so->output, 2, &isnull);
+			Assert(!isnull);
+			scan->xs_heaptid = *DatumGetItemPointer(value);
+			break;
+		}
+
+		/* VACUUM invalidates the TIDs of deleted rows; skip them. */
+		ordinal = DatumGetInt64(slot_getattr(so->output, 3, &isnull));
+		AnnArrayRead(&so->tids, ordinal, &scan->xs_heaptid);
+		if (!ItemPointerIsValid(&scan->xs_heaptid))
+			continue;
+		if (scan->xs_want_itup)
+			ReturnColumns(scan, ordinal);
+		break;
+	}
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
 	return true;
@@ -161,6 +296,15 @@ annendscan(IndexScanDesc scan)
 {
 	AnnScanOpaque so = scan->opaque;
 
+	if (so->meta)
+	{
+		AnnArrayReaderEnd(&so->tids);
+		AnnArrayReaderEnd(&so->keys);
+		AnnArrayReaderEnd(&so->vectors);
+		for (uint32 c = 0; c < so->meta->ncolumns; c++)
+			AnnArrayReaderEnd(&so->columns[c]);
+		MemoryContextDelete(so->tupleCtx);
+	}
 	ExecDropSingleTupleTableSlot(so->input);
 	ExecDropSingleTupleTableSlot(so->output);
 	tuplesort_end(so->sortstate);

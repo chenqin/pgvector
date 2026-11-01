@@ -14,7 +14,8 @@
 #include "vector.h"
 
 #define ANN_MAGIC_NUMBER 0xA991A991
-#define ANN_VERSION 1
+#define ANN_VERSION 1			/* mutable layout: index tuples */
+#define ANN_FROZEN_VERSION 2	/* frozen layout: arrays by ordinal */
 #define ANN_PAGE_ID 0xFF92
 #define ANN_METAPAGE_BLKNO 0
 #define ANN_MAX_DIM 2000
@@ -36,6 +37,68 @@ typedef struct AnnMetaPageData
 
 #define AnnPageGetMeta(page) ((AnnMetaPageData *) PageGetContents(page))
 #define AnnPageGetOpaque(page) ((AnnPageOpaqueData *) PageGetSpecialPointer(page))
+
+typedef struct AnnOptions
+{
+	int32		vl_len_;		/* varlena header (do not touch directly!) */
+	bool		frozen;			/* build the immutable layout */
+} AnnOptions;
+
+/*
+ * Frozen indexes (WITH (frozen = true)) are built once from a table that
+ * cannot change, and store every structure as a fixed-width array over
+ * consecutive pages. Element i of an array lives on block
+ * start + i / perPage at offset (i % perPage) * width of the page contents.
+ * Ordinal i is the row with the i-th smallest key, the numbering the GPU
+ * worker uses for the same rows.
+ */
+typedef struct AnnArray
+{
+	BlockNumber start;
+	BlockNumber pages;
+	uint32		width;			/* bytes per element */
+	uint32		perPage;
+	uint64		count;
+} AnnArray;
+
+/* An INCLUDE column after the key: forward values and its inverted index. */
+typedef struct AnnFrozenColumn
+{
+	AnnArray	values;			/* int32 per ordinal, ANN_FROZEN_NULL for NULL */
+	AnnArray	postings;		/* uint32 ordinals grouped by value, ascending */
+	AnnArray	dict;			/* distinct int32 values, ascending */
+	AnnArray	offsets;		/* uint32 per value plus one: its postings */
+} AnnFrozenColumn;
+
+typedef struct AnnFrozenMetaData
+{
+	uint64		rows;
+	uint64		generation;		/* hash of the indexed content */
+	Oid			guard;			/* guard trigger at build time */
+	uint32		ncolumns;		/* INCLUDE columns after the key */
+	AnnArray	tids;			/* ItemPointerData per ordinal */
+	AnnArray	keys;			/* int64 per ordinal, strictly increasing */
+	AnnArray	vectors;		/* Vector varlena per ordinal */
+	AnnFrozenColumn columns[FLEXIBLE_ARRAY_MEMBER];
+} AnnFrozenMetaData;
+
+#define ANN_FROZEN_MAX_COLUMNS (INDEX_MAX_KEYS - 2)
+#define ANN_FROZEN_NULL PG_INT32_MIN
+#define AnnPageGetFrozen(page) \
+	((AnnFrozenMetaData *) ((char *) PageGetContents(page) + MAXALIGN(sizeof(AnnMetaPageData))))
+#define AnnFrozenMetaSize(ncolumns) \
+	(offsetof(AnnFrozenMetaData, columns) + (ncolumns) * sizeof(AnnFrozenColumn))
+
+/* Sequential reads of an array, one pinned page at a time. */
+typedef struct AnnArrayReader
+{
+	Relation	index;
+	const AnnArray *array;
+	BufferAccessStrategy strategy;
+	Buffer		buf;
+	BlockNumber page;			/* page of the array pinned in buf */
+	bool		locked;
+} AnnArrayReader;
 
 extern const CustomPathMethods AnnCustomPathMethods;
 extern const CustomScanMethods AnnCustomScanMethods;
@@ -80,6 +143,21 @@ void		AnnInitMetaPage(Relation index, ForkNumber forkNum);
 void		AnnCheckMetaPage(Page page);
 void		AnnInsertTuple(Relation index, Datum *values, bool *isnull,
 						   ItemPointer tid, bool building);
+
+void		AnnInitOptions(void);
+bool		AnnFrozenOption(Relation index);
+bool		AnnIsFrozen(Relation index);
+AnnFrozenMetaData *AnnFrozenGetMeta(Relation index, bool missingOk);
+IndexBuildResult *AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo);
+void		AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
+							   BufferAccessStrategy strategy);
+char	   *AnnArrayLockPage(AnnArrayReader *reader, BlockNumber page, uint32 *count);
+void		AnnArrayUnlockPage(AnnArrayReader *reader);
+void		AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out);
+void		AnnArrayReaderEnd(AnnArrayReader *reader);
+const char *AnnFrozenColumnName(Relation index, int column);
+IndexBulkDeleteResult *AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
+										   IndexBulkDeleteCallback callback, void *callback_state);
 
 IndexBuildResult *annbuild(Relation heap, Relation index, IndexInfo *indexInfo);
 void		annbuildempty(Relation index);

@@ -28,6 +28,13 @@ AnnInsertTuple(Relation index, Datum *values, bool *isnull, ItemPointer tid, boo
 	LockBuffer(metaBuf, BUFFER_LOCK_EXCLUSIVE);
 	metaPage = BufferGetPage(metaBuf);
 	AnnCheckMetaPage(metaPage);
+	if (AnnPageGetMeta(metaPage)->version == ANN_FROZEN_VERSION)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot insert into frozen ann index \"%s\"", RelationGetRelationName(index)),
+				 errhint("Frozen indexes are rebuilt, not updated: drop the index, or build it again after the table changes.")));
+	if (RelationGetDescr(index)->natts != 1)
+		elog(ERROR, "mutable ann index \"%s\" has INCLUDE columns", RelationGetRelationName(index));
 	tupleValues[0] = isnull[0] ? (Datum) 0 : values[0];
 	if (!isnull[0])
 	{
