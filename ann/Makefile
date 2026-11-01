@@ -63,11 +63,13 @@ check: ann-worker ann-batch-tests
 	python3 ../test/ann/test_native.py
 	python3 ../test/ann/test_filtered.py
 	python3 ../test/ann/test_pipeline.py
+	python3 ../test/ann/test_frozen.py
 
 check-cuvs: ann-worker ann-worker-cuvs
 	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs.py
 	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs_gathered.py
 	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs_index.py
+	ANN_CUVS_TEST=1 python3 ../test/ann/test_frozen.py FrozenCuvsTests
 
 check-postgres: ann-worker
 	@test -n "$$ANN_PG_DSN" || { echo 'Set ANN_PG_DSN to a test database with pgvector installed' >&2; exit 1; }
@@ -76,6 +78,7 @@ check-postgres: ann-worker
 	python3 ../test/ann/test_filtered.py
 	python3 ../test/ann/test_pipeline.py
 	python3 ../test/ann/test_index.py
+	python3 ../test/ann/test_frozen.py
 
 clean:
 	rm -f ann-worker

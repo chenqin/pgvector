@@ -1488,11 +1488,12 @@ LoadIndex(Service *service, const unsigned char *payload, uint32_t size,
 	if (file == NULL)
 		return ANN_BACKEND_ERROR;
 	written = snprintf(reply, replySize, "rows %llu dimensions %u shards %u dtype %s source %s key %s vector %s "
-					   "quant %s quant_scan %s",
+					   "quant %s quant_scan %s generation %s",
 					   (unsigned long long) file->rows, file->dimensions, file->nshards,
 					   file->dtype, file->source[0] ? file->source : "-",
 					   file->key[0] ? file->key : "-", file->vector[0] ? file->vector : "-",
-					   AnnIndexQuantName(file->quant), file->quantActive ? "on" : "off");
+					   AnnIndexQuantName(file->quant), file->quantActive ? "on" : "off",
+					   file->generation[0] ? file->generation : "-");
 	AnnIndexPut(file);
 	*replyLength = written > 0 && (size_t) written < replySize ? (size_t) written : 0;
 	return ANN_OK;
@@ -1514,13 +1515,14 @@ DescribeIndex(const unsigned char *payload, uint32_t size, char *reply, size_t r
 		return ANN_STALE;
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	written = snprintf(reply, replySize, "rows %llu dimensions %u shards %u dtype %s source %s key %s vector %s "
-					   "quant %s quant_scan %s bitmaps %llu bitmap_bytes %llu bitmap_device_bytes %llu",
+					   "quant %s quant_scan %s bitmaps %llu bitmap_bytes %llu bitmap_device_bytes %llu generation %s",
 					   (unsigned long long) file->rows, file->dimensions, file->nshards,
 					   file->dtype, file->source[0] ? file->source : "-",
 					   file->key[0] ? file->key : "-", file->vector[0] ? file->vector : "-",
 					   AnnIndexQuantName(file->quant), file->quantActive ? "on" : "off",
 					   (unsigned long long) file->nbitmaps, (unsigned long long) file->bitmapBytes,
-					   (unsigned long long) file->bitmapDeviceBytes);
+					   (unsigned long long) file->bitmapDeviceBytes,
+					   file->generation[0] ? file->generation : "-");
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 	AnnIndexPut(file);
 	*replyLength = written > 0 && (size_t) written < replySize ? (size_t) written : 0;

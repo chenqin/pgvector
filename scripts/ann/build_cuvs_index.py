@@ -19,6 +19,12 @@ row in key order, so the worker can resolve "COLUMN IN (values)" filters
 itself (ann_attribute_search) instead of receiving key lists. NULL is stored
 as -2147483648, which therefore never matches.
 
+--from-export DIR builds from a directory written by SQL ann_index_export(index,
+DIR) instead of reading the table: a frozen ann index's keys, vectors and
+attribute columns plus its generation, which ann_index_load checks against the
+table. Its files are hard-linked (or copied) into --out; --dsn, --table, --key,
+--vector and --attribute are taken from the export.
+
 --quantize nvfp4|fp8 also writes a quantized copy of the vectors for the
 worker's Blackwell module, which scores filtered rows from it on compute
 capability 10.x GPUs and re-scores candidates from vectors.f32:
@@ -109,6 +115,29 @@ def export_attribute(dsn, table, key, vector, column, keys):
     if len(rows) != len(keys) or any(row[0] != k for row, k in zip(rows, keys.tolist())):
         raise SystemExit(f'table changed while exporting attribute {column}')
     return np.asarray([row[1] for row in rows], dtype='<i4')
+
+
+def read_export(directory):
+    """Manifest lines, keys and memory-mapped vectors of an ann_index_export directory."""
+    with open(os.path.join(directory, 'manifest')) as manifest:
+        lines = [line.rstrip('\n') for line in manifest if line.strip()]
+    fields = dict(line.split(' ', 1) for line in lines if not line.startswith('attribute '))
+    if fields.get('pgvector-ann-index') != '1' or 'generation' not in fields or fields.get('shards') != '0':
+        raise SystemExit(f'{directory} is not an ann_index_export directory')
+    rows, dimensions = int(fields['rows']), int(fields['dimensions'])
+    keys = np.fromfile(os.path.join(directory, 'keys.i64'), dtype='<i8')
+    vectors = np.memmap(os.path.join(directory, 'vectors.f32'), dtype='<f4', mode='r', shape=(rows, dimensions))
+    if len(keys) != rows:
+        raise SystemExit(f'{directory}/keys.i64 does not hold {rows} keys')
+    return lines, keys, vectors
+
+
+def link_or_copy(source, target):
+    try:
+        os.link(source, target)
+    except OSError:
+        import shutil
+        shutil.copyfile(source, target)
 
 
 def _e4m3_table(xp):
@@ -203,8 +232,10 @@ def build_shard(index, first, vectors, out, dtype, graph_degree, intermediate_de
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('--dsn', required=True)
-    parser.add_argument('--table', required=True, help='schema-qualified table, e.g. public.docs')
+    parser.add_argument('--dsn')
+    parser.add_argument('--table', help='schema-qualified table, e.g. public.docs')
+    parser.add_argument('--from-export', metavar='DIR',
+                        help='build from an ann_index_export directory instead of --dsn/--table')
     parser.add_argument('--key', default='id', help='unique integer key column')
     parser.add_argument('--vector', default='embedding', help='vector column')
     parser.add_argument('--out', required=True, help='new or empty output directory')
@@ -221,15 +252,31 @@ def main():
     parser.add_argument('--no-cagra', action='store_true', help='write keys/vectors only (CPU tests)')
     args = parser.parse_args()
 
+    if args.from_export:
+        if args.dsn or args.table or args.attribute or args.limit:
+            parser.error('--from-export takes the table, columns and rows from the export')
+    elif not args.dsn or not args.table:
+        parser.error('--dsn and --table are required without --from-export')
     if os.path.exists(args.out) and os.listdir(args.out):
         raise SystemExit(f'{args.out} is not empty; index directories are immutable')
     os.makedirs(args.out, exist_ok=True)
     started = time.time()
-    keys, vectors = export(args.dsn, args.table, args.key, args.vector, args.limit)
-    rows, dimensions = vectors.shape
-    log(f'exported {rows} rows x {dimensions} dims in {time.time() - started:.1f}s')
-    keys.astype('<i8').tofile(os.path.join(args.out, 'keys.i64'))
-    vectors.tofile(os.path.join(args.out, 'vectors.f32'))
+    exported = None
+    if args.from_export:
+        exported, keys, vectors = read_export(args.from_export)
+        rows, dimensions = vectors.shape
+        for line in exported:
+            if line.startswith('attribute '):
+                link_or_copy(os.path.join(args.from_export, line.split()[2]), os.path.join(args.out, line.split()[2]))
+        for name in ('keys.i64', 'vectors.f32'):
+            link_or_copy(os.path.join(args.from_export, name), os.path.join(args.out, name))
+        log(f'linked the export of {rows} rows x {dimensions} dims')
+    else:
+        keys, vectors = export(args.dsn, args.table, args.key, args.vector, args.limit)
+        rows, dimensions = vectors.shape
+        log(f'exported {rows} rows x {dimensions} dims in {time.time() - started:.1f}s')
+        keys.astype('<i8').tofile(os.path.join(args.out, 'keys.i64'))
+        vectors.tofile(os.path.join(args.out, 'vectors.f32'))
     if args.quantize:
         write_quantized(args.out, vectors, args.quantize)
         log(f'wrote the {args.quantize} copy')
@@ -253,11 +300,19 @@ def main():
                 future.result()
 
     # The manifest is written last, so a partial build is never loadable.
+    if exported:
+        # Keep the export's table, columns, attributes and generation.
+        kept = [line for line in exported if line.split(' ', 1)[0] in ('source', 'key', 'vector', 'attribute')]
+        generation = [line for line in exported if line.startswith('generation ')]
+    else:
+        kept = [f'source {args.table}', f'key {args.key}', f'vector {args.vector}']
+        kept += [f'attribute {column} attr-{column}.i32' for column in args.attribute]
+        generation = []
     lines = ['pgvector-ann-index 1', f'dimensions {dimensions}', f'rows {rows}', 'metric l2',
-             f'dtype {args.dtype}', f'source {args.table}', f'key {args.key}', f'vector {args.vector}',
-             f'shards {len(shards)}']
+             f'dtype {args.dtype}'] + [line for line in kept if not line.startswith('attribute ')]
+    lines += [f'shards {len(shards)}']
     lines += [f'shard {i} {first} {n} shard-{i}.cagra' for i, first, n in shards]
-    lines += [f'attribute {column} attr-{column}.i32' for column in args.attribute]
+    lines += [line for line in kept if line.startswith('attribute ')] + generation
     if args.quantize:
         lines.append(f'quant {args.quantize}')
     with open(os.path.join(args.out, 'manifest.tmp'), 'w') as manifest:
