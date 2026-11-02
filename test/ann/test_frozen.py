@@ -455,6 +455,12 @@ class FrozenTests(unittest.TestCase):
                                   ('docs_ann', 'category <> 4 AND tenant IN (2, 7)')).fetchone()
         self.assertEqual((swapped[0], bytes(swapped[1])), (first[0], bytes(first[1])))
         self.assertEqual(self.cache_stats()[2], hits + 1)
+        # A sparse result (under 1/64 of the rows) is kept as ordinals and rebuilt on a hit.
+        sparse = 'tenant = 7 AND category = 3'
+        hits = self.cache_stats()[2]
+        for _ in range(2):
+            self.assert_filter('docs_ann', sparse)
+        self.assertGreaterEqual(self.cache_stats()[2], hits + 1)
         # A tiny budget evicts, and results stay exact.
         self.db.execute("SET ann.frozen_filter_cache_mb = 1")
         self.db.execute("""SELECT count(*) FROM generate_series(1, 2500) g,

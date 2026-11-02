@@ -405,7 +405,7 @@ FreeBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 static size_t
 BitmapBytes(const AnnIndexFile *file, const AnnIndexBitmap *bitmap)
 {
-	size_t		bytes = ((size_t) file->rows + 31) / 32 * 4;
+	size_t		bytes = bitmap->words ? ((size_t) file->rows + 31) / 32 * 4 : 0;
 
 	for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
 		if (bitmap->owned[s])
@@ -524,6 +524,24 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 			}
 	}
 
+	/*
+	 * A sparse predicate result (under 1/64 of the rows, within the gather
+	 * limits) is only ever scanned from its rows, so its bitmap goes: at 10M
+	 * rows that is 1.25 MB an entry, eight times a 0.1% filter's rows.
+	 */
+	if (kind == ANN_BITMAP_PREDICATE && bitmap->ordinals && bitmap->count < file->rows / 64 &&
+		bitmap->count <= AnnIndexConfig.bitset_gather_limit)
+	{
+		for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
+		{
+			free(bitmap->owned[s]);
+			bitmap->owned[s] = NULL;
+			bitmap->bitsets[s] = NULL;
+		}
+		free(bitmap->words);
+		bitmap->words = NULL;
+	}
+
 	if (AnnIndexConfig.device_bitmaps && AnnIndexBitmapDevice.upload && file->device)
 		AnnIndexBitmapDevice.upload(file, bitmap);
 
@@ -547,6 +565,22 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 	if (result)
 		*result = bitmap;
 	return ANN_OK;
+}
+
+/* A cached entry's rows as a bitmap over ordinals, from its ordinals when it keeps no bitmap. */
+void
+AnnIndexBitmapWords(const AnnIndexFile *file, const AnnIndexBitmap *bitmap, uint32_t *words)
+{
+	size_t		nwords = ((size_t) file->rows + 31) / 32;
+
+	if (bitmap->words)
+	{
+		memcpy(words, bitmap->words, nwords * 4);
+		return;
+	}
+	memset(words, 0, nwords * 4);
+	for (uint64_t i = 0; i < bitmap->count; i++)
+		words[bitmap->ordinals[i] / 32] |= UINT32_C(1) << (bitmap->ordinals[i] % 32);
 }
 
 /* Attribute columns and cached bitmaps as an ann/filter.h source. */
@@ -600,7 +634,7 @@ SourceBitmap(void *arg, uint64_t id, uint32_t *words)
 
 	if (bitmap == NULL)
 		return 0;
-	memcpy(words, bitmap->words, ((size_t) file->rows + 31) / 32 * 4);
+	AnnIndexBitmapWords(file, bitmap, words);
 	AnnIndexBitmapRelease(file, bitmap);
 	return 1;
 }

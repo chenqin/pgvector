@@ -1504,12 +1504,13 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 		job->index.filter = bitmap->keys;
 		job->index.ordinals = bitmap->ordinals;
 	}
-	if (bitmap && file->nshards)
+	if (bitmap && file->nshards && bitmap->words)
 	{
 		job->index.bitsets = bitmap->bitsets;
 		job->index.deviceBitsets = bitmap->device;
-		job->index.deviceRows = bitmap->deviceRows;
 	}
+	if (bitmap && file->nshards)
+		job->index.deviceRows = bitmap->deviceRows;
 	if (bitmap && job->index.filter == NULL && job->index.bitsets == NULL)
 	{
 		/* Neither form usable: the worker's limits changed under the entry. */
@@ -1751,10 +1752,23 @@ EvaluatePredicate(Service *service, const unsigned char *payload, uint32_t size,
 			status = ANN_NOMEM;
 		else
 		{
-			Write(*reply, bitmap->count, 8);
-			for (size_t w = 0; w < nwords; w++)
-				Write(*reply + 8 + w * 4, bitmap->words[w], 4);
-			*replyLength = 8 + nwords * 4;
+			uint32_t   *words = malloc(nwords * 4 + 4);
+
+			if (words == NULL)
+			{
+				free(*reply);
+				*reply = NULL;
+				status = ANN_NOMEM;
+			}
+			else
+			{
+				AnnIndexBitmapWords(file, bitmap, words);
+				Write(*reply, bitmap->count, 8);
+				for (size_t w = 0; w < nwords; w++)
+					Write(*reply + 8 + w * 4, words[w], 4);
+				*replyLength = 8 + nwords * 4;
+				free(words);
+			}
 		}
 		AnnIndexBitmapRelease(file, bitmap);
 	}

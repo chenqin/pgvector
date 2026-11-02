@@ -6,6 +6,7 @@
 #include "funcapi.h"
 #include "access/htup_details.h"
 #include "miscadmin.h"
+#include "port/pg_bitutils.h"
 #include "utils/guc.h"
 
 #if PG_VERSION_NUM >= 170000
@@ -42,9 +43,10 @@ typedef struct FilterCacheEntry
 {
 	FilterCacheKey key;
 	dsa_pointer program;		/* the program bytes, compared on a hit */
-	dsa_pointer words;
+	dsa_pointer words;			/* the bitmap, or (sparse) uint32 ordinals */
 	uint64		nwords;
 	uint64		eligible;
+	bool		sparse;			/* under 1/64 of the rows: ordinals kept */
 	pg_atomic_uint64 used;		/* clock value of the last use */
 } FilterCacheEntry;
 
@@ -158,7 +160,16 @@ AnnFilterCacheGet(Oid index, uint64 generation, const char *program, size_t size
 		if (entry->nwords == nwords &&
 			memcmp(dsa_get_address(area, entry->program), program, size) == 0)
 		{
-			memcpy(words, dsa_get_address(area, entry->words), nwords * sizeof(uint32));
+			if (entry->sparse)
+			{
+				const uint32 *ordinals = dsa_get_address(area, entry->words);
+
+				memset(words, 0, nwords * sizeof(uint32));
+				for (uint64 i = 0; i < entry->eligible; i++)
+					words[ordinals[i] / 32] |= UINT32_C(1) << (ordinals[i] % 32);
+			}
+			else
+				memcpy(words, dsa_get_address(area, entry->words), nwords * sizeof(uint32));
 			*eligible = entry->eligible;
 			pg_atomic_write_u64(&entry->used, pg_atomic_add_fetch_u64(&control->clock, 1));
 			hit = true;
@@ -184,10 +195,17 @@ VictimCompare(const void *a, const void *b)
 	return (x > y) - (x < y);
 }
 
-static uint64
-EntryBytes(uint64 nwords, size_t length)
+/* Results under 1/64 of the rows are kept as their ordinals: fewer bytes than the bitmap. */
+static bool
+Sparse(uint64 nwords, uint64 eligible)
 {
-	return nwords * sizeof(uint32) + length + sizeof(FilterCacheEntry);
+	return eligible < nwords * 32 / 64;
+}
+
+static uint64
+EntryBytes(uint64 nwords, uint64 eligible, size_t length)
+{
+	return (Sparse(nwords, eligible) ? eligible : nwords) * sizeof(uint32) + length + sizeof(FilterCacheEntry);
 }
 
 /* Drop the least recently used entries until the cache is at 90% of its budget. */
@@ -231,7 +249,7 @@ Evict(uint64 budget)
 				continue;
 			words = entry->words;
 			program = entry->program;
-			bytes = EntryBytes(entry->nwords, entry->key.length);
+			bytes = EntryBytes(entry->nwords, entry->eligible, entry->key.length);
 			dshash_delete_entry(table, entry);
 			dsa_free(area, words);
 			dsa_free(area, program);
@@ -272,7 +290,8 @@ AnnFilterCachePut(Oid index, uint64 generation, const char *program, size_t size
 				  size_t nwords, uint64 eligible)
 {
 	uint64		budget = (uint64) ann_frozen_filter_cache_mb * 1024 * 1024;
-	uint64		bytes = EntryBytes(nwords, size);
+	uint64		bytes = EntryBytes(nwords, eligible, size);
+	bool		sparse = Sparse(nwords, eligible);
 	FilterCacheKey key;
 	FilterCacheEntry *entry;
 	dsa_pointer wordsPointer;
@@ -281,7 +300,8 @@ AnnFilterCachePut(Oid index, uint64 generation, const char *program, size_t size
 
 	if (!Attach() || bytes > budget || !Reserve(bytes, budget))
 		return;
-	wordsPointer = dsa_allocate_extended(area, Max(nwords, 1) * sizeof(uint32), DSA_ALLOC_HUGE | DSA_ALLOC_NO_OOM);
+	wordsPointer = dsa_allocate_extended(area, Max(sparse ? eligible : nwords, 1) * sizeof(uint32),
+										 DSA_ALLOC_HUGE | DSA_ALLOC_NO_OOM);
 	programPointer = dsa_allocate_extended(area, Max(size, 1), DSA_ALLOC_NO_OOM);
 	if (!DsaPointerIsValid(wordsPointer) || !DsaPointerIsValid(programPointer))
 	{
@@ -292,7 +312,17 @@ AnnFilterCachePut(Oid index, uint64 generation, const char *program, size_t size
 		pg_atomic_fetch_sub_u64(&control->bytes, bytes);
 		return;
 	}
-	memcpy(dsa_get_address(area, wordsPointer), words, nwords * sizeof(uint32));
+	if (sparse)
+	{
+		uint32	   *ordinals = dsa_get_address(area, wordsPointer);
+		uint64		n = 0;
+
+		for (uint64 w = 0; w < nwords && n < eligible; w++)
+			for (uint32 bits = words[w]; bits && n < eligible; bits &= bits - 1)
+				ordinals[n++] = (uint32) (w * 32 + pg_rightmost_one_pos32(bits));
+	}
+	else
+		memcpy(dsa_get_address(area, wordsPointer), words, nwords * sizeof(uint32));
 	memcpy(dsa_get_address(area, programPointer), program, size);
 	key = MakeKey(index, generation, program, size);
 	entry = dshash_find_or_insert(table, &key, &found);
@@ -309,6 +339,7 @@ AnnFilterCachePut(Oid index, uint64 generation, const char *program, size_t size
 	entry->words = wordsPointer;
 	entry->nwords = nwords;
 	entry->eligible = eligible;
+	entry->sparse = sparse;
 	pg_atomic_init_u64(&entry->used, pg_atomic_add_fetch_u64(&control->clock, 1));
 	dshash_release_lock(table, entry);
 	pg_atomic_fetch_add_u64(&control->entries, 1);

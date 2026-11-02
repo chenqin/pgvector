@@ -130,6 +130,27 @@ class PredicateCacheTests(unittest.TestCase):
         for (_, distance), (expected, _) in zip(hits, want):
             self.assertAlmostEqual(distance, expected, places=4)
 
+    def test_sparse_results_keep_rows_only(self):
+        """Results under 1/64 of the rows keep their rows, not a bitmap; replies and searches are unchanged."""
+        self.start()
+        try:
+            bitmap = (ROWS + 31) // 32 * 4
+            before = self.stats()['predicate_bytes']
+            sparse = [3, 7, 11]   # 120 rows, under ROWS / 64
+            self.evaluate(1, sparse)
+            added = self.stats()['predicate_bytes'] - before
+            self.assertEqual(added, len(self.rows(sparse)) * 16)
+            self.assertLess(added, bitmap)
+            rng = random.Random(9)
+            for i in range(5):
+                self.search(10 + i, sparse, [round(rng.uniform(-3, 3), 2) for _ in range(DIMENSIONS)], k=7)
+            self.evaluate(20, sparse)   # words rebuilt from the cached rows
+            before = self.stats()['predicate_bytes']
+            self.evaluate(30, self.window(0))   # 4,000 rows: a bitmap is kept
+            self.assertGreaterEqual(self.stats()['predicate_bytes'] - before, bitmap)
+        finally:
+            self.stop()
+
     def test_budget_evicts_least_recently_used(self):
         self.start('--predicate-cache-mb', str(BUDGET_MB))
         try:

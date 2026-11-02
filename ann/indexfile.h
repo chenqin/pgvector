@@ -81,7 +81,8 @@ typedef struct AnnIndexBitmap
 	uint64_t	id;
 	int			kind;			/* ANN_BITMAP_PUSHED or ANN_BITMAP_PREDICATE */
 	uint64_t	count;
-	uint32_t   *words;
+	uint32_t   *words;			/* NULL for a sparse predicate result: its
+								 * ordinals are the only form kept */
 	uint32_t   *bitsets[ANN_INDEX_MAX_SHARDS];
 	uint32_t   *owned[ANN_INDEX_MAX_SHARDS];
 	int64_t    *keys;			/* NULL for filters only the graph route takes */
@@ -205,6 +206,7 @@ void		AnnIndexFileClose(AnnIndexFile *file);
  * columns and cached bitmaps into words ((rows + 31) / 32 of them).
  * Returns an ANN_FILTER_* code.
  */
+void		AnnIndexBitmapWords(const AnnIndexFile *file, const AnnIndexBitmap *bitmap, uint32_t *words);
 int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 							 uint32_t *words, uint64_t *count);
 
