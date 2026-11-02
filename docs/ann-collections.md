@@ -74,6 +74,71 @@ WHERE id = ANY(ARRAY(SELECT key FROM ann_collection_search('docs', $1, 10, 'tena
 
 A part's worker searches its shards as for any loaded index: one lane, every shard on its GPU, the per-shard tree merge, and same-filter grouping across concurrent searches.
 
+## Traffic between PostgreSQL and the GPU nodes
+
+A search travels as one binary frame per part, operation 22 of the [worker protocol](../ann/README.md): a 32-byte header (`PVAN`, operation, request id, the part's generation, length, status) and a payload of the index name, dimensions, k, the predicate program and the query vector (about 4.2 KB at 1,024 dimensions). The reply is the part's top k keys and distances (136 bytes at k = 10). PostgreSQL's own protocol is used only between the client and the coordinator, and for fetching non-covering columns from the shard hosts.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant B as Coordinator backend<br/>(PostgreSQL)
+    participant N0 as GPU node 0<br/>(worker, part 0)
+    participant N1 as GPU node 1<br/>(worker, part 1)
+    participant S as Shard host<br/>(PostgreSQL)
+
+    C->>B: SELECT ... ann_collection_search('docs', $1, 10, 'category = 3')
+    Note over B: catalog (cached 10 s) → parts, replicas, generations<br/>filter → predicate program (cached)<br/>placement prunes parts that cannot match
+
+    rect rgb(235, 240, 250)
+    Note over B,N1: once per backend and node: connect
+    B->>N0: TCP connect, operation 13 (auth token)
+    B->>N0: operation 16: RDMA queue pair address (LID, QPN, GID)
+    N0-->>B: worker's queue pair address
+    B->>N0: probe over RDMA (no answer: stay on TCP)
+    end
+
+    par one request per part, all in flight at once
+        B->>N0: operation 22 over RDMA (ibv_post_send) or TCP
+    and
+        B->>N1: operation 22 to the next replica in rotation
+    end
+
+    Note over N0: RDMA lane or TCP reader decodes the frame<br/>generation check (status 12 if another)<br/>program → rows (predicate cache)<br/>queue → search lane batches same-filter jobs<br/>CAGRA or exact scan per shard on its GPU<br/>FP32 re-scoring, shard merge
+    N0-->>B: top k (key, distance), same transport
+    N1-->>B: top k (key, distance)
+
+    Note over B: wait for every part within ann.worker_timeout_ms<br/>a failed node: retry on the next replica<br/>merge to the k nearest
+    B-->>C: (key, distance) rows
+
+    opt non-covering columns
+        B->>S: postgres_fdw: SELECT ... WHERE id = ANY(keys)
+        S-->>B: rows
+    end
+```
+
+The transports, end to end:
+
+```mermaid
+flowchart LR
+    subgraph Coordinator host
+      BK[backend] -- "TCP socket" --> NIC1[(Ethernet / loopback)]
+      BK -- "queue pair, registered buffers" --> HCA1[mlx5_2]
+    end
+    subgraph Fabric
+      SW{{InfiniBand switch}}
+    end
+    subgraph GPU node
+      HCA2[mlx5_0] --> RL["RDMA lanes (--rdma-lanes)"]
+      NIC2[(TCP :7861)] --> RT[reader thread per connection]
+      RL & RT --> Q[scheduler queue] --> SL["search lanes (--lanes)"] --> G[GPUs: one shard each]
+    end
+    HCA1 --- SW --- HCA2
+    NIC1 --- NIC2
+```
+
+Each backend keeps one TCP connection per node for authentication, heartbeats, loads and frames too large for RDMA, plus one queue pair per node when `ann.worker_rdma` names a local device (here `mlx5_2`; the worker listens on the device given by `--rdma`, here `mlx5_0`). Device names are the kernel's names for the InfiniBand adapters (`ibv_devices` lists them); the two ends must be on a routed InfiniBand or RoCE subnet.
+
 ## Catalog
 
 | Table | Columns |
