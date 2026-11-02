@@ -1189,7 +1189,8 @@ FrozenBitmap(const char *source, uint64 generation, const char *filter, bytea **
 	nwords = (meta->rows + 31) / 32;
 	*bitmap = palloc(VARHDRSZ + nwords * 4);
 	SET_VARSIZE(*bitmap, VARHDRSZ + nwords * 4);
-	AnnFrozenEvaluateOrError(index, meta, program.data, program.len, (uint32 *) VARDATA(*bitmap), eligible);
+	AnnFrozenEvaluateOrError(index, meta, program.data, program.len, (uint32 *) VARDATA(*bitmap), eligible,
+							 false);
 	index_close(index, AccessShareLock);
 	return true;
 }

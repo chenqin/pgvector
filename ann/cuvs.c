@@ -941,31 +941,47 @@ UploadBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 {
 	AnnCuvsIndex *state = file->device;
 	size_t		n = (size_t) state->copies * state->nshards;
-	void	  **device = calloc(n, sizeof(void *));
+	void	  **device = NULL;
 	void	  **rows = NULL;
 	uint32_t   *staged = NULL;
 	uint64_t	start[ANN_INDEX_MAX_SHARDS + 1];
 	uint64_t	bytes = 0;
-	int			ok = device != NULL;
+	int			ok = 1;
 
-	for (size_t i = 0; ok && i < n; i++)
-	{
-		uint32_t	s = (uint32_t) (i % state->nshards);
-		size_t		size = ((size_t) file->shards[s].rows + 31) / 32 * sizeof(uint32_t);
+	/*
+	 * Keep on the GPUs only what this filter's routes read: bitsets for
+	 * filtered CAGRA, taken by filters past the bitset gather limit or whose
+	 * rows are not kept, and rows for the gather scans, which start past the
+	 * exact limit. Smaller filters run exact on the CPU; a route that finds
+	 * no device copy copies the filter per query.
+	 */
+	int			needBitsets = bitmap->ordinals == NULL ||
+		bitmap->count > AnnIndexConfig.bitset_gather_limit;
+	int			needRows = bitmap->ordinals != NULL && bitmap->count > AnnIndexConfig.exact_limit;
 
-		ok = UploadArray(state->shards[i].device, &device[i], bitmap->bitsets[s], size);
-		bytes += size;
-	}
-	if (!ok)
+	if (needBitsets)
 	{
-		fprintf(stderr, "cuVS: could not keep filter bitmap %llu on the GPUs; it is copied per query\n",
-				(unsigned long long) bitmap->id);
-		FreeDeviceArrays(state, device);
-		return;
+		device = calloc(n, sizeof(void *));
+		ok = device != NULL;
+		for (size_t i = 0; ok && i < n; i++)
+		{
+			uint32_t	s = (uint32_t) (i % state->nshards);
+			size_t		size = ((size_t) file->shards[s].rows + 31) / 32 * sizeof(uint32_t);
+
+			ok = UploadArray(state->shards[i].device, &device[i], bitmap->bitsets[s], size);
+			bytes += size;
+		}
+		if (!ok)
+		{
+			fprintf(stderr, "cuVS: could not keep filter bitmap %llu on the GPUs; it is copied per query\n",
+					(unsigned long long) bitmap->id);
+			FreeDeviceArrays(state, device);
+			return;
+		}
+		bitmap->device = device;
+		bitmap->deviceBytes = bytes;
 	}
-	bitmap->device = device;
-	bitmap->deviceBytes = bytes;
-	if (bitmap->ordinals == NULL || bitmap->count == 0)
+	if (!needRows || bitmap->count == 0)
 		return;
 
 	/* Rows are sorted: split them at shard boundaries, then relative rows. */

@@ -14,9 +14,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 1024};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0};
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
 
 typedef struct Entry
@@ -82,6 +83,82 @@ ReadHuge(int fd, size_t size)
 #endif
 }
 
+/* Prewarm totals of the index this thread is opening. */
+static _Thread_local uint64_t warmBytes;
+static _Thread_local double warmSeconds;
+
+static double
+Now(void)
+{
+	struct timespec now;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &now);
+	return (double) now.tv_sec + (double) now.tv_nsec / 1e9;
+}
+
+static size_t
+PageSize(void)
+{
+	long		size = sysconf(_SC_PAGESIZE);
+
+	return size > 0 ? (size_t) size : 4096;
+}
+
+/*
+ * Fault in every page of a fresh mapping, so the first searches and filter
+ * evaluations do not wait on the disk. Mappings of the frozen files never
+ * change, so nothing is written back.
+ */
+static void
+Prewarm(const void *data, size_t size)
+{
+	const volatile unsigned char *bytes = data;
+	size_t		page = PageSize();
+	unsigned char sum = 0;
+	double		start;
+
+	if (!AnnIndexConfig.prewarm || data == NULL || size == 0)
+		return;
+	start = Now();
+#ifdef MADV_WILLNEED
+	(void) madvise((void *) data, size, MADV_WILLNEED);
+#endif
+	for (size_t at = 0; at < size; at += page)
+		sum ^= bytes[at];
+	sum ^= bytes[size - 1];
+	(void) sum;
+	warmBytes += size;
+	warmSeconds += Now() - start;
+}
+
+/* mlock the pages under [data, data + size); a refusal is reported once. */
+static uint64_t
+Lock(const void *data, size_t size, int *refused)
+{
+	size_t		page = PageSize();
+	uintptr_t	first = (uintptr_t) data / page * page;
+	uintptr_t	last = ((uintptr_t) data + size + page - 1) / page * page;
+
+	if (data == NULL || size == 0 || *refused)
+		return 0;
+	if (mlock((const void *) first, last - first) == 0)
+		return size;
+	*refused = errno ? errno : EPERM;
+	return 0;
+}
+
+/* Undo Lock on heap memory before it is freed; munmap unlocks mappings. */
+static void
+Unlock(const void *data, size_t size)
+{
+	size_t		page = PageSize();
+	uintptr_t	first = (uintptr_t) data / page * page;
+	uintptr_t	last = ((uintptr_t) data + size + page - 1) / page * page;
+
+	if (AnnIndexConfig.lock_memory && data != NULL && size != 0)
+		(void) munlock((const void *) first, last - first);
+}
+
 static int
 MapFile(const char *directory, const char *name, size_t expected, const void **data, size_t *size)
 {
@@ -111,6 +188,7 @@ MapFile(const char *directory, const char *name, size_t expected, const void **d
 	(void) close(fd);
 	if (mapping == MAP_FAILED)
 		return 0;
+	Prewarm(mapping, expected);
 	*data = mapping;
 	return 1;
 }
@@ -337,6 +415,39 @@ BitmapBytes(const AnnIndexFile *file, const AnnIndexBitmap *bitmap)
 	return bytes;
 }
 
+/* Count an entry into (sign 1) or out of (-1) the cache's totals; under bitmapMutex. */
+static void
+Account(AnnIndexFile *file, const AnnIndexBitmap *bitmap, int sign)
+{
+	uint64_t	host = bitmap->hostBytes;
+	uint64_t	device = bitmap->deviceBytes;
+
+	if (sign > 0)
+	{
+		file->nbitmaps++;
+		file->bitmapBytes += host;
+		file->bitmapDeviceBytes += device;
+		if (bitmap->kind == ANN_BITMAP_PREDICATE)
+		{
+			file->predicateEntries++;
+			file->predicateBytes += host;
+			file->predicateDeviceBytes += device;
+		}
+	}
+	else
+	{
+		file->nbitmaps--;
+		file->bitmapBytes -= host;
+		file->bitmapDeviceBytes -= device;
+		if (bitmap->kind == ANN_BITMAP_PREDICATE)
+		{
+			file->predicateEntries--;
+			file->predicateBytes -= host;
+			file->predicateDeviceBytes -= device;
+		}
+	}
+}
+
 AnnStatus
 AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
 				  uint64_t expandLimit, AnnIndexBitmap **result)
@@ -416,22 +527,20 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 	if (AnnIndexConfig.device_bitmaps && AnnIndexBitmapDevice.upload && file->device)
 		AnnIndexBitmapDevice.upload(file, bitmap);
 
+	bitmap->hostBytes = BitmapBytes(file, bitmap);
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	for (link = &file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
 		if ((*link)->id == id && (*link)->kind == kind)
 		{
 			old = *link;
 			*link = old->next;
-			file->nbitmaps--;
-			file->bitmapBytes -= BitmapBytes(file, old);
-			file->bitmapDeviceBytes -= old->deviceBytes;
+			Account(file, old, -1);
 			break;
 		}
+	bitmap->used = ++file->clock;
 	bitmap->next = file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS];
 	file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS] = bitmap;
-	file->nbitmaps++;
-	file->bitmapBytes += BitmapBytes(file, bitmap);
-	file->bitmapDeviceBytes += bitmap->deviceBytes;
+	Account(file, bitmap, 1);
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 	if (old)
 		AnnIndexBitmapRelease(file, old);
@@ -514,56 +623,114 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 	return AnnFilterEvaluate(&source, program, size, words, count);
 }
 
+/* The host budget for predicate results: the option, else a quarter of RAM. */
+static uint64_t
+PredicateHostBudget(void)
+{
+	long		pages;
+	long		pageSize;
+
+	if (AnnIndexConfig.predicate_cache_bytes)
+		return AnnIndexConfig.predicate_cache_bytes;
+	pages = sysconf(_SC_PHYS_PAGES);
+	pageSize = sysconf(_SC_PAGESIZE);
+	if (pages <= 0 || pageSize <= 0)
+		return UINT64_C(1) << 30;
+	return (uint64_t) pages * (uint64_t) pageSize / 4;
+}
+
+static int
+UsedCompare(const void *left, const void *right)
+{
+	const AnnIndexBitmap *a = *(AnnIndexBitmap *const *) left;
+	const AnnIndexBitmap *b = *(AnnIndexBitmap *const *) right;
+
+	return (a->used > b->used) - (a->used < b->used);
+}
+
+static int
+OverBudget(const AnnIndexFile *file, uint64_t hostBudget, uint64_t deviceBudget, uint64_t entryCap, int target)
+{
+	/* target: the 90% mark eviction stops at, else the budget itself */
+	uint64_t	host = target ? hostBudget / 10 * 9 : hostBudget;
+	uint64_t	device = target ? deviceBudget / 10 * 9 : deviceBudget;
+	uint64_t	entries = target ? entryCap - entryCap / 10 : entryCap;
+
+	return file->predicateBytes > host || file->predicateDeviceBytes > device ||
+		(entryCap && file->predicateEntries > entries);
+}
+
 AnnStatus
 AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords, uint64_t expandLimit,
 					 AnnIndexBitmap **result)
 {
-	AnnStatus	status = AnnIndexBitmapPut(file, id, ANN_BITMAP_PREDICATE, words, nwords, expandLimit, result);
-	uint64_t	evicted = 0;
-	int			evict = 0;
-	int			listed = 0;
-	uint32_t	limit = AnnIndexConfig.predicate_cache ? AnnIndexConfig.predicate_cache : 1;
-	AnnIndexBitmap *old = NULL;
+	AnnIndexBitmap *kept = NULL;
+	AnnStatus	status = AnnIndexBitmapPut(file, id, ANN_BITMAP_PREDICATE, words, nwords, expandLimit, &kept);
+	uint64_t	hostBudget = PredicateHostBudget();
+	uint64_t	deviceBudget = AnnIndexConfig.predicate_device_bytes;
+	uint64_t	entryCap = AnnIndexConfig.predicate_cache;
+	AnnIndexBitmap **victims = NULL;
+	uint64_t	nvictims = 0;
 
 	if (status != ANN_OK)
 		return status;
 	(void) pthread_mutex_lock(&file->bitmapMutex);
-	if (file->predicates == NULL)
-		file->predicates = calloc(limit, sizeof(uint64_t));
-	/* A program cached again (evaluated twice at once) keeps one place. */
-	for (uint32_t i = 0; file->predicates && i < file->npredicates && !listed; i++)
-		listed = file->predicates[i] == id;
-	if (file->predicates && !listed)
+	if (OverBudget(file, hostBudget, deviceBudget, entryCap, 0) &&
+		(victims = malloc(sizeof(*victims) * (file->predicateEntries + 1))) != NULL)
 	{
-		if (file->npredicates == limit)
-		{
-			evicted = file->predicates[file->predicateNext];
-			evict = 1;
-		}
-		else
-			file->npredicates++;
-		file->predicates[file->predicateNext] = id;
-		file->predicateNext = (file->predicateNext + 1) % limit;
-	}
-	if (evict)
-	{
-		AnnIndexBitmap **link;
+		uint64_t	n = 0;
 
-		for (link = &file->bitmaps[evicted % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
-			if ((*link)->id == evicted && (*link)->kind == ANN_BITMAP_PREDICATE)
-			{
-				old = *link;
-				*link = old->next;
-				file->nbitmaps--;
-				file->bitmapBytes -= BitmapBytes(file, old);
-				file->bitmapDeviceBytes -= old->deviceBytes;
-				break;
-			}
+		/* Least recently used first, down to 90% of the budget. */
+		for (uint32_t b = 0; b < ANN_INDEX_BITMAP_BUCKETS; b++)
+			for (AnnIndexBitmap *bitmap = file->bitmaps[b]; bitmap; bitmap = bitmap->next)
+				if (bitmap->kind == ANN_BITMAP_PREDICATE && bitmap != kept)
+					victims[n++] = bitmap;
+		qsort(victims, n, sizeof(*victims), UsedCompare);
+		/* The new result goes last: alone over budget, it is not kept. */
+		victims[n++] = kept;
+		for (uint64_t v = 0; v < n && OverBudget(file, hostBudget, deviceBudget, entryCap, 1); v++)
+		{
+			AnnIndexBitmap **link;
+
+			for (link = &file->bitmaps[victims[v]->id % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
+				if (*link == victims[v])
+				{
+					*link = victims[v]->next;
+					Account(file, victims[v], -1);
+					file->predicateEvictions++;
+					victims[nvictims++] = victims[v];
+					break;
+				}
+		}
 	}
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
-	if (old)
-		AnnIndexBitmapRelease(file, old);
+	for (uint64_t v = 0; v < nvictims; v++)
+		AnnIndexBitmapRelease(file, victims[v]);
+	free(victims);
+	if (result)
+		*result = kept;
+	else
+		AnnIndexBitmapRelease(file, kept);
 	return ANN_OK;
+}
+
+void
+AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *deviceBytes, uint64_t *evictions)
+{
+	*entries = *bytes = *deviceBytes = *evictions = 0;
+	(void) pthread_mutex_lock(&registryMutex);
+	for (Entry *entry = registry; entry; entry = entry->next)
+	{
+		AnnIndexFile *file = entry->file;
+
+		(void) pthread_mutex_lock(&file->bitmapMutex);
+		*entries += file->predicateEntries;
+		*bytes += file->predicateBytes;
+		*deviceBytes += file->predicateDeviceBytes;
+		*evictions += file->predicateEvictions;
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+	}
+	(void) pthread_mutex_unlock(&registryMutex);
 }
 
 AnnIndexBitmap *
@@ -576,6 +743,8 @@ AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind)
 		if (bitmap->id == id && bitmap->kind == kind)
 		{
 			bitmap->references++;
+			if (kind == ANN_BITMAP_PREDICATE)
+				bitmap->used = ++file->clock;
 			break;
 		}
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
@@ -703,6 +872,8 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 	(void) pthread_mutex_init(&file->bitmapMutex, NULL);
 	strcpy(file->name, name);
 	strcpy(file->directory, directory);
+	warmBytes = 0;
+	warmSeconds = 0;
 	status = ParseManifest(file);
 	if (status == ANN_OK &&
 		(!MapFile(directory, "keys.i64", file->rows * sizeof(int64_t), &data, &file->keysBytes) ||
@@ -747,6 +918,39 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 		AnnIndexFileClose(file);
 		return status;
 	}
+	if (AnnIndexConfig.prewarm)
+		fprintf(stderr, "ann index %s: prewarmed %.1f MB in %.2f s\n", file->name,
+				(double) warmBytes / 1048576.0, warmSeconds);
+	if (AnnIndexConfig.lock_memory)
+	{
+		int			refused = 0;
+		uint64_t	locked = 0;
+
+		/* What searches and filters read: the files, the inverted columns. */
+		locked += Lock(file->keys, file->rows * sizeof(int64_t), &refused);
+		locked += Lock(file->vectors, file->rows * file->dimensions * sizeof(float), &refused);
+		if (file->quant != ANN_QUANT_NONE)
+		{
+			locked += Lock(file->quantData, file->rows * file->quantRowBytes, &refused);
+			locked += Lock(file->quantScales, file->quantScales ? file->rows * file->quantBlocks : 0, &refused);
+			locked += Lock(file->rowScales, file->rows * sizeof(float), &refused);
+		}
+		for (uint32_t a = 0; a < file->nattributes; a++)
+		{
+			AnnIndexAttribute *attribute = &file->attributes[a];
+
+			locked += Lock(attribute->postings, sizeof(AnnIndexPosting) * attribute->nvalues, &refused);
+			locked += Lock(attribute->keys, sizeof(int64_t) * file->rows, &refused);
+			locked += Lock(attribute->ordinals, sizeof(uint64_t) * file->rows, &refused);
+		}
+		if (refused)
+			fprintf(stderr, "ann index %s: warning: could not lock index memory (%s; locked %.1f MB); "
+					"raise RLIMIT_MEMLOCK (ulimit -l) to keep it resident\n",
+					file->name, strerror(refused), (double) locked / 1048576.0);
+		else
+			fprintf(stderr, "ann index %s: locked %.1f MB in memory\n", file->name,
+					(double) locked / 1048576.0);
+	}
 	*result = file;
 	return ANN_OK;
 }
@@ -777,6 +981,9 @@ AnnIndexFileClose(AnnIndexFile *file)
 					free(attribute->postings[v].bitsets[s]);
 				free(attribute->postings[v].bitsets);
 			}
+		Unlock(attribute->postings, sizeof(AnnIndexPosting) * attribute->nvalues);
+		Unlock(attribute->keys, sizeof(int64_t) * file->rows);
+		Unlock(attribute->ordinals, sizeof(uint64_t) * file->rows);
 		free(attribute->postings);
 		free(attribute->keys);
 		free(attribute->ordinals);
@@ -790,7 +997,6 @@ AnnIndexFileClose(AnnIndexFile *file)
 			FreeBitmap(file, bitmap);
 		}
 	(void) pthread_mutex_destroy(&file->bitmapMutex);
-	free(file->predicates);
 	free(file);
 }
 

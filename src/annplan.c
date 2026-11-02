@@ -162,6 +162,7 @@ AnnInit(void)
 							 NULL, NULL, NULL);
 	AnnInitOptions();
 	AnnFrozenScanInit();
+	AnnFilterCacheInit();
 	AnnWorkerInit();
 	AnnRemoteInit();
 	RegisterCustomScanMethods(&AnnCustomScanMethods);

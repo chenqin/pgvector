@@ -6,16 +6,18 @@ scripts/ann/build_cuvs_index.py --no-cagra, which needs numpy and psycopg.
 """
 
 import filecmp
+import json
 import os
 import random
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import uuid
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from test_server import ROOT, Server  # noqa: E402
+from test_server import ROOT, STATS, Server, frame, receive  # noqa: E402
 
 DSN = os.environ.get('ANN_PG_DSN')
 BUILD = os.path.join(ROOT, 'scripts', 'ann', 'build_cuvs_index.py')
@@ -424,6 +426,130 @@ class FrozenTests(unittest.TestCase):
         huge = ' OR '.join(f'category = {i}' for i in range(600))
         self.assertNotIn('AnnFrozenSearch', self.plan(statement.format(huge)))
         self.assertEqual(len(self.db.execute(statement.format(huge)).fetchall()), 20)
+
+    def cache_stats(self, db=None):
+        return (db or self.db).execute('SELECT entries, bytes, hits, misses, evictions FROM ann_frozen_cache()').fetchone()
+
+    def test_shared_filter_cache(self):
+        self.create()
+        predicate = 'tenant IN (2, 7) AND category <> 4'
+        before = self.cache_stats()
+        first = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)', ('docs_ann', predicate)).fetchone()
+        middle = self.cache_stats()
+        self.assertGreaterEqual(middle[3], before[3] + 1)
+        self.assertGreaterEqual(middle[0] + middle[4], before[0] + before[4] + 1)
+        # Another backend finds the rows cached.
+        other = self.psycopg.connect(DSN, autocommit=True)
+        try:
+            other.execute(f'SET search_path = {self.schema}, public')
+            second = other.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                   ('docs_ann', predicate)).fetchone()
+            self.assertGreaterEqual(self.cache_stats(other)[2], middle[2] + 1)
+        finally:
+            other.close()
+        self.assertEqual((second[0], bytes(second[1])), (first[0], bytes(first[1])))
+        self.assert_filter('docs_ann', predicate)
+        # A conjunction is one program however its clauses are ordered.
+        hits = self.cache_stats()[2]
+        swapped = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                  ('docs_ann', 'category <> 4 AND tenant IN (2, 7)')).fetchone()
+        self.assertEqual((swapped[0], bytes(swapped[1])), (first[0], bytes(first[1])))
+        self.assertEqual(self.cache_stats()[2], hits + 1)
+        # A tiny budget evicts, and results stay exact.
+        self.db.execute("SET ann.frozen_filter_cache_mb = 1")
+        self.db.execute("""SELECT count(*) FROM generate_series(1, 2500) g,
+                               ann_frozen_filter('docs_ann', 'tenant >= ' || (g % 13) || ' AND category <> ' || g) f""")
+        stats = self.cache_stats()
+        self.assertGreater(stats[4], middle[4])
+        self.assertLessEqual(stats[1], 1024 * 1024)
+        # Concurrent backends stay within the budget while one of them evicts.
+        errors = []
+
+        def fill(offset):
+            try:
+                db = self.psycopg.connect(DSN, autocommit=True)
+                try:
+                    db.execute(f'SET search_path = {self.schema}, public')
+                    db.execute('SET ann.frozen_filter_cache_mb = 1')
+                    db.execute("""SELECT count(*) FROM generate_series(1, 1500) g,
+                                      ann_frozen_filter('docs_ann', 'tenant >= ' || (g %% 11) ||
+                                                        ' AND category <> ' || (g + %s)) f""", (offset,))
+                finally:
+                    db.close()
+            except Exception as e:  # reported below
+                errors.append(e)
+        threads = [threading.Thread(target=fill, args=(100000 * (i + 1),)) for i in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        stats = self.cache_stats()
+        self.assertLessEqual(stats[1], 1024 * 1024)
+        for predicate in self.FILTERS[:6]:
+            self.assert_filter('docs_ann', predicate)
+        # The route's page evaluation goes through the cache too.
+        actual, plan = self.route('tenant = 9', '[1,2,3,4]', 10)
+        expected, _ = self.route('tenant = 9', '[1,2,3,4]', 10, route=False)
+        self.assertEqual(actual, expected)
+        self.db.execute('RESET ann.frozen_filter_cache_mb')
+
+    def test_prewarm_and_precompute(self):
+        self.create()
+        size = self.value("SELECT pg_relation_size('docs_ann')")
+        self.assertEqual(self.value("SELECT ann_frozen_prewarm('docs_ann')"), size - 8192)
+        self.db.execute('SET ann.frozen_mmap = off')
+        self.assertEqual(self.value("SELECT ann_frozen_prewarm('docs_ann')"), size - 8192)
+        self.db.execute('RESET ann.frozen_mmap')
+        filters = ['tenant = 11 AND category = 3', 'category BETWEEN 2 AND 4', 'NOT (tenant < 6)']
+        self.assertEqual(self.value('SELECT ann_frozen_precompute(%s, %s)', ('docs_ann', filters)), 3)
+        before = self.cache_stats()
+        for predicate in filters:
+            self.assert_filter('docs_ann', predicate)
+        self.assertGreaterEqual(self.cache_stats()[2], before[2] + 3)
+        self.assertIn('is not a predicate over the INCLUDE attributes',
+                      self.error('SELECT ann_frozen_precompute(%s, %s)', ('docs_ann', ['body = $$x$$'])))
+        role = 'ann_frozen_nobody_' + uuid.uuid4().hex[:6]
+        self.db.execute(f'CREATE ROLE {role}')
+        self.db.execute(f'GRANT USAGE ON SCHEMA {self.schema} TO {role}')
+        try:
+            self.db.execute(f'SET ROLE {role}')
+            for statement in ["SELECT ann_frozen_prewarm('docs_ann')",
+                              "SELECT ann_frozen_precompute('docs_ann', ARRAY['tenant = 1'])"]:
+                self.assertIn('permission denied', self.error(statement))
+        finally:
+            self.db.execute('RESET ROLE')
+            self.db.execute(f'DROP OWNED BY {role}')
+            self.db.execute(f'DROP ROLE {role}')
+
+    def test_precompute_on_the_worker(self):
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            name = 'pre_' + uuid.uuid4().hex[:8]
+            self.load(server, name)
+
+            def worker_stats():
+                with server.connect() as connection:
+                    connection.sendall(frame(STATS, 1))
+                    return json.loads(receive(connection)[3])
+
+            before = worker_stats()
+            self.assertEqual(self.value('SELECT ann_frozen_precompute(%s, %s)',
+                                        ('docs_ann', ['tenant = 4 AND category IN (1, 2)'])), 1)
+            middle = worker_stats()
+            self.assertEqual(middle['predicate_evaluations'], before['predicate_evaluations'] + 1)
+            actual, plan = self.route('tenant = 4 AND category IN (1, 2)', '[1,2,3,4]', 10)
+            self.assertIn(f'GPU worker "{name}"', plan)
+            after = worker_stats()
+            self.assertEqual(after['predicate_evaluations'], middle['predicate_evaluations'])
+            self.assertGreater(after['predicate_hits'], middle['predicate_hits'])
+            expected, _ = self.route('tenant = 4 AND category IN (1, 2)', '[1,2,3,4]', 10, route=False)
+            self.assertEqual([row[:2] for row in actual], [row[:2] for row in expected])
+        finally:
+            server.close()
 
     def load(self, server, name, table='docs'):
         export = os.path.join(self.directory.name, name + '-export')

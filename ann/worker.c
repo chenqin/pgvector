@@ -356,6 +356,14 @@ main(int argc, char **argv)
 			AnnIndexConfig.filtered_iterations = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--predicate-cache") == 0)
 			AnnIndexConfig.predicate_cache = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--predicate-cache-mb") == 0)
+			AnnIndexConfig.predicate_cache_bytes = (uint64_t) strtoull(value, NULL, 10) << 20;
+		else if (strcmp(argv[i], "--predicate-device-mb") == 0)
+			AnnIndexConfig.predicate_device_bytes = (uint64_t) strtoull(value, NULL, 10) << 20;
+		else if (strcmp(argv[i], "--prewarm") == 0)
+			AnnIndexConfig.prewarm = strcmp(value, "off") != 0;
+		else if (strcmp(argv[i], "--lock-memory") == 0)
+			AnnIndexConfig.lock_memory = strcmp(value, "on") == 0;
 		else
 			goto usage;
 	}
@@ -525,13 +533,15 @@ usage:
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
-			"  [--quantized-scan on|off] [--quant-slack N] [--predicate-cache N]]\n"
+			"  [--quantized-scan on|off] [--quant-slack N] [--predicate-cache N]\n"
+			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
-			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--predicate-cache N]]\n"
+			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
+			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"cuvs, hipvs, and fused-nvfp4 require vendor adapters\n");
 #endif
 	return 2;

@@ -61,6 +61,7 @@ check: ann-worker ann-batch-tests
 	python3 ../test/ann/test_batching.py
 	python3 ../test/ann/test_server.py
 	python3 ../test/ann/test_index.py
+	python3 ../test/ann/test_predicate_cache.py
 	python3 ../test/ann/test_cuvs.py
 	python3 ../test/ann/test_postgres.py
 	python3 ../test/ann/test_native.py

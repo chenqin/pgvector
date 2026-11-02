@@ -1541,8 +1541,9 @@ MicrosecondsSince(const struct timespec *start)
 
 /*
  * A predicate's rows as a cached bitmap: found under the program's hash, or
- * evaluated over the attribute columns and cached (dropping the oldest
- * predicate result past --predicate-cache). Returns a referenced bitmap.
+ * evaluated over the attribute columns and cached (dropping the least recently
+ * used predicate results past --predicate-cache-mb, --predicate-device-mb or
+ * --predicate-cache). Returns a referenced bitmap.
  */
 static AnnStatus PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program,
 								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result);
@@ -2095,8 +2096,12 @@ Reader(void *argument)
 		}
 		else if (operation == 0 || operation == ANN_OP_STATS)
 		{
-			char		message[512];
+			char		message[1024];
 			int			size;
+			uint64_t	predicateEntries = 0,
+						predicateBytes = 0,
+						predicateDeviceBytes = 0,
+						predicateEvictions = 0;
 
 			uint64_t	rdmaFrames = 0,
 						rdmaFallbacks = 0;
@@ -2105,6 +2110,9 @@ Reader(void *argument)
 			if (service->rdma)
 				AnnRdmaStats(service->rdma, &rdmaFrames, &rdmaFallbacks, &rdmaLanes);
 			(void) rdmaFrames;
+			if (operation == ANN_OP_STATS)
+				AnnIndexPredicateStats(&predicateEntries, &predicateBytes, &predicateDeviceBytes,
+									   &predicateEvictions);
 			(void) pthread_mutex_lock(&service->mutex);
 			if (operation == 0)
 				size = snprintf(message, sizeof(message),
@@ -2120,7 +2128,9 @@ Reader(void *argument)
 								"\"rejected\":%llu,\"failed\":%llu,\"pending_bytes\":%llu,\"device_jobs\":%llu,"
 								"\"rdma_frames\":%llu,\"rdma_fallbacks\":%llu,\"rdma_lanes\":%d,"
 								"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu,\"predicate_hits\":%llu,"
-								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu}",
+								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
+								"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
+								"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu}",
 								(unsigned long long) service->jobs, (unsigned long long) service->batches,
 								(unsigned long long) service->max_batch, (unsigned long long) service->rows,
 								(unsigned long long) service->rejected, (unsigned long long) service->failed,
@@ -2132,7 +2142,10 @@ Reader(void *argument)
 								(unsigned long long) service->grouped_jobs, (unsigned long long) service->held,
 								(unsigned long long) service->predicate_hits,
 								(unsigned long long) service->predicate_evaluations,
-								(unsigned long long) service->predicate_eval_us);
+								(unsigned long long) service->predicate_eval_us,
+								(unsigned long long) predicateEntries, (unsigned long long) predicateBytes,
+								(unsigned long long) predicateDeviceBytes,
+								(unsigned long long) predicateEvictions);
 			(void) pthread_mutex_unlock(&service->mutex);
 			Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 				  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);

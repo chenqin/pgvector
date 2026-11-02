@@ -389,7 +389,8 @@ LocalSearch(FrozenScanState *state)
 	BlockNumber page = InvalidBlockNumber;
 	char	   *data = NULL;
 
-	AnnFrozenEvaluateOrError(state->index, meta, state->program.data, state->program.len, words, &eligible);
+	AnnFrozenEvaluateOrError(state->index, meta, state->program.data, state->program.len, words, &eligible,
+							 false);
 	state->eligible = eligible;
 	state->localRuns++;
 	ordinals = MemoryContextAllocHuge(state->resultCtx, Max(eligible, 1) * sizeof(uint64));

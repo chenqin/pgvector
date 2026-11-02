@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "access/table.h"
@@ -26,6 +27,7 @@
 #include "executor/tuptable.h"
 #include "funcapi.h"
 #include "miscadmin.h"
+#include "portability/instr_time.h"
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -362,6 +364,8 @@ MapIndex(Relation index)
 			return NULL;
 		}
 		map->bases[segment] = base;
+		/* start reading the file into memory in the background */
+		(void) madvise(base, bytes, MADV_WILLNEED);
 	}
 	map->nsegments = (map->blocks + RELSEG_SIZE - 1) / RELSEG_SIZE;
 	return map->nsegments > 0 ? map : NULL;
@@ -1573,11 +1577,53 @@ AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned 
 	return code;
 }
 
+/*
+ * CPU time of this backend in microseconds, so that waiting for a CPU under
+ * load doesn't count as evaluation cost; wall time where it is unavailable.
+ */
+static uint64
+CpuMicroseconds(void)
+{
+#ifdef CLOCK_PROCESS_CPUTIME_ID
+	struct timespec now;
+
+	if (clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &now) == 0)
+		return (uint64) now.tv_sec * 1000000 + now.tv_nsec / 1000;
+#endif
+	{
+		instr_time	now;
+
+		INSTR_TIME_SET_CURRENT(now);
+		return (uint64) INSTR_TIME_GET_MICROSEC(now);
+	}
+}
+
+/*
+ * Evaluate a program into words, through the shared filter cache
+ * (annfiltercache.c). A hit copies the bitmap out, so a result is kept only
+ * when evaluating it took clearly more CPU time than that copy (bytes / 2
+ * nanoseconds, about four copies at 8 GB/s), when its bitmap is small, or
+ * when cache is set: cheap programs over large indexes would only displace
+ * expensive ones.
+ */
 void
 AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const char *program,
-						 size_t size, uint32 *words, uint64 *count)
+						 size_t size, uint32 *words, uint64 *count, bool cache)
 {
-	int			code = AnnFrozenEvaluate(index, meta, (const unsigned char *) program, size, words, count);
+	size_t		nwords = (meta->rows + 31) / 32;
+	uint64		start;
+	uint64		duration;
+	int			code;
+
+	if (AnnFilterCacheGet(RelationGetRelid(index), meta->generation, program, size, words, nwords, count))
+		return;
+	start = CpuMicroseconds();
+	code = AnnFrozenEvaluate(index, meta, (const unsigned char *) program, size, words, count);
+	duration = CpuMicroseconds() - start;
+	if (code == ANN_FILTER_OK &&
+		(cache || nwords * sizeof(uint32) <= 64 * 1024 ||
+		 duration * 2000 >= nwords * sizeof(uint32)))
+		AnnFilterCachePut(RelationGetRelid(index), meta->generation, program, size, words, nwords, *count);
 
 	if (code == ANN_FILTER_UNKNOWN_COLUMN)
 		ereport(ERROR,
@@ -1911,9 +1957,168 @@ ann_frozen_filter(PG_FUNCTION_ARGS)
 				 errmsg("filter \"%s\" is not a predicate over the INCLUDE attributes of \"%s\"",
 						filter, RelationGetRelationName(index))));
 	SET_VARSIZE(bitmap, VARHDRSZ + nwords * 4);
-	AnnFrozenEvaluateOrError(index, meta, program.data, program.len, (uint32 *) VARDATA(bitmap), &eligible);
+	AnnFrozenEvaluateOrError(index, meta, program.data, program.len, (uint32 *) VARDATA(bitmap), &eligible,
+							 false);
 	index_close(index, AccessShareLock);
 	values[0] = Int64GetDatum((int64) eligible);
 	values[1] = PointerGetDatum(bitmap);
 	PG_RETURN_DATUM(HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls)));
+}
+
+/* Touch every page of an array: through the mapping, else shared buffers. */
+static uint64
+WarmArray(Relation index, const AnnFrozenMap *map, const AnnArray *array, bool buffers)
+{
+	volatile uint64 sum = 0;
+
+	if (array->pages == 0)
+		return 0;
+	if (map && !buffers && MappedArrayValid(map, array))
+	{
+		for (BlockNumber p = 0; p < array->pages; p++)
+		{
+			const char *page = (const char *) MappedPage(map, array->start + p);
+
+			if (p % 1024 == 0)
+			{
+				CHECK_FOR_INTERRUPTS();
+				(void) madvise((void *) page, (size_t) Min(1024, array->pages - p) * BLCKSZ, MADV_WILLNEED);
+			}
+			for (int offset = 0; offset < BLCKSZ; offset += 4096)
+				sum += page[offset];
+		}
+	}
+	else
+	{
+		for (BlockNumber p = 0; p < array->pages; p++)
+		{
+			Buffer		buf;
+
+			CHECK_FOR_INTERRUPTS();
+			buf = ReadBuffer(index, array->start + p);
+			sum += BufferGetBlockNumber(buf);
+			ReleaseBuffer(buf);
+		}
+	}
+	(void) sum;
+	return (uint64) array->pages * BLCKSZ;
+}
+
+/*
+ * ann_frozen_prewarm(index): read a frozen index into memory ahead of
+ * queries: its immutable pages through the file mappings (the operating
+ * system's page cache, shared by every backend), its TID pages into shared
+ * buffers. Returns the bytes read.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_prewarm);
+Datum
+ann_frozen_prewarm(PG_FUNCTION_ARGS)
+{
+	Relation	index = OpenFrozenIndex(PG_GETARG_OID(0));
+	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
+	const AnnFrozenMap *map = CachedMap(index);
+	AnnFrozenColumnExtra *extra = AnnFrozenGetExtra(meta);
+	uint64		bytes = 0;
+
+	bytes += WarmArray(index, map, &meta->tids, true);
+	bytes += WarmArray(index, map, &meta->keys, false);
+	bytes += WarmArray(index, map, &meta->vectors, false);
+	for (uint32 c = 0; c < meta->ncolumns; c++)
+	{
+		bytes += WarmArray(index, map, &meta->columns[c].values, false);
+		bytes += WarmArray(index, map, &meta->columns[c].postings, false);
+		bytes += WarmArray(index, map, &meta->columns[c].dict, false);
+		bytes += WarmArray(index, map, &meta->columns[c].offsets, false);
+		bytes += WarmArray(index, map, &extra[c].codes, false);
+		bytes += WarmArray(index, map, &extra[c].words, false);
+		bytes += WarmArray(index, map, &extra[c].strings, false);
+		bytes += WarmArray(index, map, &extra[c].starts, false);
+	}
+	index_close(index, AccessShareLock);
+	PG_RETURN_INT64((int64) bytes);
+}
+
+/*
+ * ann_frozen_precompute(index, filters): evaluate each filter over the
+ * index's attributes once, into the shared filter cache and, when a GPU
+ * worker serves the index's generation, into the worker's predicate cache
+ * (operation 23), so the first queries using them find their rows ready.
+ * Returns the number of filters cached.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_precompute);
+Datum
+ann_frozen_precompute(PG_FUNCTION_ARGS)
+{
+	Relation	index = OpenFrozenIndex(PG_GETARG_OID(0));
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(1);
+	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
+	size_t		nwords = (meta->rows + 31) / 32;
+	uint32	   *words = MemoryContextAllocHuge(CurrentMemoryContext, Max(nwords, 1) * sizeof(uint32));
+	AnnPredicateColumns columns;
+	Datum	   *filters;
+	bool	   *nulls;
+	int			nfilters;
+	char	   *worker = NULL;
+	int64		cached = 0;
+
+	deconstruct_array(array, TEXTOID, -1, false, TYPALIGN_INT, &filters, &nulls, &nfilters);
+	AnnPredicateColumnsInit(index, &columns);
+	if (AnnRemoteConfigured() || (ann_worker_socket && ann_worker_socket[0]))
+		worker = AnnCatalogNameFor(index->rd_index->indrelid, meta->generation);
+	for (int i = 0; i < nfilters; i++)
+	{
+		char	   *filter;
+		StringInfoData program;
+		uint64		eligible;
+
+		if (nulls[i])
+			continue;
+		CHECK_FOR_INTERRUPTS();
+		filter = TextDatumGetCString(filters[i]);
+		initStringInfo(&program);
+		if (!AnnPredicateFromText(index->rd_index->indrelid, filter, &columns, &program))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("filter \"%s\" is not a predicate over the INCLUDE attributes of \"%s\"",
+							filter, RelationGetRelationName(index))));
+		AnnFrozenEvaluateOrError(index, meta, program.data, program.len, words, &eligible, true);
+		if (worker)
+		{
+			StringInfoData payload;
+			uint32		length = strlen(worker);
+			uint32		status = 0;
+			char	   *reply = NULL;
+			uint32		replyLength;
+			int			failed = 0;
+
+			initStringInfo(&payload);
+			appendBinaryStringInfo(&payload, (char *) &length, sizeof(length));
+			appendBinaryStringInfo(&payload, worker, length);
+			appendBinaryStringInfo(&payload, program.data, program.len);
+			ann_request_generation = meta->generation;
+			PG_TRY();
+			{
+				if (AnnRemoteConfigured())
+					(void) AnnRemoteBroadcastEach(ANN_OP_INDEX_PREDICATE, payload.data, payload.len, 0, &failed,
+												  &status);
+				else if (!AnnWorkerCall(ANN_OP_INDEX_PREDICATE, payload.data, payload.len, 0, &status, &reply,
+										&replyLength) || status != ANN_STATUS_OK)
+					failed = 1;
+			}
+			PG_FINALLY();
+			{
+				ann_request_generation = 0;
+			}
+			PG_END_TRY();
+			if (failed)
+				ereport(WARNING,
+						(errmsg("could not cache filter \"%s\" on the GPU worker \"%s\" (status %u)",
+								filter, worker, status)));
+			pfree(payload.data);
+		}
+		pfree(program.data);
+		cached++;
+	}
+	index_close(index, AccessShareLock);
+	PG_RETURN_INT64(cached);
 }

@@ -207,7 +207,7 @@ void		AnnArrayReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *ou
 int			AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned char *program,
 							  size_t size, uint32 *words, uint64 *count);
 void		AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const char *program,
-									 size_t size, uint32 *words, uint64 *count);
+									 size_t size, uint32 *words, uint64 *count, bool cache);
 int64		AnnFrozenKeyOrdinal(Relation index, const AnnFrozenMetaData *meta, int64 key);
 
 /* Predicates over a frozen index's attribute columns (annpred.c). */
@@ -265,6 +265,12 @@ char	   *AnnCatalogNameFor(Oid relid, uint64 generation);
 /* Generation sent in request headers; 0 for untagged requests. */
 extern uint64 ann_request_generation;
 extern bool ann_enable_frozen_search;
+extern int	ann_frozen_filter_cache_mb;
+void		AnnFilterCacheInit(void);
+bool		AnnFilterCacheGet(Oid index, uint64 generation, const char *program, size_t size, uint32 *words,
+							  size_t nwords, uint64 *eligible);
+void		AnnFilterCachePut(Oid index, uint64 generation, const char *program, size_t size,
+							  const uint32 *words, size_t nwords, uint64 eligible);
 extern bool ann_frozen_mmap;
 void		AnnFrozenScanInit(void);
 IndexBulkDeleteResult *AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,

@@ -90,6 +90,8 @@ typedef struct AnnIndexBitmap
 	void	  **deviceRows;		/* backend copies of each shard's rows, or
 								 * NULL */
 	uint64_t	deviceBytes;	/* device memory those copies hold */
+	uint64_t	hostBytes;		/* host memory the entry holds */
+	uint64_t	used;			/* last use, for predicate eviction */
 	int			references;
 	struct AnnIndexBitmap *next;
 } AnnIndexBitmap;
@@ -142,10 +144,11 @@ struct AnnIndexFile
 	uint64_t	nbitmaps;
 	uint64_t	bitmapBytes;
 	uint64_t	bitmapDeviceBytes;
-	uint64_t   *predicates;		/* ids of cached predicate results, a ring of
-								 * predicate_cache entries */
-	uint32_t	npredicates;
-	uint32_t	predicateNext;
+	uint64_t	clock;			/* stamps predicate entries' last use */
+	uint64_t	predicateEntries;	/* cached predicate results */
+	uint64_t	predicateBytes; /* host memory they hold */
+	uint64_t	predicateDeviceBytes;	/* device memory they hold */
+	uint64_t	predicateEvictions;
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
 	size_t		keysBytes;		/* mapped or reserved bytes, for munmap */
@@ -180,7 +183,14 @@ typedef struct AnnIndexOptions
 								 * by the backend, read by the scheduler */
 	int			quantized_scan; /* scan quantized copies on Blackwell GPUs */
 	uint32_t	quant_slack;	/* extra candidates re-scored in FP32 */
-	uint32_t	predicate_cache;	/* predicate results kept per index */
+	uint32_t	predicate_cache;	/* most predicate results per index, 0 for
+									 * no cap */
+	uint64_t	predicate_cache_bytes;	/* host memory for predicate results
+										 * per index; 0 for a quarter of RAM */
+	uint64_t	predicate_device_bytes; /* device memory for their GPU copies
+										 * per index */
+	int			prewarm;		/* read index files into memory at load */
+	int			lock_memory;	/* mlock them */
 } AnnIndexOptions;
 
 extern AnnIndexOptions AnnIndexConfig;
@@ -199,11 +209,18 @@ int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t 
 							 uint32_t *words, uint64_t *count);
 
 /*
- * Cache a predicate's result under its id like a pushed bitmap; the oldest
- * predicate result is dropped once predicate_cache of them are cached.
+ * Cache a predicate's result under its id like a pushed bitmap. Predicate
+ * results share a memory budget per index (predicate_cache_bytes of host
+ * memory, predicate_device_bytes of device memory, and optionally at most
+ * predicate_cache entries): past it, the least recently used ones are
+ * dropped down to 90% of the budget. Pushed bitmaps are never dropped.
  */
 AnnStatus	AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords,
 								 uint64_t expandLimit, AnnIndexBitmap **result);
+
+/* Totals over loaded indexes, for the stats reply. */
+void		AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *deviceBytes,
+								   uint64_t *evictions);
 
 /* Registry of loaded indexes; lookups take a reference released by Put. */
 AnnStatus	AnnIndexRegister(AnnIndexFile *file);

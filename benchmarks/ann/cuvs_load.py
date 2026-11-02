@@ -62,6 +62,12 @@ WORKLOADS = {
                      "ORDER BY emb <-> :v::vector LIMIT 10;"),
     'frozen-10pct-hot3': ("SELECT id FROM {table} WHERE category BETWEEN :h * 10 AND :h * 10 + 9 "
                           "ORDER BY emb <-> :v::vector LIMIT 10;"),
+    # Many distinct predicates: 100,000 tenant x category pairs (about 100
+    # rows each), or 10,000 of them; the caches' memory decides the hit rate.
+    'frozen-combo': ("SELECT id FROM {table} WHERE tenant = :t AND category = :c "
+                     "ORDER BY emb <-> :v::vector LIMIT 10;"),
+    'frozen-combo10k': ("SELECT id FROM {table} WHERE tenant = :t100 AND category = :c "
+                        "ORDER BY emb <-> :v::vector LIMIT 10;"),
     # 5%: a 10% tenant range and half the categories.
     'frozen-and': ("SELECT id FROM {table} WHERE tenant BETWEEN :d * 100 AND :d * 100 + 99 AND category < 50 "
                    "ORDER BY emb <-> :v::vector LIMIT 10;"),
@@ -205,7 +211,8 @@ def bench(args):
             script = os.path.join(directory, f'{workload}.sql')
             with open(script, 'w') as out:
                 out.write('\\set q random(1, 1000)\n\\set c random(0, 99)\n\\set t random(0, 999)\n'
-                          '\\set d random(0, 9)\n\\set h random(0, 2)\n\\set c10 random(0, 9)\n')
+                          '\\set d random(0, 9)\n\\set h random(0, 2)\n\\set c10 random(0, 9)\n'
+                          '\\set t100 random(0, 99)\n')
                 out.write(f'SELECT v FROM {args.table}_queries WHERE q = :q \\gset\n')
                 out.write(WORKLOADS[workload].format(table=args.table) + '\n')
             for clients in [int(c) for c in args.clients.split(',')]:

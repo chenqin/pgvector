@@ -629,24 +629,67 @@ AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *col
 		cxt.bytes + (size_t) cxt.steps * 80 <= ANN_FILTER_MAX_PROGRAM;
 }
 
+static int
+ClauseCompare(const void *a, const void *b)
+{
+	const StringInfoData *x = *(const StringInfoData *const *) a;
+	const StringInfoData *y = *(const StringInfoData *const *) b;
+	int			c = memcmp(x->data, y->data, Min(x->len, y->len));
+
+	return c != 0 ? c : (x->len > y->len) - (x->len < y->len);
+}
+
+/*
+ * The AND of clauses, in an order of their own: each clause's instructions
+ * are sorted by their bytes, so a conjunction has one program however the
+ * query spelled or the planner ordered it, and every route caches its rows
+ * under the same hash (here and on the worker).
+ */
+static void
+PutConjunction(Context *cxt, List *clauses)
+{
+	StringInfo	program = cxt->program;
+	int			n = list_length(clauses);
+	StringInfoData **parts;
+	int			i = 0;
+	ListCell   *lc;
+
+	if (n == 0)
+	{
+		PutByte(program, ANN_FILTER_ALL);
+		return;
+	}
+	parts = palloc(sizeof(StringInfoData *) * n);
+	foreach(lc, clauses)
+	{
+		parts[i] = palloc(sizeof(StringInfoData));
+		initStringInfo(parts[i]);
+		cxt->program = parts[i];
+		if (!Translate(cxt, lfirst(lc), false))
+			elog(ERROR, "unsupported ann predicate");
+		i++;
+	}
+	cxt->program = program;
+	qsort(parts, n, sizeof(StringInfoData *), ClauseCompare);
+	for (i = 0; i < n; i++)
+	{
+		appendBinaryStringInfo(program, parts[i]->data, parts[i]->len);
+		if (i > 0)
+			PutByte(program, ANN_FILTER_AND);
+		pfree(parts[i]->data);
+		pfree(parts[i]);
+	}
+	pfree(parts);
+}
+
 /* The program of supported clauses (AND of them; ALL when there are none). */
 void
 AnnPredicateBuild(List *clauses, Index varno, const AnnPredicateColumns *columns,
 				  PlanState *parent, ExprContext *econtext, StringInfo program)
 {
 	Context		cxt = {varno, columns, program, parent, econtext};
-	int			i = 0;
-	ListCell   *lc;
 
-	foreach(lc, clauses)
-	{
-		if (!Translate(&cxt, lfirst(lc), false))
-			elog(ERROR, "unsupported ann predicate");
-		if (i++ > 0)
-			PutByte(program, ANN_FILTER_AND);
-	}
-	if (i == 0)
-		PutByte(program, ANN_FILTER_ALL);
+	PutConjunction(&cxt, clauses);
 }
 
 /*
@@ -687,18 +730,8 @@ AnnPredicateFromText(Oid relid, const char *filter, const AnnPredicateColumns *c
 		supported = AnnPredicateSupported(clauses, 1, columns);
 		if (supported)
 		{
-			ListCell   *lc;
-			int			i = 0;
-
 			cxt.program = program;
-			foreach(lc, clauses)
-			{
-				(void) Translate(&cxt, lfirst(lc), false);
-				if (i++ > 0)
-					PutByte(program, ANN_FILTER_AND);
-			}
-			if (i == 0)
-				PutByte(program, ANN_FILTER_ALL);
+			PutConjunction(&cxt, clauses);
 		}
 		FreeExprContext(econtext, true);
 	}
