@@ -112,7 +112,20 @@ typedef struct AnnFrozenMetaData
 /* The extra directory follows the columns. */
 #define AnnFrozenGetExtra(meta) ((AnnFrozenColumnExtra *) &(meta)->columns[(meta)->ncolumns])
 
-/* Sequential reads of an array, one pinned page at a time. */
+/*
+ * Frozen metapages whose build flushed every page to the files say so in
+ * insertPage (unused by frozen indexes); only those are read through
+ * read-only mappings of the files.
+ */
+#define ANN_FROZEN_FLUSHED ((BlockNumber) 0xFFFFFFFE)
+
+struct AnnFrozenMap;
+
+/*
+ * Reads of an array, one page at a time: through a read-only mapping of the
+ * index files when the array never changes (everything but the TIDs), else
+ * pinned and share-locked in shared buffers.
+ */
 typedef struct AnnArrayReader
 {
 	Relation	index;
@@ -121,6 +134,7 @@ typedef struct AnnArrayReader
 	Buffer		buf;
 	BlockNumber page;			/* page of the array pinned in buf */
 	bool		locked;
+	const struct AnnFrozenMap *map;
 } AnnArrayReader;
 
 extern const CustomPathMethods AnnCustomPathMethods;
@@ -172,6 +186,7 @@ bool		AnnFrozenOption(Relation index);
 bool		AnnIsFrozen(Relation index);
 AnnFrozenMetaData *AnnFrozenGetMeta(Relation index, bool missingOk);
 AnnFrozenMetaData *AnnFrozenMeta(Relation index);
+bool		AnnFrozenFlushed(Relation index);
 IndexBuildResult *AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo);
 void		AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
 							   BufferAccessStrategy strategy);
@@ -242,6 +257,7 @@ char	   *AnnCatalogNameFor(Oid relid, uint64 generation);
 /* Generation sent in request headers; 0 for untagged requests. */
 extern uint64 ann_request_generation;
 extern bool ann_enable_frozen_search;
+extern bool ann_frozen_mmap;
 void		AnnFrozenScanInit(void);
 IndexBulkDeleteResult *AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 										   IndexBulkDeleteCallback callback, void *callback_state);

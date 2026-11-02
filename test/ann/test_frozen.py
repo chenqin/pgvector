@@ -233,6 +233,11 @@ class FrozenTests(unittest.TestCase):
                         'INCLUDE (id, tenant, category) WITH (frozen = true, bitset_min = 0)')
         for predicate in self.FILTERS:
             self.assertEqual(self.assert_filter('docs_ann', predicate), self.assert_filter('docs_bits', predicate))
+        # Pages read through shared buffers instead of the file mappings agree.
+        self.db.execute('SET ann.frozen_mmap = off')
+        for predicate in self.FILTERS[:8]:
+            self.assert_filter('docs_ann', predicate)
+        self.db.execute('RESET ann.frozen_mmap')
         for predicate in ['body = $$x$$', 'tenant = random()::int', 'tenant + 1 = 3']:
             self.assertIn('not a predicate over the INCLUDE attributes',
                           self.error('SELECT * FROM ann_frozen_filter(%s, %s)', ('docs_ann', predicate)))

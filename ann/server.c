@@ -323,25 +323,9 @@ Finish(Service *service, Job *job)
 				for (uint32_t i = 0; i < job->index.nresults; i++)
 				{
 					uint32_t	bits;
-					uint64_t	id = (uint64_t) job->index.results[i].key;
+					uint64_t	id = (job->flags & ANN_PREDICATE_ORDINALS) ? job->index.results[i].ordinal :
+						(uint64_t) job->index.results[i].key;
 
-					if ((job->flags & ANN_PREDICATE_ORDINALS) && job->bitmapFile)
-					{
-						const int64_t *keys = job->bitmapFile->keys;
-						uint64_t	low = 0,
-									high = job->bitmapFile->rows;
-
-						while (low < high)
-						{
-							uint64_t	middle = low + (high - low) / 2;
-
-							if (keys[middle] < job->index.results[i].key)
-								low = middle + 1;
-							else
-								high = middle;
-						}
-						id = low;
-					}
 					memcpy(&bits, &job->index.results[i].distance, sizeof(bits));
 					Write(data + head + (size_t) i * 12, id, 8);
 					Write(data + head + 8 + (size_t) i * 12, bits, 4);
@@ -1565,9 +1549,8 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 	{
 		if ((*result = AnnIndexBitmapGet(file, id)) != NULL)
 		{
-			(void) pthread_mutex_lock(&service->mutex);
-			service->predicate_hits++;
-			(void) pthread_mutex_unlock(&service->mutex);
+			/* Not under service->mutex: every search would contend for it. */
+			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
 			return ANN_OK;
 		}
 		(void) pthread_mutex_lock(&evaluatingMutex);
@@ -1626,10 +1609,8 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 								  AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
 								  AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit);
 	free(words);
-	(void) pthread_mutex_lock(&service->mutex);
-	service->predicate_evaluations++;
-	service->predicate_eval_us += MicrosecondsSince(&start);
-	(void) pthread_mutex_unlock(&service->mutex);
+	(void) __atomic_fetch_add(&service->predicate_evaluations, 1, __ATOMIC_RELAXED);
+	(void) __atomic_fetch_add(&service->predicate_eval_us, MicrosecondsSince(&start), __ATOMIC_RELAXED);
 	if (status != ANN_OK)
 		return status;
 	if ((*result = AnnIndexBitmapGet(file, id)) == NULL)

@@ -1,8 +1,14 @@
 #include "postgres.h"
 
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "ann.h"
 #include "ann/filter.h"
@@ -14,6 +20,7 @@
 #include "commands/defrem.h"
 #include "commands/trigger.h"
 #include "common/hashfn.h"
+#include "common/relpath.h"
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
@@ -254,16 +261,129 @@ WriterEnd(ArrayWriter *writer)
 			 writer->written, writer->array->count);
 }
 
+/*
+ * Read-only mappings of frozen index files, per backend, by relfilenode.
+ * Every backend maps the same files, so the operating system keeps one copy
+ * of the pages in host memory and reads take no buffer pins or locks.
+ * Frozen pages never change after the build, which flushed them, so the
+ * files hold their final content; TID pages, which VACUUM can still
+ * change, always go through shared buffers. During recovery (a standby
+ * replays into shared buffers, not the files) nothing is mapped.
+ */
+typedef struct AnnFrozenMap
+{
+	RelFileLocator locator;		/* hash key */
+	int			nsegments;		/* 0 when the files could not be mapped */
+	char	  **bases;
+	BlockNumber blocks;
+} AnnFrozenMap;
+
+bool		ann_frozen_mmap = true;
+static HTAB *frozenMaps = NULL;
+static Oid	buildingIndex = InvalidOid; /* reads during its own build use buffers */
+
+static const AnnFrozenMap *
+MapIndex(Relation index)
+{
+	AnnFrozenMap *map;
+	bool		found;
+	char	   *path;
+	MemoryContext oldCtx;
+
+	if (!ann_frozen_mmap || RecoveryInProgress() || index->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT ||
+		AnnFrozenMeta(index) == NULL || !AnnFrozenFlushed(index))
+		return NULL;
+	if (frozenMaps == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(RelFileLocator);
+		ctl.entrysize = sizeof(AnnFrozenMap);
+		frozenMaps = hash_create("ann frozen index mappings", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	map = hash_search(frozenMaps, &index->rd_locator, HASH_ENTER, &found);
+	if (found)
+		return map->nsegments > 0 ? map : NULL;
+	map->nsegments = 0;
+	map->blocks = RelationGetNumberOfBlocks(index);
+	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
+	map->bases = palloc0(sizeof(char *) * ((map->blocks + RELSEG_SIZE - 1) / RELSEG_SIZE + 1));
+	MemoryContextSwitchTo(oldCtx);
+	path = relpathperm(index->rd_locator, MAIN_FORKNUM);
+	for (BlockNumber first = 0; first < map->blocks; first += RELSEG_SIZE)
+	{
+		int			segment = first / RELSEG_SIZE;
+		char	   *file = segment == 0 ? path : psprintf("%s.%d", path, segment);
+		size_t		bytes = (size_t) Min(map->blocks - first, RELSEG_SIZE) * BLCKSZ;
+		struct stat st;
+		int			fd = open(file, O_RDONLY | PG_BINARY, 0);
+		void	   *base = MAP_FAILED;
+
+		if (fd >= 0 && fstat(fd, &st) == 0 && (size_t) st.st_size >= bytes)
+			base = mmap(NULL, bytes, PROT_READ, MAP_SHARED, fd, 0);
+		if (fd >= 0)
+			close(fd);
+		if (base == MAP_FAILED)
+		{
+			elog(DEBUG1, "could not map \"%s\"; frozen ann index pages are read through shared buffers", file);
+			for (int s = 0; s < segment; s++)
+				(void) munmap(map->bases[s], (size_t) Min(map->blocks - (BlockNumber) s * RELSEG_SIZE,
+														  RELSEG_SIZE) * BLCKSZ);
+			return NULL;
+		}
+		map->bases[segment] = base;
+	}
+	map->nsegments = (map->blocks + RELSEG_SIZE - 1) / RELSEG_SIZE;
+	return map->nsegments > 0 ? map : NULL;
+}
+
+static Page
+MappedPage(const AnnFrozenMap *map, BlockNumber block)
+{
+	return (Page) (map->bases[block / RELSEG_SIZE] + (size_t) (block % RELSEG_SIZE) * BLCKSZ);
+}
+
+/* The array's first and last pages in the files are the finished ones. */
+static bool
+MappedArrayValid(const AnnFrozenMap *map, const AnnArray *array)
+{
+	BlockNumber ends[2] = {array->start, array->start + array->pages - 1};
+
+	if (array->pages == 0)
+		return true;
+	if (array->start + array->pages > map->blocks)
+		return false;
+	for (int i = 0; i < 2; i++)
+	{
+		Page		page = MappedPage(map, ends[i]);
+		uint64		count = i == 0 && array->pages > 1 ? array->perPage :
+			array->count - (uint64) (array->pages - 1) * array->perPage;
+
+		if (PageIsNew(page) || PageGetSpecialSize(page) != MAXALIGN(sizeof(AnnPageOpaqueData)) ||
+			AnnPageGetOpaque(page)->page_id != ANN_PAGE_ID ||
+			((PageHeader) page)->pd_lower != MAXALIGN(SizeOfPageHeaderData) + count * array->width)
+			return false;
+	}
+	return true;
+}
+
 void
 AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
 				   BufferAccessStrategy strategy)
 {
+	const AnnFrozenMap *map;
+	AnnFrozenMetaData *meta;
+
 	reader->index = index;
 	reader->array = array;
 	reader->strategy = strategy;
 	reader->buf = InvalidBuffer;
 	reader->page = InvalidBlockNumber;
 	reader->locked = false;
+	reader->map = NULL;
+	if (RelationGetRelid(index) != buildingIndex && (map = MapIndex(index)) != NULL && (meta = AnnFrozenMeta(index)) != NULL &&
+		array->start != meta->tids.start && MappedArrayValid(map, array))
+		reader->map = map;
 }
 
 /*
@@ -279,6 +399,13 @@ AnnArrayLockPage(AnnArrayReader *reader, BlockNumber page, uint32 *count)
 
 	if (page >= array->pages)
 		elog(ERROR, "ann array page %u is out of range", page);
+	if (reader->map)
+	{
+		if (count)
+			*count = page + 1 < array->pages ? array->perPage :
+				(uint32) (array->count - (uint64) page * array->perPage);
+		return PageGetContents(MappedPage(reader->map, array->start + page));
+	}
 	AnnArrayUnlockPage(reader);
 	if (reader->page != page)
 	{
@@ -362,11 +489,12 @@ AnnIsFrozen(Relation index)
 typedef struct AnnIndexCache
 {
 	AnnFrozenMetaData *meta;	/* NULL for a mutable index */
+	bool		flushed;		/* the build flushed the pages to the files */
 	bool		columnsReady;
 	AnnPredicateColumns columns;
 } AnnIndexCache;
 
-static AnnFrozenMetaData *ReadFrozenMeta(Relation index);
+static AnnFrozenMetaData *ReadFrozenMeta(Relation index, bool *flushed);
 
 static AnnIndexCache *
 IndexCache(Relation index)
@@ -376,11 +504,17 @@ IndexCache(Relation index)
 		MemoryContext oldCtx = MemoryContextSwitchTo(index->rd_indexcxt);
 		AnnIndexCache *cache = palloc0(sizeof(AnnIndexCache));
 
-		cache->meta = ReadFrozenMeta(index);
+		cache->meta = ReadFrozenMeta(index, &cache->flushed);
 		MemoryContextSwitchTo(oldCtx);
 		index->rd_amcache = cache;
 	}
 	return (AnnIndexCache *) index->rd_amcache;
+}
+
+bool
+AnnFrozenFlushed(Relation index)
+{
+	return IndexCache(index)->flushed;
 }
 
 /* The cached frozen metadata (read-only), or NULL for a mutable index. */
@@ -422,7 +556,7 @@ AnnFrozenGetMeta(Relation index, bool missingOk)
 
 /* The metapage's frozen metadata, or NULL; allocated in the current context. */
 static AnnFrozenMetaData *
-ReadFrozenMeta(Relation index)
+ReadFrozenMeta(Relation index, bool *flushed)
 {
 	Buffer		buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
 	Page		page;
@@ -441,6 +575,7 @@ ReadFrozenMeta(Relation index)
 		meta = palloc0(AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
 		memcpy(meta, stored, bitsets ? AnnFrozenMetaSize(stored->ncolumns) : AnnFrozenMetaSizeV2(stored->ncolumns));
 	}
+	*flushed = meta != NULL && AnnPageGetMeta(page)->insertPage == ANN_FROZEN_FLUSHED;
 	UnlockReleaseBuffer(buf);
 	return meta;
 }
@@ -1116,6 +1251,7 @@ WriteFrozenMeta(Relation index, const AnnFrozenMetaData *frozen)
 	page = BufferGetPage(buf);
 	AnnCheckMetaPage(page);
 	AnnPageGetMeta(page)->version = ANN_FROZEN_VERSION;
+	AnnPageGetMeta(page)->insertPage = ANN_FROZEN_FLUSHED;
 	stored = AnnPageGetFrozen(page);
 	memcpy(stored, frozen, AnnFrozenMetaSize(frozen->ncolumns));
 	((PageHeader) page)->pd_lower = ((char *) stored + AnnFrozenMetaSize(frozen->ncolumns)) - (char *) page;
@@ -1138,6 +1274,7 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	AnnCheckIndex(index);
 	guard = CheckFrozenTable(heap, index, indexInfo);
+	buildingIndex = RelationGetRelid(index);
 	AnnInitMetaPage(index, MAIN_FORKNUM);
 	bs.dims = TupleDescAttr(indexDesc, 0)->atttypmod;
 	bs.bitsetMin = index->rd_options ? ((AnnOptions *) index->rd_options)->bitsetMin : -1;
@@ -1179,6 +1316,14 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	result->index_tuples = meta->rows;
 	if (RelationNeedsWAL(index))
 		log_newpage_range(index, MAIN_FORKNUM, 0, RelationGetNumberOfBlocks(index), true);
+	/* The files now hold the final pages: backends may map them. */
+	FlushRelationBuffers(index);
+	buildingIndex = InvalidOid;
+	if (index->rd_amcache)
+	{
+		pfree(index->rd_amcache);
+		index->rd_amcache = NULL;
+	}
 	MemoryContextDelete(bs.tmpCtx);
 	return result;
 }

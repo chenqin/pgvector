@@ -719,6 +719,9 @@ AnnFrozenScanInit(void)
 	DefineCustomBoolVariable("ann.enable_frozen_search",
 							 "Answer ordered searches of tables with frozen ann indexes from the index and the GPU worker.",
 							 NULL, &ann_enable_frozen_search, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("ann.frozen_mmap",
+							 "Read frozen ann index pages through read-only mappings of the index files.",
+							 NULL, &ann_frozen_mmap, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&FrozenScanMethods);
 	previous_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = AnnSetRelPathlist;

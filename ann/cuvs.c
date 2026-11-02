@@ -1201,6 +1201,7 @@ ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint3
 			(bitset && !(bitset[local / 32] & (UINT32_C(1) << (local % 32)))))
 			continue;
 		hits[count].key = file->keys[file->shards[s].first + local];
+		hits[count].ordinal = file->shards[s].first + local;
 		hits[count].distance = ExactDistance(file, file->shards[s].first + local, query);
 		count++;
 	}
@@ -1847,6 +1848,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			if (low == first + file->shards[s].rows || file->keys[low] != key)
 				continue;
 			hits[counts[s]].key = key;
+			hits[counts[s]].ordinal = low;
 			hits[counts[s]].distance = ExactDistance(file, low, job->query);
 			counts[s]++;
 		}
@@ -2295,6 +2297,7 @@ SearchGatherGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 						continue;
 					row = ordinals[start[s] + positions[i]];
 					hits[*found].key = file->keys[row];
+					hits[*found].ordinal = row;
 					hits[*found].distance = ExactDistance(file, row, job->query);
 					(*found)++;
 				}

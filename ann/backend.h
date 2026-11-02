@@ -64,6 +64,7 @@ typedef struct AnnIndexHit
 {
 	int64_t		key;
 	float		distance;
+	uint64_t	ordinal;		/* the row's position in key order */
 } AnnIndexHit;
 
 #define ANN_ROUTE_ANN 0			/* unfiltered graph search */

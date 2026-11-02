@@ -1019,6 +1019,7 @@ AnnIndexExact(const AnnIndexFile *file, AnnIndexJob *job, const uint64_t *ordina
 		AnnIndexHit hit;
 
 		hit.key = file->keys[row];
+		hit.ordinal = row;
 		hit.distance = Distance(file->vectors + row * file->dimensions, job->query, file->dimensions);
 		Offer(job->results, &job->nresults, job->k, hit);
 	}
