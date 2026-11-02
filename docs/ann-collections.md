@@ -36,7 +36,8 @@ python3 scripts/ann/build_cuvs_index.py --dtype float16 --quantize nvfp4 --out /
 
 ```sh
 ann/ann-worker-cuvs --backend cuvs --listen /run/ann.sock --listen-tcp 0.0.0.0:7700 \
-    --auth-token-file /etc/ann/token --lanes 24 --itopk 64 --rdma mlx5_0:1 --rdma-lanes 4
+    --auth-token-file /etc/ann/token --lanes 24 --itopk 64 --bitset-gather-limit 4000000 \
+    --rdma mlx5_0:1 --rdma-lanes 4 --rdma-poll wait
 ```
 
 **4. Coordinators:** the table the filters are written against (here partitioned, with `postgres_fdw` foreign partitions on the shard hosts), the collection, and its parts. `ann_collection_load` loads a part's directory on every node of its replica list, checks that all serve the same generation, and records it; with a NULL path it attaches a part already loaded (other coordinators).

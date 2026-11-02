@@ -41,6 +41,8 @@ SELECT ann_index_attach('docs');                     -- verifies this host's tab
 
 ## Queries and routing
 
+Every node listed in `ann.worker_address` holds the whole index. To split a table across nodes, with replicas per part and one search fanned out to all of them, use [collections](ann-collections.md).
+
 ```sql
 -- the host evaluates the filter, then routes by its size
 SELECT * FROM ann_hybrid_search('docs', $1, 10, format('tenant = %s AND lang = %L', $2, $3));
@@ -205,6 +207,8 @@ What the measurements show:
 - Worker lanes spin by default, one core each. Use `--rdma-poll wait` when cores are scarce.
 - AWS EFA isn't supported: it needs the SRD transport through libfabric or `efadv`, not reliable-connected queue pairs.
 - The test host's IP-over-InfiniBand interfaces have no addresses, so libfabric's `verbs;ofi_rxm` provider can't be used there. Native verbs addressing by LID works without them.
+
+**Collections over RDMA.** Coordinators that fan one search out to several nodes measured lower latency over RDMA than over TCP, but lower peak throughput once a query reached two or more nodes; see [collections](ann-collections.md#measured-16m--1024-on-one-b200-host-split-into-nodes). On hosts whose RDMA lanes share cores with search lanes, `--rdma-poll wait` helped.
 
 ## Tests
 
