@@ -203,41 +203,49 @@ Evict(uint64 budget)
 
 	if (pg_atomic_exchange_u32(&control->evicting, 1) != 0)
 		return;
-	victims = palloc(sizeof(Victim) * capacity);
-	dshash_seq_init(&status, table, false);
-	while ((entry = dshash_seq_next(&status)) != NULL)
+	/* An error must not leave the flag set, or no backend could evict again. */
+	PG_TRY();
 	{
-		if (n == capacity)
+		victims = palloc(sizeof(Victim) * capacity);
+		dshash_seq_init(&status, table, false);
+		while ((entry = dshash_seq_next(&status)) != NULL)
 		{
-			capacity *= 2;
-			victims = repalloc_huge(victims, sizeof(Victim) * capacity);
+			if (n == capacity)
+			{
+				capacity *= 2;
+				victims = repalloc_huge(victims, sizeof(Victim) * capacity);
+			}
+			victims[n].key = entry->key;
+			victims[n].used = pg_atomic_read_u64(&entry->used);
+			n++;
 		}
-		victims[n].key = entry->key;
-		victims[n].used = pg_atomic_read_u64(&entry->used);
-		n++;
-	}
-	dshash_seq_term(&status);
-	qsort(victims, n, sizeof(Victim), VictimCompare);
-	for (uint64 i = 0; i < n && pg_atomic_read_u64(&control->bytes) > target; i++)
-	{
-		dsa_pointer words;
-		dsa_pointer program;
-		uint64		bytes;
+		dshash_seq_term(&status);
+		qsort(victims, n, sizeof(Victim), VictimCompare);
+		for (uint64 i = 0; i < n && pg_atomic_read_u64(&control->bytes) > target; i++)
+		{
+			dsa_pointer words;
+			dsa_pointer program;
+			uint64		bytes;
 
-		if ((entry = dshash_find(table, &victims[i].key, true)) == NULL)
-			continue;
-		words = entry->words;
-		program = entry->program;
-		bytes = EntryBytes(entry->nwords, entry->key.length);
-		dshash_delete_entry(table, entry);
-		dsa_free(area, words);
-		dsa_free(area, program);
-		pg_atomic_fetch_sub_u64(&control->bytes, bytes);
-		pg_atomic_fetch_sub_u64(&control->entries, 1);
-		pg_atomic_fetch_add_u64(&control->evictions, 1);
+			if ((entry = dshash_find(table, &victims[i].key, true)) == NULL)
+				continue;
+			words = entry->words;
+			program = entry->program;
+			bytes = EntryBytes(entry->nwords, entry->key.length);
+			dshash_delete_entry(table, entry);
+			dsa_free(area, words);
+			dsa_free(area, program);
+			pg_atomic_fetch_sub_u64(&control->bytes, bytes);
+			pg_atomic_fetch_sub_u64(&control->entries, 1);
+			pg_atomic_fetch_add_u64(&control->evictions, 1);
+		}
+		pfree(victims);
 	}
-	pfree(victims);
-	pg_atomic_write_u32(&control->evicting, 0);
+	PG_FINALLY();
+	{
+		pg_atomic_write_u32(&control->evicting, 0);
+	}
+	PG_END_TRY();
 }
 
 /*
