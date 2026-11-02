@@ -132,6 +132,8 @@ Files: `src/annplan.c` (union of frozen base and hot partition under one `ORDER 
 
 Gates: a query over base plus delta equals exact SQL over the whole table; publishing a new generation leaves no window where a stale bitmap id answers (the id carries the generation); the retired generation's guard trigger drop and `DROP INDEX` reclaim everything.
 
+Partitioning a collection across many PostgreSQL hosts is planned separately (TODO): [sharded frozen collections](ann-sharded-collections-plan.md).
+
 ## 9. What does not change
 
 The CAGRA shards, quantized copies, gather and grouped tensor-core scans, same-filter scheduler, RDMA lanes, heartbeats and the 8-GPU replication all stay as measured in [ann-gpu-filters.md](ann-gpu-filters.md) and [ann-blackwell.md](ann-blackwell.md). This plan moves the filter side onto fixed-shape pages that both PostgreSQL and the worker address by the same integer; it does not touch how the GPU scores rows.
