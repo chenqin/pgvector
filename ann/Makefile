@@ -68,6 +68,7 @@ check: ann-worker ann-batch-tests
 	python3 ../test/ann/test_filtered.py
 	python3 ../test/ann/test_pipeline.py
 	python3 ../test/ann/test_frozen.py
+	python3 ../test/ann/test_collection.py
 
 check-cuvs: ann-worker ann-worker-cuvs
 	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs.py

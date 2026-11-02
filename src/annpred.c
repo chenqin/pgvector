@@ -75,6 +75,51 @@ AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns)
 	columns->meta = AnnFrozenMeta(index);
 }
 
+/*
+ * The predicate columns of a table's attribute columns, by name, for
+ * programs only GPU nodes evaluate (no frozen index on this host): integer,
+ * boolean and date columns. Text needs a dictionary shared by the nodes and
+ * is refused.
+ */
+void
+AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateColumns *columns)
+{
+	TupleDesc	desc = RelationGetDescr(rel);
+
+	if (count > INDEX_MAX_KEYS)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("an ann collection has at most %d attributes", INDEX_MAX_KEYS)));
+	memset(columns, 0, sizeof(*columns));
+	for (int c = 0; c < count; c++)
+	{
+		AttrNumber	attno = InvalidAttrNumber;
+		Oid			opclass;
+
+		for (int i = 0; i < desc->natts && attno == InvalidAttrNumber; i++)
+			if (!TupleDescAttr(desc, i)->attisdropped &&
+				strcmp(NameStr(TupleDescAttr(desc, i)->attname), names[c]) == 0)
+				attno = i + 1;
+		if (attno == InvalidAttrNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("column \"%s\" of an ann collection is not a column of \"%s\"",
+							names[c], RelationGetRelationName(rel))));
+		columns->attnos[c] = attno;
+		columns->types[c] = TupleDescAttr(desc, attno - 1)->atttypid;
+		columns->collations[c] = TupleDescAttr(desc, attno - 1)->attcollation;
+		columns->names[c] = names[c];
+		if (!AnnFrozenAttributeType(columns->types[c]) || AnnFrozenTextType(columns->types[c]))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ann collection attribute \"%s\" must be smallint, integer, bigint, boolean or date",
+							names[c])));
+		opclass = GetDefaultOpClass(columns->types[c], BTREE_AM_OID);
+		columns->families[c] = OidIsValid(opclass) ? get_opclass_family(opclass) : InvalidOid;
+	}
+	columns->ncolumns = count;
+}
+
 static void
 PutByte(StringInfo program, int value)
 {

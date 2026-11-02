@@ -174,6 +174,29 @@ bool		AnnRemoteCall(uint16 operation, const char *payload, size_t length, int ti
 						  uint32 *status, char **reply, uint32 *replyLength);
 int			AnnRemoteBroadcast(uint16 operation, const char *payload, size_t length, int timeoutMs,
 							   uint32 *status, char **reply, uint32 *replyLength);
+
+/* One request of a fan-out (AnnRemoteFanout): to one of the replicas in nodes. */
+typedef struct AnnRemoteRequest
+{
+	const char *nodes;			/* comma-separated host:port replicas */
+	uint16		operation;
+	uint64		generation;		/* request header generation */
+	const char *payload;
+	size_t		length;
+	/* results */
+	bool		ok;
+	uint32		status;
+	char	   *reply;
+	uint32		replyLength;
+	/* internal */
+	bool		done;
+	uint64		tried;			/* replicas tried, by position */
+	uint64		rotation;
+} AnnRemoteRequest;
+
+int			AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs);
+int			AnnRemoteBroadcastTo(const char *nodes, uint16 operation, const char *payload, size_t length,
+								 int timeoutMs, uint32 *status, char **reply, uint32 *replyLength);
 int			AnnRemoteBroadcastEach(uint16 operation, const char *payload, size_t length, int timeoutMs,
 								   int *failed, uint32 *status);
 bool		AnnWorkerCall(uint16 operation, const char *payload, size_t length, int timeoutMs,
@@ -236,6 +259,7 @@ int32		AnnFrozenAttributeValue(Datum value, bool isnull, Oid type);
 Datum		AnnFrozenAttributeDatum(int32 value, Oid type);
 
 void		AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns);
+void		AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateColumns *columns);
 bool		AnnFrozenCachedColumns(Relation index, AnnPredicateColumns *columns);
 void		AnnFrozenStoreColumns(Relation index, const AnnPredicateColumns *columns);
 bool		AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *columns);

@@ -25,6 +25,13 @@ attribute columns plus its generation, which ann_index_load checks against the
 table. Its files are hard-linked (or copied) into --out; --dsn, --table, --key,
 --vector and --attribute are taken from the export.
 
+--from-export may be repeated to build one index (a part of an ann collection)
+from several partitions' exports, for example the key-range partitions of a
+table. Their keys must not overlap; the members are concatenated in key
+order, so keys stay sorted across the whole index. Each member becomes one
+shard unless --shards says otherwise. The generation is a hash of the
+members' generations, and each member is recorded on a "# member" line.
+
 --quantize nvfp4|fp8 also writes a quantized copy of the vectors for the
 worker's Blackwell module, which scores filtered rows from it on compute
 capability 10.x GPUs and re-scores candidates from vectors.f32:
@@ -132,6 +139,52 @@ def read_export(directory):
     return lines, keys, vectors
 
 
+def combine_exports(directories, out):
+    """Concatenate several exports, in key order, into out; returns the merged manifest lines,
+    keys, memory-mapped vectors and (source, first row, rows, generation) per member."""
+    import hashlib
+    import shutil
+
+    parts = []
+    for directory in directories:
+        lines, keys, vectors = read_export(directory)
+        fields = dict(line.split(' ', 1) for line in lines if not line.startswith('attribute '))
+        attributes = [line.split()[1:] for line in lines if line.startswith('attribute ')]
+        parts.append((keys[0] if len(keys) else 0, directory, lines, fields, attributes, keys, vectors))
+    parts.sort(key=lambda part: part[0])
+    dimensions = parts[0][6].shape[1]
+    attributes = [name for name, _ in parts[0][4]]
+    for _, directory, _, fields, member_attributes, _, vectors in parts:
+        if vectors.shape[1] != dimensions or [name for name, _ in member_attributes] != attributes:
+            raise SystemExit(f'{directory} has other dimensions or attributes than {parts[0][1]}')
+    for previous, part in zip(parts, parts[1:]):
+        if len(previous[5]) and len(part[5]) and previous[5][-1] >= part[5][0]:
+            raise SystemExit(f'the keys of {previous[1]} and {part[1]} overlap; members must be key ranges')
+    members = []
+    first = 0
+    digest = hashlib.sha256()
+    for _, directory, _, fields, _, keys, _ in parts:
+        members.append((fields.get('source', '-'), first, len(keys), fields['generation']))
+        digest.update(f'{fields["generation"]} {len(keys)};'.encode())
+        first += len(keys)
+    names = ['keys.i64', 'vectors.f32'] + [f'attr-{name}.i32' for name in attributes]
+    for name in names:
+        source_names = {'keys.i64': 'keys.i64', 'vectors.f32': 'vectors.f32'}
+        with open(os.path.join(out, name), 'wb') as target:
+            for part in parts:
+                member_file = name if name in source_names else dict(
+                    (column, file) for column, file in part[4])[name[5:-4]]
+                with open(os.path.join(part[1], member_file), 'rb') as source:
+                    shutil.copyfileobj(source, target, 64 << 20)
+    rows = first
+    lines = [line for line in parts[0][2] if line.split(' ', 1)[0] in ('source', 'key', 'vector')]
+    lines += [f'attribute {name} attr-{name}.i32' for name in attributes]
+    lines.append(f'generation {digest.hexdigest()[:16]}')
+    keys = np.fromfile(os.path.join(out, 'keys.i64'), dtype='<i8')
+    vectors = np.memmap(os.path.join(out, 'vectors.f32'), dtype='<f4', mode='r', shape=(rows, dimensions))
+    return lines, keys, vectors, members
+
+
 def link_or_copy(source, target):
     try:
         os.link(source, target)
@@ -234,8 +287,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dsn')
     parser.add_argument('--table', help='schema-qualified table, e.g. public.docs')
-    parser.add_argument('--from-export', metavar='DIR',
-                        help='build from an ann_index_export directory instead of --dsn/--table')
+    parser.add_argument('--from-export', metavar='DIR', action='append', default=[],
+                        help='build from an ann_index_export directory instead of --dsn/--table '
+                             '(repeatable: several partitions into one index)')
     parser.add_argument('--key', default='id', help='unique integer key column')
     parser.add_argument('--vector', default='embedding', help='vector column')
     parser.add_argument('--out', required=True, help='new or empty output directory')
@@ -262,15 +316,21 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     started = time.time()
     exported = None
-    if args.from_export:
-        exported, keys, vectors = read_export(args.from_export)
+    members = []
+    if len(args.from_export) == 1:
+        exported, keys, vectors = read_export(args.from_export[0])
         rows, dimensions = vectors.shape
         for line in exported:
             if line.startswith('attribute '):
-                link_or_copy(os.path.join(args.from_export, line.split()[2]), os.path.join(args.out, line.split()[2]))
+                link_or_copy(os.path.join(args.from_export[0], line.split()[2]),
+                             os.path.join(args.out, line.split()[2]))
         for name in ('keys.i64', 'vectors.f32'):
-            link_or_copy(os.path.join(args.from_export, name), os.path.join(args.out, name))
+            link_or_copy(os.path.join(args.from_export[0], name), os.path.join(args.out, name))
         log(f'linked the export of {rows} rows x {dimensions} dims')
+    elif args.from_export:
+        exported, keys, vectors, members = combine_exports(args.from_export, args.out)
+        rows, dimensions = vectors.shape
+        log(f'combined {len(members)} exports: {rows} rows x {dimensions} dims')
     else:
         keys, vectors = export(args.dsn, args.table, args.key, args.vector, args.limit)
         rows, dimensions = vectors.shape
@@ -289,8 +349,11 @@ def main():
     if not args.no_cagra:
         import cupy
         devices = cupy.cuda.runtime.getDeviceCount()
-        count = args.shards or devices
-        bounds = [rows * i // count for i in range(count + 1)]
+        count = args.shards or (len(members) if members else devices)
+        if members and not args.shards:
+            bounds = [first for _, first, _, _ in members] + [rows]
+        else:
+            bounds = [rows * i // count for i in range(count + 1)]
         shards = [(i, bounds[i], bounds[i + 1] - bounds[i]) for i in range(count) if bounds[i + 1] > bounds[i]]
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(shards), devices)) as pool:
             futures = [pool.submit(build_shard, i, first, vectors[first:first + n], args.out, args.dtype,
@@ -313,6 +376,7 @@ def main():
     lines += [f'shards {len(shards)}']
     lines += [f'shard {i} {first} {n} shard-{i}.cagra' for i, first, n in shards]
     lines += [line for line in kept if line.startswith('attribute ')] + generation
+    lines += [f'# member {source} {first} {n} {member_generation}' for source, first, n, member_generation in members]
     if args.quantize:
         lines.append(f'quant {args.quantize}')
     with open(os.path.join(args.out, 'manifest.tmp'), 'w') as manifest:

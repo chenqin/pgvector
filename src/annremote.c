@@ -45,6 +45,24 @@ AnnRemoteBroadcastEach(uint16 operation, const char *payload, size_t length, int
 	return 0;
 }
 
+int
+AnnRemoteBroadcastTo(const char *nodes, uint16 operation, const char *payload, size_t length, int timeoutMs,
+					 uint32 *status, char **reply, uint32 *replyLength)
+{
+	return -1;
+}
+
+int
+AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs)
+{
+	for (int i = 0; i < count; i++)
+	{
+		requests[i].ok = false;
+		requests[i].done = true;
+	}
+	return 0;
+}
+
 #else
 
 #include <errno.h>
@@ -86,6 +104,8 @@ static bool Exchange(int fd, uint16 operation, const char *payload, size_t lengt
 					 uint32 *status, char **reply, uint32 *replyLength);
 static double ElapsedMs(instr_time since);
 static void PutHeader(char *header, uint16 operation, uint64 request, uint32 length);
+static void PutHeaderGeneration(char *header, uint16 operation, uint64 request, uint32 length,
+								uint64 generation);
 static bool RecvAll(int fd, char *data, size_t size, instr_time start, int timeoutMs);
 
 #ifdef ANN_USE_RDMA
@@ -114,18 +134,28 @@ typedef struct RdmaClient
 	char	   *region;			/* receive buffer, then send buffer */
 	size_t		frame;
 	bool		sending;		/* send completion not yet reaped */
+	bool		shared;			/* context and pd belong to rdmaDevice */
 } RdmaClient;
 
 static RdmaClient *rdmaClient = NULL;
 
-static void
-CloseRdma(void)
+/*
+ * The device context and protection domain, opened once per backend and
+ * shared by its queue pairs: opening a device takes tens of milliseconds,
+ * which a backend connecting to several nodes would otherwise pay per node.
+ */
+static struct
 {
-	RdmaClient *client = rdmaClient;
+	char		name[64];
+	struct ibv_context *context;
+	struct ibv_pd *pd;
+}			rdmaDevice;
 
+static void
+RdmaFree(RdmaClient *client)
+{
 	if (client == NULL)
 		return;
-	rdmaClient = NULL;
 	if (client->qp)
 		(void) ibv_destroy_qp(client->qp);
 	if (client->mr)
@@ -134,12 +164,21 @@ CloseRdma(void)
 		(void) ibv_destroy_cq(client->cq);
 	if (client->channel)
 		(void) ibv_destroy_comp_channel(client->channel);
-	if (client->pd)
+	if (client->pd && !client->shared)
 		(void) ibv_dealloc_pd(client->pd);
-	if (client->context)
+	if (client->context && !client->shared)
 		(void) ibv_close_device(client->context);
 	free(client->region);
 	free(client);
+}
+
+static void
+CloseRdma(void)
+{
+	RdmaClient *client = rdmaClient;
+
+	rdmaClient = NULL;
+	RdmaFree(client);
 }
 
 static bool
@@ -157,11 +196,11 @@ PostRdmaReceive(RdmaClient *client)
 
 /*
  * Open the device, connect a queue pair with the node over the
- * authenticated TCP connection fd, and post the receive buffer. Any failure
- * leaves the backend on TCP only.
+ * authenticated TCP connection fd, and post the receive buffer. Returns NULL
+ * on any failure, which leaves that connection on TCP only.
  */
-static void
-OpenRdma(int fd, int timeoutMs)
+static RdmaClient *
+RdmaConnect(int fd, int timeoutMs)
 {
 	RdmaClient *client = calloc(1, sizeof(RdmaClient));
 	struct ibv_device **list = NULL;
@@ -187,17 +226,33 @@ OpenRdma(int fd, int timeoutMs)
 
 	if (client == NULL)
 		goto fail;
-	rdmaClient = client;
 	snprintf(device, sizeof(device), "%.*s",
 			 (int) (colon ? (size_t) (colon - ann_worker_rdma) : strlen(ann_worker_rdma)), ann_worker_rdma);
-	list = ibv_get_device_list(&devices);
-	for (int i = 0; list && i < devices && client->context == NULL; i++)
-		if (strcmp(ibv_get_device_name(list[i]), device) == 0)
-			client->context = ibv_open_device(list[i]);
-	if (list)
-		ibv_free_device_list(list);
-	if (client->context == NULL)
-		goto fail;
+	if (rdmaDevice.context && strcmp(rdmaDevice.name, device) == 0)
+	{
+		client->context = rdmaDevice.context;
+		client->pd = rdmaDevice.pd;
+		client->shared = true;
+	}
+	else
+	{
+		list = ibv_get_device_list(&devices);
+		for (int i = 0; list && i < devices && client->context == NULL; i++)
+			if (strcmp(ibv_get_device_name(list[i]), device) == 0)
+				client->context = ibv_open_device(list[i]);
+		if (list)
+			ibv_free_device_list(list);
+		if (client->context == NULL || (client->pd = ibv_alloc_pd(client->context)) == NULL)
+			goto fail;
+		if (rdmaDevice.context == NULL)
+		{
+			/* Keep it for the backend's later connections. */
+			strlcpy(rdmaDevice.name, device, sizeof(rdmaDevice.name));
+			rdmaDevice.context = client->context;
+			rdmaDevice.pd = client->pd;
+			client->shared = true;
+		}
+	}
 	step = "query port";
 	if (ibv_query_port(client->context, portNumber, &port) != 0 || port.state != IBV_PORT_ACTIVE ||
 		ibv_query_gid(client->context, portNumber, 0, &gid) != 0)
@@ -208,8 +263,7 @@ OpenRdma(int fd, int timeoutMs)
 	init.cap.max_send_sge = 1;
 	init.cap.max_recv_sge = 1;
 	init.qp_type = IBV_QPT_RC;
-	if ((client->pd = ibv_alloc_pd(client->context)) == NULL ||
-		(client->channel = ibv_create_comp_channel(client->context)) == NULL ||
+	if ((client->channel = ibv_create_comp_channel(client->context)) == NULL ||
 		fcntl(client->channel->fd, F_SETFL, fcntl(client->channel->fd, F_GETFL) | O_NONBLOCK) != 0 ||
 		(client->cq = ibv_create_cq(client->context, 16, NULL, client->channel, 0)) == NULL)
 		goto fail;
@@ -280,13 +334,12 @@ OpenRdma(int fd, int timeoutMs)
 					  IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC) != 0)
 		goto fail;
 	elog(DEBUG1, "ann worker RDMA on %s port %u ready, frames up to %zu bytes", device, portNumber, client->frame);
-	return;
+	return client;
 
 fail:
 	elog(DEBUG1, "ann worker RDMA on %s unavailable: %s failed", ann_worker_rdma, step);
-	if (rdmaClient == NULL)
-		free(client);
-	CloseRdma();
+	RdmaFree(client);
+	return NULL;
 }
 
 /*
@@ -344,10 +397,9 @@ CopyReply(const char *frame, size_t size, uint64 request, uint32 *status, char *
  * because the node answers over TCP when a reply exceeds the RDMA frame.
  */
 static bool
-RdmaExchange(int fd, uint16 operation, const char *payload, size_t length, int timeoutMs,
+RdmaExchange(RdmaClient *client, int fd, uint16 operation, const char *payload, size_t length, int timeoutMs,
 			 uint32 *status, char **reply, uint32 *replyLength)
 {
-	RdmaClient *client = rdmaClient;
 	char	   *buffer = client->region + client->frame;
 	uint64		request = remoteRequest++;
 	struct ibv_sge sge;
@@ -457,6 +509,30 @@ RdmaExchange(int fd, uint16 operation, const char *payload, size_t length, int t
 		}
 	}
 }
+
+/*
+ * Connect a queue pair and send one probe over it: a port the fabric does not
+ * route accepts the connection but never delivers a frame, so without the
+ * probe every request would wait for its timeout. A connection whose probe
+ * goes unanswered stays on TCP.
+ */
+static RdmaClient *
+RdmaConnectChecked(int fd, int timeoutMs)
+{
+	RdmaClient *client = RdmaConnect(fd, timeoutMs);
+	uint32		status;
+	char	   *reply = NULL;
+	uint32		length;
+
+	if (client && !RdmaExchange(client, fd, ANN_OP_PROBE, NULL, 0, Min(timeoutMs, 1000), &status, &reply,
+								&length))
+	{
+		elog(DEBUG1, "ann worker RDMA on %s did not answer a probe; using TCP", ann_worker_rdma);
+		RdmaFree(client);
+		client = NULL;
+	}
+	return client;
+}
 #endif
 
 static void
@@ -533,9 +609,9 @@ AnnRemoteConfigured(void)
 
 /* Split ann.worker_address into host and port strings; returns the count. */
 static int
-ParseNodes(char **hosts, char **ports)
+ParseNodes(const char *nodes, char **hosts, char **ports)
 {
-	char	   *list = pstrdup(ann_worker_address);
+	char	   *list = pstrdup(nodes);
 	char	   *token;
 	char	   *save = NULL;
 	int			count = 0;
@@ -548,7 +624,7 @@ ParseNodes(char **hosts, char **ports)
 		if (colon == NULL || colon == token)
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("invalid ann.worker_address entry \"%s\"", token),
+					 errmsg("invalid ann node address \"%s\"", token),
 					 errhint("Use a comma-separated list of host:port.")));
 		*colon = '\0';
 		hosts[count] = token;
@@ -631,10 +707,9 @@ RecvAll(int fd, char *data, size_t size, instr_time start, int timeoutMs)
 }
 
 static void
-PutHeader(char *header, uint16 operation, uint64 request, uint32 length)
+PutHeaderGeneration(char *header, uint16 operation, uint64 request, uint32 length, uint64 generation)
 {
 	uint16		version = 1;
-	uint64		generation = ann_request_generation;
 	uint32		status = 0;
 
 	memcpy(header, "PVAN", 4);
@@ -644,6 +719,12 @@ PutHeader(char *header, uint16 operation, uint64 request, uint32 length)
 	memcpy(header + 16, &generation, 8);
 	memcpy(header + 24, &length, 4);
 	memcpy(header + 28, &status, 4);
+}
+
+static void
+PutHeader(char *header, uint16 operation, uint64 request, uint32 length)
+{
+	PutHeaderGeneration(header, operation, request, length, ann_request_generation);
 }
 
 /*
@@ -749,7 +830,7 @@ AnnRemoteCall(uint16 operation, const char *payload, size_t length, int timeoutM
 {
 	char	   *hosts[ANN_MAX_NODES];
 	char	   *ports[ANN_MAX_NODES];
-	int			count = ParseNodes(hosts, ports);
+	int			count = ParseNodes(ann_worker_address, hosts, ports);
 
 	if (timeoutMs <= 0)
 		timeoutMs = ann_worker_timeout_ms;
@@ -803,7 +884,7 @@ AnnRemoteCall(uint16 operation, const char *payload, size_t length, int timeoutM
 						remoteNode = node;
 #ifdef ANN_USE_RDMA
 						if (ann_worker_rdma && ann_worker_rdma[0] != '\0')
-							OpenRdma(remoteFd, timeoutMs);
+							rdmaClient = RdmaConnectChecked(remoteFd, timeoutMs);
 #endif
 					}
 					else
@@ -816,7 +897,7 @@ AnnRemoteCall(uint16 operation, const char *payload, size_t length, int timeoutM
 		if (
 #ifdef ANN_USE_RDMA
 			(rdmaClient && RdmaOperation(operation) && ANN_HEADER_SIZE + length <= rdmaClient->frame) ?
-			RdmaExchange(remoteFd, operation, payload, length, timeoutMs, status, reply, replyLength) :
+			RdmaExchange(rdmaClient, remoteFd, operation, payload, length, timeoutMs, status, reply, replyLength) :
 #endif
 			Exchange(remoteFd, operation, payload, length, timeoutMs, status, reply, replyLength))
 		{
@@ -840,9 +921,18 @@ int
 AnnRemoteBroadcast(uint16 operation, const char *payload, size_t length, int timeoutMs,
 				   uint32 *status, char **reply, uint32 *replyLength)
 {
+	return AnnRemoteBroadcastTo(ann_worker_address, operation, payload, length, timeoutMs, status, reply,
+								replyLength);
+}
+
+/* AnnRemoteBroadcast to the nodes of a host:port list instead. */
+int
+AnnRemoteBroadcastTo(const char *nodes, uint16 operation, const char *payload, size_t length, int timeoutMs,
+					 uint32 *status, char **reply, uint32 *replyLength)
+{
 	char	   *hosts[ANN_MAX_NODES];
 	char	   *ports[ANN_MAX_NODES];
-	int			count = ParseNodes(hosts, ports);
+	int			count = ParseNodes(nodes, hosts, ports);
 
 	for (int i = 0; i < count; i++)
 	{
@@ -865,6 +955,513 @@ AnnRemoteBroadcast(uint16 operation, const char *payload, size_t length, int tim
 }
 
 /*
+ * Fan-out for collections: several requests in flight at once, each to one
+ * replica of its own node list. A backend keeps one connection per node
+ * address it has used (apart from the single-node connection above), with
+ * at most one request outstanding on each, over RDMA when ann.worker_rdma is
+ * set. Replicas are taken in rotation, so a backend spreads its requests
+ * over them; a node that fails is skipped for ann.worker_retry_ms and the
+ * request moves to the next replica while time remains.
+ */
+#define ANN_FANOUT_NODES 64
+
+typedef struct FanoutNode
+{
+	char	   *address;		/* host:port, malloc'd */
+	int			fd;
+#ifdef ANN_USE_RDMA
+	RdmaClient *rdma;
+	bool		armed;			/* completion channel armed */
+#endif
+	bool		busy;			/* a request is outstanding */
+	bool		viaRdma;		/* it was sent over RDMA */
+	bool		readable;		/* poll reported the TCP socket readable */
+	int			owner;			/* the request it serves */
+	uint64		request;
+	instr_time	used;
+	instr_time	down;			/* zero when believed healthy */
+	char		header[ANN_HEADER_SIZE];	/* TCP reply being read */
+	size_t		got;
+	char	   *body;
+} FanoutNode;
+
+static FanoutNode fanoutNodes[ANN_FANOUT_NODES];
+static int	fanoutCount = 0;
+static uint64 fanoutRotation = 0;
+
+static void
+FanoutClose(FanoutNode *node)
+{
+#ifdef ANN_USE_RDMA
+	RdmaFree(node->rdma);
+	node->rdma = NULL;
+	node->armed = false;
+#endif
+	if (node->fd >= 0)
+		close(node->fd);
+	node->fd = -1;
+	node->busy = false;
+	node->got = 0;
+	node->body = NULL;
+}
+
+static FanoutNode *
+FanoutNodeFor(const char *address, size_t length)
+{
+	FanoutNode *node;
+
+	for (int i = 0; i < fanoutCount; i++)
+		if (strlen(fanoutNodes[i].address) == length && strncmp(fanoutNodes[i].address, address, length) == 0)
+			return &fanoutNodes[i];
+	if (fanoutCount == ANN_FANOUT_NODES)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("more than %d ann nodes in use by one backend", ANN_FANOUT_NODES)));
+	node = &fanoutNodes[fanoutCount];
+	memset(node, 0, sizeof(*node));
+	node->fd = -1;
+	node->address = strndup(address, length);
+	if (node->address == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OUT_OF_MEMORY), errmsg("out of memory")));
+	fanoutCount++;
+	return node;
+}
+
+static bool
+FanoutAvailable(FanoutNode *node)
+{
+	if (INSTR_TIME_IS_ZERO(node->down))
+		return true;
+	if (ElapsedMs(node->down) < ann_worker_retry_ms)
+		return false;
+	INSTR_TIME_SET_ZERO(node->down);
+	return true;
+}
+
+/* Connect (and probe an idle connection) so a request can be sent. */
+static bool
+FanoutReady(FanoutNode *node, int timeoutMs)
+{
+	if (node->fd >= 0 && ann_worker_heartbeat_ms > 0 && ElapsedMs(node->used) > ann_worker_heartbeat_ms)
+	{
+		uint32		status;
+		char	   *reply;
+		uint32		length;
+
+		node->busy = true;
+		if (!Exchange(node->fd, ANN_OP_PROBE, NULL, 0, ann_worker_heartbeat_ms, &status, &reply, &length))
+		{
+			elog(DEBUG1, "ann node %s missed a heartbeat", node->address);
+			FanoutClose(node);
+			INSTR_TIME_SET_CURRENT(node->down);
+			return false;
+		}
+		node->busy = false;
+		INSTR_TIME_SET_CURRENT(node->used);
+	}
+	if (node->fd < 0)
+	{
+		char	   *host = pstrdup(node->address);
+		char	   *colon = strrchr(host, ':');
+
+		if (colon == NULL || colon == host)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("invalid ann node address \"%s\"", node->address)));
+		*colon = '\0';
+		node->fd = ConnectNode(host, colon + 1, Max(timeoutMs, 1000));
+		if (node->fd < 0)
+		{
+			INSTR_TIME_SET_CURRENT(node->down);
+			return false;
+		}
+#ifdef ANN_USE_RDMA
+		if (ann_worker_rdma && ann_worker_rdma[0] != '\0')
+			node->rdma = RdmaConnectChecked(node->fd, Max(timeoutMs, 1000));
+#endif
+		INSTR_TIME_SET_CURRENT(node->used);
+	}
+	return true;
+}
+
+/* Send a request without waiting for its reply. */
+static bool
+FanoutSend(FanoutNode *node, AnnRemoteRequest *request, int owner, int timeoutMs)
+{
+	char		header[ANN_HEADER_SIZE];
+	instr_time	start;
+
+	node->request = remoteRequest++;
+	node->owner = owner;
+	node->got = 0;
+	node->body = NULL;
+	node->readable = false;
+	node->viaRdma = false;
+	node->busy = true;
+#ifdef ANN_USE_RDMA
+	if (node->rdma && RdmaOperation(request->operation) &&
+		ANN_HEADER_SIZE + request->length <= node->rdma->frame)
+	{
+		RdmaClient *client = node->rdma;
+		char	   *buffer = client->region + client->frame;
+		struct ibv_sge sge;
+		struct ibv_send_wr wr = {0};
+		struct ibv_send_wr *bad;
+
+		if (!ReapRdmaSend(client))
+			return false;
+		PutHeaderGeneration(buffer, request->operation, node->request, (uint32) request->length,
+							request->generation);
+		if (request->length)
+			memcpy(buffer + ANN_HEADER_SIZE, request->payload, request->length);
+		sge.addr = (uintptr_t) buffer;
+		sge.length = (uint32) (ANN_HEADER_SIZE + request->length);
+		sge.lkey = client->mr->lkey;
+		wr.wr_id = 2;
+		wr.sg_list = &sge;
+		wr.num_sge = 1;
+		wr.opcode = IBV_WR_SEND;
+		wr.send_flags = IBV_SEND_SIGNALED;
+		if (ibv_post_send(client->qp, &wr, &bad) != 0)
+			return false;
+		client->sending = true;
+		node->viaRdma = true;
+		return true;
+	}
+#endif
+	INSTR_TIME_SET_CURRENT(start);
+	PutHeaderGeneration(header, request->operation, node->request, (uint32) request->length,
+						request->generation);
+	return SendAll(node->fd, header, sizeof(header), start, timeoutMs) &&
+		(request->length == 0 || SendAll(node->fd, request->payload, request->length, start, timeoutMs));
+}
+
+/*
+ * Read what has arrived on a node's TCP socket without blocking. Returns 1
+ * when the reply is complete, 0 when more is to come, -1 on failure.
+ */
+static int
+FanoutReadTcp(FanoutNode *node, AnnRemoteRequest *request)
+{
+	for (;;)
+	{
+		ssize_t		n;
+		uint32		size;
+
+		if (node->got < ANN_HEADER_SIZE)
+			n = recv(node->fd, node->header + node->got, ANN_HEADER_SIZE - node->got, 0);
+		else
+		{
+			memcpy(&size, node->header + 24, 4);
+			if (node->body == NULL)
+			{
+				uint64		replyRequest;
+
+				memcpy(&replyRequest, node->header + 8, 8);
+				if (memcmp(node->header, "PVAN", 4) != 0 || replyRequest != node->request ||
+					size > 64 * 1024 * 1024)
+					return -1;
+				node->body = palloc(size + 1);
+			}
+			if (node->got == ANN_HEADER_SIZE + size)
+			{
+				node->body[size] = '\0';
+				memcpy(&request->status, node->header + 28, 4);
+				request->reply = node->body;
+				request->replyLength = size;
+				return 1;
+			}
+			n = recv(node->fd, node->body + (node->got - ANN_HEADER_SIZE),
+					 ANN_HEADER_SIZE + size - node->got, 0);
+		}
+		if (n > 0)
+			node->got += n;
+		else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+			return 0;
+		else
+			return -1;
+	}
+}
+
+#ifdef ANN_USE_RDMA
+/* Reap a node's RDMA completions; 1 when its reply arrived, -1 on failure. */
+static int
+FanoutPollRdma(FanoutNode *node, AnnRemoteRequest *request)
+{
+	RdmaClient *client = node->rdma;
+	struct ibv_wc wc;
+	int			n;
+
+	while ((n = ibv_poll_cq(client->cq, 1, &wc)) == 1)
+	{
+		if (wc.status != IBV_WC_SUCCESS)
+			return -1;
+		if (wc.wr_id == 2)
+		{
+			client->sending = false;
+			continue;
+		}
+		if (!CopyReply(client->region, wc.byte_len, node->request, &request->status, &request->reply,
+					   &request->replyLength) ||
+			!PostRdmaReceive(client))
+			return -1;
+		return 1;
+	}
+	return n < 0 ? -1 : 0;
+}
+#endif
+
+/*
+ * The next replica of a request to try, or NULL when none can take it now;
+ * *exhausted is then set when none ever will.
+ */
+static FanoutNode *
+FanoutPick(AnnRemoteRequest *request, int timeoutMs, bool *exhausted)
+{
+	const char *list = request->nodes;
+	const char *starts[ANN_MAX_NODES];
+	size_t		lengths[ANN_MAX_NODES];
+	int			count = 0;
+	bool		waiting = false;
+
+	while (*list && count < ANN_MAX_NODES)
+	{
+		size_t		length;
+
+		while (*list == ',' || *list == ' ')
+			list++;
+		length = strcspn(list, ", ");
+		if (length == 0)
+			break;
+		starts[count] = list;
+		lengths[count++] = length;
+		list += length;
+	}
+	for (int pass = 0; pass < 2; pass++)
+		for (int i = 0; i < count; i++)
+		{
+			int			index = (int) ((request->rotation + i) % count);
+			FanoutNode *node = FanoutNodeFor(starts[index], lengths[index]);
+
+			if (request->tried & (UINT64_C(1) << index))
+				continue;
+			if (node->busy)
+			{
+				waiting = true; /* free once its current reply is in */
+				continue;
+			}
+			if (pass == 0 && !FanoutAvailable(node))
+				continue;
+			request->tried |= UINT64_C(1) << index;
+			if (FanoutReady(node, timeoutMs))
+				return node;
+		}
+	*exhausted = !waiting;
+	return NULL;
+}
+
+/*
+ * Send every request and collect the replies within timeoutMs of sending
+ * them; connecting to a node for the first time has a budget of its own (at
+ * least a second), so a new backend's first search isn't cut short. Each
+ * request's ok, status and reply are set; replies are palloc'd in the
+ * current context. Returns the number of requests answered.
+ */
+int
+AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs)
+{
+	FanoutNode *active[ANN_FANOUT_NODES];
+	int			nactive = 0;
+	int			pending = count;
+	int			answered = 0;
+	bool		started = false;
+	instr_time	start;
+
+	if (timeoutMs <= 0)
+		timeoutMs = ann_worker_timeout_ms;
+	INSTR_TIME_SET_CURRENT(start);
+
+	/* An exchange an error interrupted may have left a reply unread. */
+	for (int i = 0; i < fanoutCount; i++)
+		if (fanoutNodes[i].busy)
+			FanoutClose(&fanoutNodes[i]);
+	for (int i = 0; i < count; i++)
+	{
+		requests[i].ok = false;
+		requests[i].done = false;
+		requests[i].status = UINT32_MAX;
+		requests[i].reply = NULL;
+		requests[i].replyLength = 0;
+		requests[i].tried = 0;
+		requests[i].rotation = (uint64) MyProcPid + fanoutRotation++;
+	}
+
+	while (pending > 0)
+	{
+		instr_time	spinStart;
+
+		/* Send what can be sent: each request to a free replica. */
+		for (int i = 0; i < count; i++)
+		{
+			AnnRemoteRequest *request = &requests[i];
+			bool		inflight = false;
+			bool		exhausted = false;
+			FanoutNode *node;
+
+			if (request->done)
+				continue;
+			for (int a = 0; a < nactive && !inflight; a++)
+				inflight = active[a]->owner == i;
+			if (inflight)
+				continue;
+			while ((node = FanoutPick(request, timeoutMs, &exhausted)) != NULL)
+			{
+				if (FanoutSend(node, request, i, timeoutMs))
+				{
+					active[nactive++] = node;
+					break;
+				}
+				elog(DEBUG1, "ann node %s failed a send; trying another replica", node->address);
+				FanoutClose(node);
+				INSTR_TIME_SET_CURRENT(node->down);
+			}
+			if (node == NULL && exhausted)
+			{
+				request->done = true;
+				pending--;
+			}
+		}
+		if (pending == 0 || nactive == 0)
+			break;
+		if (!started)
+		{
+			/* The deadline counts from the first sends, after connecting. */
+			INSTR_TIME_SET_CURRENT(start);
+			started = true;
+		}
+
+		/* Collect replies until at least one request finishes. */
+		INSTR_TIME_SET_CURRENT(spinStart);
+		for (;;)
+		{
+			bool		finished = false;
+			bool		rdmaWaiting = false;
+			bool		newlyArmed = false;
+			struct pollfd pollers[2 * ANN_FANOUT_NODES];
+			int			npollers = 0;
+			double		elapsed;
+
+			for (int a = 0; a < nactive; a++)
+			{
+				FanoutNode *node = active[a];
+				AnnRemoteRequest *request = &requests[node->owner];
+				int			result = 0;
+
+#ifdef ANN_USE_RDMA
+				if (node->viaRdma)
+				{
+					result = FanoutPollRdma(node, request);
+					rdmaWaiting |= result == 0;
+				}
+#endif
+				/* A reply too large for RDMA comes over TCP. */
+				if (result == 0 && (!node->viaRdma || node->readable || node->got > 0))
+					result = FanoutReadTcp(node, request);
+				node->readable = false;
+				if (result == 0)
+					continue;
+				node->busy = false;
+				if (result > 0)
+				{
+					INSTR_TIME_SET_CURRENT(node->used);
+					request->ok = true;
+					request->done = true;
+					answered++;
+					pending--;
+				}
+				else
+				{
+					elog(DEBUG1, "ann node %s failed; trying another replica", node->address);
+					FanoutClose(node);
+					INSTR_TIME_SET_CURRENT(node->down);
+				}
+				active[a--] = active[--nactive];
+				finished = true;
+			}
+			if (finished || nactive == 0)
+				break;
+			elapsed = ElapsedMs(start);
+			if (elapsed > timeoutMs)
+			{
+				/* Late replies would come out of order: close. */
+				for (int a = 0; a < nactive; a++)
+				{
+					requests[active[a]->owner].done = true;
+					FanoutClose(active[a]);
+				}
+				return answered;
+			}
+			if (rdmaWaiting && ElapsedMs(spinStart) * 1000.0 < ann_worker_rdma_spin_us)
+				continue;
+			CHECK_FOR_INTERRUPTS();
+#ifdef ANN_USE_RDMA
+			/* Arm, and poll again: a completion may race it. */
+			for (int a = 0; a < nactive; a++)
+				if (active[a]->viaRdma && !active[a]->armed &&
+					ibv_req_notify_cq(active[a]->rdma->cq, 0) == 0)
+				{
+					active[a]->armed = true;
+					newlyArmed = true;
+				}
+			if (newlyArmed)
+				continue;
+#endif
+			for (int a = 0; a < nactive; a++)
+			{
+#ifdef ANN_USE_RDMA
+				if (active[a]->viaRdma)
+				{
+					pollers[npollers].fd = active[a]->rdma->channel->fd;
+					pollers[npollers].events = POLLIN;
+					pollers[npollers++].revents = 0;
+				}
+#endif
+				pollers[npollers].fd = active[a]->fd;
+				pollers[npollers].events = POLLIN;
+				pollers[npollers++].revents = 0;
+			}
+			if (poll(pollers, npollers, Max(1, Min(10, (int) (timeoutMs - elapsed)))) < 0 && errno != EINTR)
+				break;
+			for (int p = 0, a = 0; a < nactive; a++)
+			{
+				FanoutNode *node = active[a];
+
+#ifdef ANN_USE_RDMA
+				if (node->viaRdma)
+				{
+					if (pollers[p].revents & POLLIN)
+					{
+						struct ibv_cq *eventCq;
+						void	   *ignored;
+
+						if (ibv_get_cq_event(node->rdma->channel, &eventCq, &ignored) == 0)
+							ibv_ack_cq_events(eventCq, 1);
+						node->armed = false;
+					}
+					p++;
+				}
+#endif
+				if (pollers[p].revents & (POLLIN | POLLERR | POLLHUP))
+					node->readable = true;
+				p++;
+			}
+			INSTR_TIME_SET_CURRENT(spinStart);
+		}
+	}
+	return answered;
+}
+
+/*
  * Send one request to every node, continuing past failures, for caches that
  * nodes can refill later. Returns the number of nodes that accepted it;
  * *failed counts the rest and *status holds the last failure's status
@@ -876,7 +1473,7 @@ AnnRemoteBroadcastEach(uint16 operation, const char *payload, size_t length, int
 {
 	char	   *hosts[ANN_MAX_NODES];
 	char	   *ports[ANN_MAX_NODES];
-	int			count = ParseNodes(hosts, ports);
+	int			count = ParseNodes(ann_worker_address, hosts, ports);
 	int			accepted = 0;
 
 	*failed = 0;
