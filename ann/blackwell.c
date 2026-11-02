@@ -264,37 +264,39 @@ static const char *const BlackwellSource[] = {
 	"      : \"+f\"(c[0]), \"+f\"(c[1]), \"+f\"(c[2]), \"+f\"(c[3]) : \"r\"(a0), \"r\"(a1), \"r\"(a2), \"r\"(a3), \"r\"(b0), \"r\"(b1));\n"
 	"}\n",
 	"/*\n"
-	" * Distances of up to 16 queries to every listed row on the tensor cores,\n"
+	" * Distances of up to 8 * NT queries to every listed row on the tensor cores,\n"
 	" * written as a [queries][rows] matrix for a batched top-k selection. Each\n"
 	" * warp takes 16 rows at a time, loads their quantized bytes and block\n"
-	" * scales up front, and multiplies them against all 16 queries with\n"
+	" * scales up front, and multiplies them against every query with\n"
 	" * mma.sync (FP16 in, FP32 out): the FP4 and FP8 conversion instructions\n"
 	" * yield the A fragments directly (a half2 is two neighbouring dimensions\n"
 	" * of one row), block scales are folded into them, and the B fragments\n"
-	" * are two 32-bit loads of the half queries in shared memory. Distances\n"
+	" * are two 32-bit loads of the half queries in shared memory, per tile of\n"
+	" * 8 queries: a row's loads and conversions are shared by NT tiles (16,\n"
+	" * 32 or 64 queries). Distances\n"
 	" * follow from |x|^2 + |q|^2 - 2 x.q with |x|^2 summed from the same half\n"
 	" * values. Rows absent from the index (UINT32_MAX) score +inf.\n"
 	" */\n"
 	"#define KSEG 8 /* k-steps loaded per round: 128 dimensions */\n"
-	"template <int QUANT>\n"
+	"template <int QUANT, int NT>\n"
 	"__device__ void score_mma(const unsigned char *data, const unsigned char *scales,\n"
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
 	"    const float *queries, int nq, int dims, float *out)\n"
 	"{\n"
 	"  extern __shared__ unsigned short qh[];\n"
-	"  __shared__ float qn[16];\n"
+	"  __shared__ float qn[NT * 8];\n"
 	"  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;\n"
 	"  int g = lane >> 2, t = lane & 3;\n"
 	"  int qstride = (dims + 15) & ~15;\n"
 	"  const float inf = __int_as_float(0x7f800000);\n"
-	"  for (int i = threadIdx.x; i < 16 * qstride; i += blockDim.x)\n"
+	"  for (int i = threadIdx.x; i < NT * 8 * qstride; i += blockDim.x)\n"
 	"  {\n"
 	"    int q = i / qstride, d = i - q * qstride;\n"
 	"    float v = (q < nq && d < dims) ? queries[q * dims + d] : 0.0f;\n"
 	"    unsigned short h; asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h) : \"f\"(v)); qh[i] = h;\n"
 	"  }\n"
 	"  __syncthreads();\n"
-	"  if (threadIdx.x < 16)\n"
+	"  if (threadIdx.x < NT * 8)\n"
 	"  {\n"
 	"    float s = 0.0f;\n"
 	"    for (int d = 0; d < dims; d++) { float v = half_bits(qh[threadIdx.x * qstride + d]); s += v * v; }\n"
@@ -307,9 +309,9 @@ static const char *const BlackwellSource[] = {
 	"    unsigned row0 = i0 < n ? rows[i0] : 0xffffffffu, row1 = i1 < n ? rows[i1] : 0xffffffffu;\n"
 	"    bool v0 = row0 != 0xffffffffu, v1 = row1 != 0xffffffffu;\n"
 	"    unsigned r0 = v0 ? row0 : 0u, r1 = v1 ? row1 : 0u;\n"
-	"    float acc[8]; float nx0 = 0.0f, nx1 = 0.0f;\n"
+	"    float acc[NT * 4]; float nx0 = 0.0f, nx1 = 0.0f;\n"
 	"#pragma unroll\n"
-	"    for (int j = 0; j < 8; j++) acc[j] = 0.0f;\n"
+	"    for (int j = 0; j < NT * 4; j++) acc[j] = 0.0f;\n"
 	"    for (unsigned seg = 0; seg < blocks; seg += KSEG)\n",
 	"    {\n"
 	"      uint2 w0[KSEG], w1[KSEG]; uint2 e0 = {0, 0}, e1 = {0, 0};\n"
@@ -405,10 +407,12 @@ static const char *const BlackwellSource[] = {
 	"        }\n"
 	"        nx0 += sumsq2(a0) + sumsq2(a2); nx1 += sumsq2(a1) + sumsq2(a3);\n"
 	"        const unsigned short *qk = qh + (seg + k) * 16 + 2 * t;\n"
-	"        unsigned b0 = *(const unsigned *) (qk + g * qstride), b1 = *(const unsigned *) (qk + g * qstride + 8);\n"
-	"        unsigned b2 = *(const unsigned *) (qk + (8 + g) * qstride), b3 = *(const unsigned *) (qk + (8 + g) * qstride + 8);\n"
-	"        mma16816(acc, a0, a1, a2, a3, b0, b1);\n"
-	"        mma16816(acc + 4, a0, a1, a2, a3, b2, b3);\n"
+	"#pragma unroll\n"
+	"        for (int nt = 0; nt < NT; nt++)\n"
+	"        {\n"
+	"          const unsigned short *qq = qk + (nt * 8 + g) * qstride;\n"
+	"          mma16816(acc + nt * 4, a0, a1, a2, a3, *(const unsigned *) qq, *(const unsigned *) (qq + 8));\n"
+	"        }\n"
 	"      }\n"
 	"    }\n",
 	"    nx0 += __shfl_xor_sync(0xffffffffu, nx0, 1); nx0 += __shfl_xor_sync(0xffffffffu, nx0, 2);\n"
@@ -416,7 +420,7 @@ static const char *const BlackwellSource[] = {
 	"    float rs0 = rowScales ? rowScales[r0] : 1.0f, rs1 = rowScales ? rowScales[r1] : 1.0f;\n"
 	"    /* acc[nt * 4 + c]: c0 (row g, query nt*8 + 2t), c1 (g, +1), c2 (row g + 8, 2t), c3 (g + 8, +1) */\n"
 	"#pragma unroll\n"
-	"    for (int j = 0; j < 8; j++)\n"
+	"    for (int j = 0; j < NT * 4; j++)\n"
 	"    {\n"
 	"      int nn = (j >> 2) * 8 + 2 * t + (j & 1);\n"
 	"      unsigned i = (j & 2) ? i1 : i0; bool vr = (j & 2) ? v1 : v0;\n"
@@ -426,14 +430,14 @@ static const char *const BlackwellSource[] = {
 	"    }\n"
 	"  }\n"
 	"}\n",
-	"#define MMA(NAME, QUANT) extern \"C\" __global__ void NAME(const unsigned char *data, \\\n"
+	"#define MMA(NAME, QUANT, NT) extern \"C\" __global__ void NAME(const unsigned char *data, \\\n"
 	"    const unsigned char *scales, const float *rowScales, unsigned rowBytes, unsigned blocks, \\\n"
 	"    const unsigned *rows, unsigned n, const float *queries, int nq, int dims, float *out) \\\n"
-	"{ score_mma<QUANT>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, out); }\n"
-	"MMA(score_mma_nvfp4, 1)\n"
-	"MMA(score_mma_fp8, 2)\n"
-	"MMA(score_mma_half, 3)\n"
-	"MMA(score_mma_float, 4)\n",
+	"{ score_mma<QUANT, NT>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, out); }\n"
+	"MMA(score_mma_nvfp4, 1, 2) MMA(score_mma_nvfp4_32, 1, 4) MMA(score_mma_nvfp4_64, 1, 8)\n"
+	"MMA(score_mma_fp8, 2, 2) MMA(score_mma_fp8_32, 2, 4) MMA(score_mma_fp8_64, 2, 8)\n"
+	"MMA(score_mma_half, 3, 2) MMA(score_mma_half_32, 3, 4) MMA(score_mma_half_64, 3, 8)\n"
+	"MMA(score_mma_float, 4, 2) MMA(score_mma_float_32, 4, 4) MMA(score_mma_float_64, 4, 8)\n",
 	"/*\n"
 	" * Batched top-32 over a [queries][rows] score matrix. Block (slice, q)\n"
 	" * scans its slice of query q's scores: each warp takes 32 scores a step,\n"
@@ -499,8 +503,9 @@ typedef struct BlackwellModule
 	CUfunction	fp8;
 	CUfunction	searchNvfp4;
 	CUfunction	searchFp8;
-	CUfunction	mma[4];			/* [format - 1]: score matrix of up to 16
-								 * queries from NVFP4, FP8, FP16, FP32 rows */
+	CUfunction	mma[4][3];		/* [format - 1][tiles]: score matrix of up to
+								 * 16, 32 or 64 queries from NVFP4, FP8, FP16
+								 * or FP32 rows */
 	CUfunction	select32;		/* batched top-32 over a score matrix */
 	CUfunction	merge32;
 	int			sms;			/* streaming multiprocessors */
@@ -546,6 +551,31 @@ JoinSource(void)
 	return source;
 }
 
+/*
+ * The tensor-core scan in three widths per format: 2, 4 or 8 tiles of 8
+ * queries. The wider ones keep their queries in up to 128 KB of shared
+ * memory, past the 48 KB a launch gets without opting in.
+ */
+static int
+LoadScoreFunctions(BlackwellModule *module)
+{
+	static const char *const formats[] = {"nvfp4", "fp8", "half", "float"};
+	static const char *const widths[] = {"", "_32", "_64"};
+
+	for (int f = 0; f < 4; f++)
+		for (int w = 0; w < 3; w++)
+		{
+			char		name[64];
+
+			snprintf(name, sizeof(name), "score_mma_%s%s", formats[f], widths[w]);
+			if (cuModuleGetFunction(&module->mma[f][w], module->module, name) != CUDA_SUCCESS ||
+				(w > 0 && cuFuncSetAttribute(module->mma[f][w], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+											 ANN_BLACKWELL_SHARED_MAX) != CUDA_SUCCESS))
+				return 0;
+		}
+	return 1;
+}
+
 int
 AnnBlackwellReady(int device)
 {
@@ -581,10 +611,7 @@ AnnBlackwellReady(int device)
 		cuModuleGetFunction(&module->fp8, module->module, "score_fp8") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->searchNvfp4, module->module, "search_nvfp4") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->searchFp8, module->module, "search_fp8") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->mma[0], module->module, "score_mma_nvfp4") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->mma[1], module->module, "score_mma_fp8") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->mma[2], module->module, "score_mma_half") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->mma[3], module->module, "score_mma_float") != CUDA_SUCCESS ||
+		!LoadScoreFunctions(module) ||
 		cuModuleGetFunction(&module->select32, module->module, "select32") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->merge32, module->module, "merge32") != CUDA_SUCCESS ||
 		cudaDeviceGetAttribute(&module->sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
@@ -595,8 +622,8 @@ AnnBlackwellReady(int device)
 	module->state = 1;
 	{
 		/* Register arrays indexed by an unrolled loop must not spill. */
-		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_fp8"};
-		CUfunction	functions[] = {module->searchNvfp4, module->mma[0], module->mma[1]};
+		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_fp8", "score_mma_nvfp4_64"};
+		CUfunction	functions[] = {module->searchNvfp4, module->mma[0][0], module->mma[1][0], module->mma[0][2]};
 
 		for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
 		{
@@ -747,13 +774,29 @@ GetSlot(int device, unsigned slot, unsigned maxBlocks)
 	return sc;
 }
 
+/*
+ * The most queries one grouped scan takes: 64, 32 or 16 as their FP16 copies
+ * fit in shared memory (ANN_BLACKWELL_GROUP caps it, for measurements), 1
+ * when not even 16 do.
+ */
 int
 AnnBlackwellGroupLimit(int dims)
 {
-	/* 16 half queries live in dynamic shared memory next to 3 KB of lists. */
-	int			qstride = (dims + 15) & ~15;
+	static int	cap = 0;
+	size_t		qstride = ((size_t) dims + 15) & ~(size_t) 15;
 
-	return (size_t) 16 * qstride * 2 <= 45 * 1024 ? ANN_BLACKWELL_GROUP_MAX : 1;
+	if (cap == 0)
+	{
+		const char *value = getenv("ANN_BLACKWELL_GROUP");
+
+		cap = value ? atoi(value) : ANN_BLACKWELL_GROUP_MAX;
+		if (cap < 16 || cap > ANN_BLACKWELL_GROUP_MAX)
+			cap = ANN_BLACKWELL_GROUP_MAX;
+	}
+	for (int queries = ANN_BLACKWELL_GROUP_MAX; queries > 16; queries /= 2)
+		if (queries <= cap && queries * qstride * 2 <= ANN_BLACKWELL_SHARED_MAX)
+			return queries;
+	return 16 * qstride * 2 <= 45 * 1024 ? 16 : 1;
 }
 
 int
@@ -827,7 +870,8 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 		unsigned	cap = (unsigned) module->sms / 4 > 1 ? (unsigned) module->sms / 4 : 1;
 		unsigned	slices = (n + 8191) / 8192 < cap ? (n + 8191) / 8192 : cap;
 		unsigned	perSlice;
-		unsigned	shared = (unsigned) (16 * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t));
+		int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
+		unsigned	shared = (unsigned) ((16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t));
 
 		if (slices < 1)
 			slices = 1;
@@ -851,7 +895,7 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 			void	   *selectArgs[] = {&sc->scores, &n, &perSlice, &sc->partD, &sc->partR};
 			void	   *mergeArgs[] = {&sc->partD, &sc->partR, &slices, &sc->outD, &sc->outR};
 
-			if (cuLaunchKernel(module->mma[shard->quant - 1], sgrid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, shared,
+			if (cuLaunchKernel(module->mma[shard->quant - 1][width], sgrid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, shared,
 							   (CUstream) stream, args, NULL) != CUDA_SUCCESS ||
 				cuLaunchKernel(module->select32, slices, nq, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0, (CUstream) stream,
 							   selectArgs, NULL) != CUDA_SUCCESS ||

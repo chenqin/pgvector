@@ -65,7 +65,9 @@ int			AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32
  * (UINT32_MAX past the end) and their quantized distances, ascending.
  */
 #define ANN_BLACKWELL_TOP 32
-#define ANN_BLACKWELL_GROUP_MAX 16
+#define ANN_BLACKWELL_GROUP_MAX 64
+/* Opt-in dynamic shared memory for one scan block's queries. */
+#define ANN_BLACKWELL_SHARED_MAX (160 * 1024)
 int			AnnBlackwellGroupLimit(int dims);
 int			AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, const uint32_t *rows,
 							   unsigned n, const float *queries, unsigned nq, int dims, void *stream);
