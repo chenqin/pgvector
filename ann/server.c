@@ -73,9 +73,9 @@ typedef struct Job
 /*
  * A filter the worker already holds (a cached bitmap's rows, an attribute
  * value's rows), by its shared row arrays: its queued jobs, oldest first,
- * and the lanes working on it. Entries live for the process; a reused
- * pointer means the old filter's jobs are all done, so the entry then
- * stands for the new one.
+ * and the lanes working on it. An entry is freed once no queued or running
+ * search uses it, so cache churn doesn't grow the table; while it exists,
+ * its arrays are referenced by its jobs, so the pointers can't be reused.
  */
 typedef struct FilterEntry
 {
@@ -394,13 +394,47 @@ JobBytes(const Job *job)
 	return (uint64_t) job->job.rows * job->job.dimensions * 4;
 }
 
+/*
+ * Bucket of a filter's arrays. Every pointer bit counts: arrays a thread
+ * allocated under load come from arena chunks whose low bits barely differ,
+ * and a hash of the low bits put hundreds of filters in a few buckets, whose
+ * chains every enqueue then walked under service->mutex.
+ */
+static FilterEntry **
+FilterBucket(Service *service, const void *ordinals, const void *bitsets, uint32_t nfilter)
+{
+	uint64_t	hash = (uint64_t) (uintptr_t) ordinals * UINT64_C(0x9E3779B97F4A7C15) ^
+		(uint64_t) (uintptr_t) bitsets * UINT64_C(0xC2B2AE3D27D4EB4F) ^ nfilter;
+
+	hash ^= hash >> 31;
+	hash *= UINT64_C(0xBF58476D1CE4E5B9);
+	hash ^= hash >> 29;
+	return &service->filters[hash & (ANN_FILTER_BUCKETS - 1)];
+}
+
+/* Drop a filter's entry once no queued or running search uses it. */
+static void
+FilterDone(Service *service, FilterEntry *entry)
+{
+	FilterEntry **link;
+
+	if (entry->queued || entry->active || entry->head)
+		return;
+	for (link = FilterBucket(service, entry->ordinals, entry->bitsets, entry->nfilter); *link;
+		 link = &(*link)->next)
+		if (*link == entry)
+		{
+			*link = entry->next;
+			free(entry);
+			return;
+		}
+}
+
 /* The entry for a shareable job's filter, created on first sight. */
 static FilterEntry *
 FilterFor(Service *service, const Job *job)
 {
-	uintptr_t	hash = ((uintptr_t) job->index.ordinals >> 4) * 0x9E3779B1u ^
-		((uintptr_t) job->index.bitsets >> 4) * 0x85EBCA77u ^ job->index.nfilter;
-	FilterEntry **bucket = &service->filters[hash & (ANN_FILTER_BUCKETS - 1)];
+	FilterEntry **bucket = FilterBucket(service, job->index.ordinals, job->index.bitsets, job->index.nfilter);
 	FilterEntry *entry;
 
 	for (entry = *bucket; entry; entry = entry->next)
@@ -656,6 +690,7 @@ Lane(void *argument)
 			(void) pthread_mutex_lock(&service->mutex);
 			owns->active--;
 			service->activeLanes--;
+			FilterDone(service, owns);
 			if (service->blockedWaiters)
 				(void) pthread_cond_signal(&service->condition);
 			(void) pthread_mutex_unlock(&service->mutex);
@@ -1356,9 +1391,9 @@ PutBitmap(const unsigned char *payload, uint32_t size)
 	}
 
 	/* Keep rows for every filter a scan may take; see SubmitCached. */
-	status = AnnIndexBitmapPut(file, id, bitmap, words, file->device == NULL ? UINT64_MAX :
+	status = AnnIndexBitmapPut(file, id, ANN_BITMAP_PUSHED, bitmap, words, file->device == NULL ? UINT64_MAX :
 							   AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
-							   AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit);
+							   AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit, NULL);
 	AnnIndexPut(file);
 	free(bitmap);
 	return status;
@@ -1405,7 +1440,7 @@ SubmitCached(Service *service, Connection *connection, int rdma, uint64_t reques
 		return ANN_INVALID;
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
-	bitmap = AnnIndexBitmapGet(file, id);
+	bitmap = AnnIndexBitmapGet(file, id, ANN_BITMAP_PUSHED);
 	AnnIndexPut(file);
 	if (bitmap == NULL)
 		return ANN_MISSING;
@@ -1547,7 +1582,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 
 	for (;;)
 	{
-		if ((*result = AnnIndexBitmapGet(file, id)) != NULL)
+		if ((*result = AnnIndexBitmapGet(file, id, ANN_BITMAP_PREDICATE)) != NULL)
 		{
 			/* Not under service->mutex: every search would contend for it. */
 			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
@@ -1605,16 +1640,15 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	}
 
 	/* Keep rows for every filter a scan may take; see SubmitCached. */
+	/* The entry comes back referenced: an eviction meanwhile can't lose it. */
 	status = AnnIndexPredicatePut(file, id, words, nwords, file->device == NULL ? UINT64_MAX :
 								  AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
-								  AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit);
+								  AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit, result);
 	free(words);
 	(void) __atomic_fetch_add(&service->predicate_evaluations, 1, __ATOMIC_RELAXED);
 	(void) __atomic_fetch_add(&service->predicate_eval_us, MicrosecondsSince(&start), __ATOMIC_RELAXED);
 	if (status != ANN_OK)
 		return status;
-	if ((*result = AnnIndexBitmapGet(file, id)) == NULL)
-		return ANN_BACKEND_ERROR;
 	return ANN_OK;
 }
 

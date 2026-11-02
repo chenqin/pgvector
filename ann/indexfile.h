@@ -79,6 +79,7 @@ typedef struct AnnIndexAttribute
 typedef struct AnnIndexBitmap
 {
 	uint64_t	id;
+	int			kind;			/* ANN_BITMAP_PUSHED or ANN_BITMAP_PREDICATE */
 	uint64_t	count;
 	uint32_t   *words;
 	uint32_t   *bitsets[ANN_INDEX_MAX_SHARDS];
@@ -202,7 +203,7 @@ int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t 
  * predicate result is dropped once predicate_cache of them are cached.
  */
 AnnStatus	AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords,
-								 uint64_t expandLimit);
+								 uint64_t expandLimit, AnnIndexBitmap **result);
 
 /* Registry of loaded indexes; lookups take a reference released by Put. */
 AnnStatus	AnnIndexRegister(AnnIndexFile *file);
@@ -224,11 +225,20 @@ AnnStatus	AnnIndexMatch(const AnnIndexFile *file, const char *attribute, const i
  * entry with that id. Filters of at most expandLimit rows also get their
  * ordinals and keys.
  */
-AnnStatus	AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords,
-							  uint64_t expandLimit);
+/*
+ * Pushed filters (operation 20, ids PostgreSQL computes) and predicate
+ * results (operation 22, ids hashed from the program) are separate kinds:
+ * an id names an entry only together with its kind, so a pushed bitmap can
+ * never stand in for a predicate's rows. With result, the new entry comes
+ * back with a reference the caller releases.
+ */
+#define ANN_BITMAP_PUSHED 0
+#define ANN_BITMAP_PREDICATE 1
+AnnStatus	AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
+							  uint64_t expandLimit, AnnIndexBitmap **result);
 
 /* A referenced cached bitmap, or NULL; release it with AnnIndexBitmapRelease. */
-AnnIndexBitmap *AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id);
+AnnIndexBitmap *AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind);
 void		AnnIndexBitmapRelease(AnnIndexFile *file, AnnIndexBitmap *bitmap);
 
 /* Map sorted unique keys to sorted global ordinals; returns the count found. */

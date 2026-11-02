@@ -338,7 +338,8 @@ BitmapBytes(const AnnIndexFile *file, const AnnIndexBitmap *bitmap)
 }
 
 AnnStatus
-AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords, uint64_t expandLimit)
+AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
+				  uint64_t expandLimit, AnnIndexBitmap **result)
 {
 	AnnIndexBitmap *bitmap;
 	AnnIndexBitmap **link;
@@ -353,8 +354,11 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t
 		free(bitmap);
 		return ANN_NOMEM;
 	}
+	if (result)
+		*result = NULL;
 	bitmap->id = id;
-	bitmap->references = 1;
+	bitmap->kind = kind;
+	bitmap->references = result ? 2 : 1;	/* the cache's, and the caller's */
 	memcpy(bitmap->words, words, nwords * 4);
 	if (file->rows % 32)
 		bitmap->words[nwords - 1] &= (UINT32_C(1) << (file->rows % 32)) - 1;
@@ -414,7 +418,7 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t
 
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	for (link = &file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
-		if ((*link)->id == id)
+		if ((*link)->id == id && (*link)->kind == kind)
 		{
 			old = *link;
 			*link = old->next;
@@ -431,6 +435,8 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 	if (old)
 		AnnIndexBitmapRelease(file, old);
+	if (result)
+		*result = bitmap;
 	return ANN_OK;
 }
 
@@ -481,7 +487,7 @@ static int
 SourceBitmap(void *arg, uint64_t id, uint32_t *words)
 {
 	AnnIndexFile *file = arg;
-	AnnIndexBitmap *bitmap = AnnIndexBitmapGet(file, id);
+	AnnIndexBitmap *bitmap = AnnIndexBitmapGet(file, id, ANN_BITMAP_PUSHED);
 
 	if (bitmap == NULL)
 		return 0;
@@ -509,24 +515,30 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 }
 
 AnnStatus
-AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords, uint64_t expandLimit)
+AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords, uint64_t expandLimit,
+					 AnnIndexBitmap **result)
 {
-	AnnStatus	status = AnnIndexBitmapPut(file, id, words, nwords, expandLimit);
+	AnnStatus	status = AnnIndexBitmapPut(file, id, ANN_BITMAP_PREDICATE, words, nwords, expandLimit, result);
 	uint64_t	evicted = 0;
 	int			evict = 0;
+	int			listed = 0;
 	uint32_t	limit = AnnIndexConfig.predicate_cache ? AnnIndexConfig.predicate_cache : 1;
+	AnnIndexBitmap *old = NULL;
 
 	if (status != ANN_OK)
 		return status;
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	if (file->predicates == NULL)
 		file->predicates = calloc(limit, sizeof(uint64_t));
-	if (file->predicates)
+	/* A program cached again (evaluated twice at once) keeps one place. */
+	for (uint32_t i = 0; file->predicates && i < file->npredicates && !listed; i++)
+		listed = file->predicates[i] == id;
+	if (file->predicates && !listed)
 	{
 		if (file->npredicates == limit)
 		{
 			evicted = file->predicates[file->predicateNext];
-			evict = evicted != id;
+			evict = 1;
 		}
 		else
 			file->npredicates++;
@@ -538,31 +550,30 @@ AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, siz
 		AnnIndexBitmap **link;
 
 		for (link = &file->bitmaps[evicted % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
-			if ((*link)->id == evicted)
+			if ((*link)->id == evicted && (*link)->kind == ANN_BITMAP_PREDICATE)
 			{
-				AnnIndexBitmap *old = *link;
-
+				old = *link;
 				*link = old->next;
 				file->nbitmaps--;
 				file->bitmapBytes -= BitmapBytes(file, old);
 				file->bitmapDeviceBytes -= old->deviceBytes;
-				(void) pthread_mutex_unlock(&file->bitmapMutex);
-				AnnIndexBitmapRelease(file, old);
-				return ANN_OK;
+				break;
 			}
 	}
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	if (old)
+		AnnIndexBitmapRelease(file, old);
 	return ANN_OK;
 }
 
 AnnIndexBitmap *
-AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id)
+AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind)
 {
 	AnnIndexBitmap *bitmap;
 
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	for (bitmap = file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS]; bitmap; bitmap = bitmap->next)
-		if (bitmap->id == id)
+		if (bitmap->id == id && bitmap->kind == kind)
 		{
 			bitmap->references++;
 			break;
