@@ -113,7 +113,7 @@ class FrozenTests(unittest.TestCase):
         self.db.execute('RESET session_replication_role')
 
         self.db.execute('VACUUM (FREEZE) docs')
-        self.assertIn('smallint or integer', self.error(f'{ann} INCLUDE (id, body) WITH (frozen = true)'))
+        self.assertIn('date, text or varchar', self.error(f'{ann} INCLUDE (id, emb) WITH (frozen = true)'))
         self.assertIn('smallint, integer or bigint', self.error(f'{ann} INCLUDE (body) WITH (frozen = true)'))
         self.assertIn('partial', self.error(f'{ann} INCLUDE (id) WITH (frozen = true) WHERE tenant = 1'))
         self.assertIn('appears more than once', self.error(f'{ann} INCLUDE (tenant) WITH (frozen = true)'))
@@ -128,7 +128,7 @@ class FrozenTests(unittest.TestCase):
             self.db.execute(f'VACUUM (FREEZE) {table}')
             message = self.error(f'CREATE INDEX ON {table} USING ann (emb vector_l2_ops) '
                                  'INCLUDE (id, tenant) WITH (frozen = true)')
-            self.assertIn({'nullkey': 'NULL keys', 'nullvec': 'NULL vectors', 'reserved': 'reserve'}[table], message)
+            self.assertIn({'nullkey': 'NULL keys', 'nullvec': 'NULL vectors', 'reserved': 'out of range'}[table], message)
         self.db.execute('CREATE UNLOGGED TABLE scratch (LIKE docs)')
         self.db.execute("SELECT ann_freeze('scratch')")
         self.assertIn('permanent table', self.error('CREATE INDEX ON scratch USING ann (emb vector_l2_ops) '
@@ -306,6 +306,93 @@ class FrozenTests(unittest.TestCase):
             expected = [row[0] for row in self.db.execute(statement)]
             self.db.execute('RESET ann.enable_frozen_search')
             self.assertEqual(actual, expected, predicate)
+
+        # Publish the next generation: a new base holding base and delta, swapped in one transaction.
+        self.db.execute('CREATE TABLE base2 AS SELECT * FROM parts')
+        self.db.execute("SELECT ann_freeze('base2')")
+        self.vacuum('base2')
+        self.db.execute('CREATE INDEX base2_ann ON base2 USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, tenant, category) WITH (frozen = true)')
+        statement = "SELECT id FROM parts WHERE tenant = 3 ORDER BY emb <-> '[3,1,4,1]' LIMIT 30"
+        before = [row[0] for row in self.db.execute(statement)]
+        with self.db.transaction():
+            self.db.execute('ALTER TABLE parts DETACH PARTITION base')
+            self.db.execute('ALTER TABLE parts DETACH PARTITION delta')
+            self.db.execute('ALTER TABLE parts ATTACH PARTITION base2 FOR VALUES FROM (0) TO (100000000)')
+            self.db.execute('CREATE TABLE delta2 PARTITION OF parts DEFAULT')
+        self.assertIn('AnnFrozenSearch) on base2', self.plan(statement))
+        self.assertEqual([row[0] for row in self.db.execute(statement)], before)
+        self.db.execute('DROP TABLE base, delta')
+        self.assertEqual(self.value("SELECT count(*) FROM pg_trigger t JOIN pg_class c ON c.oid = t.tgrelid "
+                                    "WHERE c.relname = 'base' AND c.relnamespace = %s::regnamespace",
+                                    (self.schema,)), 0)
+
+    def test_bool_date_bigint_attributes(self):
+        self.db.execute('CREATE TABLE typed (id bigint, flag boolean, day date, big bigint, emb vector(4))')
+        self.db.execute("""INSERT INTO typed SELECT i * 5, CASE WHEN i % 9 = 0 THEN NULL ELSE i % 3 = 0 END,
+                               CASE WHEN i % 13 = 0 THEN NULL ELSE date '2024-01-01' + (i % 90) END,
+                               CASE WHEN i % 17 = 0 THEN NULL ELSE i % 11 END,
+                               ARRAY[sin(i) * 50, cos(i * 1.3) * 40, sin(i * 0.7) * 30, i % 5]::vector
+                           FROM generate_series(1, 2000) i""")
+        self.db.execute("SELECT ann_freeze('typed')")
+        self.vacuum('typed')
+        self.db.execute('CREATE INDEX typed_ann ON typed USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, flag, day, big) WITH (frozen = true)')
+        for predicate in ['flag', 'NOT flag', 'flag IS NOT TRUE', 'flag IS UNKNOWN', 'flag IS NOT FALSE',
+                          'flag = false', "day >= '2024-03-01'", "day <> '2024-01-05'",
+                          "day BETWEEN '2024-01-10' AND '2024-02-01' AND flag", 'big IN (5, 7)',
+                          'big > 1000', 'NOT (big < 4 OR flag)', 'day IS NULL OR big = 0']:
+            eligible, bitmap = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                               ('typed_ann', predicate)).fetchone()
+            expected = [row[0] for row in self.db.execute(f'SELECT id FROM typed WHERE {predicate} ORDER BY id')]
+            self.assertEqual(self.bitmap_rows(bytes(bitmap)), expected, predicate)
+            self.assertEqual(eligible, len(expected), predicate)
+            statement = f"SELECT id, flag, day, big FROM typed WHERE {predicate} ORDER BY emb <-> '[1,2,3,4]' LIMIT 15"
+            plan = self.plan(statement)
+            self.assertIn('AnnFrozenSearch', plan, predicate)
+            actual = self.db.execute(statement).fetchall()
+            self.db.execute('SET ann.enable_frozen_search = off')
+            self.assertEqual(actual, self.db.execute(statement).fetchall(), predicate)
+            self.db.execute('RESET ann.enable_frozen_search')
+        self.db.execute('CREATE TABLE wide (id bigint, big bigint, emb vector(4))')
+        self.db.execute("INSERT INTO wide VALUES (1, 5000000000, '[1,2,3,4]')")
+        self.db.execute("SELECT ann_freeze('wide')")
+        self.vacuum('wide')
+        self.assertIn('out of range', self.error('CREATE INDEX ON wide USING ann (emb vector_l2_ops) '
+                                                 'INCLUDE (id, big) WITH (frozen = true)'))
+
+    def test_text_attributes(self):
+        self.db.execute('CREATE TABLE named (id bigint, label text, code varchar(8) COLLATE "C", emb vector(4))')
+        self.db.execute("""INSERT INTO named SELECT i * 5,
+                               CASE WHEN i % 10 = 0 THEN NULL ELSE (ARRAY['apple', 'Banana', 'cherry', 'date',
+                                   'Éclair', 'fig', 'grape'])[1 + i % 7] END,
+                               CASE WHEN i % 15 = 0 THEN NULL ELSE 'c' || (i % 23) END,
+                               ARRAY[sin(i) * 50, cos(i * 1.3) * 40, sin(i * 0.7) * 30, i % 5]::vector
+                           FROM generate_series(1, 2000) i""")
+        self.db.execute("SELECT ann_freeze('named')")
+        self.vacuum('named')
+        self.db.execute('CREATE INDEX named_ann ON named USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, label, code) WITH (frozen = true)')
+        self.assertEqual(self.value("SELECT distinct_values FROM ann_frozen_info('named_ann')"), [8, 24])
+        for predicate in ["label = 'cherry'", "label <> 'fig'", "label = 'missing'", "label <> 'missing'",
+                          "label IN ('apple', 'grape', 'zzz')", "label NOT IN ('apple', 'Banana')",
+                          "label < 'cherry'", "label >= 'date'", "label BETWEEN 'b' AND 'e'", 'label IS NULL',
+                          "code = 'c7'", "code > 'c19' AND label IS NOT NULL", "NOT (code < 'c3' OR label = 'fig')",
+                          "code IN ('c1', 'c22', 'c99')"]:
+            eligible, bitmap = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                               ('named_ann', predicate)).fetchone()
+            expected = [row[0] for row in self.db.execute(f'SELECT id FROM named WHERE {predicate} ORDER BY id')]
+            self.assertEqual(self.bitmap_rows(bytes(bitmap)), expected, predicate)
+            self.assertEqual(eligible, len(expected), predicate)
+            statement = f"SELECT id, label, code FROM named WHERE {predicate} ORDER BY emb <-> '[1,2,3,4]' LIMIT 12"
+            self.assertIn('AnnFrozenSearch', self.plan(statement), predicate)
+            actual = self.db.execute(statement).fetchall()
+            self.db.execute('SET ann.enable_frozen_search = off')
+            self.assertEqual(actual, self.db.execute(statement).fetchall(), predicate)
+            self.db.execute('RESET ann.enable_frozen_search')
+        # Another collation orders strings differently: not translated.
+        plan = self.plan("SELECT id FROM named WHERE label < 'cherry' COLLATE \"C\" ORDER BY emb <-> '[1,2,3,4]' LIMIT 3")
+        self.assertNotIn('AnnFrozenSearch', plan)
 
     def load(self, server, name, table='docs'):
         export = os.path.join(self.directory.name, name + '-export')

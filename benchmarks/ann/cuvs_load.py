@@ -52,6 +52,19 @@ WORKLOADS = {
     # Skewed traffic: a few hot filters, as broad filters tend to be.
     'bitmap-10pct-hot3': "SELECT id FROM ann_bitmap_search(:idx, :v::vector, 10, 'category / 10 = ' || :h);",
     'bitmap-1pct-hot10': "SELECT id FROM ann_bitmap_search(:idx, :v::vector, 10, 'category = ' || :c10);",
+    # Plain SQL over a table with a frozen ann index: the planner's frozen
+    # route turns the WHERE clause into a predicate program the GPU node
+    # evaluates and caches (operation 22).
+    'frozen-ann': "SELECT id FROM {table} ORDER BY emb <-> :v::vector LIMIT 10;",
+    'frozen-0.1pct': "SELECT id FROM {table} WHERE tenant = :t ORDER BY emb <-> :v::vector LIMIT 10;",
+    'frozen-1pct': "SELECT id FROM {table} WHERE category = :c ORDER BY emb <-> :v::vector LIMIT 10;",
+    'frozen-10pct': ("SELECT id FROM {table} WHERE category BETWEEN :d * 10 AND :d * 10 + 9 "
+                     "ORDER BY emb <-> :v::vector LIMIT 10;"),
+    'frozen-10pct-hot3': ("SELECT id FROM {table} WHERE category BETWEEN :h * 10 AND :h * 10 + 9 "
+                          "ORDER BY emb <-> :v::vector LIMIT 10;"),
+    # 5%: a 10% tenant range and half the categories.
+    'frozen-and': ("SELECT id FROM {table} WHERE tenant BETWEEN :d * 100 AND :d * 100 + 99 AND category < 50 "
+                   "ORDER BY emb <-> :v::vector LIMIT 10;"),
 }
 
 

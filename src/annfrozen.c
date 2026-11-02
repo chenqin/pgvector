@@ -6,6 +6,8 @@
 #include "access/xloginsert.h"
 #include "ann.h"
 #include "ann/filter.h"
+#include "access/stratnum.h"
+#include "catalog/pg_opfamily_d.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_trigger.h"
 #include "catalog/pg_type_d.h"
@@ -24,6 +26,7 @@
 #include "utils/rls.h"
 #include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
+#include "utils/varlena.h"
 
 /* Bytes of a page's contents available to array elements. */
 #define ANN_ARRAY_SPACE (BLCKSZ - MAXALIGN(SizeOfPageHeaderData) - MAXALIGN(sizeof(AnnPageOpaqueData)))
@@ -348,19 +351,78 @@ AnnArrayReaderEnd(AnnArrayReader *reader)
 bool
 AnnIsFrozen(Relation index)
 {
-	Buffer		buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
-	bool		frozen;
+	return AnnFrozenMeta(index) != NULL;
+}
 
-	LockBuffer(buf, BUFFER_LOCK_SHARE);
-	AnnCheckMetaPage(BufferGetPage(buf));
-	frozen = AnnVersionFrozen(AnnPageGetMeta(BufferGetPage(buf))->version);
-	UnlockReleaseBuffer(buf);
-	return frozen;
+/*
+ * A frozen index never changes after its build, so its metadata and the
+ * description of its predicate columns are kept with the relcache entry
+ * (rd_amcache, freed when the entry is invalidated, as by REINDEX).
+ */
+typedef struct AnnIndexCache
+{
+	AnnFrozenMetaData *meta;	/* NULL for a mutable index */
+	bool		columnsReady;
+	AnnPredicateColumns columns;
+} AnnIndexCache;
+
+static AnnFrozenMetaData *ReadFrozenMeta(Relation index);
+
+static AnnIndexCache *
+IndexCache(Relation index)
+{
+	if (index->rd_amcache == NULL)
+	{
+		MemoryContext oldCtx = MemoryContextSwitchTo(index->rd_indexcxt);
+		AnnIndexCache *cache = palloc0(sizeof(AnnIndexCache));
+
+		cache->meta = ReadFrozenMeta(index);
+		MemoryContextSwitchTo(oldCtx);
+		index->rd_amcache = cache;
+	}
+	return (AnnIndexCache *) index->rd_amcache;
+}
+
+/* The cached frozen metadata (read-only), or NULL for a mutable index. */
+AnnFrozenMetaData *
+AnnFrozenMeta(Relation index)
+{
+	return IndexCache(index)->meta;
+}
+
+/* The cached predicate columns slot; *ready says whether it is filled. */
+AnnPredicateColumns *
+AnnFrozenColumnsCache(Relation index, bool **ready)
+{
+	AnnIndexCache *cache = IndexCache(index);
+
+	*ready = &cache->columnsReady;
+	return &cache->columns;
 }
 
 /* A copy of the frozen metadata; NULL for a mutable index when missingOk. */
 AnnFrozenMetaData *
 AnnFrozenGetMeta(Relation index, bool missingOk)
+{
+	AnnFrozenMetaData *cached = AnnFrozenMeta(index);
+	AnnFrozenMetaData *meta = NULL;
+
+	if (cached)
+	{
+		meta = palloc(AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
+		memcpy(meta, cached, AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
+	}
+	else if (!missingOk)
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a frozen ann index", RelationGetRelationName(index)),
+				 errhint("Create it WITH (frozen = true).")));
+	return meta;
+}
+
+/* The metapage's frozen metadata, or NULL; allocated in the current context. */
+static AnnFrozenMetaData *
+ReadFrozenMeta(Relation index)
 {
 	Buffer		buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
 	Page		page;
@@ -380,12 +442,23 @@ AnnFrozenGetMeta(Relation index, bool missingOk)
 		memcpy(meta, stored, bitsets ? AnnFrozenMetaSize(stored->ncolumns) : AnnFrozenMetaSizeV2(stored->ncolumns));
 	}
 	UnlockReleaseBuffer(buf);
-	if (meta == NULL && !missingOk)
-		ereport(ERROR,
-				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				 errmsg("\"%s\" is not a frozen ann index", RelationGetRelationName(index)),
-				 errhint("Create it WITH (frozen = true).")));
 	return meta;
+}
+
+/*
+ * Collation of an index column (0-based) from its table column: INCLUDE
+ * columns have no collation in the index itself.
+ */
+Oid
+AnnFrozenColumnCollation(Relation index, int column)
+{
+	Oid			type;
+	int32		typmod;
+	Oid			collation;
+
+	get_atttypetypmodcoll(index->rd_index->indrelid, index->rd_index->indkey.values[column],
+						  &type, &typmod, &collation);
+	return collation;
 }
 
 /* Current table column name of an index column (1-based). */
@@ -405,6 +478,8 @@ typedef struct FrozenBuildState
 	int			ncolumns;		/* INCLUDE columns after the key */
 	int			bitsetMin;		/* reloption: bitset pages from this many rows */
 	Oid			keyType;
+	bool		text[ANN_FROZEN_MAX_COLUMNS];	/* dictionary-coded columns */
+	Oid			collations[ANN_FROZEN_MAX_COLUMNS];
 	TupleDesc	sortDesc;
 	TupleTableSlot *slot;
 	Tuplesortstate *sort;
@@ -422,19 +497,125 @@ KeyValue(Datum value, Oid type)
 	return DatumGetInt64(value);
 }
 
-static int32
-AttributeValue(Datum value, bool isnull, Oid type)
+bool
+AnnFrozenAttributeType(Oid type)
 {
-	int32		result;
+	return type == INT2OID || type == INT4OID || type == INT8OID || type == BOOLOID || type == DATEOID ||
+		AnnFrozenTextType(type);
+}
+
+/* A text column's string for a code, as a text datum. */
+Datum
+AnnFrozenTextDatum(Relation index, const AnnFrozenMetaData *meta, int column, int32 code)
+{
+	const AnnFrozenColumnExtra *extra = &AnnFrozenGetExtra(meta)[column];
+	AnnArrayReader starts;
+	AnnArrayReader strings;
+	uint32		range[2];
+	text	   *result;
+
+	AnnArrayReaderInit(&starts, index, &extra->starts, NULL);
+	AnnArrayReaderInit(&strings, index, &extra->strings, NULL);
+	AnnArrayReadRange(&starts, (uint64) code, 2, range);
+	result = palloc(VARHDRSZ + range[1] - range[0]);
+	SET_VARSIZE(result, VARHDRSZ + range[1] - range[0]);
+	if (range[1] > range[0])
+		AnnArrayReadRange(&strings, range[0], range[1] - range[0], VARDATA(result));
+	AnnArrayReaderEnd(&starts);
+	AnnArrayReaderEnd(&strings);
+	return PointerGetDatum(result);
+}
+
+/*
+ * First code whose string sorts at or after the value (after it when
+ * upper), in the column's collation: a binary search over the dictionary.
+ */
+int64
+AnnFrozenTextSearch(Relation index, const AnnFrozenMetaData *meta, int column, Oid collation,
+					text *value, bool upper)
+{
+	const AnnFrozenColumnExtra *extra = &AnnFrozenGetExtra(meta)[column];
+	AnnArrayReader starts;
+	AnnArrayReader strings;
+	int64		low = 0;
+	int64		high = extra->starts.count > 0 ? (int64) extra->starts.count - 1 : 0;
+	char	   *buffer = NULL;
+	uint32		capacity = 0;
+
+	AnnArrayReaderInit(&starts, index, &extra->starts, NULL);
+	AnnArrayReaderInit(&strings, index, &extra->strings, NULL);
+	while (low < high)
+	{
+		int64		middle = low + (high - low) / 2;
+		uint32		range[2];
+		int			cmp;
+
+		AnnArrayReadRange(&starts, middle, 2, range);
+		if (range[1] - range[0] > capacity)
+		{
+			capacity = Max(range[1] - range[0], 64);
+			buffer = buffer ? repalloc(buffer, capacity) : palloc(capacity);
+		}
+		if (range[1] > range[0])
+			AnnArrayReadRange(&strings, range[0], range[1] - range[0], buffer);
+		cmp = varstr_cmp(buffer ? buffer : "", range[1] - range[0], VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value),
+						 collation);
+		if (cmp < 0 || (upper && cmp == 0))
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	AnnArrayReaderEnd(&starts);
+	AnnArrayReaderEnd(&strings);
+	return low;
+}
+
+/* The int32 an attribute stores: the integer, 0/1 for bool, days for date. */
+int32
+AnnFrozenAttributeValue(Datum value, bool isnull, Oid type)
+{
+	int64		result;
 
 	if (isnull)
 		return ANN_FROZEN_NULL;
-	result = type == INT2OID ? DatumGetInt16(value) : DatumGetInt32(value);
-	if (result == ANN_FROZEN_NULL)
+	switch (type)
+	{
+		case INT2OID:
+			result = DatumGetInt16(value);
+			break;
+		case INT8OID:
+			result = DatumGetInt64(value);
+			break;
+		case BOOLOID:
+			result = DatumGetBool(value) ? 1 : 0;
+			break;
+		default:
+			result = DatumGetInt32(value);	/* integer, date */
+			break;
+	}
+	if (result <= ANN_FROZEN_NULL || result > PG_INT32_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
-				 errmsg("frozen ann indexes reserve the value %d for NULL", ANN_FROZEN_NULL)));
-	return result;
+				 errmsg("frozen ann index attribute value " INT64_FORMAT " is out of range", result),
+				 errdetail("Attributes hold values above %d; %d stands for NULL, and -infinity dates are not stored.",
+						   ANN_FROZEN_NULL, ANN_FROZEN_NULL)));
+	return (int32) result;
+}
+
+Datum
+AnnFrozenAttributeDatum(int32 value, Oid type)
+{
+	switch (type)
+	{
+		case INT2OID:
+			return Int16GetDatum((int16) value);
+		case INT8OID:
+			return Int64GetDatum((int64) value);
+		case BOOLOID:
+			return BoolGetDatum(value != 0);
+		default:
+			return Int32GetDatum(value);
+	}
 }
 
 /* Key, heap TID, vector and attributes of each row, sorted by key. */
@@ -464,10 +645,20 @@ FrozenBuildCallback(Relation index, ItemPointer tid, Datum *values, bool *isnull
 	slot->tts_values[1] = Int64GetDatum(((int64) ItemPointerGetBlockNumber(tid) << 16) |
 										ItemPointerGetOffsetNumber(tid));
 	slot->tts_values[2] = PointerGetDatum(vector);
-	for (int c = 0; c < bs->ncolumns; c++)
-		slot->tts_values[3 + c] = Int32GetDatum(AttributeValue(values[2 + c], isnull[2 + c],
-															   TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid));
 	memset(slot->tts_isnull, 0, sizeof(bool) * (3 + bs->ncolumns));
+	for (int c = 0; c < bs->ncolumns; c++)
+	{
+		if (bs->text[c])
+		{
+			/* Text goes through the sort; its code is assigned afterwards. */
+			slot->tts_isnull[3 + c] = isnull[2 + c];
+			slot->tts_values[3 + c] = isnull[2 + c] ? (Datum) 0 :
+				PointerGetDatum(PG_DETOAST_DATUM_PACKED(values[2 + c]));
+		}
+		else
+			slot->tts_values[3 + c] = Int32GetDatum(AnnFrozenAttributeValue(values[2 + c], isnull[2 + c],
+																			TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid));
+	}
 	ExecStoreVirtualTuple(slot);
 	tuplesort_puttupleslot(bs->sort, slot);
 	bs->rows++;
@@ -512,10 +703,16 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 	for (int i = 2; i < desc->natts; i++)
 	{
 		type = TupleDescAttr(desc, i)->atttypid;
-		if (type != INT2OID && type != INT4OID)
+		if (AnnFrozenTextType(type) && OidIsValid(AnnFrozenColumnCollation(index, i)) &&
+			!get_collation_isdeterministic(AnnFrozenColumnCollation(index, i)))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("text INCLUDE column \"%s\" of a frozen ann index needs a deterministic collation",
+							NameStr(TupleDescAttr(desc, i)->attname))));
+		if (!AnnFrozenAttributeType(type))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("INCLUDE column \"%s\" of a frozen ann index must be smallint or integer",
+					 errmsg("INCLUDE column \"%s\" of a frozen ann index must be smallint, integer, bigint, boolean, date, text or varchar",
 							NameStr(TupleDescAttr(desc, i)->attname))));
 	}
 	guard = FindGuard(heap);
@@ -568,7 +765,7 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
  * value, then the distinct values and where each one's postings start.
  */
 static void
-WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, AnnFrozenBitsets *bitsets,
+WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, AnnFrozenColumnExtra *bitsets,
 			  int64 bitsetMin, uint64 rows)
 {
 	ArrayWriter postings;
@@ -681,6 +878,88 @@ WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, Ann
 }
 
 /*
+ * A text column from its (string, ordinal) sort in the column's collation:
+ * distinct strings get codes 0, 1, ... in that order (NULL stays
+ * ANN_FROZEN_NULL), so ranges of strings are ranges of codes. Writes the
+ * strings and their offsets, fills the reserved value pages with each
+ * row's code, and feeds the codes to the column's postings sort.
+ */
+static void
+WriteDictionary(Relation index, TupleDesc textDesc, Tuplesortstate *textSort, Tuplesortstate *sort,
+				AnnFrozenColumn *column, AnnFrozenColumnExtra *extra, uint64 rows)
+{
+	TupleTableSlot *slot = MakeSingleTupleTableSlot(textDesc, &TTSOpsMinimalTuple);
+	int32	   *codes = MemoryContextAllocHuge(CurrentMemoryContext, Max(rows, 1) * sizeof(int32));
+	uint64		capacity = 1024;
+	uint32	   *starts = palloc(capacity * sizeof(uint32));
+	uint64		nstrings = 0;
+	uint64		bytes = 0;
+	text	   *previous = NULL;
+	ArrayWriter writer;
+
+	tuplesort_performsort(textSort);
+	InitArray(&extra->strings, 1, 0);
+	WriterBegin(&writer, index, &extra->strings, false);
+	while (tuplesort_gettupleslot(textSort, true, true, slot, NULL))
+	{
+		bool		isnull;
+		Datum		value = slot_getattr(slot, 1, &isnull);
+		uint64		ordinal = (uint64) DatumGetInt64(slot_getattr(slot, 2, &isnull));
+		text	   *string;
+		int			length;
+
+		CHECK_FOR_INTERRUPTS();
+		if (slot_attisnull(slot, 1))
+		{
+			codes[ordinal] = ANN_FROZEN_NULL;
+			continue;
+		}
+		string = DatumGetTextPP(value);
+		length = VARSIZE_ANY_EXHDR(string);
+		if (previous == NULL || VARSIZE_ANY_EXHDR(previous) != length ||
+			memcmp(VARDATA_ANY(previous), VARDATA_ANY(string), length) != 0)
+		{
+			if (nstrings + 1 >= capacity)
+			{
+				capacity *= 2;
+				starts = repalloc_huge(starts, capacity * sizeof(uint32));
+			}
+			if (bytes + length > PG_UINT32_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("frozen ann index text dictionaries hold at most 4 GB")));
+			starts[nstrings++] = (uint32) bytes;
+			for (int i = 0; i < length; i++)
+				*WriterNext(&writer) = VARDATA_ANY(string)[i];
+			bytes += length;
+			if (previous)
+				pfree(previous);
+			previous = (text *) PG_DETOAST_DATUM_COPY(PointerGetDatum(string));
+		}
+		codes[ordinal] = (int32) (nstrings - 1);
+	}
+	WriterEnd(&writer);
+	starts[nstrings] = (uint32) bytes;
+	InitArray(&extra->starts, sizeof(uint32), 0);
+	WriterBegin(&writer, index, &extra->starts, false);
+	for (uint64 i = 0; i <= nstrings; i++)
+		memcpy(WriterNext(&writer), &starts[i], sizeof(uint32));
+	WriterEnd(&writer);
+
+	/* Codes per row into the reserved value pages, and to the postings. */
+	WriterBegin(&writer, index, &column->values, true);
+	for (uint64 i = 0; i < rows; i++)
+	{
+		memcpy(WriterNext(&writer), &codes[i], sizeof(int32));
+		tuplesort_putdatum(sort, Int64GetDatum((int64) codes[i] * INT64CONST(4294967296) + (int64) i), false);
+	}
+	WriterEnd(&writer);
+	ExecDropSingleTupleTableSlot(slot);
+	pfree(codes);
+	pfree(starts);
+}
+
+/*
  * Lay out the sorted rows: TIDs, keys and attribute values fill reserved
  * pages side by side while vectors are appended after them; each attribute's
  * inverted index follows. The generation hashes every key, vector and value
@@ -695,6 +974,9 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	ArrayWriter vectors;
 	ArrayWriter *values = palloc0(sizeof(ArrayWriter) * Max(bs->ncolumns, 1));
 	Tuplesortstate **sorts = palloc0(sizeof(Tuplesortstate *) * Max(bs->ncolumns, 1));
+	Tuplesortstate **textSorts = palloc0(sizeof(Tuplesortstate *) * Max(bs->ncolumns, 1));
+	TupleDesc	textDesc;
+	TupleTableSlot *textSlot;
 	int			workMem = Max(maintenance_work_mem / Max(bs->ncolumns, 1), 1024);
 	uint32		header[2] = {bs->dims, bs->ncolumns};
 	uint64		hash = hash_bytes_extended((const unsigned char *) header, sizeof(header), ANN_FROZEN_SEED);
@@ -705,11 +987,31 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	InitArray(&meta->keys, sizeof(int64), bs->rows);
 	ReserveArray(index, &meta->tids);
 	ReserveArray(index, &meta->keys);
+	textDesc = CreateTemplateTupleDesc(2);
+	TupleDescInitEntry(textDesc, 1, "value", TEXTOID, -1, 0);
+	TupleDescInitEntry(textDesc, 2, "ordinal", INT8OID, -1, 0);
+#if PG_VERSION_NUM >= 190000
+	TupleDescFinalize(textDesc);
+#endif
+	textSlot = MakeSingleTupleTableSlot(textDesc, &TTSOpsVirtual);
 	for (int c = 0; c < bs->ncolumns; c++)
 	{
 		InitArray(&meta->columns[c].values, sizeof(int32), bs->rows);
 		ReserveArray(index, &meta->columns[c].values);
-		WriterBegin(&values[c], index, &meta->columns[c].values, true);
+		if (!bs->text[c])
+			WriterBegin(&values[c], index, &meta->columns[c].values, true);
+		else
+		{
+			/* (string, ordinal) in the column's collation, NULLs first */
+			AttrNumber	attNums[2] = {1, 2};
+			Oid			operators[2] = {get_opfamily_member(TEXT_BTREE_FAM_OID, TEXTOID, TEXTOID,
+															BTLessStrategyNumber), Int8LessOperator};
+			Oid			collations[2] = {bs->collations[c], InvalidOid};
+			bool		nullsFirst[2] = {true, false};
+
+			textSorts[c] = tuplesort_begin_heap(textDesc, 2, attNums, operators, collations, nullsFirst,
+												workMem, NULL, false);
+		}
 		sorts[c] = tuplesort_begin_datum(INT8OID, Int8LessOperator, InvalidOid, false,
 										 workMem, NULL, false);
 	}
@@ -742,7 +1044,29 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 		hash = hash_bytes_extended((const unsigned char *) vector->x, sizeof(float) * bs->dims, hash);
 		for (int c = 0; c < bs->ncolumns; c++)
 		{
-			row[c] = DatumGetInt32(slot_getattr(slot, 4 + c, &isnull));
+			Datum		value = slot_getattr(slot, 4 + c, &isnull);
+
+			if (bs->text[c])
+			{
+				/* Hash the string; it gets its code from the collation sort. */
+				ExecClearTuple(textSlot);
+				textSlot->tts_values[0] = value;
+				textSlot->tts_isnull[0] = isnull;
+				textSlot->tts_values[1] = Int64GetDatum((int64) ordinal);
+				textSlot->tts_isnull[1] = false;
+				ExecStoreVirtualTuple(textSlot);
+				tuplesort_puttupleslot(textSorts[c], textSlot);
+				row[c] = isnull ? ANN_FROZEN_NULL : 0;
+				if (!isnull)
+				{
+					text	   *string = DatumGetTextPP(value);
+
+					hash = hash_bytes_extended((const unsigned char *) VARDATA_ANY(string),
+											   VARSIZE_ANY_EXHDR(string), hash);
+				}
+				continue;
+			}
+			row[c] = DatumGetInt32(value);
 			memcpy(WriterNext(&values[c]), &row[c], sizeof(int32));
 			/* value * 2^32 + ordinal sorts by value, then ordinal */
 			tuplesort_putdatum(sorts[c], Int64GetDatum((int64) row[c] * INT64CONST(4294967296) + (int64) ordinal),
@@ -759,13 +1083,22 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	WriterEnd(&keys);
 	WriterEnd(&vectors);
 	for (int c = 0; c < bs->ncolumns; c++)
-		WriterEnd(&values[c]);
+		if (!bs->text[c])
+			WriterEnd(&values[c]);
 	ExecDropSingleTupleTableSlot(slot);
+	for (int c = 0; c < bs->ncolumns; c++)
+		if (bs->text[c])
+		{
+			WriteDictionary(index, textDesc, textSorts[c], sorts[c], &meta->columns[c],
+							&AnnFrozenGetExtra(meta)[c], ordinal);
+			tuplesort_end(textSorts[c]);
+		}
+	ExecDropSingleTupleTableSlot(textSlot);
 	meta->rows = ordinal;
 	meta->generation = hash_bytes_extended((const unsigned char *) &ordinal, sizeof(ordinal), hash);
 	for (int c = 0; c < bs->ncolumns; c++)
 	{
-		WritePostings(index, sorts[c], &meta->columns[c], &AnnFrozenGetBitsets(meta)[c],
+		WritePostings(index, sorts[c], &meta->columns[c], &AnnFrozenGetExtra(meta)[c],
 					  bs->bitsetMin < 0 ? Max(ordinal / 32, 1) : Max(bs->bitsetMin, 1), ordinal);
 		tuplesort_end(sorts[c]);
 	}
@@ -815,7 +1148,11 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	TupleDescInitEntry(bs.sortDesc, 2, "tid", INT8OID, -1, 0);
 	TupleDescInitEntry(bs.sortDesc, 3, "vector", AnnVectorTypeOid(), -1, 0);
 	for (int c = 0; c < bs.ncolumns; c++)
-		TupleDescInitEntry(bs.sortDesc, 4 + c, "value", INT4OID, -1, 0);
+	{
+		bs.text[c] = AnnFrozenTextType(TupleDescAttr(indexDesc, 2 + c)->atttypid);
+		bs.collations[c] = AnnFrozenColumnCollation(index, 2 + c);
+		TupleDescInitEntry(bs.sortDesc, 4 + c, "value", bs.text[c] ? TEXTOID : INT4OID, -1, 0);
+	}
 #if PG_VERSION_NUM >= 190000
 	TupleDescFinalize(bs.sortDesc);
 #endif
@@ -851,7 +1188,7 @@ typedef struct FrozenSource
 {
 	Relation	index;
 	const AnnFrozenMetaData *meta;
-	const AnnFrozenBitsets *bitsets;
+	const AnnFrozenColumnExtra *bitsets;
 	const char *names[ANN_FROZEN_MAX_COLUMNS];
 	AnnArrayReader dict[ANN_FROZEN_MAX_COLUMNS];
 	AnnArrayReader offsets[ANN_FROZEN_MAX_COLUMNS];
@@ -907,7 +1244,7 @@ static int
 SourceBitset(void *arg, int column, uint64_t i, uint32_t *words)
 {
 	FrozenSource *source = arg;
-	const AnnFrozenBitsets *bitsets = &source->bitsets[column];
+	const AnnFrozenColumnExtra *bitsets = &source->bitsets[column];
 	uint64		nwords = (source->meta->rows + 31) / 32;
 	int64		low = 0;
 	int64		high = (int64) bitsets->codes.count - 1;
@@ -957,7 +1294,7 @@ AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned 
 
 	state->index = index;
 	state->meta = meta;
-	state->bitsets = AnnFrozenGetBitsets(meta);
+	state->bitsets = AnnFrozenGetExtra(meta);
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 	{
 		state->names[c] = AnnFrozenColumnName(index, 3 + c);

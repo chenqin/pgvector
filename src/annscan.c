@@ -178,8 +178,11 @@ ReturnColumns(IndexScanDesc scan, uint64 ordinal)
 
 		AnnArrayRead(&so->columns[c], ordinal, &value);
 		isnull[2 + c] = value == ANN_FROZEN_NULL;
-		values[2 + c] = TupleDescAttr(desc, 2 + c)->atttypid == INT2OID ?
-			Int16GetDatum((int16) value) : Int32GetDatum(value);
+		if (AnnFrozenTextType(TupleDescAttr(desc, 2 + c)->atttypid))
+			values[2 + c] = isnull[2 + c] ? (Datum) 0 :
+				AnnFrozenTextDatum(scan->indexRelation, so->meta, c, value);
+		else
+			values[2 + c] = AnnFrozenAttributeDatum(value, TupleDescAttr(desc, 2 + c)->atttypid);
 	}
 	scan->xs_hitup = heap_form_tuple(desc, values, isnull);
 	scan->xs_hitupdesc = desc;

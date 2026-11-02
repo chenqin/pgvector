@@ -11,6 +11,7 @@
 #include "nodes/extensible.h"
 #include "storage/bufmgr.h"
 #include "utils/rel.h"
+#include "catalog/pg_type_d.h"
 #include "vector.h"
 
 #define ANN_MAGIC_NUMBER 0xA991A991
@@ -74,12 +75,19 @@ typedef struct AnnFrozenColumn
 	AnnArray	offsets;		/* uint32 per value plus one: its postings */
 } AnnFrozenColumn;
 
-/* Prebuilt bitsets of a column's most frequent values (version 3). */
-typedef struct AnnFrozenBitsets
+/*
+ * Version 3 directory per column: prebuilt bitsets of its most frequent
+ * values, and for text columns the dictionary its int32 codes index.
+ */
+typedef struct AnnFrozenColumnExtra
 {
 	AnnArray	codes;			/* uint32 distinct-value positions, ascending */
 	AnnArray	words;			/* (rows + 31) / 32 uint32 words per code */
-} AnnFrozenBitsets;
+	AnnArray	strings;		/* text: the distinct strings' bytes, in
+								 * collation order (code 0 first) */
+	AnnArray	starts;			/* text: uint32 offset of each code's string,
+								 * plus the end */
+} AnnFrozenColumnExtra;
 
 typedef struct AnnFrozenMetaData
 {
@@ -100,9 +108,9 @@ typedef struct AnnFrozenMetaData
 #define AnnFrozenMetaSizeV2(ncolumns) \
 	(offsetof(AnnFrozenMetaData, columns) + (ncolumns) * sizeof(AnnFrozenColumn))
 #define AnnFrozenMetaSize(ncolumns) \
-	(AnnFrozenMetaSizeV2(ncolumns) + (ncolumns) * sizeof(AnnFrozenBitsets))
-/* The bitset directory follows the columns. */
-#define AnnFrozenGetBitsets(meta) ((AnnFrozenBitsets *) &(meta)->columns[(meta)->ncolumns])
+	(AnnFrozenMetaSizeV2(ncolumns) + (ncolumns) * sizeof(AnnFrozenColumnExtra))
+/* The extra directory follows the columns. */
+#define AnnFrozenGetExtra(meta) ((AnnFrozenColumnExtra *) &(meta)->columns[(meta)->ncolumns])
 
 /* Sequential reads of an array, one pinned page at a time. */
 typedef struct AnnArrayReader
@@ -163,6 +171,7 @@ void		AnnInitOptions(void);
 bool		AnnFrozenOption(Relation index);
 bool		AnnIsFrozen(Relation index);
 AnnFrozenMetaData *AnnFrozenGetMeta(Relation index, bool missingOk);
+AnnFrozenMetaData *AnnFrozenMeta(Relation index);
 IndexBuildResult *AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo);
 void		AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
 							   BufferAccessStrategy strategy);
@@ -171,6 +180,7 @@ void		AnnArrayUnlockPage(AnnArrayReader *reader);
 void		AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out);
 void		AnnArrayReaderEnd(AnnArrayReader *reader);
 const char *AnnFrozenColumnName(Relation index, int column);
+Oid			AnnFrozenColumnCollation(Relation index, int column);
 void		AnnArrayReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *out);
 int			AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned char *program,
 							  size_t size, uint32 *words, uint64 *count);
@@ -183,10 +193,28 @@ typedef struct AnnPredicateColumns
 {
 	int			ncolumns;
 	AttrNumber	attnos[INDEX_MAX_KEYS]; /* table columns */
+	Oid			types[INDEX_MAX_KEYS];
+	Oid			families[INDEX_MAX_KEYS];	/* default btree operator families */
+	Oid			collations[INDEX_MAX_KEYS];
 	char	   *names[INDEX_MAX_KEYS];
+	Relation	index;			/* for text dictionaries */
+	AnnFrozenMetaData *meta;
 } AnnPredicateColumns;
 
+/*
+ * Attribute columns hold int32 values: smallint, integer, bigint, bool,
+ * date, and codes of a dictionary for text and varchar.
+ */
+#define AnnFrozenTextType(type) ((type) == TEXTOID || (type) == VARCHAROID)
+bool		AnnFrozenAttributeType(Oid type);
+Datum		AnnFrozenTextDatum(Relation index, const AnnFrozenMetaData *meta, int column, int32 code);
+int64		AnnFrozenTextSearch(Relation index, const AnnFrozenMetaData *meta, int column, Oid collation,
+								text *value, bool upper);
+int32		AnnFrozenAttributeValue(Datum value, bool isnull, Oid type);
+Datum		AnnFrozenAttributeDatum(int32 value, Oid type);
+
 void		AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns);
+AnnPredicateColumns *AnnFrozenColumnsCache(Relation index, bool **ready);
 bool		AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *columns);
 void		AnnPredicateBuild(List *clauses, Index varno, const AnnPredicateColumns *columns,
 							  PlanState *parent, ExprContext *econtext, StringInfo program);

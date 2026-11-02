@@ -318,7 +318,8 @@ Finish(Service *service, Job *job)
 				Write(data, job->index.nresults, 4);
 				Write(data + 4, job->index.route, 4);
 				if (head == 16)
-					Write(data + 8, job->bitmap ? job->bitmap->count : 0, 8);
+					Write(data + 8, job->bitmap ? job->bitmap->count :
+						  job->bitmapFile ? job->bitmapFile->rows : 0, 8);
 				for (uint32_t i = 0; i < job->index.nresults; i++)
 				{
 					uint32_t	bits;
@@ -1444,14 +1445,15 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	if (job == NULL || (job->index.results = malloc(sizeof(AnnIndexHit) * k)) == NULL)
 	{
 		free(job);
-		AnnIndexBitmapRelease(file, bitmap);
+		if (bitmap)
+			AnnIndexBitmapRelease(file, bitmap);
 		return ANN_NOMEM;
 	}
 	job->kind = JOB_INDEX;
 	strcpy(job->index.name, name);
 	job->index.dimensions = dimensions;
 	job->index.k = k;
-	job->index.filtered = 1;
+	job->index.filtered = bitmap != NULL;	/* NULL: every row, plain ANN */
 	{
 		float	   *query = (float *) (void *) payload;
 
@@ -1469,19 +1471,20 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	 * the scans, bitsets for filtered CAGRA. The backend routes by the
 	 * filter's size and by how many queued jobs share it.
 	 */
-	job->index.nfilter = (uint32_t) (bitmap->count < UINT32_MAX ? bitmap->count : UINT32_MAX - 1);
-	if (bitmap->keys)
+	if (bitmap)
+		job->index.nfilter = (uint32_t) (bitmap->count < UINT32_MAX ? bitmap->count : UINT32_MAX - 1);
+	if (bitmap && bitmap->keys)
 	{
 		job->index.filter = bitmap->keys;
 		job->index.ordinals = bitmap->ordinals;
 	}
-	if (file->nshards)
+	if (bitmap && file->nshards)
 	{
 		job->index.bitsets = bitmap->bitsets;
 		job->index.deviceBitsets = bitmap->device;
 		job->index.deviceRows = bitmap->deviceRows;
 	}
-	if (job->index.filter == NULL && job->index.bitsets == NULL)
+	if (bitmap && job->index.filter == NULL && job->index.bitsets == NULL)
 	{
 		/* Neither form usable: the worker's limits changed under the entry. */
 		free(job->index.results);
@@ -1501,7 +1504,8 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	if (Enqueue(service, connection, job))
 		return ANN_PENDING;
 	free(job->index.results);
-	AnnIndexBitmapRelease(file, bitmap);
+	if (bitmap)
+		AnnIndexBitmapRelease(file, bitmap);
 	free(job);
 	return ANN_OVERLOADED;
 }
@@ -1521,25 +1525,91 @@ MicrosecondsSince(const struct timespec *start)
  * evaluated over the attribute columns and cached (dropping the oldest
  * predicate result past --predicate-cache). Returns a referenced bitmap.
  */
+static AnnStatus PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program,
+								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result);
+
+/*
+ * Programs being evaluated: a search that misses the cache while another
+ * thread evaluates the same program waits for its result instead of
+ * evaluating it again, so a burst of new predicates costs one evaluation
+ * each.
+ */
+#define ANN_EVALUATING_MAX 256
+static pthread_mutex_t evaluatingMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t evaluatingDone = PTHREAD_COND_INITIALIZER;
+static struct
+{
+	const AnnIndexFile *file;
+	uint64_t	id;
+}			evaluating[ANN_EVALUATING_MAX];
+
+static int
+Evaluating(const AnnIndexFile *file, uint64_t id)
+{
+	for (int i = 0; i < ANN_EVALUATING_MAX; i++)
+		if (evaluating[i].file == file && evaluating[i].id == id)
+			return i;
+	return -1;
+}
+
 static AnnStatus
 PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
 				AnnIndexBitmap **result)
 {
 	uint64_t	id = AnnFilterHash(program, size);
 	size_t		nwords = ((size_t) file->rows + 31) / 32;
+	int			slot = -1;
+	AnnStatus	status;
+
+	for (;;)
+	{
+		if ((*result = AnnIndexBitmapGet(file, id)) != NULL)
+		{
+			(void) pthread_mutex_lock(&service->mutex);
+			service->predicate_hits++;
+			(void) pthread_mutex_unlock(&service->mutex);
+			return ANN_OK;
+		}
+		(void) pthread_mutex_lock(&evaluatingMutex);
+		if (Evaluating(file, id) >= 0)
+		{
+			/* Someone else is on it: wait, then look in the cache again. */
+			while (Evaluating(file, id) >= 0)
+				(void) pthread_cond_wait(&evaluatingDone, &evaluatingMutex);
+			(void) pthread_mutex_unlock(&evaluatingMutex);
+			continue;
+		}
+		for (int i = 0; i < ANN_EVALUATING_MAX && slot < 0; i++)
+			if (evaluating[i].file == NULL)
+			{
+				evaluating[i].file = file;
+				evaluating[i].id = id;
+				slot = i;
+			}
+		(void) pthread_mutex_unlock(&evaluatingMutex);
+		break;					/* evaluate (unclaimed if every slot is busy) */
+	}
+	status = PredicateEvaluate(service, file, program, size, id, nwords, result);
+	if (slot >= 0)
+	{
+		(void) pthread_mutex_lock(&evaluatingMutex);
+		evaluating[slot].file = NULL;
+		(void) pthread_cond_broadcast(&evaluatingDone);
+		(void) pthread_mutex_unlock(&evaluatingMutex);
+	}
+	return status;
+}
+
+static AnnStatus
+PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
+				  uint64_t id, size_t nwords, AnnIndexBitmap **result)
+{
 	uint32_t   *words;
 	uint64_t	count;
 	int			code;
 	AnnStatus	status;
 	struct timespec start;
 
-	if ((*result = AnnIndexBitmapGet(file, id)) != NULL)
-	{
-		(void) pthread_mutex_lock(&service->mutex);
-		service->predicate_hits++;
-		(void) pthread_mutex_unlock(&service->mutex);
-		return ANN_OK;
-	}
 	if ((words = malloc(nwords * 4 + 4)) == NULL)
 		return ANN_NOMEM;
 	(void) clock_gettime(CLOCK_MONOTONIC, &start);
@@ -1608,6 +1678,13 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 		return ANN_INVALID;
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
+	/* A program matching every row is a plain ANN search. */
+	if (programLength == 1 && payload[offset] == ANN_FILTER_ALL)
+	{
+		AnnIndexPut(file);
+		return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, NULL, name,
+							   dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+	}
 	status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap);
 	AnnIndexPut(file);
 	if (status != ANN_OK)

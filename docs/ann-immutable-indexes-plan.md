@@ -1,6 +1,6 @@
 # Immutable forward and inverted indexes with GPU ANN: plan
 
-Status: phases 1 and 2 and the inverted pages of phase 3 are implemented; see the [frozen index guide](ann-frozen-index.md) for what was built and measured. The shared predicate evaluator, operation 22, prebuilt bitset pages, ordinals in replies and phase 4 remain proposed. Everything it builds on is implemented: the `ann` access method ([guide](ann-native-index.md)), the filtered CustomScan ([guide](ann-filtered-search.md)), loaded cuVS indexes and hybrid search ([guide](ann-cuvs-index.md)), filters resolved on the GPU node with attribute columns, cached bitmaps and same-filter grouping ([guide](ann-gpu-filters.md)), and the networked GPU nodes ([guide](ann-networked.md)). Generations and the mutable delta are specified in [section 8 of the cuVS plan](cuvs-filtered-ann-plan.md#8-identity-mvcc-and-mutable-operation) and are referenced, not rewritten, here.
+Status: implemented, phases 1 to 4; see the [frozen index guide](ann-frozen-index.md) for what was built, how it behaves, and benchmarks and profiles on B200s. Where the implementation differs from this plan: the ordinals flag exists on operation 22 only (the frozen route is its only user); a worker without operation 22 makes the route evaluate from the pages and score on the CPU rather than send operations 19 or 21; attribute types are smallint, integer, bigint (values that fit an integer), boolean, date, text and varchar, not enum; and loaded names are not unloaded from workers (a retired generation's GPU memory is freed when the worker restarts). Everything it builds on is implemented: the `ann` access method ([guide](ann-native-index.md)), the filtered CustomScan ([guide](ann-filtered-search.md)), loaded cuVS indexes and hybrid search ([guide](ann-cuvs-index.md)), filters resolved on the GPU node with attribute columns, cached bitmaps and same-filter grouping ([guide](ann-gpu-filters.md)), and the networked GPU nodes ([guide](ann-networked.md)). Generations and the mutable delta are specified in [section 8 of the cuVS plan](cuvs-filtered-ann-plan.md#8-identity-mvcc-and-mutable-operation) and are referenced, not rewritten, here.
 
 ## 1. Objective
 
@@ -22,7 +22,7 @@ Runtime code stays C. Python remains in the offline CAGRA build and in tests. Li
 
 The index needs a key column: the first `INCLUDE` column, of an integer type. Duplicate or NULL keys fail the build; the cuVS builder already requires the same.
 
-**Verification.** The build computes a generation id: `hash_bytes_extended` chained over every key, vector and attribute value in ordinal order (implemented as a content hash, so any changed value changes it), stored in the metapage and written by the exporter into the manifest as `generation`. Operation 15 (index info) reports it; `ann_index_load` resolves the source table through `ann_index_catalog.source`, finds its frozen `ann` index, and refuses a directory whose generation differs from that relation's (today it compares only the row count). Still to do: every cached bitmap id becomes `hash(index name, generation, filter text)`, so a rebuilt table invalidates every cache entry without a push, and requests tagged with a generation the worker doesn't serve get a new status, `ANN_GENERATION` (12).
+**Verification.** The build computes a generation id: `hash_bytes_extended` chained over every key, vector and attribute value in ordinal order (implemented as a content hash, so any changed value changes it), stored in the metapage and written by the exporter into the manifest as `generation`. Operation 15 (index info) reports it; `ann_index_load` resolves the source table through `ann_index_catalog.source`, finds its frozen `ann` index, and refuses a directory whose generation differs from that relation's (today it compares only the row count). Every cached bitmap id becomes `hash(index name, generation, filter text)`, so a rebuilt table invalidates every cache entry without a push, and requests tagged with a generation the worker doesn't serve get a new status, `ANN_GENERATION` (12).
 
 ## 3. Freeze contract
 
@@ -118,13 +118,15 @@ Files: `src/annbuild.c` (TID, key, vector, attribute and dictionary pages), new 
 
 Gates: an export equals the builder's SQL-sourced files byte for byte on the test fixtures; `ann_index_load` accepts the export; a frozen index answers `SELECT id, tenant, embedding <-> $q` without heap access (`Heap Fetches: 0`); exact-route results equal SQL on `test/ann/test_filtered.py`.
 
-### Phase 3: inverted pages and the shared evaluator (postings, distinct values and offsets implemented)
+### Phase 3: inverted pages and the shared evaluator (implemented)
 
 Files: `src/annbuild.c` (postings, per-code bitsets), new `ann/filter.c`/`filter.h` (evaluator, program encoding), `src/annpred.c` (predicate → program, with the whitelist of columns and operators), `src/anncustom.c` (route, EXPLAIN fields), `src/annindex.c` (`ann_filter_bitmap_build` via pages when parseable, bitmap id with generation), `ann/server.c` and `ann/cuvs.c` (operation 22, `ANN_GENERATION`, the ordinal flag), `ann/indexfile.c` (postings for the evaluator), docs and protocol tables.
 
 Gates: for every predicate shape in the whitelist, PostgreSQL's bitset equals the worker's word for word on the 7-shard CPU fixture and on `bench10m`; results equal exact SQL on every route, as `test_cuvs_index.py` checks today; `ann_filter_bitmap_build` on `bench10m` (10M rows) drops from seconds (heap scan) to a cost proportional to the selected rows: an equality, IN or range comes from prebuilt bitsets or postings (under 1 ms for a 1% filter, a few ms for 10%), an AND of two bitsets is 154 pages of word operations (under 1 ms), and only a column without postings falls back to walking its 4,902 attribute pages (5–20 ms); filtered QPS on one and eight B200s is unchanged within noise, since the GPU routes don't change; grouping statistics show operation-22 searches grouping by program hash.
 
-### Phase 4: delta union and generation switch
+### Phase 4: delta union and generation switch (implemented)
+
+The union is PostgreSQL's own: the frozen route is a scan-level path carrying the distance ordering, so a partitioned table (or a `UNION ALL` view) with a frozen base and a mutable delta becomes a Merge Append of the two under one `LIMIT`. The route finds its worker by the generation of the table it scans, so swapping partitions in one transaction switches generations.
 
 Files: `src/annplan.c` (union of frozen base and hot partition under one `ORDER BY … LIMIT`), `src/annremote.c` (generation in request headers, `ANN_GENERATION` retry after reload), docs.
 

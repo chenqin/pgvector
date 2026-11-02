@@ -1463,12 +1463,12 @@ ann_index_filter(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("%s has no frozen ann index with the generation of \"%s\"", entry.source, name)));
 	AnnPredicateColumnsInit(index, &columns);
-	index_close(index, AccessShareLock);
 	initStringInfo(&program);
 	if (!AnnPredicateFromText(relid, filter, &columns, &program))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("filter \"%s\" is not a predicate over the index's INCLUDE attributes", filter)));
+	index_close(index, AccessShareLock);
 	initStringInfo(&payload);
 	Put32(&payload, strlen(name));
 	appendBinaryStringInfo(&payload, name, strlen(name));

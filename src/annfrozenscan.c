@@ -25,6 +25,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/timestamp.h"
 
 /*
  * Ordered scans of a table with a frozen ann index, answered from the index
@@ -92,6 +93,7 @@ typedef struct FrozenScanState
 	int			workerRoute;
 } FrozenScanState;
 
+static char *WorkerName(Oid relid, uint64 generation, bool refresh);
 static Plan *PlanFrozenPath(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 							List *tlist, List *clauses, List *custom_plans);
 static Node *CreateFrozenScanState(CustomScan *scan);
@@ -277,7 +279,8 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 	CustomScan *scan = (CustomScan *) node->ss.ps.plan;
 
 	state->index = index_open(state->indexOid, AccessShareLock);
-	state->meta = AnnFrozenGetMeta(state->index, false);
+	if ((state->meta = AnnFrozenMeta(state->index)) == NULL)
+		elog(ERROR, "\"%s\" is not a frozen ann index", RelationGetRelationName(state->index));
 	AnnPredicateColumnsInit(state->index, &state->columns);
 	state->queryState = ExecInitExpr(linitial(scan->custom_exprs), &node->ss.ps);
 	state->quals = list_copy_tail(scan->custom_exprs, 1);
@@ -298,7 +301,57 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 	state->fetch = table_index_fetch_begin(node->ss.ss_currentRelation);
 	state->heapSlot = table_slot_create(node->ss.ss_currentRelation, NULL);
 	if (AnnRemoteConfigured() || (ann_worker_socket && ann_worker_socket[0]))
-		state->workerName = AnnCatalogNameFor(state->index->rd_index->indrelid, state->meta->generation);
+		state->workerName = WorkerName(state->index->rd_index->indrelid, state->meta->generation, false);
+}
+
+/*
+ * Loaded exports by (table, generation), cached per backend: read from the
+ * catalog on first use, again after a failed call, and, when none was
+ * loaded, at most once a second.
+ */
+typedef struct WorkerEntry
+{
+	Oid			relid;
+	uint64		generation;
+	char		name[NAMEDATALEN];
+	TimestampTz checked;
+} WorkerEntry;
+
+static HTAB *workerNames = NULL;
+
+static char *
+WorkerName(Oid relid, uint64 generation, bool refresh)
+{
+	struct
+	{
+		Oid			relid;
+		uint64		generation;
+	}			key;
+	WorkerEntry *entry;
+	bool		found;
+	TimestampTz now = GetCurrentTimestamp();
+
+	if (workerNames == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(key);
+		ctl.entrysize = sizeof(WorkerEntry);
+		workerNames = hash_create("ann frozen worker names", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	memset(&key, 0, sizeof(key));
+	key.relid = relid;
+	key.generation = generation;
+	entry = hash_search(workerNames, &key, HASH_ENTER, &found);
+	if (!found || refresh ||
+		(entry->name[0] == '\0' && TimestampDifferenceExceeds(entry->checked, now, 1000)))
+	{
+		char	   *name = AnnCatalogNameFor(relid, generation);
+
+		strlcpy(entry->name, name ? name : "", sizeof(entry->name));
+		entry->checked = now;
+	}
+	return entry->name[0] ? pstrdup(entry->name) : NULL;
 }
 
 static int
@@ -424,6 +477,7 @@ WorkerSearch(FrozenScanState *state, uint64 k)
 		/* No worker, another generation there, or no op 22: use the pages. */
 		elog(DEBUG1, "ann frozen search falls back to index pages (worker status %u)", status);
 		state->workerFailed = true;
+		(void) WorkerName(state->index->rd_index->indrelid, state->meta->generation, true);
 		return false;
 	}
 	state->workerRoute = *(uint32 *) (reply + 4);
@@ -532,7 +586,8 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 
 			AnnArrayRead(&state->values[i - 2], ordinal, &v);
 			isnull = v == ANN_FROZEN_NULL;
-			value = type == INT2OID ? Int16GetDatum((int16) v) : Int32GetDatum(v);
+			value = !AnnFrozenTextType(type) ? AnnFrozenAttributeDatum(v, type) :
+				isnull ? (Datum) 0 : AnnFrozenTextDatum(index, state->meta, i - 2, v);
 		}
 		slot->tts_values[attno - 1] = value;
 		slot->tts_isnull[attno - 1] = isnull;

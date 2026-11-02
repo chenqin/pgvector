@@ -866,6 +866,53 @@ DestroyIndexState(AnnCuvsIndex *state)
 	free(state);
 }
 
+/*
+ * Cached bitmaps are copied and freed on a non-blocking stream per device,
+ * stream-ordered: cudaMalloc and cudaFree would wait for every lane's work
+ * on the device, so each new predicate would stall all searches.
+ */
+static pthread_mutex_t uploadMutex = PTHREAD_MUTEX_INITIALIZER;
+static cudaStream_t uploadStreams[ANN_INDEX_MAX_SHARDS];
+
+static cudaStream_t
+UploadStream(int device)
+{
+	cudaStream_t stream;
+
+	(void) pthread_mutex_lock(&uploadMutex);
+	if (uploadStreams[device] == NULL)
+	{
+		cudaMemPool_t pool;
+		uint64_t	keep = UINT64_MAX;
+
+		if (cudaStreamCreateWithFlags(&uploadStreams[device], cudaStreamNonBlocking) != cudaSuccess)
+			uploadStreams[device] = NULL;
+		/* Keep freed bitmap memory in the pool instead of unmapping it. */
+		else if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess)
+			(void) cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
+	}
+	stream = uploadStreams[device];
+	(void) pthread_mutex_unlock(&uploadMutex);
+	return stream;
+}
+
+static int
+UploadArray(int device, void **target, const void *source, size_t size)
+{
+	cudaStream_t stream;
+
+	*target = NULL;
+	if (cudaSetDevice(device) != cudaSuccess || (stream = UploadStream(device)) == NULL)
+		return 0;
+	if (cudaMallocAsync(target, size, stream) != cudaSuccess)
+	{
+		*target = NULL;
+		return 0;
+	}
+	return cudaMemcpyAsync(*target, source, size, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+		cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
 /* Shards load in parallel, one thread each; any failure rejects the load. */
 static void
 FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
@@ -873,8 +920,11 @@ FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
 	for (size_t i = 0; arrays && i < (size_t) state->copies * state->nshards; i++)
 		if (arrays[i])
 		{
+			cudaStream_t stream;
+
 			(void) cudaSetDevice(state->shards[i].device);
-			(void) cudaFree(arrays[i]);
+			if ((stream = UploadStream(state->shards[i].device)) != NULL)
+				(void) cudaFreeAsync(arrays[i], stream);
 		}
 	free(arrays);
 }
@@ -903,9 +953,7 @@ UploadBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 		uint32_t	s = (uint32_t) (i % state->nshards);
 		size_t		size = ((size_t) file->shards[s].rows + 31) / 32 * sizeof(uint32_t);
 
-		ok = cudaSetDevice(state->shards[i].device) == cudaSuccess &&
-			cudaMalloc(&device[i], size) == cudaSuccess &&
-			cudaMemcpy(device[i], bitmap->bitsets[s], size, cudaMemcpyHostToDevice) == cudaSuccess;
+		ok = UploadArray(state->shards[i].device, &device[i], bitmap->bitsets[s], size);
 		bytes += size;
 	}
 	if (!ok)
@@ -952,9 +1000,7 @@ UploadBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 
 		if (size == 0)
 			continue;
-		ok = cudaSetDevice(state->shards[i].device) == cudaSuccess &&
-			cudaMalloc(&rows[i], size) == cudaSuccess &&
-			cudaMemcpy(rows[i], staged + start[s], size, cudaMemcpyHostToDevice) == cudaSuccess;
+		ok = UploadArray(state->shards[i].device, &rows[i], staged + start[s], size);
 		bytes += size;
 	}
 	free(staged);

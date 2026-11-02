@@ -86,10 +86,11 @@ The C worker uses version 1, 32-byte little-endian headers: magic `PVAN`, u16 ve
 | — | Indexes built with `--quantize nvfp4\|fp8` report `quant KIND quant_scan on\|off` in load and index-info replies ([Blackwell module](../docs/ann-blackwell.md)) | |
 | 8 stats | | JSON also carries `groups`, `grouped_jobs` (same-filter searches scanned together) and `held` (lane pickups that waited for a filter's lanes to free up); see [same-filter grouping](../docs/ann-gpu-filters.md#same-filter-grouping) | |
 | 17–21 | Attribute search, bitmap build, bitmap search, bitmap cache put, cached bitmap search ([GPU-side filters](../docs/ann-gpu-filters.md)) | |
+| 22–23 | Search by predicate program and evaluate a predicate program ([filter.h](filter.h)), cached under the program's hash ([frozen indexes](../docs/ann-frozen-index.md#worker-operations-and-caching)) | |
 
 Metric values: 0 L2, 1 negative inner product, 2 cosine. Filter values: 0 none, 1 shared IDs, 2 IDs per query. Allowlists are u32 count followed by strictly increasing unique u32 ordinals; an empty list differs from no filter. Capability masks use `1 << enum_value`. The CPU backend uses FP32 input and double accumulation.
 
-Statuses 0–5 are success, invalid, unsupported, stale, allocation failure, and backend failure. The C scheduling API adds 6 pending, 7 overloaded, 8 timed out, 9 canceled, and 10 closed. Search errors have empty protocol payloads. The PostgreSQL client enforces `ann.worker_timeout_ms`, and server mode sets a 10 s reply write timeout; timeouts in the Python test client are test infrastructure, not a shipped C client feature.
+Statuses 0–5 are success, invalid, unsupported, stale, allocation failure, and backend failure. The C scheduling API adds 6 pending, 7 overloaded, 8 timed out, 9 canceled, and 10 closed; loaded indexes add 11 missing (a cached filter id) and 12 generation (the request's header names another generation of the index than the one loaded). Search errors have empty protocol payloads. The PostgreSQL client enforces `ann.worker_timeout_ms`, and server mode sets a 10 s reply write timeout; timeouts in the Python test client are test infrastructure, not a shipped C client feature.
 
 ## Test references and benchmarks
 

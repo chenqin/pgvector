@@ -3,7 +3,9 @@
 #include "access/stratnum.h"
 #include "ann.h"
 #include "ann/filter.h"
+#include "catalog/pg_am_d.h"
 #include "catalog/pg_opfamily_d.h"
+#include "commands/defrem.h"
 #include "catalog/pg_type_d.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -38,12 +40,34 @@ typedef struct Context
 void
 AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns)
 {
-	columns->ncolumns = RelationGetDescr(index)->natts - 2;
-	for (int c = 0; c < columns->ncolumns; c++)
+	bool	   *ready;
+	AnnPredicateColumns *cached = AnnFrozenColumnsCache(index, &ready);
+
+	/* Computed once per relcache entry: GetDefaultOpClass scans pg_opclass. */
+	if (!*ready)
 	{
-		columns->attnos[c] = index->rd_index->indkey.values[2 + c];
-		columns->names[c] = pstrdup(AnnFrozenColumnName(index, 3 + c));
+		MemoryContext oldCtx = MemoryContextSwitchTo(index->rd_indexcxt);
+
+		cached->ncolumns = RelationGetDescr(index)->natts - 2;
+		for (int c = 0; c < cached->ncolumns; c++)
+		{
+			Oid			opclass;
+
+			cached->attnos[c] = index->rd_index->indkey.values[2 + c];
+			cached->names[c] = pstrdup(AnnFrozenColumnName(index, 3 + c));
+			cached->types[c] = TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid;
+			cached->collations[c] = AnnFrozenColumnCollation(index, 2 + c);
+			/* varchar compares with text's operators */
+			opclass = GetDefaultOpClass(AnnFrozenTextType(cached->types[c]) ? TEXTOID : cached->types[c],
+										BTREE_AM_OID);
+			cached->families[c] = OidIsValid(opclass) ? get_opclass_family(opclass) : InvalidOid;
+		}
+		MemoryContextSwitchTo(oldCtx);
+		*ready = true;
 	}
+	*columns = *cached;
+	columns->index = index;
+	columns->meta = AnnFrozenMeta(index);
 }
 
 static void
@@ -113,19 +137,26 @@ ColumnOf(Context *cxt, Node *node)
 	return -1;
 }
 
+/* Operand types an attribute of this type is compared with. */
 static bool
-IntegerType(Oid type)
+OperandType(Oid column, Oid type, bool array)
 {
+	if (column == BOOLOID)
+		return type == (array ? BOOLARRAYOID : BOOLOID);
+	if (column == DATEOID)
+		return type == (array ? DATEARRAYOID : DATEOID);
+	if (AnnFrozenTextType(column))
+		return type == (array ? TEXTARRAYOID : TEXTOID);
+	if (array)
+		return type == INT2ARRAYOID || type == INT4ARRAYOID || type == INT8ARRAYOID;
 	return type == INT2OID || type == INT4OID || type == INT8OID;
 }
 
 /* A value known before the scan: no columns, nothing volatile. */
 static bool
-OperandOk(Node *node, bool array)
+OperandOk(Context *cxt, int column, Node *node, bool array)
 {
-	Oid			type = exprType(node);
-
-	if (array ? !(type == INT2ARRAYOID || type == INT4ARRAYOID || type == INT8ARRAYOID) : !IntegerType(type))
+	if (!OperandType(cxt->columns->types[column], exprType(node), array))
 		return false;
 	return !contain_var_clause(node) && !contain_volatile_functions(node) && !contain_subplans(node);
 }
@@ -144,28 +175,36 @@ Evaluate(Context *cxt, Node *node, bool *isnull)
 	return ExecEvalExprSwitchContext(state, cxt->econtext, isnull);
 }
 
+/* The int32 domain value of an operand: integers, 0/1, date days. */
 static int64
 IntegerValue(Datum value, Oid type)
 {
-	if (type == INT2OID)
-		return DatumGetInt16(value);
-	if (type == INT4OID)
-		return DatumGetInt32(value);
-	return DatumGetInt64(value);
+	switch (type)
+	{
+		case INT2OID:
+			return DatumGetInt16(value);
+		case INT8OID:
+			return DatumGetInt64(value);
+		case BOOLOID:
+			return DatumGetBool(value) ? 1 : 0;
+		default:
+			return DatumGetInt32(value);	/* integer, date */
+	}
 }
 
-/* Strategy of an integer comparison, STRATEGY_NE for <>, else 0. */
+/* Strategy of a comparison in the column's btree family, STRATEGY_NE for <>, else 0. */
 static int
-Strategy(Oid opno)
+Strategy(Oid opno, Oid family)
 {
-	int			strategy = get_op_opfamily_strategy(opno, INTEGER_BTREE_FAM_OID);
+	int			strategy;
 	Oid			negator;
 
-	if (strategy)
+	if (!OidIsValid(family))
+		return 0;
+	if ((strategy = get_op_opfamily_strategy(opno, family)) != 0)
 		return strategy;
 	negator = get_negator(opno);
-	if (OidIsValid(negator) &&
-		get_op_opfamily_strategy(negator, INTEGER_BTREE_FAM_OID) == BTEqualStrategyNumber)
+	if (OidIsValid(negator) && get_op_opfamily_strategy(negator, family) == BTEqualStrategyNumber)
 		return STRATEGY_NE;
 	return 0;
 }
@@ -254,6 +293,55 @@ PutComparison(Context *cxt, int column, int strategy, int64 value)
 	}
 }
 
+/* Text comparisons must use the column's collation, which orders its codes. */
+static bool
+SameCollation(Context *cxt, int column, Oid collation)
+{
+	return !AnnFrozenTextType(cxt->columns->types[column]) || collation == cxt->columns->collations[column];
+}
+
+/*
+ * A text comparison over the dictionary's codes: codes follow the
+ * collation, so the strings below, at or above a value are code ranges.
+ */
+static void
+PutTextComparison(Context *cxt, int column, int strategy, text *value)
+{
+	int64		lower = AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
+											cxt->columns->collations[column], value, false);
+	int64		upper = AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
+											cxt->columns->collations[column], value, true);
+	bool		found = upper > lower;
+
+	switch (strategy)
+	{
+		case BTEqualStrategyNumber:
+			if (found)
+				PutComparison(cxt, column, strategy, lower);
+			else
+				PutByte(cxt->program, ANN_FILTER_NONE);
+			break;
+		case STRATEGY_NE:
+			if (found)
+				PutComparison(cxt, column, strategy, lower);
+			else
+				PutLeaf(cxt, ANN_FILTER_NULL, column, true);
+			break;
+		case BTLessStrategyNumber:
+			PutComparison(cxt, column, BTLessStrategyNumber, lower);
+			break;
+		case BTLessEqualStrategyNumber:
+			PutComparison(cxt, column, BTLessStrategyNumber, upper);
+			break;
+		case BTGreaterStrategyNumber:
+			PutComparison(cxt, column, BTGreaterEqualStrategyNumber, upper);
+			break;
+		default:
+			PutComparison(cxt, column, BTGreaterEqualStrategyNumber, lower);
+			break;
+	}
+}
+
 static bool Translate(Context *cxt, Node *node, bool negate);
 
 static bool
@@ -271,19 +359,19 @@ TranslateOp(Context *cxt, OpExpr *op, bool negate)
 		return false;
 	left = linitial(op->args);
 	right = lsecond(op->args);
-	strategy = Strategy(op->opno);
-	if (strategy == 0)
-		return false;
 	if ((column = ColumnOf(cxt, left)) >= 0)
+	{
 		operand = right;
+		strategy = Strategy(op->opno, cxt->columns->families[column]);
+	}
 	else if ((column = ColumnOf(cxt, right)) >= 0)
 	{
 		operand = left;
-		strategy = Commute(strategy);
+		strategy = Commute(Strategy(op->opno, cxt->columns->families[column]));
 	}
 	else
 		return false;
-	if (!OperandOk(operand, false))
+	if (strategy == 0 || !OperandOk(cxt, column, operand, false) || !SameCollation(cxt, column, op->inputcollid))
 		return false;
 	if (cxt->program == NULL)
 		return true;
@@ -292,6 +380,8 @@ TranslateOp(Context *cxt, OpExpr *op, bool negate)
 	value = Evaluate(cxt, operand, &isnull);
 	if (isnull)
 		PutByte(cxt->program, ANN_FILTER_NONE);
+	else if (AnnFrozenTextType(cxt->columns->types[column]))
+		PutTextComparison(cxt, column, strategy, DatumGetTextPP(value));
 	else
 		PutComparison(cxt, column, strategy, IntegerValue(value, exprType(operand)));
 	return true;
@@ -321,14 +411,14 @@ TranslateArray(Context *cxt, ScalarArrayOpExpr *op, bool negate)
 	if (list_length(op->args) != 2 || (column = ColumnOf(cxt, linitial(op->args))) < 0)
 		return false;
 	operand = lsecond(op->args);
-	strategy = Strategy(op->opno);
+	strategy = Strategy(op->opno, cxt->columns->families[column]);
 	if (op->useOr && strategy == BTEqualStrategyNumber)
 		in = true;
 	else if (!op->useOr && strategy == STRATEGY_NE)
 		in = false;
 	else
 		return false;
-	if (!OperandOk(operand, true))
+	if (!OperandOk(cxt, column, operand, true) || !SameCollation(cxt, column, op->inputcollid))
 		return false;
 	if (cxt->program == NULL)
 		return true;
@@ -354,7 +444,20 @@ TranslateArray(Context *cxt, ScalarArrayOpExpr *op, bool negate)
 			anyNull = true;
 			continue;
 		}
-		v = IntegerValue(elements[i], type);
+		if (AnnFrozenTextType(cxt->columns->types[column]))
+		{
+			/* a string's code, or none when it is not in the dictionary */
+			text	   *string = DatumGetTextPP(elements[i]);
+			int64		lower = AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
+													cxt->columns->collations[column], string, false);
+
+			if (AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
+									cxt->columns->collations[column], string, true) == lower)
+				continue;
+			v = lower;
+		}
+		else
+			v = IntegerValue(elements[i], type);
 		if (!InRange(v))
 			continue;
 		Put32(&values, (uint32) (int32) v);
@@ -410,6 +513,41 @@ Translate(Context *cxt, Node *node, bool negate)
 		return TranslateOp(cxt, (OpExpr *) node, negate);
 	if (IsA(node, ScalarArrayOpExpr))
 		return TranslateArray(cxt, (ScalarArrayOpExpr *) node, negate);
+	if (ColumnOf(cxt, node) >= 0 && cxt->columns->types[ColumnOf(cxt, node)] == BOOLOID)
+	{
+		/* "flag" is flag = true; NOT flag is flag = false (NULL never matches). */
+		if (cxt->program)
+			PutComparison(cxt, ColumnOf(cxt, node), BTEqualStrategyNumber, negate ? 0 : 1);
+		return true;
+	}
+	if (IsA(node, BooleanTest))
+	{
+		BooleanTest *test = (BooleanTest *) node;
+		int			column = ColumnOf(cxt, (Node *) test->arg);
+		BoolTestType type = test->booltesttype;
+
+		if (column < 0 || cxt->columns->types[column] != BOOLOID)
+			return false;
+		if (cxt->program == NULL)
+			return true;
+		/* Boolean tests are never NULL, so NOT is the complementary test. */
+		if (negate)
+			type = type == IS_TRUE ? IS_NOT_TRUE : type == IS_NOT_TRUE ? IS_TRUE :
+				type == IS_FALSE ? IS_NOT_FALSE : type == IS_NOT_FALSE ? IS_FALSE :
+				type == IS_UNKNOWN ? IS_NOT_UNKNOWN : IS_UNKNOWN;
+		if (type == IS_UNKNOWN || type == IS_NOT_UNKNOWN)
+			PutLeaf(cxt, ANN_FILTER_NULL, column, type == IS_NOT_UNKNOWN);
+		else
+		{
+			PutComparison(cxt, column, BTEqualStrategyNumber, type == IS_TRUE || type == IS_NOT_FALSE ? 1 : 0);
+			if (type == IS_NOT_TRUE || type == IS_NOT_FALSE)
+			{
+				PutLeaf(cxt, ANN_FILTER_NULL, column, false);
+				PutByte(cxt->program, ANN_FILTER_OR);
+			}
+		}
+		return true;
+	}
 	if (IsA(node, NullTest))
 	{
 		NullTest   *test = (NullTest *) node;
