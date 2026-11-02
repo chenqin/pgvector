@@ -54,12 +54,15 @@ class Scan:
         self.module = cp.RawModule(code=kernel_source(), options=('-arch=sm_100a',), backend='nvrtc')
         self.sms = cp.cuda.Device().attributes['MultiProcessorCount']
         self.functions = {}
+        self.fused = {}
         for width, suffix in WIDTHS.items():
-            function = self.module.get_function('score_mma_nvfp4' + suffix)
-            if width > 16:
-                function.max_dynamic_shared_size_bytes = 160 * 1024
-            self.functions[width] = function
+            for table, prefix in ((self.functions, 'score_mma_nvfp4'), (self.fused, 'fuse_mma_nvfp4')):
+                function = self.module.get_function(prefix + suffix)
+                if width > 16:
+                    function.max_dynamic_shared_size_bytes = 160 * 1024
+                table[width] = function
         self.select = self.module.get_function('select32')
+        self.selectc = self.module.get_function('select32c')
         self.merge = self.module.get_function('merge32')
 
     def index(self, vectors):
@@ -76,11 +79,44 @@ class Scan:
                 'rowScales': cp.asarray(row, dtype=cp.float32), 'rowBytes': blocks * 8, 'blocks': blocks,
                 'dims': dims, 'dequantized': dequantized}
 
-    def run(self, index, rows, queries, width):
-        """Scores [nq][n] and the merged best 32 (distances, positions) per query."""
-        launch, results = self.prepare(index, rows, queries, width)
+    def run(self, index, rows, queries, width, fused=False):
+        """Scores [nq][n] (unfused) and the merged best 32 (distances, positions) per query."""
+        launch, results = (self.prepare_fused if fused else self.prepare)(index, rows, queries, width)
         launch()
         return results
+
+    def prepare_fused(self, index, rows, queries, width, sample=8192, slices=8):
+        """Bounds from a sample of the rows, then the fused scan and a selection over candidates."""
+        cp = self.cp
+        n, nq, dims = len(rows), queries.shape[0], index['dims']
+        s = min(sample, n)
+        # A spread sample (every (n / s)-th row), as the worker's stride_rows takes.
+        picked = rows[(np.arange(s, dtype=np.uint64) * n // s).astype(np.int64)]
+        bound_launch, (_, bounds, _) = self.prepare(index, picked, queries, width)
+        rows_d = cp.asarray(rows, dtype=cp.uint32)
+        queries_d = cp.asarray(queries, dtype=cp.float32)
+        cand_d = cp.empty((nq, n), dtype=cp.float32)
+        cand_r = cp.empty((nq, n), dtype=cp.uint32)
+        counts = cp.zeros(nq, dtype=cp.uint32)
+        sgrid = min((n + 127) // 128, self.sms * 4)
+        shared = width * ((dims + 15) & ~15) * 2
+        part_d = cp.empty(slices * nq * 32, dtype=cp.float32)
+        part_r = cp.empty(slices * nq * 32, dtype=cp.uint32)
+        out_d = cp.empty(nq * 32, dtype=cp.float32)
+        out_r = cp.empty(nq * 32, dtype=cp.uint32)
+
+        def launch():
+            bound_launch()
+            counts.fill(0)
+            self.fused[width]((sgrid,), (256,), (
+                index['data'], index['scales'], index['rowScales'], np.uint32(index['rowBytes']),
+                np.uint32(index['blocks']), rows_d, np.uint32(n), queries_d, np.int32(nq), np.int32(dims),
+                bounds, cand_d, cand_r, counts), shared_mem=shared)
+            self.selectc((slices, nq), (256,), (cand_d, cand_r, counts, np.uint32(n), part_d, part_r))
+            self.merge((nq,), (32,), (part_d, part_r, np.uint32(slices), out_d, out_r))
+
+        self.last_counts = counts
+        return launch, (None, out_d.reshape(nq, 32), out_r.reshape(nq, 32))
 
     def prepare(self, index, rows, queries, width):
         """Buffers allocated once; returns (launch, (scores, distances, positions))."""
@@ -118,24 +154,39 @@ def sample(rng, n, dims):
     return (latent @ projection + rng.normal(scale=0.05, size=(n, dims))).astype(np.float32)
 
 
-def check_case(scan, dims, index_rows, n, nq, width, absent=0, seed=0):
+def check_case(scan, dims, index_rows, n, nq, width, absent=0, seed=0, fused=False):
     rng = np.random.default_rng(seed)
     index = scan.index(sample(rng, index_rows, dims))
     rows = np.sort(rng.choice(index_rows, size=min(n, index_rows), replace=False)).astype(np.uint32)
     rows = np.concatenate([rows, np.full(absent, ABSENT, dtype=np.uint32)])
     queries = sample(np.random.default_rng(seed + 1), nq, dims)
-    scores, out_d, out_r = (scan.cp.asnumpy(a) for a in scan.run(index, rows, queries, width))
+    scores, out_d, out_r = (None if a is None else scan.cp.asnumpy(a)
+                            for a in scan.run(index, rows, queries, width, fused))
     present = rows != ABSENT
     x = index['dequantized'][rows[present]]
     q = queries.astype(np.float64)
     exact = (x * x).sum(1)[None, :] + (q * q).sum(1)[:, None] - 2 * q @ x.T
     scale = (x * x).sum(1)[None, :] + (q * q).sum(1)[:, None]
-    error = np.abs(scores[:, present] - exact) / np.maximum(scale, 1e-6)
     problems = []
-    if error.max() > 2e-2:
-        problems.append(f'score error {error.max():.3g}')
-    if absent and not np.isinf(scores[:, ~present]).all():
-        problems.append('absent rows did not score +inf')
+    if fused:
+        # The fused scan returns no matrix: check the returned distances instead.
+        for j in range(nq):
+            ok = out_r[j] != ABSENT
+            got = out_r[j][ok]
+            if (~present[got]).any():
+                problems.append('an absent row was returned')
+                break
+            where = np.searchsorted(positions_all := np.flatnonzero(present), got)
+            e = np.abs(out_d[j][ok] - exact[j][where]) / np.maximum(scale[j][where], 1e-6)
+            if e.size and e.max() > 2e-2:
+                problems.append(f'returned distance error {e.max():.3g}')
+                break
+    else:
+        error = np.abs(scores[:, present] - exact) / np.maximum(scale, 1e-6)
+        if error.max() > 2e-2:
+            problems.append(f'score error {error.max():.3g}')
+        if absent and not np.isinf(scores[:, ~present]).all():
+            problems.append('absent rows did not score +inf')
     positions = np.flatnonzero(present)
     for j in range(nq):
         top = positions[np.argsort(exact[j], kind='stable')[:min(10, len(positions))]]
@@ -153,7 +204,7 @@ def check(args):
     scan = Scan()
     failures = 0
     stages = [('smoke', [(128, 2000, 1000, 16)]),
-              ('sweep', [(d, 20000, n, nq) for d in (64, 128, 200, 1024) for n in (1, 15, 777, 20000)
+              ('sweep', [(d, 60000, n, nq) for d in (64, 128, 200, 1024) for n in (1, 15, 777, 20000, 50000)
                          for nq in (1, 2, 15, 16, 17, 31, 32, 33, 47, 64)]),
               ('edges', [(128, 5000, 300, 64), (1024, 5000, 300, 33)])]
     for stage, cases in stages:
@@ -163,10 +214,13 @@ def check(args):
                     continue
                 if width * ((dims + 15) & ~15) * 2 > 160 * 1024:
                     continue
-                problems = check_case(scan, dims, index_rows, n, nq, width, absent=37 if stage == 'edges' else 0)
-                if problems:
-                    failures += 1
-                    print(f'FAIL {stage} dims={dims} rows={n} queries={nq} width={width}: {"; ".join(problems)}')
+                for fused in (False, True):
+                    problems = check_case(scan, dims, index_rows, n, nq, width,
+                                          absent=37 if stage == 'edges' else 0, fused=fused)
+                    if problems:
+                        failures += 1
+                        print(f'FAIL {stage} dims={dims} rows={n} queries={nq} width={width} fused={fused}: '
+                              f'{"; ".join(problems)}')
         print(f'{stage}: done', flush=True)
     # determinism
     rng = np.random.default_rng(7)
@@ -177,6 +231,12 @@ def check(args):
     if len(set(runs)) != 1:
         failures += 1
         print('FAIL determinism: runs differ')
+    # Fused candidates arrive in any order: the sets and distances must still agree.
+    runs = [tuple(np.sort(scan.cp.asnumpy(a), axis=1).tobytes() for a in scan.run(index, rows, queries, 64, True)[1:])
+            for _ in range(3)]
+    if len(set(runs)) != 1:
+        failures += 1
+        print('FAIL determinism (fused): runs differ')
     print('determinism: done')
     print('PASS' if failures == 0 else f'{failures} failures')
     return failures == 0
@@ -198,7 +258,8 @@ def time_widths(args):
                         continue
                     passes = (nq + width - 1) // width
                     queries = sample(np.random.default_rng(2), nq, dims)
-                    launches = [scan.prepare(index, rows, queries[p * width:(p + 1) * width], width)[0]
+                    prepare = scan.prepare_fused if args.fused else scan.prepare
+                    launches = [prepare(index, rows, queries[p * width:(p + 1) * width], width)[0]
                                 for p in range(passes)]
                     for launch in launches * 3:
                         launch()
@@ -222,6 +283,7 @@ def main():
     t.add_argument('--rows', default='100000,1000000')
     t.add_argument('--queries', default='16,32,64')
     t.add_argument('--repeat', type=int, default=50)
+    t.add_argument('--fused', action='store_true', help='sample bounds, fused scan, select over candidates')
     args = parser.parse_args()
     if args.command == 'check':
         sys.exit(0 if check(args) else 1)

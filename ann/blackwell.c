@@ -278,13 +278,21 @@ static const char *const BlackwellSource[] = {
 	" * values. Rows absent from the index (UINT32_MAX) score +inf.\n"
 	" */\n"
 	"#define KSEG 8 /* k-steps loaded per round: 128 dimensions */\n"
-	"template <int QUANT, int NT>\n"
+	"/*\n"
+	" * FUSED: instead of the whole matrix, append (distance, position) to query\n"
+	" * q's candidate list (out and candR, n slots per query, counts[q] filled)\n"
+	" * only when the distance is at most bounds[q * 32 + 31], the 32nd best\n"
+	" * of a sample of the rows: no row of the true best 32 is above it.\n"
+	" */\n"
+	"template <int QUANT, int NT, int FUSED>\n"
 	"__device__ void score_mma(const unsigned char *data, const unsigned char *scales,\n"
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
-	"    const float *queries, int nq, int dims, float *out)\n"
+	"    const float *queries, int nq, int dims, float *out, const float *bounds, unsigned *candR,\n"
+	"    unsigned *counts)\n"
 	"{\n"
 	"  extern __shared__ unsigned short qh[];\n"
 	"  __shared__ float qn[NT * 8];\n"
+	"  __shared__ float th[NT * 8];\n"
 	"  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;\n"
 	"  int g = lane >> 2, t = lane & 3;\n"
 	"  int qstride = (dims + 15) & ~15;\n"
@@ -301,6 +309,7 @@ static const char *const BlackwellSource[] = {
 	"    float s = 0.0f;\n"
 	"    for (int d = 0; d < dims; d++) { float v = half_bits(qh[threadIdx.x * qstride + d]); s += v * v; }\n"
 	"    qn[threadIdx.x] = s;\n"
+	"    if (FUSED) th[threadIdx.x] = threadIdx.x < nq ? bounds[threadIdx.x * 32 + 31] : 0.0f;\n"
 	"  }\n"
 	"  __syncthreads();\n"
 	"  for (unsigned base = (blockIdx.x * warps + warp) * 16; base < n; base += gridDim.x * warps * 16)\n"
@@ -426,18 +435,36 @@ static const char *const BlackwellSource[] = {
 	"      unsigned i = (j & 2) ? i1 : i0; bool vr = (j & 2) ? v1 : v0;\n"
 	"      float nx = (j & 2) ? nx1 : nx0; float rs = (j & 2) ? rs1 : rs0;\n"
 	"      float dist = fmaxf(rs * rs * nx + qn[nn] - 2.0f * rs * acc[j], 0.0f);\n"
-	"      if (nn < nq && i < n) out[(unsigned long long) nn * n + i] = vr ? dist : inf;\n"
+	"      if (FUSED)\n"
+	"      {\n"
+	"        if (nn < nq && i < n && vr && dist <= th[nn])\n"
+	"        {\n"
+	"          unsigned at = atomicAdd(counts + nn, 1u);\n"
+	"          out[(unsigned long long) nn * n + at] = dist; candR[(unsigned long long) nn * n + at] = i;\n"
+	"        }\n"
+	"      }\n"
+	"      else if (nn < nq && i < n) out[(unsigned long long) nn * n + i] = vr ? dist : inf;\n"
 	"    }\n"
 	"  }\n"
 	"}\n",
 	"#define MMA(NAME, QUANT, NT) extern \"C\" __global__ void NAME(const unsigned char *data, \\\n"
 	"    const unsigned char *scales, const float *rowScales, unsigned rowBytes, unsigned blocks, \\\n"
 	"    const unsigned *rows, unsigned n, const float *queries, int nq, int dims, float *out) \\\n"
-	"{ score_mma<QUANT, NT>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, out); }\n"
+	"{ score_mma<QUANT, NT, 0>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, out, 0, 0, 0); }\n"
+	"#define FUSE(NAME, QUANT, NT) extern \"C\" __global__ void NAME(const unsigned char *data, \\\n"
+	"    const unsigned char *scales, const float *rowScales, unsigned rowBytes, unsigned blocks, \\\n"
+	"    const unsigned *rows, unsigned n, const float *queries, int nq, int dims, const float *bounds, \\\n"
+	"    float *candD, unsigned *candR, unsigned *counts) \\\n"
+	"{ score_mma<QUANT, NT, 1>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, candD, bounds, \\\n"
+	"    candR, counts); }\n"
 	"MMA(score_mma_nvfp4, 1, 2) MMA(score_mma_nvfp4_32, 1, 4) MMA(score_mma_nvfp4_64, 1, 8)\n"
 	"MMA(score_mma_fp8, 2, 2) MMA(score_mma_fp8_32, 2, 4) MMA(score_mma_fp8_64, 2, 8)\n"
 	"MMA(score_mma_half, 3, 2) MMA(score_mma_half_32, 3, 4) MMA(score_mma_half_64, 3, 8)\n"
-	"MMA(score_mma_float, 4, 2) MMA(score_mma_float_32, 4, 4) MMA(score_mma_float_64, 4, 8)\n",
+	"MMA(score_mma_float, 4, 2) MMA(score_mma_float_32, 4, 4) MMA(score_mma_float_64, 4, 8)\n"
+	"FUSE(fuse_mma_nvfp4, 1, 2) FUSE(fuse_mma_nvfp4_32, 1, 4) FUSE(fuse_mma_nvfp4_64, 1, 8)\n"
+	"FUSE(fuse_mma_fp8, 2, 2) FUSE(fuse_mma_fp8_32, 2, 4) FUSE(fuse_mma_fp8_64, 2, 8)\n"
+	"FUSE(fuse_mma_half, 3, 2) FUSE(fuse_mma_half_32, 3, 4) FUSE(fuse_mma_half_64, 3, 8)\n"
+	"FUSE(fuse_mma_float, 4, 2) FUSE(fuse_mma_float_32, 4, 4) FUSE(fuse_mma_float_64, 4, 8)\n",
 	"/*\n"
 	" * Batched top-32 over a [queries][rows] score matrix. Block (slice, q)\n"
 	" * scans its slice of query q's scores: each warp takes 32 scores a step,\n"
@@ -446,15 +473,13 @@ static const char *const BlackwellSource[] = {
 	" * bound (so, with long slices, almost never). Warps merge per block into\n"
 	" * one partial list per (q, slice); merge32 then folds a query's slices.\n"
 	" */\n"
-	"extern \"C\" __global__ void select32(const float *scores, unsigned n, unsigned perBlock, float *partD,\n"
+	"__device__ void select_slice(const float *row, const unsigned *pos, unsigned begin, unsigned end, float *partD,\n"
 	"    unsigned *partR)\n"
 	"{\n"
 	"  __shared__ float sd[8 * 32]; __shared__ unsigned sr[8 * 32]; __shared__ unsigned bound;\n"
 	"  int lane = threadIdx.x & 31, warp = __shfl_sync(0xffffffffu, (int) (threadIdx.x >> 5), 0);\n"
 	"  int warps = blockDim.x >> 5;\n"
 	"  const float inf = __int_as_float(0x7f800000);\n"
-	"  const float *row = scores + (unsigned long long) blockIdx.y * n;\n"
-	"  unsigned begin = blockIdx.x * perBlock, end = min(n, begin + perBlock);\n"
 	"  float bd = inf; unsigned br = 0xffffffffu;\n"
 	"  if (threadIdx.x == 0) bound = 0x7f800000u;\n"
 	"  __syncthreads();\n"
@@ -465,7 +490,7 @@ static const char *const BlackwellSource[] = {
 	"    float thr = fminf(__shfl_sync(0xffffffffu, bd, 31), __uint_as_float(*(volatile unsigned *) &bound));\n"
 	"    if (__ballot_sync(0xffffffffu, v < thr) != 0u)\n"
 	"    {\n"
-	"      float fd = v < thr ? v : inf; unsigned fr = v < thr ? i : 0xffffffffu;\n"
+	"      float fd = v < thr ? v : inf; unsigned fr = v < thr ? (pos ? pos[i] : i) : 0xffffffffu;\n"
 	"      bitonic_sort(fd, fr, lane);\n"
 	"      merge_best(bd, br, fd, fr, lane);\n"
 	"      float worst = __shfl_sync(0xffffffffu, bd, 31);\n"
@@ -480,6 +505,27 @@ static const char *const BlackwellSource[] = {
 	"    partD[((unsigned long long) blockIdx.y * gridDim.x + blockIdx.x) * 32 + lane] = bd;\n"
 	"    partR[((unsigned long long) blockIdx.y * gridDim.x + blockIdx.x) * 32 + lane] = br;\n"
 	"  }\n"
+	"}\n"
+	"extern \"C\" __global__ void select32(const float *scores, unsigned n, unsigned perBlock, float *partD,\n"
+	"    unsigned *partR)\n"
+	"{\n"
+	"  unsigned begin = blockIdx.x * perBlock;\n"
+	"  select_slice(scores + (unsigned long long) blockIdx.y * n, 0, begin, min(n, begin + perBlock), partD, partR);\n"
+	"}\n"
+	"/* Every (n / s)-th row of a row list: a sample that does not follow the list's (key) order. */\n"
+	"extern \"C\" __global__ void stride_rows(const unsigned *rows, unsigned n, unsigned s, unsigned *out)\n"
+	"{\n"
+	"  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+	"  if (i < s) out[i] = rows[(unsigned long long) i * n / s];\n"
+	"}\n"
+	"/* select32 over each query's candidate list: counts[q] entries, stride n; positions from candR. */\n"
+	"extern \"C\" __global__ void select32c(const float *candD, const unsigned *candR, const unsigned *counts,\n"
+	"    unsigned n, float *partD, unsigned *partR)\n"
+	"{\n"
+	"  unsigned count = min(counts[blockIdx.y], n), per = (count + gridDim.x - 1) / gridDim.x;\n"
+	"  unsigned begin = blockIdx.x * per;\n"
+	"  unsigned long long base = (unsigned long long) blockIdx.y * n;\n"
+	"  select_slice(candD + base, candR + base, begin, min(count, begin + per), partD, partR);\n"
 	"}\n"
 	"/* One warp per query merges its slices' lists into the final 32, ascending. */\n"
 	"extern \"C\" __global__ void merge32(const float *partD, const unsigned *partR, unsigned slices, float *outD,\n"
@@ -506,7 +552,11 @@ typedef struct BlackwellModule
 	CUfunction	mma[4][3];		/* [format - 1][tiles]: score matrix of up to
 								 * 16, 32 or 64 queries from NVFP4, FP8, FP16
 								 * or FP32 rows */
+	CUfunction	fuse[4][3];		/* the same, appending only rows under a bound
+								 * to candidate lists */
 	CUfunction	select32;		/* batched top-32 over a score matrix */
+	CUfunction	select32c;		/* the same over candidate lists */
+	CUfunction	strideRows;		/* a spread sample of a row list */
 	CUfunction	merge32;
 	int			sms;			/* streaming multiprocessors */
 } BlackwellModule;
@@ -524,6 +574,8 @@ typedef struct SearchSlot
 	float	   *partD;
 	unsigned   *partR;
 	unsigned   *counter;
+	unsigned   *counts;			/* candidates per query (fused scans) */
+	unsigned   *sampleRows;		/* ANN_BLACKWELL_SAMPLE rows of a list */
 	float	   *outD;
 	unsigned   *outR;
 	float	   *hostD;
@@ -572,6 +624,11 @@ LoadScoreFunctions(BlackwellModule *module)
 				(w > 0 && cuFuncSetAttribute(module->mma[f][w], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
 											 ANN_BLACKWELL_SHARED_MAX) != CUDA_SUCCESS))
 				return 0;
+			snprintf(name, sizeof(name), "fuse_mma_%s%s", formats[f], widths[w]);
+			if (cuModuleGetFunction(&module->fuse[f][w], module->module, name) != CUDA_SUCCESS ||
+				(w > 0 && cuFuncSetAttribute(module->fuse[f][w], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+											 ANN_BLACKWELL_SHARED_MAX) != CUDA_SUCCESS))
+				return 0;
 		}
 	return 1;
 }
@@ -613,6 +670,8 @@ AnnBlackwellReady(int device)
 		cuModuleGetFunction(&module->searchFp8, module->module, "search_fp8") != CUDA_SUCCESS ||
 		!LoadScoreFunctions(module) ||
 		cuModuleGetFunction(&module->select32, module->module, "select32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->select32c, module->module, "select32c") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->strideRows, module->module, "stride_rows") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->merge32, module->module, "merge32") != CUDA_SUCCESS ||
 		cudaDeviceGetAttribute(&module->sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
 	{
@@ -750,6 +809,8 @@ GetSlot(int device, unsigned slot, unsigned maxBlocks)
 		(void) cudaFree(sc->partD);
 		(void) cudaFree(sc->partR);
 		(void) cudaFree(sc->counter);
+		(void) cudaFree(sc->counts);
+		(void) cudaFree(sc->sampleRows);
 		(void) cudaFree(sc->outD);
 		(void) cudaFree(sc->outR);
 		(void) cudaFreeHost(sc->hostD);
@@ -762,6 +823,8 @@ GetSlot(int device, unsigned slot, unsigned maxBlocks)
 		cudaMalloc((void **) &sc->partR, lists * sizeof(unsigned)) != cudaSuccess ||
 		cudaMalloc((void **) &sc->counter, sizeof(zero)) != cudaSuccess ||
 		cudaMemcpy(sc->counter, zero, sizeof(zero), cudaMemcpyHostToDevice) != cudaSuccess ||
+		cudaMalloc((void **) &sc->counts, ANN_BLACKWELL_GROUP_MAX * sizeof(unsigned)) != cudaSuccess ||
+		cudaMalloc((void **) &sc->sampleRows, ANN_BLACKWELL_SAMPLE * sizeof(unsigned)) != cudaSuccess ||
 		cudaMalloc((void **) &sc->outD, ANN_BLACKWELL_GROUP_MAX * ANN_BLACKWELL_TOP * sizeof(float)) != cudaSuccess ||
 		cudaMalloc((void **) &sc->outR, ANN_BLACKWELL_GROUP_MAX * ANN_BLACKWELL_TOP * sizeof(unsigned)) != cudaSuccess ||
 		cudaMallocHost((void **) &sc->hostD, ANN_BLACKWELL_GROUP_MAX * ANN_BLACKWELL_TOP * sizeof(float)) != cudaSuccess ||
@@ -772,6 +835,21 @@ GetSlot(int device, unsigned slot, unsigned maxBlocks)
 	}
 	sc->maxBlocks = maxBlocks;
 	return sc;
+}
+
+/* Fused scans unless ANN_BLACKWELL_FUSE=off (for measurements). */
+static int
+FuseEnabled(void)
+{
+	static int	enabled = -1;
+
+	if (enabled < 0)
+	{
+		const char *value = getenv("ANN_BLACKWELL_FUSE");
+
+		enabled = value == NULL || strcmp(value, "off") != 0;
+	}
+	return enabled;
 }
 
 /*
@@ -865,7 +943,8 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 		 * 165 with one slice per SM): long slices let a warp's list fill
 		 * early and then rarely change, and the merge stays short.
 		 */
-		size_t		needed = (size_t) nq * n;
+		int			fused = n >= ANN_BLACKWELL_FUSE_ROWS && dims <= ANN_BLACKWELL_FUSE_DIMS && FuseEnabled();
+		size_t		needed = (size_t) nq * n * (fused ? 2 : 1) + (fused ? (size_t) nq * ANN_BLACKWELL_SAMPLE : 0);
 		unsigned	sgrid = (n + 127) / 128 < maxBlocks ? (n + 127) / 128 : maxBlocks;
 		unsigned	cap = (unsigned) module->sms / 4 > 1 ? (unsigned) module->sms / 4 : 1;
 		unsigned	slices = (n + 8191) / 8192 < cap ? (n + 8191) / 8192 : cap;
@@ -889,6 +968,51 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 				return 0;
 			sc->scoreCapacity = needed * 2;
 		}
+		if (fused)
+		{
+			/*
+			 * Fused: the 32nd best of a spread sample bounds each query's
+			 * best 32, the scan keeps only rows at or under it (candidate
+			 * lists with room for every row, so none can overflow), and the
+			 * selection runs over the candidates. No score matrix is written
+			 * or read: at 128 dimensions and 1M rows it took half the time.
+			 */
+			unsigned	sample = ANN_BLACKWELL_SAMPLE;
+			unsigned	one = 1;
+			unsigned	candidateSlices = 8;
+			float	   *candD = sc->scores;
+			unsigned   *candR = (unsigned *) (sc->scores + (size_t) nq * n);
+			float	   *sampleScores = sc->scores + (size_t) nq * n * 2;
+			unsigned	sampleGrid = (sample + 127) / 128 < maxBlocks ? (sample + 127) / 128 : maxBlocks;
+			void	   *strideArgs[] = {(void *) &rows, &n, &sample, &sc->sampleRows};
+			void	   *sampleArgs[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+			&rowBytes, &blocks, &sc->sampleRows, &sample, (void *) &queries, &count, &dimensions, &sampleScores};
+			void	   *sampleSelect[] = {&sampleScores, &sample, &sample, &sc->partD, &sc->partR};
+			void	   *sampleMerge[] = {&sc->partD, &sc->partR, &one, &sc->outD, &sc->outR};
+			void	   *fuseArgs[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+				&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dimensions, &sc->outD, &candD,
+			&candR, &sc->counts};
+			void	   *selectArgs[] = {&candD, &candR, &sc->counts, &n, &sc->partD, &sc->partR};
+			void	   *mergeArgs[] = {&sc->partD, &sc->partR, &candidateSlices, &sc->outD, &sc->outR};
+
+			if (cuLaunchKernel(module->strideRows, (sample + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+							   strideArgs, NULL) != CUDA_SUCCESS ||
+				cuLaunchKernel(module->mma[shard->quant - 1][width], sampleGrid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1,
+							   shared, (CUstream) stream, sampleArgs, NULL) != CUDA_SUCCESS ||
+				cuLaunchKernel(module->select32, 1, nq, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0, (CUstream) stream,
+							   sampleSelect, NULL) != CUDA_SUCCESS ||
+				cuLaunchKernel(module->merge32, nq, 1, 1, 32, 1, 1, 0, (CUstream) stream, sampleMerge,
+							   NULL) != CUDA_SUCCESS ||
+				cudaMemsetAsync(sc->counts, 0, nq * sizeof(unsigned), (cudaStream_t) stream) != cudaSuccess ||
+				cuLaunchKernel(module->fuse[shard->quant - 1][width], sgrid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, shared,
+							   (CUstream) stream, fuseArgs, NULL) != CUDA_SUCCESS ||
+				cuLaunchKernel(module->select32c, candidateSlices, nq, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0,
+							   (CUstream) stream, selectArgs, NULL) != CUDA_SUCCESS ||
+				cuLaunchKernel(module->merge32, nq, 1, 1, 32, 1, 1, 0, (CUstream) stream, mergeArgs,
+							   NULL) != CUDA_SUCCESS)
+				return 0;
+		}
+		else
 		{
 			void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
 			&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dimensions, &sc->scores};

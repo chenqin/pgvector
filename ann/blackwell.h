@@ -66,6 +66,14 @@ int			AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32
  */
 #define ANN_BLACKWELL_TOP 32
 #define ANN_BLACKWELL_GROUP_MAX 64
+/*
+ * Grouped scans of at least ANN_BLACKWELL_FUSE_ROWS rows (and at most
+ * ANN_BLACKWELL_FUSE_DIMS dimensions) take the fused route: bounds from an
+ * ANN_BLACKWELL_SAMPLE-row sample, then only rows under them kept.
+ */
+#define ANN_BLACKWELL_SAMPLE 8192
+#define ANN_BLACKWELL_FUSE_ROWS 262144
+#define ANN_BLACKWELL_FUSE_DIMS 512
 /* Opt-in dynamic shared memory for one scan block's queries. */
 #define ANN_BLACKWELL_SHARED_MAX (160 * 1024)
 int			AnnBlackwellGroupLimit(int dims);
