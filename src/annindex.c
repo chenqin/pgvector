@@ -13,6 +13,8 @@
 #include "access/htup_details.h"
 #include "portability/instr_time.h"
 #include "miscadmin.h"
+#include "utils/acl.h"
+#include "utils/rls.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
@@ -77,7 +79,7 @@ CheckName(text *name)
 /* Networked GPU nodes when configured, otherwise the local worker socket. */
 bool
 AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs,
-		  uint32 *status, char **reply, uint32 *replyLength)
+			 uint32 *status, char **reply, uint32 *replyLength)
 {
 	instr_time	start;
 	long		delayUs = 500;
@@ -326,9 +328,9 @@ CatalogHasGeneration(FunctionCallInfo fcinfo)
 }
 
 static uint64
-ParseGeneration(const char *text)
+ParseGeneration(const char *value)
 {
-	return text && strlen(text) == 16 ? strtou64(text, NULL, 16) : 0;
+	return value && strlen(value) == 16 ? strtou64(value, NULL, 16) : 0;
 }
 
 static uint64
@@ -1372,6 +1374,11 @@ ann_bitmap_search(PG_FUNCTION_ARGS)
 	appendBinaryStringInfo(&payload, (char *) query->x, sizeof(float) * query->dim);
 	ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_SEARCH_CACHED, payload.data, payload.len, 0, &status, &reply,
 					&replyLength, &generation);
+	/* A generation cached before the index was (re)loaded: read it again. */
+	if (id != FilterId(name, generation, filter) &&
+		id == FilterId(name, CachedGeneration(fcinfo, name, true), filter))
+		ok = TaggedCall(fcinfo, name, ANN_OP_INDEX_SEARCH_CACHED, payload.data, payload.len, 0, &status,
+						&reply, &replyLength, &generation);
 	if (id != FilterId(name, generation, filter))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -1458,6 +1465,17 @@ ann_index_filter(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_UNDEFINED_OBJECT),
 				 errmsg("ann index \"%s\" is not an export of a frozen index in this database's catalog", name)));
 	relid = DatumGetObjectId(DirectFunctionCall1(regclassin, CStringGetDatum(entry.source)));
+	/* Like reading the table: SELECT on it, and no row-level security. */
+	{
+		AclResult	aclresult = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+
+		if (aclresult != ACLCHECK_OK)
+			aclcheck_error(aclresult, OBJECT_TABLE, get_rel_name(relid));
+		if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ann_index_filter does not support row-level security")));
+	}
 	if ((index = AnnFrozenIndexOf(relid, entry.generation, AccessShareLock)) == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

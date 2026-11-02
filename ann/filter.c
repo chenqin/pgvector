@@ -159,7 +159,8 @@ typedef struct Run
 {
 	uint64_t	first;
 	uint64_t	end;
-	uint64_t	code;			/* the value's position; UINT64_MAX for several */
+	uint64_t	code;			/* the value's position; UINT64_MAX for
+								 * several */
 } Run;
 
 /* Union of postings runs: a sorted list when small, else bits. */

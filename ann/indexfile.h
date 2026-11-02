@@ -142,8 +142,8 @@ struct AnnIndexFile
 	uint64_t	nbitmaps;
 	uint64_t	bitmapBytes;
 	uint64_t	bitmapDeviceBytes;
-	uint64_t   *predicates;		/* ids of cached predicate results, a ring
-								 * of predicate_cache entries */
+	uint64_t   *predicates;		/* ids of cached predicate results, a ring of
+								 * predicate_cache entries */
 	uint32_t	npredicates;
 	uint32_t	predicateNext;
 	const int64_t *keys;		/* mapped */

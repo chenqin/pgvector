@@ -41,7 +41,7 @@
 
 /* Evaluation results. */
 #define ANN_FILTER_OK 0
-#define ANN_FILTER_INVALID (-1)		/* malformed program */
+#define ANN_FILTER_INVALID (-1) /* malformed program */
 #define ANN_FILTER_UNKNOWN_COLUMN (-2)
 #define ANN_FILTER_NO_MEMORY (-3)
 #define ANN_FILTER_UNKNOWN_BITMAP (-4)

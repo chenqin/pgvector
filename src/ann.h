@@ -16,9 +16,10 @@
 
 #define ANN_MAGIC_NUMBER 0xA991A991
 #define ANN_VERSION 1			/* mutable layout: index tuples */
-#define ANN_FROZEN_VERSION 3	/* frozen layout: arrays by ordinal, with
-								 * bitset pages (version 2 has none) */
-#define AnnVersionFrozen(version) ((version) == 2 || (version) == ANN_FROZEN_VERSION)
+#define ANN_FROZEN_VERSION 4	/* frozen layout: arrays by ordinal; 3 adds
+								 * bitset pages and text dictionaries to 2, 4
+								 * the attribute names */
+#define AnnVersionFrozen(version) ((version) >= 2 && (version) <= ANN_FROZEN_VERSION)
 #define ANN_PAGE_ID 0xFF92
 #define ANN_METAPAGE_BLKNO 0
 #define ANN_MAX_DIM 2000
@@ -107,10 +108,16 @@ typedef struct AnnFrozenMetaData
 	((AnnFrozenMetaData *) ((char *) PageGetContents(page) + MAXALIGN(sizeof(AnnMetaPageData))))
 #define AnnFrozenMetaSizeV2(ncolumns) \
 	(offsetof(AnnFrozenMetaData, columns) + (ncolumns) * sizeof(AnnFrozenColumn))
-#define AnnFrozenMetaSize(ncolumns) \
+#define AnnFrozenMetaSizeV3(ncolumns) \
 	(AnnFrozenMetaSizeV2(ncolumns) + (ncolumns) * sizeof(AnnFrozenColumnExtra))
-/* The extra directory follows the columns. */
+#define AnnFrozenMetaSize(ncolumns) (AnnFrozenMetaSizeV3(ncolumns) + (ncolumns) * sizeof(NameData))
+/* The extra directory follows the columns, then the attribute names. */
 #define AnnFrozenGetExtra(meta) ((AnnFrozenColumnExtra *) &(meta)->columns[(meta)->ncolumns])
+/*
+ * Attribute names as of the build: predicate programs and exports use them,
+ * so a later column rename can't make a program name another column.
+ */
+#define AnnFrozenGetNames(meta) ((NameData *) &AnnFrozenGetExtra(meta)[(meta)->ncolumns])
 
 /*
  * Frozen metapages whose build flushed every page to the files say so in
@@ -229,7 +236,8 @@ int32		AnnFrozenAttributeValue(Datum value, bool isnull, Oid type);
 Datum		AnnFrozenAttributeDatum(int32 value, Oid type);
 
 void		AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns);
-AnnPredicateColumns *AnnFrozenColumnsCache(Relation index, bool **ready);
+bool		AnnFrozenCachedColumns(Relation index, AnnPredicateColumns *columns);
+void		AnnFrozenStoreColumns(Relation index, const AnnPredicateColumns *columns);
 bool		AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *columns);
 void		AnnPredicateBuild(List *clauses, Index varno, const AnnPredicateColumns *columns,
 							  PlanState *parent, ExprContext *econtext, StringInfo program);

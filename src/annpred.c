@@ -35,37 +35,42 @@ typedef struct Context
 	StringInfo	program;		/* NULL when only checking */
 	PlanState  *parent;
 	ExprContext *econtext;
+	int			steps;			/* program instructions, when checking */
+	int			nesting;		/* current and deepest AND/OR nesting */
+	int			maxNesting;
+	size_t		bytes;			/* constant IN lists' values */
 } Context;
 
 void
 AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns)
 {
-	bool	   *ready;
-	AnnPredicateColumns *cached = AnnFrozenColumnsCache(index, &ready);
-
-	/* Computed once per relcache entry: GetDefaultOpClass scans pg_opclass. */
-	if (!*ready)
+	/*
+	 * Computed once per relcache entry (GetDefaultOpClass scans pg_opclass),
+	 * in local memory: catalog lookups can process invalidations that free
+	 * the cache, which is only written once they are done.
+	 */
+	if (!AnnFrozenCachedColumns(index, columns))
 	{
-		MemoryContext oldCtx = MemoryContextSwitchTo(index->rd_indexcxt);
+		AnnPredicateColumns local;
 
-		cached->ncolumns = RelationGetDescr(index)->natts - 2;
-		for (int c = 0; c < cached->ncolumns; c++)
+		memset(&local, 0, sizeof(local));
+		local.ncolumns = RelationGetDescr(index)->natts - 2;
+		for (int c = 0; c < local.ncolumns; c++)
 		{
 			Oid			opclass;
 
-			cached->attnos[c] = index->rd_index->indkey.values[2 + c];
-			cached->names[c] = pstrdup(AnnFrozenColumnName(index, 3 + c));
-			cached->types[c] = TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid;
-			cached->collations[c] = AnnFrozenColumnCollation(index, 2 + c);
+			local.attnos[c] = index->rd_index->indkey.values[2 + c];
+			local.types[c] = TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid;
+			local.collations[c] = AnnFrozenColumnCollation(index, 2 + c);
 			/* varchar compares with text's operators */
-			opclass = GetDefaultOpClass(AnnFrozenTextType(cached->types[c]) ? TEXTOID : cached->types[c],
+			opclass = GetDefaultOpClass(AnnFrozenTextType(local.types[c]) ? TEXTOID : local.types[c],
 										BTREE_AM_OID);
-			cached->families[c] = OidIsValid(opclass) ? get_opclass_family(opclass) : InvalidOid;
+			local.families[c] = OidIsValid(opclass) ? get_opclass_family(opclass) : InvalidOid;
 		}
-		MemoryContextSwitchTo(oldCtx);
-		*ready = true;
+		AnnFrozenStoreColumns(index, &local);
+		if (!AnnFrozenCachedColumns(index, columns))
+			elog(ERROR, "could not cache the predicate columns of \"%s\"", RelationGetRelationName(index));
 	}
-	*columns = *cached;
 	columns->index = index;
 	columns->meta = AnnFrozenMeta(index);
 }
@@ -470,7 +475,7 @@ TranslateArray(Context *cxt, ScalarArrayOpExpr *op, bool negate)
 	if (in && nvalues == 0)
 		PutByte(cxt->program, ANN_FILTER_NONE);
 	else if (!in && anyNull)
-		PutByte(cxt->program, ANN_FILTER_NONE);	/* x <> NULL is never true */
+		PutByte(cxt->program, ANN_FILTER_NONE); /* x <> NULL is never true */
 	else if (!in && n == 0)
 		PutByte(cxt->program, ANN_FILTER_ALL);	/* <> ALL of nothing holds */
 	else if (!in && nvalues == 0)
@@ -500,22 +505,52 @@ Translate(Context *cxt, Node *node, bool negate)
 
 		if (expr->boolop == NOT_EXPR)
 			return Translate(cxt, linitial(expr->args), !negate);
+		cxt->maxNesting = Max(cxt->maxNesting, ++cxt->nesting);
 		foreach(lc, expr->args)
 		{
 			if (!Translate(cxt, lfirst(lc), negate))
 				return false;
-			if (cxt->program && i++ > 0)
-				PutByte(cxt->program, conjunction ? ANN_FILTER_AND : ANN_FILTER_OR);
+			if (i++ > 0)
+			{
+				cxt->steps++;
+				if (cxt->program)
+					PutByte(cxt->program, conjunction ? ANN_FILTER_AND : ANN_FILTER_OR);
+			}
 		}
+		cxt->nesting--;
 		return true;
 	}
+
+	/*
+	 * a leaf: at most three instructions (a NOT TRUE test is two leaves and
+	 * OR)
+	 */
+	cxt->steps += 3;
 	if (IsA(node, OpExpr))
 		return TranslateOp(cxt, (OpExpr *) node, negate);
 	if (IsA(node, ScalarArrayOpExpr))
+	{
+		Node	   *operand = list_length(((ScalarArrayOpExpr *) node)->args) == 2 ?
+			lsecond(((ScalarArrayOpExpr *) node)->args) : NULL;
+
+		/* constant lists count against the program's size */
+		if (operand && IsA(operand, Const) && !((Const *) operand)->constisnull)
+		{
+			ArrayType  *array = DatumGetArrayTypeP(((Const *) operand)->constvalue);
+			int			n = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
+
+			if (n > ANN_FILTER_MAX_VALUES)
+				return false;
+			cxt->bytes += (size_t) n * 4 + 80;
+		}
 		return TranslateArray(cxt, (ScalarArrayOpExpr *) node, negate);
+	}
 	if (ColumnOf(cxt, node) >= 0 && cxt->columns->types[ColumnOf(cxt, node)] == BOOLOID)
 	{
-		/* "flag" is flag = true; NOT flag is flag = false (NULL never matches). */
+		/*
+		 * "flag" is flag = true; NOT flag is flag = false (NULL never
+		 * matches).
+		 */
 		if (cxt->program)
 			PutComparison(cxt, ColumnOf(cxt, node), BTEqualStrategyNumber, negate ? 0 : 1);
 		return true;
@@ -579,9 +614,19 @@ AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *col
 	ListCell   *lc;
 
 	foreach(lc, clauses)
+	{
 		if (!Translate(&cxt, lfirst(lc), false))
 			return false;
-	return true;
+		cxt.steps++;
+	}
+
+	/*
+	 * Programs the evaluator would refuse keep ordinary plans. Stack depth is
+	 * at most the AND/OR nesting plus two; parameter lists are checked when
+	 * the program is built.
+	 */
+	return cxt.steps <= ANN_FILTER_MAX_STEPS && cxt.maxNesting + 2 <= ANN_FILTER_MAX_DEPTH &&
+		cxt.bytes + (size_t) cxt.steps * 80 <= ANN_FILTER_MAX_PROGRAM;
 }
 
 /* The program of supported clauses (AND of them; ALL when there are none). */

@@ -76,7 +76,7 @@ If the guard is dropped and rows are deleted anyway, VACUUM doesn't move any ord
 
 ## Page layout
 
-Block 0 is the metapage (layout version 3; version 2 indexes, without bitset pages or dictionaries, still read). After the existing header it holds the row count, the generation, the guard trigger's OID, and a directory of arrays. Every structure is an array of fixed-width elements over consecutive pages. Element *i* of an array is on block `start + i / perPage` at byte `(i % perPage) × width` of the page contents, with 8,160 bytes per page. Each page's `pd_lower` covers its elements, so full-page WAL images keep them.
+Block 0 is the metapage (layout version 4; versions 2 and 3, without bitset pages and dictionaries or without stored names, still read). After the existing header it holds the row count, the generation, the guard trigger's OID, and a directory of arrays. Every structure is an array of fixed-width elements over consecutive pages. Element *i* of an array is on block `start + i / perPage` at byte `(i % perPage) × width` of the page contents, with 8,160 bytes per page. Each page's `pd_lower` covers its elements, so full-page WAL images keep them.
 
 | Array | Element | Per page | 10M rows, 128 dims |
 | --- | --- | --- | --- |
@@ -94,6 +94,10 @@ Vectors are stored as whole `Vector` values, so the distance function reads them
 
 **Build.** `table_index_build_scan` feeds `(key, TID, vector, attributes)` to a tuplesort on the key (`maintenance_work_mem`). The sorted output assigns ordinals: TIDs, keys and attribute values fill pages reserved for them, while vectors are appended after them, all in one pass. Each attribute also feeds a datum sort of `value × 2^32 + ordinal`, which yields its postings in order; distinct values, offsets and bitset pages follow. A text column first goes through a `(string, ordinal)` sort in its collation, which assigns codes, writes the dictionary and fills its value pages. The build memory beyond the sorts is the distinct values and offsets of one column at a time (plus one int32 per row for a text column). The pages go through shared buffers and are WAL-logged with `log_newpage_range`, like other `ann` builds.
 
+**Reading pages from host memory.** A frozen index's pages never change after its build, apart from the TIDs VACUUM can invalidate, so backends read them through read-only mappings of the index files rather than shared buffers. Every backend maps the same files, the operating system keeps one copy in memory (the host's memory, not `shared_buffers`, bounds what stays resident), and reads take no buffer pins or content locks. TID pages always go through shared buffers. The build flushes the index's buffers and marks its metapage (`insertPage = 0xFFFFFFFE`); only marked indexes are mapped, so indexes built before this change use buffers until a `REINDEX` (which keeps the generation). Before a backend maps an index it flushes the index's buffers again (pages replayed after a crash or a promotion may not have reached the files yet), each mapped array is checked on open (its first and last pages must be finished `ann` pages), a mapping is checked against the relation's size once per relcache entry, and nothing is mapped during recovery or on a hot standby, where replay writes go to shared buffers first. `ann.frozen_mmap = off` reads everything through shared buffers. On the GPU node, the worker keeps its copies resident already: the CAGRA graph, the NVFP4 rows and every cached predicate's bitsets and rows live in GPU memory, and its attribute postings in host memory.
+
+**Attribute names.** The metapage keeps each attribute's name as of the build. Predicate programs and exports use those names, while SQL resolves columns by position, so renaming (even swapping) columns after the build can't make a program read another column.
+
 **Generation.** `hash_bytes_extended` chained over every key, vector and attribute value (text: its bytes) in ordinal order, plus the dimensions, column count and row count. The same rows in another table, inserted in another order, get the same generation. `REINDEX` keeps it, and any changed value changes it.
 
 ## Predicates
@@ -110,7 +114,7 @@ The planner, `ann_frozen_filter`, `ann_index_filter` and `ann_filter_bitmap_buil
 | `AND`, `OR`, `NOT` | `AND`, `OR`; `NOT` is pushed down to the leaves |
 | constants out of range, `= NULL`, `IN ()` | `NONE`; `<> ALL('{}')` is `ALL` |
 
-Operands are constants, parameters (including generic plans) or stable expressions without columns; integer operands of any width compare with integer attributes, `date` with `date`, `boolean` with `boolean`, `text` with `text`/`varchar` in the column's collation. A predicate that uses any other column, operator, function of a column, collation or volatile function isn't translated: the planner keeps its ordinary plans, and `ann_filter_bitmap_build` runs the filter as SQL, as before.
+Predicates the evaluator would refuse (more than 1,024 instructions, AND/OR nested deeper than 62, or more than 1 MB of constant values) keep ordinary plans; a parameter list that makes the program too large is an error at execution. Operands are constants, parameters (including generic plans) or stable expressions without columns; integer operands of any width compare with integer attributes, `date` with `date`, `boolean` with `boolean`, `text` with `text`/`varchar` in the column's collation. A predicate that uses any other column, operator, function of a column, collation or volatile function isn't translated: the planner keeps its ordinary plans, and `ann_filter_bitmap_build` runs the filter as SQL, as before.
 
 The evaluator keeps each intermediate set as a sorted list while it holds fewer than rows / 64 ordinals, and as a bitset otherwise. Lists intersect and merge in one pass; bitsets combine word by word; a prebuilt bitset replaces a frequent value's postings.
 
@@ -123,7 +127,7 @@ At execution:
 1. The scan finds the loaded export of its index's generation: `ann_index_catalog` rows whose `source` is the table and whose `generation` matches, the most recently loaded one. The name is cached per backend, and read again after a failed call (and, when none was loaded, at most once a second).
 2. It builds the program, evaluates the query vector and sends both in operation 22, with the generation in the request header and `ANN_PREDICATE_ORDINALS`. The worker evaluates the program (or finds it cached), searches the rows it selects on its usual route (exact, GPU gather, grouped tensor-core scan, filtered CAGRA; plain ANN for a program matching every row), and returns ordinals and distances.
 3. Each ordinal's TID comes from the TID pages. When every column the query reads is in the index (the vector, the key, the attributes) and the heap page is all-visible, the row is built from the index pages (`Heap Fetches: 0`); otherwise it's fetched from the heap with the query's snapshot. The table's quals are rechecked on each row.
-4. The first request asks for `LIMIT + OFFSET` rows (100 without a constant limit). If the consumer wants more, the scan asks again for four times as many and skips the rows it already returned.
+4. The first request asks for `LIMIT + OFFSET` rows (100 without a constant limit). If the consumer wants more, the scan asks again for four times as many and skips the rows it already returned. The worker also reports how many rows the program selected; if it returns fewer than asked while more qualify (filtered CAGRA is approximate), the remaining rows come from the pages, exactly. Rows from a refill of an approximate route can come out of distance order with the ones already returned, as with any approximate index; the exact, gather and page routes keep the order.
 
 Without a worker for the generation (none loaded, the nodes unreachable, or a worker without operation 22), the scan evaluates the program from the pages and scores the selected rows on the CPU from the vector pages: exact, the complete ordering at once. EXPLAIN ANALYZE reports `Filter Rows` (the program's rows), `Heap Fetches`, `Worker Calls` and `Local Evaluations`.
 
@@ -140,7 +144,7 @@ The worker evaluates a program over its attribute postings (`attr-*.i32`, invert
 
 `ann_index_export(index, directory)` writes `manifest` (with `shards 0` and `generation G`), `keys.i64`, `vectors.f32` without the `Vector` headers, and one `attr-COLUMN.i32` per attribute: integers as themselves, booleans as 0/1, dates as days, text as its dictionary codes (so `ann_attribute_search` on a text attribute takes codes; the frozen route translates strings itself). Names that a manifest can't hold (spaces, slashes, more than 63 bytes) are refused. The directory must be absolute and new or empty, and the manifest is written last with `durable_rename`. It needs superuser or `pg_write_server_files`, plus `SELECT` on the table. `build_cuvs_index.py --from-export` hard-links the files into the index directory (copying across file systems), keeps the export's `source`, `key`, `vector`, `attribute` and `generation` lines, and adds shards, `dtype` and `quant`; one export can feed several builds.
 
-`ann_frozen_info`, `ann_frozen_keys` and `ann_frozen_filter` need `SELECT` on the table and refuse tables with row-level security, since they return rows without applying policies.
+`ann_frozen_info`, `ann_frozen_keys`, `ann_frozen_filter` and `ann_index_filter` need `SELECT` on the table and refuse tables with row-level security, since they return rows without applying policies.
 
 ## Generations on the GPU nodes
 
@@ -192,22 +196,38 @@ Each PostgreSQL host (clusters A and B: 64 cores, 32 GB shared buffers) ran pgbe
 
 **Throughput: one B200, one PostgreSQL host**
 
-| Workload | Frozen route (plain SQL) | Function on the same index |
-| --- | --- | --- |
-| 0.1%: `tenant = t` (1,000 distinct predicates) | 108k QPS, p99 6.8 ms | `ann_attribute_search`: 127k |
-| 1%: `category = c` | 149k, p99 5.9 ms | `ann_attribute_search`: 151k |
-| 10%: `category BETWEEN 10d AND 10d + 9` | 81k, p99 11.6 ms | `ann_attribute_search` with 10 values: 543 (it merges 1M ordinals per query) |
-| 10%, three hot ranges | 78k | |
-| 5%: `tenant BETWEEN ... AND category < 50` | 131k | no function expresses it |
-| no filter | 165k | `ann_index_search`: 188k |
+| Workload | Frozen route (plain SQL), pages through mappings | The same through shared buffers | Function on the same index |
+| --- | --- | --- | --- |
+| 0.1%: `tenant = t` (1,000 distinct predicates) | 121k QPS, p99 5.6 ms | 113k | `ann_attribute_search` 117k; `ann_bitmap_search` 146k |
+| 1%: `category = c` | 159k, p99 5.6 ms | 146k | `ann_attribute_search` 154k |
+| 10%: `category BETWEEN 10d AND 10d + 9` | 81k, p99 11.5 ms | 81k | `ann_attribute_search` with 10 values: 543 (it merges 1M ordinals per query) |
+| 10%, three hot ranges | | 77k | |
+| 5%: `tenant BETWEEN ... AND category < 50` | 135k | 133k | no function expresses it |
+| no filter | 176k | 164k | `ann_index_search` 188k |
 
-TWO_HOST_AND_EIGHT_GPU_RESULTS
+**Throughput: two PostgreSQL hosts** (totals of both hosts, 512 clients each; one B200, then eight with the index replicated)
+
+| Workload | 1 GPU, frozen route | 1 GPU, function | 8 GPUs, frozen route | 8 GPUs, function |
+| --- | --- | --- | --- | --- |
+| 0.1% | 211k / 196k (two runs) | `ann_bitmap_search` 203k / 197k; `ann_attribute_search` 166k / 162k | 201k | `ann_bitmap_search` 202k; `ann_attribute_search` 208k |
+| 1% | 275k / 276k | `ann_attribute_search` 278k | 219k | 221k |
+| 10% | 91k / 90k | | 220k | |
+| 5% AND | 153k / 153k | | 224k | |
+| no filter | 288k / 293k | `ann_index_search` 337k | 243k | `ann_index_search` 287k |
+
+On one GPU, 10% filters are GPU-bound at about 90k QPS; on eight they rise to 220k. On eight GPUs every workload lands between 200k and 243k: the two PostgreSQL hosts (64 cores each, shared with their pgbench clients) are the limit there, not the GPUs or the worker.
 
 **Profile.**
 
-- **PostgreSQL.** gdb samples of backends running the route (perf is blocked on this host) spent 42 of 48 samples at 0.1%, and 25 of 48 unfiltered, in `poll` inside `AnnRemoteCall`, waiting for the worker. Almost all the rest was the client protocol. Building the program, the catalog lookup (cached) and rows from the pages didn't appear. The route's remaining gap to the functions (−15% at 0.1%, −12% unfiltered, none at 1%) is executor work per query on the PostgreSQL host, which the pgbench clients share.
+- **PostgreSQL.** gdb samples of backends running the route (perf is blocked on this host) spent 42 of 48 samples at 0.1%, and 25 of 48 unfiltered, in `poll` inside `AnnRemoteCall`, waiting for the worker. Almost all the rest was the client protocol; building the program and the worker-name lookup (cached) didn't appear. Reading rows from the mapped pages instead of shared buffers raised one host's throughput by 7 to 9% (table above). The route now matches or beats the functions at 0.1% and 1%; unfiltered it is 7% below `ann_index_search`, the cost of the executor nodes above the scan.
 - **GPU.** nsys traces of the worker show the same kernels per search as the attribute route (`search_nvfp4` 17.1 µs against 16.4 µs).
-- **Fixed during the measurements.** A first run reached 1,947 QPS at 0.1%. 512 clients missing the same new predicate evaluated it concurrently: 20,680 evaluations at 478 ms each, mostly synchronous `cudaMalloc` and `cudaMemcpy` of device copies, which wait for every search on the device. After single-flight evaluation, a 1,024-entry default cache and stream-ordered uploads, each distinct predicate is evaluated once in 18 ms. That gave 0.1% filters 108k QPS.
+- **Fixed during the measurements:**
+  - *Evaluation stampede.* A first run reached 1,947 QPS at 0.1%: 512 clients missing the same new predicate evaluated it concurrently, 20,680 evaluations at 478 ms each. Most of that was synchronous `cudaMalloc` and `cudaMemcpy` of device copies, which wait for every search on the device. Single-flight evaluation and stream-ordered uploads bring each distinct predicate to one evaluation of about 18 ms.
+  - *Catalog scans.* A build that looked up the attributes' operator families with `GetDefaultOpClass` (a `pg_opclass` scan) on every execution dropped the route to 56k QPS. Frozen metadata and predicate columns are now cached in the index's relcache entry.
+  - *Key searches in replies.* The worker converted every hit's key back to its ordinal with a binary search over the 80 MB key array, on the lane thread. Hits now carry their ordinals.
+  - *A global lock for a counter.* A per-request statistics counter took the scheduler's mutex; it is an atomic now.
+  - *Colliding filter entries.* Two hosts got only 98–132k QPS at 0.1%, and 10% filters sometimes collapsed to 49k, with worker lanes blocked on the scheduler's mutex (gdb samples of the worker). The scheduler groups same-filter searches in a hash table keyed by the addresses of each filter's row arrays, and its hash kept only the pointers' low bits. Predicates first evaluated under load get their arrays from allocator chunks whose low bits barely differ, so hundreds of filters shared a few buckets, and every enqueue walked long chains under the mutex. Predicates evaluated while the worker was idle didn't collide, which is why runs varied. Driving the worker directly, operation 22 went from 79–92k requests/s to 240k (operation 21: 242k). The table now hashes every pointer bit and frees idle entries.
+  - *Predicate cache races.* A predicate's result is now returned already referenced when it's cached, so an eviction can't remove it before the search uses it. The eviction ring holds each id once, and predicate results and pushed bitmaps are separate kinds of entry, so operation 20 can't replace or plant a predicate's rows.
 
 **Correctness at scale.** The two hosts built the same generation independently. Filtered results through the route equal exact SQL on the gather routes, and ANN recall@10 through the loaded export was 1.0. Crash recovery was checked by building an index, stopping the cluster with `pg_ctl -m immediate` before a checkpoint, and comparing a 20,000-row ordered scan, a postings lookup and the generation after WAL replay: identical to before the crash and to plain SQL.
 

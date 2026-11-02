@@ -195,7 +195,7 @@ ann_index_export(PG_FUNCTION_ARGS)
 					 ManifestWord(AnnFrozenColumnName(index, 1), 63, "column"));
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 	{
-		const char *name = ManifestWord(AnnFrozenColumnName(index, 3 + c), 63, "column");
+		const char *name = ManifestWord(NameStr(AnnFrozenGetNames(meta)[c]), 63, "column");
 
 		appendStringInfo(&manifest, "attribute %s attr-%s.i32\n", name, name);
 	}
@@ -207,7 +207,7 @@ ann_index_export(PG_FUNCTION_ARGS)
 				   meta->vectors.width - offsetof(Vector, x));
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 		WriteArrayFile(index, &meta->columns[c].values, directory,
-					   psprintf("attr-%s.i32", AnnFrozenColumnName(index, 3 + c)), 0, sizeof(int32));
+					   psprintf("attr-%s.i32", NameStr(AnnFrozenGetNames(meta)[c])), 0, sizeof(int32));
 
 	/* The manifest comes last, so a partial export is never loadable. */
 	temporary = psprintf("%s/manifest.tmp", directory);

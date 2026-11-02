@@ -399,6 +399,32 @@ class FrozenTests(unittest.TestCase):
         plan = self.plan("SELECT id FROM named WHERE label < 'cherry' COLLATE \"C\" ORDER BY emb <-> '[1,2,3,4]' LIMIT 3")
         self.assertNotIn('AnnFrozenSearch', plan)
 
+    def test_renames_rescans_and_limits(self):
+        self.create()
+        statement = "SELECT id FROM docs WHERE {} ORDER BY emb <-> '[3,1,4,1]' LIMIT 20"
+        before = [row[0] for row in self.db.execute(statement.format('tenant = 4 AND category < 3'))]
+        # Swapping two columns' names: programs use the names of the build.
+        self.db.execute('ALTER TABLE docs RENAME COLUMN tenant TO swap')
+        self.db.execute('ALTER TABLE docs RENAME COLUMN category TO tenant')
+        self.db.execute('ALTER TABLE docs RENAME COLUMN swap TO category')
+        renamed = statement.format('category = 4 AND tenant < 3')
+        self.assertIn('AnnFrozenSearch', self.plan(renamed))
+        self.assertEqual([row[0] for row in self.db.execute(renamed)], before)
+        self.db.execute('SET ann.enable_frozen_search = off')
+        self.assertEqual([row[0] for row in self.db.execute(renamed)], before)
+        self.db.execute('RESET ann.enable_frozen_search')
+        # A lateral join rescans the route once per outer row.
+        lateral = ("SELECT q.t, x.id FROM generate_series(0, 12) q(t) CROSS JOIN LATERAL "
+                   "(SELECT id FROM docs WHERE category = q.t ORDER BY emb <-> '[1,1,1,1]' LIMIT 3) x ORDER BY 1, 2")
+        actual = self.db.execute(lateral).fetchall()
+        self.db.execute('SET ann.enable_frozen_search = off')
+        self.assertEqual(actual, self.db.execute(lateral).fetchall())
+        self.db.execute('RESET ann.enable_frozen_search')
+        # A predicate too large for a program keeps ordinary plans.
+        huge = ' OR '.join(f'category = {i}' for i in range(600))
+        self.assertNotIn('AnnFrozenSearch', self.plan(statement.format(huge)))
+        self.assertEqual(len(self.db.execute(statement.format(huge)).fetchall()), 20)
+
     def load(self, server, name, table='docs'):
         export = os.path.join(self.directory.name, name + '-export')
         path = os.path.join(self.directory.name, name)
@@ -433,6 +459,18 @@ class FrozenTests(unittest.TestCase):
             # Stored filters over INCLUDE attributes build from the pages, with generation ids.
             self.assertEqual(self.value('SELECT ann_filter_bitmap_build(%s, %s)', (name, 'tenant IN (2, 5)')),
                              self.value('SELECT count(*) FROM docs WHERE tenant IN (2, 5)'))
+            # ann_index_filter reads rows: it needs SELECT on the table.
+            role = 'ann_frozen_reader_' + uuid.uuid4().hex[:6]
+            self.db.execute(f'CREATE ROLE {role}')
+            self.db.execute(f'GRANT USAGE ON SCHEMA {self.schema} TO {role}')
+            try:
+                self.db.execute(f'SET ROLE {role}')
+                self.assertIn('permission denied', self.error('SELECT * FROM ann_index_filter(%s, %s)',
+                                                              (name, 'tenant = 1')))
+            finally:
+                self.db.execute('RESET ROLE')
+                self.db.execute(f'DROP OWNED BY {role}')
+                self.db.execute(f'DROP ROLE {role}')
             hits = self.db.execute('SELECT id FROM ann_bitmap_search(%s, %s, 5, %s) ORDER BY distance, id',
                                    (name, '[1,2,3,4]', 'tenant IN (2, 5)')).fetchall()
             expected = self.db.execute("SELECT id FROM docs WHERE tenant IN (2, 5) "

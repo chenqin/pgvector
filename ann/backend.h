@@ -21,8 +21,8 @@ typedef enum AnnStatus
 	ANN_CANCELLED,
 	ANN_CLOSED,
 	ANN_MISSING,				/* a cached filter bitmap is not on this node */
-	ANN_GENERATION				/* the request names another generation of
-								 * the index than the one loaded */
+	ANN_GENERATION				/* the request names another generation of the
+								 * index than the one loaded */
 } AnnStatus;
 
 typedef struct AnnIndex

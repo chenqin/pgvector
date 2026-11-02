@@ -61,6 +61,7 @@ typedef struct FrozenScanState
 	FmgrInfo   *distance;
 	char	   *workerName;		/* loaded export of this generation, or NULL */
 	bool		workerFailed;
+	bool		workerShort;	/* the worker returned fewer than asked */
 	IndexFetchTableData *fetch;
 	TupleTableSlot *heapSlot;	/* heap fetches, copied to the scan slot */
 	Buffer		vmbuf;
@@ -410,9 +411,9 @@ LocalSearch(FrozenScanState *state)
 			ordinals[n] = ordinal;
 			distances[n] = state->queryIsNull ? 0 :
 				DatumGetFloat8(FunctionCall2Coll(state->distance, state->index->rd_indcollation[0],
-														 PointerGetDatum(data + (size_t) (ordinal % meta->vectors.perPage) *
-																		 meta->vectors.width),
-														 state->query));
+												 PointerGetDatum(data + (size_t) (ordinal % meta->vectors.perPage) *
+																 meta->vectors.width),
+												 state->query));
 			n++;
 		}
 	}
@@ -495,7 +496,15 @@ WorkerSearch(FrozenScanState *state, uint64 k)
 		state->ordinals[i] = (uint64) ordinal;
 	}
 	state->nresults = count;
-	state->exhausted = count < k || k >= state->meta->rows;
+
+	/*
+	 * Done once every eligible row came back. An approximate route can return
+	 * fewer than k while more rows qualify: the rest then come from the
+	 * pages, exactly, skipping what was returned.
+	 */
+	state->exhausted = count >= state->eligible;
+	if (!state->exhausted && count < k)
+		state->workerShort = true;
 	return true;
 }
 
@@ -516,17 +525,22 @@ Fill(FrozenScanState *state)
 	uint64		k;
 	MemoryContext oldCtx;
 
+	/* Everything a fill allocates goes away on rescan (resultCtx is reset). */
+	oldCtx = MemoryContextSwitchTo(state->resultCtx);
 	if (!state->started)
 	{
 		state->started = true;
 		initStringInfo(&state->program);
 		AnnPredicateBuild(state->quals, ((Scan *) state->css.ss.ps.plan)->scanrelid, &state->columns,
 						  &state->css.ss.ps, econtext, &state->program);
-		oldCtx = MemoryContextSwitchTo(state->resultCtx);
+		if (!AnnFilterCheck((const unsigned char *) state->program.data, state->program.len))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("the predicate is too large for a frozen ann search"),
+					 errhint("SET ann.enable_frozen_search = off to plan this query without it.")));
 		state->query = ExecEvalExprSwitchContext(state->queryState, econtext, &state->queryIsNull);
 		if (!state->queryIsNull)
 			state->query = PointerGetDatum(PG_DETOAST_DATUM_COPY(state->query));
-		MemoryContextSwitchTo(oldCtx);
 	}
 	k = state->requested == 0 ? (uint64) state->initialK : state->requested * 4;
 	state->requested = k;
@@ -543,10 +557,10 @@ Fill(FrozenScanState *state)
 	}
 	state->nresults = 0;
 	state->next = 0;
-	if (state->workerName && !state->workerFailed && !state->queryIsNull && k <= ANN_FROZEN_WORKER_MAX_K &&
-		WorkerSearch(state, k))
-		return;
-	LocalSearch(state);
+	if (!(state->workerName && !state->workerFailed && !state->workerShort && !state->queryIsNull &&
+		  k <= ANN_FROZEN_WORKER_MAX_K && WorkerSearch(state, k)))
+		LocalSearch(state);
+	MemoryContextSwitchTo(oldCtx);
 }
 
 static bool
@@ -586,8 +600,18 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 
 			AnnArrayRead(&state->values[i - 2], ordinal, &v);
 			isnull = v == ANN_FROZEN_NULL;
-			value = !AnnFrozenTextType(type) ? AnnFrozenAttributeDatum(v, type) :
-				isnull ? (Datum) 0 : AnnFrozenTextDatum(index, state->meta, i - 2, v);
+			if (!AnnFrozenTextType(type))
+				value = AnnFrozenAttributeDatum(v, type);
+			else if (isnull)
+				value = (Datum) 0;
+			else
+			{
+				/* per-tuple memory: ExecScan resets it before the next row */
+				MemoryContext oldCtx = MemoryContextSwitchTo(state->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+
+				value = AnnFrozenTextDatum(index, state->meta, i - 2, v);
+				MemoryContextSwitchTo(oldCtx);
+			}
 		}
 		slot->tts_values[attno - 1] = value;
 		slot->tts_isnull[attno - 1] = isnull;
@@ -664,6 +688,7 @@ ResetResults(FrozenScanState *state)
 	state->returned = NULL;
 	state->nresults = state->next = state->requested = state->nreturned = 0;
 	state->exhausted = false;
+	state->workerShort = false;
 }
 
 static void

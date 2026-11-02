@@ -8,6 +8,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "ann.h"
@@ -280,7 +281,23 @@ typedef struct AnnFrozenMap
 
 bool		ann_frozen_mmap = true;
 static HTAB *frozenMaps = NULL;
-static Oid	buildingIndex = InvalidOid; /* reads during its own build use buffers */
+static Oid	buildingIndex = InvalidOid; /* reads during its own build use
+										 * buffers */
+
+/* A failed build leaves buildingIndex set; aborts clear it. */
+static void
+ClearBuilding(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_ABORT || event == XACT_EVENT_PARALLEL_ABORT)
+		buildingIndex = InvalidOid;
+}
+
+static void
+ClearBuildingSub(SubXactEvent event, SubTransactionId mySubid, SubTransactionId parentSubid, void *arg)
+{
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		buildingIndex = InvalidOid;
+}
 
 static const AnnFrozenMap *
 MapIndex(Relation index)
@@ -302,8 +319,21 @@ MapIndex(Relation index)
 		frozenMaps = hash_create("ann frozen index mappings", 16, &ctl, HASH_ELEM | HASH_BLOBS);
 	}
 	map = hash_search(frozenMaps, &index->rd_locator, HASH_ENTER, &found);
+	if (found && map->nsegments > 0 && map->blocks == RelationGetNumberOfBlocks(index))
+		return map;
 	if (found)
-		return map->nsegments > 0 ? map : NULL;
+	{
+		/* a failed attempt, or another file under a reused relfilenode */
+		for (int s = 0; s < map->nsegments; s++)
+			(void) munmap(map->bases[s], (size_t) Min(map->blocks - (BlockNumber) s * RELSEG_SIZE,
+													  RELSEG_SIZE) * BLCKSZ);
+	}
+
+	/*
+	 * Write out any page still only in shared buffers (as after crash
+	 * recovery or promotion, before a checkpoint), so the files are current.
+	 */
+	FlushRelationBuffers(index);
 	map->nsegments = 0;
 	map->blocks = RelationGetNumberOfBlocks(index);
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
@@ -335,6 +365,35 @@ MapIndex(Relation index)
 	}
 	map->nsegments = (map->blocks + RELSEG_SIZE - 1) / RELSEG_SIZE;
 	return map->nsegments > 0 ? map : NULL;
+}
+
+typedef struct AnnIndexCache
+{
+	bool		frozen;			/* metaStore holds the frozen metadata */
+	bool		flushed;		/* the build flushed the pages to the files */
+	bool		columnsReady;
+	bool		mapChecked;
+	const struct AnnFrozenMap *map; /* file mappings, or NULL */
+	AnnPredicateColumns columns;	/* names point into metaStore */
+	uint64		metaStore[FLEXIBLE_ARRAY_MEMBER];
+} AnnIndexCache;
+
+static AnnIndexCache *IndexCache(Relation index);
+
+/* The index's mapping, looked up once per relcache entry. */
+static const AnnFrozenMap *
+CachedMap(Relation index)
+{
+	AnnIndexCache *cache = IndexCache(index);
+	const AnnFrozenMap *map;
+
+	if (cache->mapChecked)
+		return cache->map;
+	map = MapIndex(index);
+	cache = IndexCache(index);	/* MapIndex may have processed invalidations */
+	cache->map = map;
+	cache->mapChecked = true;
+	return map;
 }
 
 static Page
@@ -381,7 +440,8 @@ AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array
 	reader->page = InvalidBlockNumber;
 	reader->locked = false;
 	reader->map = NULL;
-	if (RelationGetRelid(index) != buildingIndex && (map = MapIndex(index)) != NULL && (meta = AnnFrozenMeta(index)) != NULL &&
+	if (RelationGetRelid(index) != buildingIndex && (map = CachedMap(index)) != NULL &&
+		(meta = AnnFrozenMeta(index)) != NULL &&
 		array->start != meta->tids.start && MappedArrayValid(map, array))
 		reader->map = map;
 }
@@ -486,26 +546,28 @@ AnnIsFrozen(Relation index)
  * description of its predicate columns are kept with the relcache entry
  * (rd_amcache, freed when the entry is invalidated, as by REINDEX).
  */
-typedef struct AnnIndexCache
-{
-	AnnFrozenMetaData *meta;	/* NULL for a mutable index */
-	bool		flushed;		/* the build flushed the pages to the files */
-	bool		columnsReady;
-	AnnPredicateColumns columns;
-} AnnIndexCache;
 
-static AnnFrozenMetaData *ReadFrozenMeta(Relation index, bool *flushed);
 
+static bool ReadFrozenMeta(Relation index, AnnFrozenMetaData *meta, bool *flushed);
+
+#define IndexCacheSize (offsetof(AnnIndexCache, metaStore) + AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS))
+
+/*
+ * The cache is one chunk in rd_indexcxt, built in local memory first:
+ * reading names can process invalidations, which free rd_amcache.
+ */
 static AnnIndexCache *
 IndexCache(Relation index)
 {
 	if (index->rd_amcache == NULL)
 	{
-		MemoryContext oldCtx = MemoryContextSwitchTo(index->rd_indexcxt);
-		AnnIndexCache *cache = palloc0(sizeof(AnnIndexCache));
+		AnnIndexCache *local = palloc0(IndexCacheSize);
+		AnnIndexCache *cache;
 
-		cache->meta = ReadFrozenMeta(index, &cache->flushed);
-		MemoryContextSwitchTo(oldCtx);
+		local->frozen = ReadFrozenMeta(index, (AnnFrozenMetaData *) local->metaStore, &local->flushed);
+		cache = MemoryContextAlloc(index->rd_indexcxt, IndexCacheSize);
+		memcpy(cache, local, IndexCacheSize);
+		pfree(local);
 		index->rd_amcache = cache;
 	}
 	return (AnnIndexCache *) index->rd_amcache;
@@ -521,17 +583,34 @@ AnnFrozenFlushed(Relation index)
 AnnFrozenMetaData *
 AnnFrozenMeta(Relation index)
 {
-	return IndexCache(index)->meta;
+	AnnIndexCache *cache = IndexCache(index);
+
+	return cache->frozen ? (AnnFrozenMetaData *) cache->metaStore : NULL;
 }
 
-/* The cached predicate columns slot; *ready says whether it is filled. */
-AnnPredicateColumns *
-AnnFrozenColumnsCache(Relation index, bool **ready)
+/* Copy the cached predicate columns, if filled; names point into the cache. */
+bool
+AnnFrozenCachedColumns(Relation index, AnnPredicateColumns *columns)
 {
 	AnnIndexCache *cache = IndexCache(index);
 
-	*ready = &cache->columnsReady;
-	return &cache->columns;
+	if (!cache->columnsReady)
+		return false;
+	*columns = cache->columns;
+	return true;
+}
+
+/* Keep predicate columns computed by the caller, with the build-time names. */
+void
+AnnFrozenStoreColumns(Relation index, const AnnPredicateColumns *columns)
+{
+	AnnIndexCache *cache = IndexCache(index);
+	AnnFrozenMetaData *meta = AnnFrozenMeta(index);
+
+	cache->columns = *columns;
+	for (int c = 0; meta && c < columns->ncolumns; c++)
+		cache->columns.names[c] = NameStr(AnnFrozenGetNames(meta)[c]);
+	cache->columnsReady = true;
 }
 
 /* A copy of the frozen metadata; NULL for a mutable index when missingOk. */
@@ -554,30 +633,39 @@ AnnFrozenGetMeta(Relation index, bool missingOk)
 	return meta;
 }
 
-/* The metapage's frozen metadata, or NULL; allocated in the current context. */
-static AnnFrozenMetaData *
-ReadFrozenMeta(Relation index, bool *flushed)
+/*
+ * Copy the metapage's frozen metadata into meta; false for a mutable index.
+ * Indexes built before version 4 get their current attribute names.
+ */
+static bool
+ReadFrozenMeta(Relation index, AnnFrozenMetaData *meta, bool *flushed)
 {
 	Buffer		buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
 	Page		page;
-	AnnFrozenMetaData *meta = NULL;
+	uint32		version;
 
 	LockBuffer(buf, BUFFER_LOCK_SHARE);
 	page = BufferGetPage(buf);
 	AnnCheckMetaPage(page);
-	if (AnnVersionFrozen(AnnPageGetMeta(page)->version))
+	version = AnnPageGetMeta(page)->version;
+	*flushed = false;
+	if (!AnnVersionFrozen(version))
 	{
-		AnnFrozenMetaData *stored = AnnPageGetFrozen(page);
-		bool		bitsets = AnnPageGetMeta(page)->version == ANN_FROZEN_VERSION;
-
-		if (stored->ncolumns > ANN_FROZEN_MAX_COLUMNS)
-			ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED), errmsg("invalid frozen ann index metapage")));
-		meta = palloc0(AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
-		memcpy(meta, stored, bitsets ? AnnFrozenMetaSize(stored->ncolumns) : AnnFrozenMetaSizeV2(stored->ncolumns));
+		UnlockReleaseBuffer(buf);
+		return false;
 	}
-	*flushed = meta != NULL && AnnPageGetMeta(page)->insertPage == ANN_FROZEN_FLUSHED;
+	if (AnnPageGetFrozen(page)->ncolumns > ANN_FROZEN_MAX_COLUMNS)
+		ereport(ERROR, (errcode(ERRCODE_INDEX_CORRUPTED), errmsg("invalid frozen ann index metapage")));
+	memcpy(meta, AnnPageGetFrozen(page),
+		   version == 2 ? AnnFrozenMetaSizeV2(AnnPageGetFrozen(page)->ncolumns) :
+		   version == 3 ? AnnFrozenMetaSizeV3(AnnPageGetFrozen(page)->ncolumns) :
+		   AnnFrozenMetaSize(AnnPageGetFrozen(page)->ncolumns));
+	*flushed = AnnPageGetMeta(page)->insertPage == ANN_FROZEN_FLUSHED;
 	UnlockReleaseBuffer(buf);
-	return meta;
+	if (version < 4)
+		for (uint32 c = 0; c < meta->ncolumns; c++)
+			namestrcpy(&AnnFrozenGetNames(meta)[c], AnnFrozenColumnName(index, 3 + c));
+	return true;
 }
 
 /*
@@ -613,7 +701,7 @@ typedef struct FrozenBuildState
 	int			ncolumns;		/* INCLUDE columns after the key */
 	int			bitsetMin;		/* reloption: bitset pages from this many rows */
 	Oid			keyType;
-	bool		text[ANN_FROZEN_MAX_COLUMNS];	/* dictionary-coded columns */
+	bool		coded[ANN_FROZEN_MAX_COLUMNS];	/* dictionary-coded columns */
 	Oid			collations[ANN_FROZEN_MAX_COLUMNS];
 	TupleDesc	sortDesc;
 	TupleTableSlot *slot;
@@ -783,7 +871,7 @@ FrozenBuildCallback(Relation index, ItemPointer tid, Datum *values, bool *isnull
 	memset(slot->tts_isnull, 0, sizeof(bool) * (3 + bs->ncolumns));
 	for (int c = 0; c < bs->ncolumns; c++)
 	{
-		if (bs->text[c])
+		if (bs->coded[c])
 		{
 			/* Text goes through the sort; its code is assigned afterwards. */
 			slot->tts_isnull[3 + c] = isnull[2 + c];
@@ -1133,7 +1221,7 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	{
 		InitArray(&meta->columns[c].values, sizeof(int32), bs->rows);
 		ReserveArray(index, &meta->columns[c].values);
-		if (!bs->text[c])
+		if (!bs->coded[c])
 			WriterBegin(&values[c], index, &meta->columns[c].values, true);
 		else
 		{
@@ -1181,7 +1269,7 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 		{
 			Datum		value = slot_getattr(slot, 4 + c, &isnull);
 
-			if (bs->text[c])
+			if (bs->coded[c])
 			{
 				/* Hash the string; it gets its code from the collation sort. */
 				ExecClearTuple(textSlot);
@@ -1218,11 +1306,11 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	WriterEnd(&keys);
 	WriterEnd(&vectors);
 	for (int c = 0; c < bs->ncolumns; c++)
-		if (!bs->text[c])
+		if (!bs->coded[c])
 			WriterEnd(&values[c]);
 	ExecDropSingleTupleTableSlot(slot);
 	for (int c = 0; c < bs->ncolumns; c++)
-		if (bs->text[c])
+		if (bs->coded[c])
 		{
 			WriteDictionary(index, textDesc, textSorts[c], sorts[c], &meta->columns[c],
 							&AnnFrozenGetExtra(meta)[c], ordinal);
@@ -1274,6 +1362,16 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 
 	AnnCheckIndex(index);
 	guard = CheckFrozenTable(heap, index, indexInfo);
+	{
+		static bool registered = false;
+
+		if (!registered)
+		{
+			RegisterXactCallback(ClearBuilding, NULL);
+			RegisterSubXactCallback(ClearBuildingSub, NULL);
+			registered = true;
+		}
+	}
 	buildingIndex = RelationGetRelid(index);
 	AnnInitMetaPage(index, MAIN_FORKNUM);
 	bs.dims = TupleDescAttr(indexDesc, 0)->atttypmod;
@@ -1286,9 +1384,9 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	TupleDescInitEntry(bs.sortDesc, 3, "vector", AnnVectorTypeOid(), -1, 0);
 	for (int c = 0; c < bs.ncolumns; c++)
 	{
-		bs.text[c] = AnnFrozenTextType(TupleDescAttr(indexDesc, 2 + c)->atttypid);
+		bs.coded[c] = AnnFrozenTextType(TupleDescAttr(indexDesc, 2 + c)->atttypid);
 		bs.collations[c] = AnnFrozenColumnCollation(index, 2 + c);
-		TupleDescInitEntry(bs.sortDesc, 4 + c, "value", bs.text[c] ? TEXTOID : INT4OID, -1, 0);
+		TupleDescInitEntry(bs.sortDesc, 4 + c, "value", bs.coded[c] ? TEXTOID : INT4OID, -1, 0);
 	}
 #if PG_VERSION_NUM >= 190000
 	TupleDescFinalize(bs.sortDesc);
@@ -1309,6 +1407,8 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	meta = palloc0(AnnFrozenMetaSize(ANN_FROZEN_MAX_COLUMNS));
 	meta->guard = guard;
 	meta->ncolumns = bs.ncolumns;
+	for (int c = 0; c < bs.ncolumns; c++)
+		namestrcpy(&AnnFrozenGetNames(meta)[c], AnnFrozenColumnName(index, 3 + c));
 	WriteArrays(index, &bs, meta);
 	tuplesort_end(bs.sort);
 	ExecDropSingleTupleTableSlot(bs.slot);
@@ -1442,7 +1542,7 @@ AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned 
 	state->bitsets = AnnFrozenGetExtra(meta);
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 	{
-		state->names[c] = AnnFrozenColumnName(index, 3 + c);
+		state->names[c] = NameStr(AnnFrozenGetNames(meta)[c]);
 		AnnArrayReaderInit(&state->dict[c], index, &meta->columns[c].dict, NULL);
 		AnnArrayReaderInit(&state->offsets[c], index, &meta->columns[c].offsets, NULL);
 		AnnArrayReaderInit(&state->postings[c], index, &meta->columns[c].postings, NULL);
