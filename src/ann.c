@@ -63,6 +63,13 @@ annproperty(Oid index_oid, int attno, IndexAMProperty prop, const char *propname
 
 static relopt_kind ann_relopt_kind;
 
+static relopt_enum_elt_def vectorsValues[] = {
+	{"float", ANN_FROZEN_VECTORS_FLOAT},
+	{"half", ANN_FROZEN_VECTORS_HALF},
+	{"heap", ANN_FROZEN_VECTORS_HEAP},
+	{(const char *) NULL}
+};
+
 void
 AnnInitOptions(void)
 {
@@ -73,6 +80,10 @@ AnnInitOptions(void)
 	add_int_reloption(ann_relopt_kind, "bitset_min",
 					  "Values of an attribute with at least this many rows get bitset pages (-1: rows / 32)",
 					  -1, -1, INT_MAX, AccessExclusiveLock);
+	add_enum_reloption(ann_relopt_kind, "vectors",
+					   "How a frozen index keeps the vectors: float, half or heap",
+					   vectorsValues, ANN_FROZEN_VECTORS_FLOAT,
+					   "Valid values are \"float\", \"half\" and \"heap\".", AccessExclusiveLock);
 }
 
 static bytea *
@@ -81,6 +92,7 @@ annoptions(Datum reloptions, bool validate)
 	static const relopt_parse_elt tab[] = {
 		{"frozen", RELOPT_TYPE_BOOL, offsetof(AnnOptions, frozen)},
 		{"bitset_min", RELOPT_TYPE_INT, offsetof(AnnOptions, bitsetMin)},
+		{"vectors", RELOPT_TYPE_ENUM, offsetof(AnnOptions, vectors)},
 	};
 
 	return (bytea *) build_reloptions(reloptions, validate, ann_relopt_kind,
@@ -96,11 +108,16 @@ AnnFrozenOption(Relation index)
 	return options && options->frozen;
 }
 
-/* Frozen pages hold every column, so index-only scans can return them all. */
+/*
+ * Frozen pages hold every column, so index-only scans can return them all,
+ * except the vector when the pages keep halves of it or none.
+ */
 static bool
 anncanreturn(Relation index, int attno)
 {
-	return AnnIsFrozen(index);
+	if (!AnnIsFrozen(index))
+		return false;
+	return attno != 1 || AnnFrozenVectorMode(index, AnnFrozenGetMeta(index, false)) == ANN_FROZEN_VECTORS_FLOAT;
 }
 
 /*

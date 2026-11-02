@@ -52,3 +52,8 @@ CREATE FUNCTION ann_collection_search(collection text, query vector, k integer, 
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 10;
 
 COMMENT ON FUNCTION ann_collection_search(text, vector, integer, text) IS 'the k nearest rows of an ann collection matching a filter over its attributes, searched on the parts'' GPU nodes in parallel';
+
+CREATE FUNCTION ann_frozen_sizes(index regclass, OUT structure text, OUT pages bigint, OUT bytes bigint)
+	RETURNS SETOF record AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
+
+COMMENT ON FUNCTION ann_frozen_sizes(regclass) IS 'pages and bytes of each structure of a frozen ann index, with how it keeps the vectors';

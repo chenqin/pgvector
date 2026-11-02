@@ -26,6 +26,7 @@
 #include "executor/spi.h"
 #include "executor/tuptable.h"
 #include "funcapi.h"
+#include "halfutils.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
 #include "utils/acl.h"
@@ -34,6 +35,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rls.h"
+#include "utils/snapmgr.h"
 #include "utils/tuplesort.h"
 #include "utils/tuplestore.h"
 #include "utils/varlena.h"
@@ -704,6 +706,7 @@ typedef struct FrozenBuildState
 	int			dims;
 	int			ncolumns;		/* INCLUDE columns after the key */
 	int			bitsetMin;		/* reloption: bitset pages from this many rows */
+	int			vectors;		/* reloption: ANN_FROZEN_VECTORS_* */
 	Oid			keyType;
 	bool		coded[ANN_FROZEN_MAX_COLUMNS];	/* dictionary-coded columns */
 	Oid			collations[ANN_FROZEN_MAX_COLUMNS];
@@ -1244,8 +1247,13 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	}
 	WriterBegin(&tids, index, &meta->tids, true);
 	WriterBegin(&keys, index, &meta->keys, true);
-	InitArray(&meta->vectors, VECTOR_SIZE(bs->dims), 0);
-	WriterBegin(&vectors, index, &meta->vectors, false);
+	if (bs->vectors == ANN_FROZEN_VECTORS_HEAP)
+		InitArray(&meta->vectors, ANN_FROZEN_HEAP_WIDTH, 0);
+	else
+	{
+		InitArray(&meta->vectors, bs->vectors == ANN_FROZEN_VECTORS_HALF ? 2 * bs->dims : VECTOR_SIZE(bs->dims), 0);
+		WriterBegin(&vectors, index, &meta->vectors, false);
+	}
 
 	while (tuplesort_gettupleslot(bs->sort, true, false, slot, NULL))
 	{
@@ -1266,7 +1274,15 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 		ItemPointerSet(&item, (BlockNumber) (tid >> 16), (OffsetNumber) (tid & 0xFFFF));
 		memcpy(WriterNext(&tids), &item, sizeof(item));
 		memcpy(WriterNext(&keys), &key, sizeof(key));
-		memcpy(WriterNext(&vectors), vector, VECTOR_SIZE(bs->dims));
+		if (bs->vectors == ANN_FROZEN_VECTORS_FLOAT)
+			memcpy(WriterNext(&vectors), vector, VECTOR_SIZE(bs->dims));
+		else if (bs->vectors == ANN_FROZEN_VECTORS_HALF)
+		{
+			half	   *halves = (half *) WriterNext(&vectors);
+
+			for (int d = 0; d < bs->dims; d++)
+				halves[d] = Float4ToHalfUnchecked(vector->x[d]);
+		}
 		hash = hash_bytes_extended((const unsigned char *) &key, sizeof(key), hash);
 		hash = hash_bytes_extended((const unsigned char *) vector->x, sizeof(float) * bs->dims, hash);
 		for (int c = 0; c < bs->ncolumns; c++)
@@ -1308,7 +1324,8 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	}
 	WriterEnd(&tids);
 	WriterEnd(&keys);
-	WriterEnd(&vectors);
+	if (bs->vectors != ANN_FROZEN_VECTORS_HEAP)
+		WriterEnd(&vectors);
 	for (int c = 0; c < bs->ncolumns; c++)
 		if (!bs->coded[c])
 			WriterEnd(&values[c]);
@@ -1380,6 +1397,7 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	AnnInitMetaPage(index, MAIN_FORKNUM);
 	bs.dims = TupleDescAttr(indexDesc, 0)->atttypmod;
 	bs.bitsetMin = index->rd_options ? ((AnnOptions *) index->rd_options)->bitsetMin : -1;
+	bs.vectors = index->rd_options ? ((AnnOptions *) index->rd_options)->vectors : ANN_FROZEN_VECTORS_FLOAT;
 	bs.ncolumns = indexDesc->natts - 2;
 	bs.keyType = TupleDescAttr(indexDesc, 1)->atttypid;
 	bs.sortDesc = CreateTemplateTupleDesc(3 + bs.ncolumns);
@@ -1641,6 +1659,104 @@ AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const ch
 }
 
 /* Ordinal of a key (binary search over the key pages), or -1. */
+/* How the index keeps its vectors (ANN_FROZEN_VECTORS_*), from the array's width. */
+int
+AnnFrozenVectorMode(Relation index, const AnnFrozenMetaData *meta)
+{
+	int			dims = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
+
+	if (meta->vectors.width == ANN_FROZEN_HEAP_WIDTH)
+		return ANN_FROZEN_VECTORS_HEAP;
+	if (dims > 0 && meta->vectors.width == (uint32) (2 * dims))
+		return ANN_FROZEN_VECTORS_HALF;
+	return ANN_FROZEN_VECTORS_FLOAT;
+}
+
+/*
+ * Read ordinals' vectors: from vector pages as they are, from half pages
+ * widened to FP32 (rounded, so only for the CPU routes' distances), or, for
+ * heap indexes and when exact is set on a half index, from the heap by TID.
+ * A frozen table cannot change, so any snapshot sees the same row.
+ */
+void
+AnnFrozenVectorReaderInit(AnnFrozenVectorReader *reader, Relation index, const AnnFrozenMetaData *meta,
+						  BufferAccessStrategy strategy, bool exact)
+{
+	memset(reader, 0, sizeof(*reader));
+	reader->mode = AnnFrozenVectorMode(index, meta);
+	reader->dims = TupleDescAttr(RelationGetDescr(index), 0)->atttypmod;
+	if (reader->mode == ANN_FROZEN_VECTORS_HALF && exact)
+		reader->mode = ANN_FROZEN_VECTORS_HEAP;
+	if (reader->dims <= 0)
+		elog(ERROR, "frozen ann index \"%s\" has no vector dimensions", RelationGetRelationName(index));
+	reader->vector = palloc0(VECTOR_SIZE(reader->dims));
+	SET_VARSIZE(reader->vector, VECTOR_SIZE(reader->dims));
+	reader->vector->dim = reader->dims;
+	if (reader->mode == ANN_FROZEN_VECTORS_HEAP)
+	{
+		reader->heap = table_open(index->rd_index->indrelid, AccessShareLock);
+		reader->slot = table_slot_create(reader->heap, NULL);
+		reader->attno = index->rd_index->indkey.values[0];
+		AnnArrayReaderInit(&reader->tids, index, &meta->tids, strategy);
+	}
+	else
+	{
+		AnnArrayReaderInit(&reader->pages, index, &meta->vectors, strategy);
+		if (reader->mode == ANN_FROZEN_VECTORS_HALF)
+			reader->raw = palloc(meta->vectors.width);
+	}
+}
+
+Vector *
+AnnFrozenVectorRead(AnnFrozenVectorReader *reader, uint64 ordinal)
+{
+	if (reader->mode == ANN_FROZEN_VECTORS_FLOAT)
+		AnnArrayRead(&reader->pages, ordinal, reader->vector);
+	else if (reader->mode == ANN_FROZEN_VECTORS_HALF)
+	{
+		AnnArrayRead(&reader->pages, ordinal, reader->raw);
+		for (int d = 0; d < reader->dims; d++)
+			reader->vector->x[d] = HalfToFloat4(((half *) reader->raw)[d]);
+	}
+	else
+	{
+		ItemPointerData tid;
+		bool		isnull;
+		Vector	   *value;
+
+		AnnArrayRead(&reader->tids, ordinal, &tid);
+		if (!table_tuple_fetch_row_version(reader->heap, &tid, SnapshotAny, reader->slot))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("frozen ann index row " UINT64_FORMAT " is missing from \"%s\"", ordinal,
+							RelationGetRelationName(reader->heap))));
+		value = DatumGetVector(slot_getattr(reader->slot, reader->attno, &isnull));
+		if (isnull || value->dim != reader->dims)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("frozen ann index row " UINT64_FORMAT " of \"%s\" has no vector of %d dimensions",
+							ordinal, RelationGetRelationName(reader->heap), reader->dims)));
+		memcpy(reader->vector->x, value->x, sizeof(float) * reader->dims);
+		if ((Pointer) value != DatumGetPointer(slot_getattr(reader->slot, reader->attno, &isnull)))
+			pfree(value);
+		ExecClearTuple(reader->slot);
+	}
+	return reader->vector;
+}
+
+void
+AnnFrozenVectorReaderEnd(AnnFrozenVectorReader *reader)
+{
+	if (reader->heap)
+	{
+		AnnArrayReaderEnd(&reader->tids);
+		ExecDropSingleTupleTableSlot(reader->slot);
+		table_close(reader->heap, AccessShareLock);
+	}
+	else
+		AnnArrayReaderEnd(&reader->pages);
+}
+
 int64
 AnnFrozenKeyOrdinal(Relation index, const AnnFrozenMetaData *meta, int64 key)
 {
@@ -1919,6 +2035,68 @@ ann_frozen_keys(PG_FUNCTION_ARGS)
 	AnnArrayReaderEnd(&offsets);
 	AnnArrayReaderEnd(&postings);
 	AnnArrayReaderEnd(&keys);
+	index_close(index, AccessShareLock);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = store;
+	rsinfo->setDesc = tupdesc;
+	return (Datum) 0;
+}
+
+static void
+PutSize(Tuplestorestate *store, TupleDesc desc, const char *name, const AnnArray *array)
+{
+	Datum		values[3];
+	bool		nulls[3] = {false, false, false};
+
+	values[0] = CStringGetTextDatum(name);
+	values[1] = Int64GetDatum((int64) array->pages);
+	values[2] = Int64GetDatum((int64) array->pages * BLCKSZ);
+	tuplestore_putvalues(store, desc, values, nulls);
+}
+
+/*
+ * ann_frozen_sizes(index): pages and bytes of each structure of a frozen
+ * index: TIDs, keys, vectors (with how they are kept), and per attribute its
+ * values, distinct values, offsets, postings, bitsets and text dictionary.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_sizes);
+Datum
+ann_frozen_sizes(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	Relation	index = OpenFrozenIndex(PG_GETARG_OID(0));
+	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
+	AnnFrozenColumnExtra *extra = AnnFrozenGetExtra(meta);
+	static const char *const modes[] = {"vectors (float)", "vectors (half)", "vectors (heap)"};
+	TupleDesc	tupdesc;
+	Tuplestorestate *store;
+	MemoryContext oldCtx;
+
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo) || !(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+	oldCtx = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+	tupdesc = CreateTupleDescCopy(tupdesc);
+	store = tuplestore_begin_heap(true, false, work_mem);
+	MemoryContextSwitchTo(oldCtx);
+	PutSize(store, tupdesc, "tids", &meta->tids);
+	PutSize(store, tupdesc, "keys", &meta->keys);
+	PutSize(store, tupdesc, modes[AnnFrozenVectorMode(index, meta)], &meta->vectors);
+	for (uint32 c = 0; c < meta->ncolumns; c++)
+	{
+		const char *name = NameStr(AnnFrozenGetNames(meta)[c]);
+
+		PutSize(store, tupdesc, psprintf("%s values", name), &meta->columns[c].values);
+		PutSize(store, tupdesc, psprintf("%s distinct values", name), &meta->columns[c].dict);
+		PutSize(store, tupdesc, psprintf("%s offsets", name), &meta->columns[c].offsets);
+		PutSize(store, tupdesc, psprintf("%s postings", name), &meta->columns[c].postings);
+		PutSize(store, tupdesc, psprintf("%s bitsets", name), &extra[c].words);
+		if (extra[c].strings.pages)
+			PutSize(store, tupdesc, psprintf("%s dictionary", name), &extra[c].strings);
+	}
 	index_close(index, AccessShareLock);
 	rsinfo->returnMode = SFRM_Materialize;
 	rsinfo->setResult = store;

@@ -75,6 +75,16 @@ After the build, `aminsert` refuses every insert ("cannot insert into frozen ann
 
 **Dump and restore.** `pg_dump` writes indexes before triggers, and restores load rows with plain `COPY`, so restoring a frozen table's `CREATE INDEX` fails: the guard doesn't exist yet and no page is frozen. The guard is restored right after it. Then run `VACUUM (FREEZE)` and the `CREATE INDEX` again; the generation is the same, so existing GPU directories still load. The guard is per table: a partitioned table needs `ann_freeze` and a frozen index on each frozen partition.
 
+**Keeping the vectors smaller.** The vector copy is most of a frozen index (5.2 of 5.5 GB at 10M × 128). `WITH (frozen = true, vectors = half)` keeps FP16 halves of it, and `vectors = heap` keeps none:
+
+| `vectors` | Index (10M × 128, two attributes) | Per row | Build | CPU route, 0.1% / 1% filter |
+| --- | --- | --- | --- | --- |
+| `float` (default) | 5,496 MB | 576 B | about 30 s | 3.0 / 60 ms |
+| `half` | 2,807 MB | 294 B | 16.3 s | 5.3 / 52 ms |
+| `heap` | 287 MB | 30 B | 9.9 s | 14.4 / 65 ms |
+
+The GPU routes don't read the vector pages, so they are unchanged. With half or no pages, the CPU routes (the frozen route without a worker, and the access method's ordered scans) score half vectors widened to FP32, or the heap's vectors read by TID. Half distances are rounded, so those routes' order can differ from exact SQL among near ties; the heap's are exact. The vector column is then never served from the index: index-only scans don't offer it, the frozen route fetches it from the heap when a query reads it, and `ann_index_export` writes the heap's exact vectors, so the GPU index is the same file as from a float index (the generation is the same too). `ann_frozen_sizes(index)` lists each structure's pages and bytes and how the vectors are kept. At 30 bytes per row, the forward and inverted index of a billion rows without vectors is about 30 GB.
+
 If the guard is dropped and rows are deleted anyway, VACUUM doesn't move any ordinal: it overwrites the deleted rows' TIDs with an invalid TID, and scans skip them, so heap slots can be reused safely. The GPU index still holds those rows until it is rebuilt; the frozen route skips them, and joins back to the table drop them, as for any loaded index.
 
 ## Page layout
@@ -86,7 +96,7 @@ Block 0 is the metapage (layout version 4; versions 2 and 3, without bitset page
 | TIDs | `ItemPointerData` (6 bytes) | 1,360 | 7,353 pages |
 | Keys | `int64` | 1,020 | 9,804 pages |
 | Attribute values, per column | `int32` (text: its code) | 2,040 | 4,902 pages |
-| Vectors | a complete `Vector` (8-byte header + 4 × dims) | 15 | 666,667 pages |
+| Vectors | a complete `Vector` (8-byte header + 4 × dims); with `vectors = half`, 2 × dims bytes of FP16; with `vectors = heap`, none | 15 (half: 31) | 666,667 pages (half: 322,581) |
 | Postings, per column | `uint32` ordinals, grouped by value, ascending within a value | 2,040 | 4,902 pages |
 | Distinct values, per column | `int32`, ascending | 2,040 | 1 page |
 | Offsets, per column | `uint32` start of each value's postings, plus the end | 2,040 | 1 page |

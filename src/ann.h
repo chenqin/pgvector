@@ -48,7 +48,20 @@ typedef struct AnnOptions
 	bool		frozen;			/* build the immutable layout */
 	int			bitsetMin;		/* values with more rows get bitset pages; -1
 								 * for rows / 32 */
+	int			vectors;		/* frozen: ANN_FROZEN_VECTORS_* */
 } AnnOptions;
+
+/*
+ * How a frozen index keeps the vectors (reloption vectors): full vector
+ * values, FP16 halves (2 bytes a dimension, for the CPU routes only: exports
+ * and returned columns read the heap's exact vectors), or none, read from
+ * the heap by TID. The vector array's width tells them apart: the vector
+ * size, 2 * dims, or ANN_FROZEN_HEAP_WIDTH with no pages.
+ */
+#define ANN_FROZEN_VECTORS_FLOAT 0
+#define ANN_FROZEN_VECTORS_HALF 1
+#define ANN_FROZEN_VECTORS_HEAP 2
+#define ANN_FROZEN_HEAP_WIDTH 1
 
 /*
  * Frozen indexes (WITH (frozen = true)) are built once from a table that
@@ -98,7 +111,8 @@ typedef struct AnnFrozenMetaData
 	uint32		ncolumns;		/* INCLUDE columns after the key */
 	AnnArray	tids;			/* ItemPointerData per ordinal */
 	AnnArray	keys;			/* int64 per ordinal, strictly increasing */
-	AnnArray	vectors;		/* Vector varlena per ordinal */
+	AnnArray	vectors;		/* Vector varlena per ordinal, or halves, or
+								 * none (see ANN_FROZEN_VECTORS_*) */
 	AnnFrozenColumn columns[FLEXIBLE_ARRAY_MEMBER];
 } AnnFrozenMetaData;
 
@@ -232,6 +246,25 @@ int			AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const uns
 void		AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const char *program,
 									 size_t size, uint32 *words, uint64 *count, bool cache);
 int64		AnnFrozenKeyOrdinal(Relation index, const AnnFrozenMetaData *meta, int64 key);
+int			AnnFrozenVectorMode(Relation index, const AnnFrozenMetaData *meta);
+
+/* Ordinal i's vector, as an exact or (FP16 pages) rounded vector value. */
+typedef struct AnnFrozenVectorReader
+{
+	int			mode;			/* ANN_FROZEN_VECTORS_*, or HEAP when forced */
+	int			dims;
+	AnnArrayReader pages;		/* vector or half pages */
+	AnnArrayReader tids;		/* heap reads */
+	Relation	heap;
+	struct TupleTableSlot *slot;
+	AttrNumber	attno;			/* the vector's table column */
+	struct Vector *vector;		/* the result, valid until the next read */
+	char	   *raw;
+} AnnFrozenVectorReader;
+void		AnnFrozenVectorReaderInit(AnnFrozenVectorReader *reader, Relation index, const AnnFrozenMetaData *meta,
+									  BufferAccessStrategy strategy, bool exact);
+struct Vector *AnnFrozenVectorRead(AnnFrozenVectorReader *reader, uint64 ordinal);
+void		AnnFrozenVectorReaderEnd(AnnFrozenVectorReader *reader);
 
 /* Predicates over a frozen index's attribute columns (annpred.c). */
 typedef struct AnnPredicateColumns

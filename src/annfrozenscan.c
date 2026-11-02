@@ -52,6 +52,7 @@ typedef struct FrozenScanState
 	CustomScanState css;
 	Oid			indexOid;
 	bool		covering;		/* every used column is in the index */
+	int			vectorMode;		/* ANN_FROZEN_VECTORS_* */
 	int			initialK;
 	Relation	index;
 	AnnFrozenMetaData *meta;
@@ -123,7 +124,11 @@ static const CustomExecMethods FrozenExecMethods = {
 	.ExplainCustomScan = ExplainFrozenScan,
 };
 
-/* The operand of "column <-> operand" ordering this rel, if the column is indexed. */
+/*
+ * The operand of "column <-> operand" ordering this rel, if the column has a
+ * frozen index (whose key, the first INCLUDE column, index-only scans return;
+ * the vector may not be returnable when the pages hold halves or none).
+ */
 static Node *
 DistanceOperand(PlannerInfo *root, RelOptInfo *rel, PathKey *pathkey, IndexOptInfo **found)
 {
@@ -159,7 +164,7 @@ DistanceOperand(PlannerInfo *root, RelOptInfo *rel, PathKey *pathkey, IndexOptIn
 			Oid			proc;
 
 			if (index->relam != amoid || index->nkeycolumns != 1 || index->indexkeys[0] != var->varattno ||
-				index->indpred || index->indexprs || !index->canreturn[0])
+				index->indpred || index->indexprs || index->ncolumns < 2 || !index->canreturn[1])
 				continue;
 			proc = get_opfamily_proc(index->opfamily[0], index->opcintype[0], index->opcintype[0],
 									 ANN_DISTANCE_PROC);
@@ -219,7 +224,9 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 		AttrNumber	attno = member + FirstLowInvalidHeapAttributeNumber;
 		bool		in = false;
 
-		for (int i = 0; i < RelationGetDescr(indexRel)->natts; i++)
+		/* Half or no vector pages: the vector itself comes from the heap. */
+		for (int i = AnnFrozenVectorMode(indexRel, AnnFrozenGetMeta(indexRel, false)) ==
+			 ANN_FROZEN_VECTORS_FLOAT ? 0 : 1; i < RelationGetDescr(indexRel)->natts; i++)
 			in |= indexRel->rd_index->indkey.values[i] == attno;
 		covering &= in;
 	}
@@ -296,6 +303,7 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 	for (uint32 c = 0; c < state->meta->ncolumns; c++)
 		AnnArrayReaderInit(&state->values[c], state->index, &state->meta->columns[c].values, NULL);
 	state->vector = palloc(state->meta->vectors.width);
+	state->vectorMode = AnnFrozenVectorMode(state->index, state->meta);
 	state->workerRoute = -1;
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
@@ -395,6 +403,28 @@ LocalSearch(FrozenScanState *state)
 	state->localRuns++;
 	ordinals = MemoryContextAllocHuge(state->resultCtx, Max(eligible, 1) * sizeof(uint64));
 	distances = MemoryContextAllocHuge(state->resultCtx, Max(eligible, 1) * sizeof(double));
+	if (state->vectorMode != ANN_FROZEN_VECTORS_FLOAT)
+	{
+		/* Half pages widened, or the heap's vectors by TID. */
+		AnnFrozenVectorReader vr;
+
+		AnnFrozenVectorReaderInit(&vr, state->index, meta, strategy, false);
+		for (size_t w = 0; w < nwords; w++)
+			for (uint32 bits = words[w]; bits; bits &= bits - 1)
+			{
+				uint64		ordinal = (uint64) w * 32 + pg_rightmost_one_pos32(bits);
+
+				CHECK_FOR_INTERRUPTS();
+				ordinals[n] = ordinal;
+				distances[n] = state->queryIsNull ? 0 :
+					DatumGetFloat8(FunctionCall2Coll(state->distance, state->index->rd_indcollation[0],
+													 PointerGetDatum(AnnFrozenVectorRead(&vr, ordinal)),
+													 state->query));
+				n++;
+			}
+		AnnFrozenVectorReaderEnd(&vr);
+		nwords = 0;				/* done: skip the page loop */
+	}
 	AnnArrayReaderInit(&reader, state->index, &meta->vectors, strategy);
 	for (size_t w = 0; w < nwords; w++)
 	{
@@ -581,7 +611,8 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 
 	ExecClearTuple(slot);
 	memset(slot->tts_isnull, true, sizeof(bool) * desc->natts);
-	AnnArrayRead(&state->vectors, ordinal, state->vector);
+	if (state->vectorMode == ANN_FROZEN_VECTORS_FLOAT)
+		AnnArrayRead(&state->vectors, ordinal, state->vector);
 	AnnArrayRead(&state->keys, ordinal, &key);
 	for (int i = 0; i < RelationGetDescr(index)->natts; i++)
 	{
@@ -591,7 +622,12 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 		bool		isnull = false;
 
 		if (i == 0)
+		{
+			/* not read by the query unless the pages hold whole vectors */
+			if (state->vectorMode != ANN_FROZEN_VECTORS_FLOAT)
+				continue;
 			value = PointerGetDatum(state->vector);
+		}
 		else if (i == 1)
 			value = type == INT2OID ? Int16GetDatum((int16) key) :
 				type == INT4OID ? Int32GetDatum((int32) key) : Int64GetDatum(key);

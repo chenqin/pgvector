@@ -143,6 +143,44 @@ WriteArrayFile(Relation index, const AnnArray *array, const char *directory, con
 }
 
 /*
+ * vectors.f32 of an index whose pages hold halves or no vectors: the heap's
+ * exact vectors, by TID in key order, so every export is the same file.
+ */
+static void
+WriteExactVectors(Relation index, const AnnFrozenMetaData *meta, const char *directory)
+{
+	char	   *path = psprintf("%s/vectors.f32", directory);
+	int			fd = CreateFile(path);
+	BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
+	char	   *buffer = palloc(ANN_EXPORT_BUFFER);
+	size_t		used = 0;
+	AnnFrozenVectorReader reader;
+	size_t		bytes;
+
+	AnnFrozenVectorReaderInit(&reader, index, meta, strategy, true);
+	bytes = sizeof(float) * reader.dims;
+	for (uint64 ordinal = 0; ordinal < meta->rows; ordinal++)
+	{
+		Vector	   *vector;
+
+		CHECK_FOR_INTERRUPTS();
+		vector = AnnFrozenVectorRead(&reader, ordinal);
+		if (used + bytes > ANN_EXPORT_BUFFER)
+		{
+			WriteAll(fd, path, buffer, used);
+			used = 0;
+		}
+		memcpy(buffer + used, vector->x, bytes);
+		used += bytes;
+	}
+	WriteAll(fd, path, buffer, used);
+	AnnFrozenVectorReaderEnd(&reader);
+	FreeAccessStrategy(strategy);
+	CloseFile(fd, path);
+	pfree(buffer);
+}
+
+/*
  * ann_index_export(index, directory): write a frozen index's rows in the
  * worker's directory format: keys.i64, vectors.f32, one attr-COLUMN.i32 per
  * INCLUDE column after the key, and a manifest with the index's generation
@@ -203,8 +241,11 @@ ann_index_export(PG_FUNCTION_ARGS)
 
 	PrepareDirectory(directory);
 	WriteArrayFile(index, &meta->keys, directory, "keys.i64", 0, sizeof(int64));
-	WriteArrayFile(index, &meta->vectors, directory, "vectors.f32", offsetof(Vector, x),
-				   meta->vectors.width - offsetof(Vector, x));
+	if (AnnFrozenVectorMode(index, meta) == ANN_FROZEN_VECTORS_FLOAT)
+		WriteArrayFile(index, &meta->vectors, directory, "vectors.f32", offsetof(Vector, x),
+					   meta->vectors.width - offsetof(Vector, x));
+	else
+		WriteExactVectors(index, meta, directory);
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 		WriteArrayFile(index, &meta->columns[c].values, directory,
 					   psprintf("attr-%s.i32", NameStr(AnnFrozenGetNames(meta)[c])), 0, sizeof(int32));

@@ -661,6 +661,69 @@ class FrozenTests(unittest.TestCase):
         self.assertEqual(self.value('SELECT ann_index_export(%s, %s)', ('docs_ann', path)), ROWS)
         return path
 
+    def test_vector_storage(self):
+        """vectors = half keeps FP16 pages for the CPU routes, vectors = heap none; exports stay exact."""
+        self.create(index=False)
+        build = ('CREATE INDEX docs_ann ON docs USING ann (emb vector_l2_ops) INCLUDE (id, tenant, category) '
+                 'WITH (frozen = true{})')
+        self.db.execute(build.format(''))
+        generation = self.value("SELECT generation FROM ann_frozen_info('docs_ann')")
+        base = self.export('float')
+        float_pages = self.value("SELECT pages FROM ann_frozen_sizes('docs_ann') WHERE structure = 'vectors (float)'")
+        self.assertGreater(float_pages, 0)
+        query = '[11,-7,3,2]'
+        for mode in ('half', 'heap'):
+            self.db.execute('DROP INDEX docs_ann')
+            self.db.execute(build.format(f', vectors = {mode}'))
+            self.assertEqual(self.value("SELECT generation FROM ann_frozen_info('docs_ann')"), generation)
+            pages = self.value(f"SELECT pages FROM ann_frozen_sizes('docs_ann') WHERE structure = 'vectors ({mode})'")
+            if mode == 'heap':
+                self.assertEqual(pages, 0)
+            else:
+                self.assertTrue(0 < pages < float_pages, (pages, float_pages))
+            # Exports read the heap's exact vectors: the same files as from a float index.
+            path = self.export(mode)
+            for name in ['keys.i64', 'vectors.f32', 'attr-tenant.i32', 'attr-category.i32']:
+                self.assertTrue(filecmp.cmp(os.path.join(base, name), os.path.join(path, name), shallow=False),
+                                (mode, name))
+            # The frozen route without a worker scores from the pages (half) or the heap.
+            for predicate in ['tenant = 3', 'category IN (1, 4) AND tenant > 6', 'TRUE']:
+                # The vector is not covered now, so on 3,000 rows other plans cost less: switch them off.
+                statement = (f'SELECT id, tenant, emb <-> %s::vector AS d FROM docs WHERE {predicate} '
+                             f'ORDER BY emb <-> %s::vector LIMIT 10')
+                for setting in ['enable_seqscan', 'enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan']:
+                    self.db.execute(f'SET {setting} = off')
+                try:
+                    actual = self.db.execute(statement, (query, query)).fetchall()
+                    plan = self.plan(statement, (query, query))
+                finally:
+                    for setting in ['enable_seqscan', 'enable_indexscan', 'enable_indexonlyscan', 'enable_bitmapscan']:
+                        self.db.execute(f'RESET {setting}')
+                expected, _ = self.route(predicate, query, 10, route=False)
+                self.assertIn('AnnFrozenSearch', plan)
+                if mode == 'heap':
+                    self.assertEqual([r[:2] for r in actual], [r[:2] for r in expected], predicate)
+                else:
+                    overlap = len({r[0] for r in actual} & {r[0] for r in expected})
+                    self.assertGreaterEqual(overlap, 8, predicate)
+                    for got, want in zip(actual, expected):
+                        self.assertAlmostEqual(got[2], want[2], delta=max(0.02 * want[2], 0.05))
+            # The vector column is never served from half or missing pages.
+            statement = 'SELECT id, emb FROM docs WHERE tenant = 3 ORDER BY emb <-> %s::vector LIMIT 5'
+            rows = self.db.execute(statement, (query,)).fetchall()
+            exact = dict(self.db.execute('SELECT id, emb FROM docs WHERE tenant = 3').fetchall())
+            for key, vector in rows:
+                self.assertEqual(vector, exact[key])
+            self.assertNotIn('index pages when all-visible', self.plan(statement, (query,)))
+            # The access method's ordered scan.
+            got, plan = self.ordered('id', 'TRUE', query, 7, True)
+            want, _ = self.ordered('id', 'TRUE', query, 7, False)
+            if mode == 'heap':
+                self.assertEqual([r[0] for r in got], [r[0] for r in want])
+            else:
+                self.assertGreaterEqual(len({r[0] for r in got} & {r[0] for r in want}), 6)
+        self.assertIn('invalid value', self.error(build.replace('docs_ann', 'docs_bad').format(', vectors = int8')))
+
     def test_export_matches_builder(self):
         self.create()
         path = self.export('export')

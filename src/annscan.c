@@ -116,6 +116,44 @@ GetFrozenScanItems(IndexScanDesc scan)
 	AnnArrayReader reader;
 
 	ItemPointerSetInvalid(&none);
+	if (AnnFrozenVectorMode(index, so->meta) != ANN_FROZEN_VECTORS_FLOAT)
+	{
+		/* Widened half pages, or the heap's vectors, ordinal by ordinal. */
+		AnnFrozenVectorReader vr;
+
+		AnnFrozenVectorReaderInit(&vr, index, so->meta, strategy, false);
+		for (uint64 ordinal = 0; ordinal < so->meta->rows; ordinal++)
+		{
+			double		distance = 0;
+
+			CHECK_FOR_INTERRUPTS();
+			if (!queryIsNull)
+			{
+				MemoryContext oldCtx = MemoryContextSwitchTo(so->tmpCtx);
+
+				distance = DatumGetFloat8(FunctionCall2Coll(so->procinfo, index->rd_indcollation[0],
+															PointerGetDatum(AnnFrozenVectorRead(&vr, ordinal)),
+															query));
+				MemoryContextSwitchTo(oldCtx);
+				MemoryContextReset(so->tmpCtx);
+			}
+			ExecClearTuple(so->input);
+			so->input->tts_isnull[0] = queryIsNull;
+			so->input->tts_values[0] = queryIsNull ? (Datum) 0 : Float8GetDatum(distance);
+			so->input->tts_isnull[1] = false;
+			so->input->tts_values[1] = PointerGetDatum(&none);
+			so->input->tts_isnull[2] = false;
+			so->input->tts_values[2] = Int64GetDatum((int64) ordinal);
+			ExecStoreVirtualTuple(so->input);
+			tuplesort_puttupleslot(so->sortstate, so->input);
+			ExecClearTuple(so->input);
+		}
+		AnnFrozenVectorReaderEnd(&vr);
+		FreeAccessStrategy(strategy);
+		pfree(distances);
+		tuplesort_performsort(so->sortstate);
+		return;
+	}
 	AnnArrayReaderInit(&reader, index, array, strategy);
 	for (BlockNumber p = 0; p < array->pages; p++)
 	{
@@ -167,8 +205,17 @@ ReturnColumns(IndexScanDesc scan, uint64 ordinal)
 
 	MemoryContextReset(so->tupleCtx);
 	oldCtx = MemoryContextSwitchTo(so->tupleCtx);
-	AnnArrayRead(&so->vectors, ordinal, so->vector);
-	values[0] = PointerGetDatum(so->vector);
+	if (AnnFrozenVectorMode(scan->indexRelation, so->meta) == ANN_FROZEN_VECTORS_FLOAT)
+	{
+		AnnArrayRead(&so->vectors, ordinal, so->vector);
+		values[0] = PointerGetDatum(so->vector);
+	}
+	else
+	{
+		/* anncanreturn offers no vector from half or missing pages */
+		values[0] = (Datum) 0;
+		isnull[0] = true;
+	}
 	AnnArrayRead(&so->keys, ordinal, &key);
 	values[1] = type == INT2OID ? Int16GetDatum((int16) key) :
 		type == INT4OID ? Int32GetDatum((int32) key) : Int64GetDatum(key);
