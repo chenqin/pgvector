@@ -122,9 +122,16 @@ typedef struct Service
 	Job		   *plainHead[2];	/* jobs that cannot share a scan, by kind */
 	Job		   *plainTail[2];
 	AnnRdma    *rdma;
-	Connection **peers;			/* by RDMA peer id, under mutex */
+
+	/*
+	 * The RDMA peer table has a lock of its own: every RDMA frame looks its
+	 * peer up, and taking the scheduler's mutex for that as well as for
+	 * queueing the job doubled the traffic on the busiest lock.
+	 */
+	pthread_mutex_t peersMutex;
+	Connection **peers;			/* by RDMA peer id, under peersMutex */
 	uint64_t	npeers;
-	uint64_t	rdma_frames;
+	uint64_t	rdma_frames;	/* atomic */
 } Service;
 
 static volatile sig_atomic_t stopRequested;
@@ -1896,7 +1903,7 @@ Hello(Service *service, Connection *connection, const unsigned char *payload, ui
 	if (4 + ANN_RDMA_ADDRESS + strlen(device) > replySize ||
 		!AnnRdmaAddPeer(service->rdma, payload, reply + 4, &peer))
 		return ANN_BACKEND_ERROR;
-	(void) pthread_mutex_lock(&service->mutex);
+	(void) pthread_mutex_lock(&service->peersMutex);
 	if (peer >= service->npeers)
 	{
 		uint64_t	count = peer + 64;
@@ -1904,7 +1911,7 @@ Hello(Service *service, Connection *connection, const unsigned char *payload, ui
 
 		if (peers == NULL)
 		{
-			(void) pthread_mutex_unlock(&service->mutex);
+			(void) pthread_mutex_unlock(&service->peersMutex);
 			AnnRdmaRemovePeer(service->rdma, peer);
 			return ANN_NOMEM;
 		}
@@ -1913,7 +1920,7 @@ Hello(Service *service, Connection *connection, const unsigned char *payload, ui
 		service->npeers = count;
 	}
 	service->peers[peer] = connection;
-	(void) pthread_mutex_unlock(&service->mutex);
+	(void) pthread_mutex_unlock(&service->peersMutex);
 	(void) pthread_mutex_lock(&connection->mutex);
 	connection->references++;	/* held by the peer table */
 	connection->rdma = service->rdma;
@@ -1934,10 +1941,10 @@ Goodbye(Service *service, Connection *connection)
 {
 	if (connection->rdma == NULL)
 		return;
-	(void) pthread_mutex_lock(&service->mutex);
+	(void) pthread_mutex_lock(&service->peersMutex);
 	if (connection->peer < service->npeers && service->peers[connection->peer] == connection)
 		service->peers[connection->peer] = NULL;
-	(void) pthread_mutex_unlock(&service->mutex);
+	(void) pthread_mutex_unlock(&service->peersMutex);
 	Release(connection);
 }
 
@@ -1963,7 +1970,7 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 		free(frame);
 		return;
 	}
-	(void) pthread_mutex_lock(&service->mutex);
+	(void) pthread_mutex_lock(&service->peersMutex);
 	if (peer < service->npeers)
 		connection = service->peers[peer];
 	if (connection)
@@ -1972,8 +1979,8 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 		connection->references++;
 		(void) pthread_mutex_unlock(&connection->mutex);
 	}
-	service->rdma_frames++;
-	(void) pthread_mutex_unlock(&service->mutex);
+	(void) pthread_mutex_unlock(&service->peersMutex);
+	__atomic_fetch_add(&service->rdma_frames, 1, __ATOMIC_RELAXED);
 	if (connection == NULL)
 	{
 		free(frame);
@@ -2137,7 +2144,8 @@ Reader(void *argument)
 								(unsigned long long) service->pending_bytes,
 								(unsigned long long) (service->backend->device_jobs ?
 													  service->backend->device_jobs() : 0),
-								(unsigned long long) service->rdma_frames, (unsigned long long) rdmaFallbacks,
+								(unsigned long long) __atomic_load_n(&service->rdma_frames, __ATOMIC_RELAXED),
+								(unsigned long long) rdmaFallbacks,
 								rdmaLanes, (unsigned long long) service->groups,
 								(unsigned long long) service->grouped_jobs, (unsigned long long) service->held,
 								(unsigned long long) service->predicate_hits,
@@ -2275,6 +2283,7 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	service.backend = backend;
 	service.options = *options;
 	(void) pthread_mutex_init(&service.mutex, NULL);
+	(void) pthread_mutex_init(&service.peersMutex, NULL);
 	(void) pthread_cond_init(&service.condition, NULL);
 	action.sa_handler = OnSignal;
 	(void) sigaction(SIGINT, &action, NULL);

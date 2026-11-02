@@ -199,7 +199,7 @@ If phase S3 shows the worker's request path binds, the work that would make RDMA
 - Queue pairs shared per coordinator instead of one per backend.
 - Coordinators writing requests directly into ring buffers on the worker (RDMA write with immediate), so no lane receives them.
 
-Phase S4 measures RDMA against TCP across a switch at the same client counts. RDMA is adopted only if it raises R_proc or cuts worker CPU per request. First measurements on [collections](ann-collections.md#measured-16m--1024-on-one-b200-host-split-into-nodes) (across two InfiniBand ports of one host): RDMA cut p99 2–8× and matched TCP's peak for one-node queries, but plateaued for queries fanning out to several nodes, whatever the worker's lane count; the coordinator's multi-queue-pair wait is the next thing to profile.
+Phase S4 measures RDMA against TCP across a switch at the same client counts. RDMA is adopted only if it raises R_proc or cuts worker CPU per request. First measurements on [collections](ann-collections.md#measured-16m--1024-on-one-b200-host-split-into-nodes) (across two InfiniBand ports of one host): RDMA cut p99 2–8× and came within about 10% of TCP's peak for one-node queries, but its total stayed near 200–240k frames per second (about 55k per node, against 100k over TCP). Lane count, polling mode on either side, and a separate worker peer lock did not move it, and waiting lanes helped layouts with copies; queue-pair scaling (one per backend per node) and RDMA batching on the GPUs are the next things to measure.
 
 ## 9. Deltas, rebuilds and rebalancing
 
