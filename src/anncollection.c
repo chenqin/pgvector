@@ -628,7 +628,8 @@ ann_collection_search(PG_FUNCTION_ARGS)
 	int			programLength;
 	RangeSet	ranges = RangeAll();
 	AnnRemoteRequest requests[ANN_COLLECTION_MAX_PARTS];
-	int			selected[ANN_COLLECTION_MAX_PARTS];
+	int			selected[ANN_COLLECTION_MAX_PARTS]; /* a request's first part */
+	int			members[ANN_COLLECTION_MAX_PARTS];	/* parts per request */
 	int			nselected;
 	Hit		   *hits = NULL;
 	int			nhits = 0;
@@ -656,20 +657,58 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			!PlacementRanges(program, programLength, collection->attributes[collection->placement], &ranges))
 			ranges = RangeAll();
 
-		/* One request per part that can match: the payload of operation 22. */
+		/*
+		 * One request per replica set: the parts that can match, grouped by
+		 * their node list, so a node holding several parts answers them in
+		 * one request (operation 25); a lone part is operation 22.
+		 */
 		nselected = 0;
 		for (int i = 0; i < collection->nparts; i++)
 		{
-			CollectionPart *part = &collection->parts[i];
+			int			r;
+
+			if (!PartMatches(&collection->parts[i], &ranges))
+				continue;
+			for (r = 0; r < nselected; r++)
+				if (strcmp(collection->parts[selected[r]].nodes, collection->parts[i].nodes) == 0)
+					break;
+			if (r == nselected)
+			{
+				selected[nselected] = i;
+				members[nselected++] = 0;
+			}
+			members[r]++;
+		}
+		for (int r = 0; r < nselected; r++)
+		{
 			StringInfoData payload;
 			uint32		header[4];
-			uint32		length = strlen(part->index);
 
-			if (!PartMatches(part, &ranges))
-				continue;
 			initStringInfo(&payload);
-			appendBinaryStringInfo(&payload, (char *) &length, 4);
-			appendBinaryStringInfo(&payload, part->index, length);
+			if (members[r] > 1)
+			{
+				uint32		count = (uint32) members[r];
+
+				appendBinaryStringInfo(&payload, (char *) &count, 4);
+				for (int i = selected[r]; i < collection->nparts; i++)
+				{
+					CollectionPart *part = &collection->parts[i];
+					uint32		length = strlen(part->index);
+
+					if (!PartMatches(part, &ranges) || strcmp(part->nodes, collection->parts[selected[r]].nodes) != 0)
+						continue;
+					appendBinaryStringInfo(&payload, (char *) &length, 4);
+					appendBinaryStringInfo(&payload, part->index, length);
+					appendBinaryStringInfo(&payload, (char *) &part->generation, 8);
+				}
+			}
+			else
+			{
+				uint32		length = strlen(collection->parts[selected[r]].index);
+
+				appendBinaryStringInfo(&payload, (char *) &length, 4);
+				appendBinaryStringInfo(&payload, collection->parts[selected[r]].index, length);
+			}
 			header[0] = query->dim;
 			header[1] = (uint32) k;
 			header[2] = 0;		/* keys, not ordinals */
@@ -677,13 +716,12 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			appendBinaryStringInfo(&payload, (char *) header, sizeof(header));
 			appendBinaryStringInfo(&payload, program, programLength);
 			appendBinaryStringInfo(&payload, (char *) query->x, sizeof(float) * query->dim);
-			memset(&requests[nselected], 0, sizeof(AnnRemoteRequest));
-			requests[nselected].nodes = part->nodes;
-			requests[nselected].operation = ANN_OP_INDEX_SEARCH_PREDICATE;
-			requests[nselected].generation = part->generation;
-			requests[nselected].payload = payload.data;
-			requests[nselected].length = payload.len;
-			selected[nselected++] = i;
+			memset(&requests[r], 0, sizeof(AnnRemoteRequest));
+			requests[r].nodes = collection->parts[selected[r]].nodes;
+			requests[r].operation = members[r] > 1 ? ANN_OP_COLLECTION_SEARCH : ANN_OP_INDEX_SEARCH_PREDICATE;
+			requests[r].generation = members[r] > 1 ? 0 : collection->parts[selected[r]].generation;
+			requests[r].payload = payload.data;
+			requests[r].length = payload.len;
 		}
 		if (nselected == 0)
 			break;

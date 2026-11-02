@@ -312,6 +312,7 @@ Relation	AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode);
 #define ANN_STATUS_GENERATION 12
 
 #define ANN_OP_INDEX_SEARCH_PREDICATE 22
+#define ANN_OP_COLLECTION_SEARCH 25
 #define ANN_OP_INDEX_PREDICATE 23
 #define ANN_PREDICATE_ORDINALS 1
 

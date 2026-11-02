@@ -10,6 +10,7 @@ as they would across hosts.
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -216,6 +217,47 @@ class CollectionTests(unittest.TestCase):
             "SELECT * FROM ann_collection_search(%s, %s, 10, 'body = ''x''')", (self.collection, '[1,2,3,4]')))
         self.assertIn('does not exist', self.error(
             "SELECT * FROM ann_collection_search('nope', '[1,2,3,4]', 10)"))
+
+    def test_one_request_per_replica_set(self):
+        """Parts on the same replicas go in one request (operation 25), merged by the node."""
+        exports = self.create()
+        parts = [self.build('p0', exports[:1]), self.build('p1', exports[1:2]), self.build('p2', exports[2:])]
+        a, b, c = self.node('a'), self.node('b'), self.node('c')
+        self.collection = self.schema + '_docs'
+        self.db.execute('SELECT ann_collection_create(%s, %s, %s, %s)',
+                        (self.collection, f'{self.schema}.docs', ['tenant', 'category'], 'tenant'))
+        names = [self.collection + f'_p{i}' for i in range(3)]
+        for i, (low, high, nodes) in enumerate([(0, 3, f'{a},{b}'), (4, 7, f'{a},{b}'), (8, 15, c)]):
+            self.db.execute('SELECT ann_collection_load(%s, %s, %s, %s, %s, %s, %s)',
+                            (self.collection, i, names[i], parts[i], nodes, low, high))
+        for query in ['[1,2,3,4]', '[-30,10,5,0]']:
+            for condition in [None, 'category = 3', 'tenant BETWEEN 2 AND 6', 'tenant IN (1, 12)']:
+                self.assertEqual(self.search(query, 9, condition), self.exact(query, 9, condition),
+                                 (query, condition))
+        # Straight to a node: both parts in one request.
+        generations = {name: int(g, 16) for name, g in self.db.execute(
+            'SELECT index_name, generation FROM ann_collection_part WHERE collection = %s',
+            (self.collection,)).fetchall()}
+
+        def request(parts, k=5, flags=0):
+            payload = struct.pack('<I', len(parts))
+            for name, generation in parts:
+                payload += struct.pack('<I', len(name)) + name.encode() + struct.pack('<Q', generation)
+            query = [1.0, 2.0, 3.0, 4.0]
+            payload += struct.pack('<IIII', 4, k, flags, 1) + bytes([8]) + struct.pack('<4f', *query)
+            with self.nodes['a'].connect() as connection:
+                connection.sendall(frame(25, 7, payload))
+                return receive(connection)
+
+        _, _, status, payload = request([(names[0], generations[names[0]]), (names[1], generations[names[1]])])
+        self.assertEqual(status, 0)
+        count, _, eligible = struct.unpack_from('<IIQ', payload)
+        self.assertEqual(eligible, 8 * PER_TENANT)
+        keys = [struct.unpack_from('<q', payload, 16 + i * 12)[0] for i in range(count)]
+        self.assertEqual(keys, [key for key, _ in self.exact('[1,2,3,4]', 5, 'tenant < 8')])
+        self.assertEqual(request([(names[0], generations[names[0]] ^ 1), (names[1], 0)])[2], 12)
+        self.assertEqual(request([(names[0], 0), ('missing', 0)])[2], 3)
+        self.assertEqual(request([(names[0], 0)], flags=1)[2], 1)
 
     def test_catalog_checks(self):
         self.create(partitions=2)

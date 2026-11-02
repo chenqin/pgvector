@@ -68,7 +68,31 @@ typedef struct Job
 	struct Job *fnext;			/* the same filter's jobs, or the plain jobs
 								 * of this kind, oldest first */
 	struct FilterEntry *filter; /* NULL for a job that cannot share a scan */
+	struct Composite *composite;	/* operation 25: the request this part
+									 * answers into */
 } Job;
+
+/*
+ * Operation 25: several loaded indexes (parts of a collection on this node)
+ * searched with one program and query. Each part runs as an operation 22
+ * job; each hands its hits here, and the last merges them and replies once.
+ */
+typedef struct Composite
+{
+	pthread_mutex_t mutex;
+	uint32_t	remaining;		/* parts not yet answered */
+	uint32_t	k;
+	AnnStatus	status;
+	uint64_t	eligible;
+	uint32_t	nhits;
+	AnnIndexHit *hits;			/* up to k per part */
+	Connection *connection;		/* referenced until the reply */
+	int			rdma;
+	uint64_t	request;
+} Composite;
+
+/* Set while a reader or RDMA lane submits a composite's parts. */
+static _Thread_local Composite *submittingComposite = NULL;
 
 /*
  * A filter the worker already holds (a cached bitmap's rows, an attribute
@@ -298,13 +322,93 @@ SendReply(Connection *connection, int rdma, uint16_t operation, uint64_t request
 		Reply(connection, operation, request, status, data, size);
 }
 
+static int
+HitCompare(const void *a, const void *b)
+{
+	const AnnIndexHit *x = a;
+	const AnnIndexHit *y = b;
+
+	if (x->distance != y->distance)
+		return x->distance < y->distance ? -1 : 1;
+	return (x->key > y->key) - (x->key < y->key);
+}
+
+/*
+ * A part of a composite is answered (status, its hits and eligible rows);
+ * the last one replies with the k nearest of all parts: u32 count, u32
+ * route (0), u64 eligible rows over every part, then (i64 key, f32
+ * distance) per hit, ascending.
+ */
+static void
+CompositeAnswer(Composite *composite, AnnStatus status, const AnnIndexHit *hits, uint32_t nhits,
+				uint64_t eligible)
+{
+	int			last;
+
+	(void) pthread_mutex_lock(&composite->mutex);
+	if (status == ANN_OK)
+	{
+		uint32_t	n = nhits < composite->k ? nhits : composite->k;
+
+		memcpy(composite->hits + composite->nhits, hits, sizeof(AnnIndexHit) * n);
+		composite->nhits += n;
+		composite->eligible += eligible;
+	}
+	else if (composite->status == ANN_OK)
+		composite->status = status;
+	last = --composite->remaining == 0;
+	(void) pthread_mutex_unlock(&composite->mutex);
+	if (!last)
+		return;
+	{
+		uint32_t	count = composite->nhits < composite->k ? composite->nhits : composite->k;
+		size_t		size = 16 + (size_t) count * 12;
+		unsigned char *data = NULL;
+		AnnStatus	result = composite->status;
+
+		if (result == ANN_OK)
+		{
+			qsort(composite->hits, composite->nhits, sizeof(AnnIndexHit), HitCompare);
+			if ((data = malloc(size)) == NULL)
+				result = ANN_NOMEM;
+			else
+			{
+				Write(data, count, 4);
+				Write(data + 4, 0, 4);
+				Write(data + 8, composite->eligible, 8);
+				for (uint32_t i = 0; i < count; i++)
+				{
+					uint32_t	bits;
+
+					memcpy(&bits, &composite->hits[i].distance, sizeof(bits));
+					Write(data + 16 + (size_t) i * 12, (uint64_t) composite->hits[i].key, 8);
+					Write(data + 24 + (size_t) i * 12, bits, 4);
+				}
+			}
+		}
+		SendReply(composite->connection, composite->rdma, ANN_OP_COLLECTION_SEARCH, composite->request, result,
+				  data, result == ANN_OK ? size : 0);
+		free(data);
+		Release(composite->connection);
+		(void) pthread_mutex_destroy(&composite->mutex);
+		free(composite->hits);
+		free(composite);
+	}
+}
+
 static void
 Finish(Service *service, Job *job)
 {
 	unsigned char *data = NULL;
 	size_t		size = 0;
 
-	if (job->kind == JOB_INDEX)
+	if (job->composite)
+	{
+		job->job.status = job->index.status;
+		CompositeAnswer(job->composite, job->index.status, job->index.results, job->index.nresults,
+						job->bitmap ? job->bitmap->count : job->bitmapFile ? job->bitmapFile->rows : 0);
+	}
+	else if (job->kind == JOB_INDEX)
 	{
 		/*
 		 * u32 count, u32 route, then (i64 key, f32 distance) per hit;
@@ -359,8 +463,9 @@ Finish(Service *service, Job *job)
 			}
 		}
 	}
-	SendReply(job->connection, job->rdma, job->operation, job->request, job->job.status,
-			  data, job->job.status == ANN_OK ? size : 0);
+	if (!job->composite)
+		SendReply(job->connection, job->rdma, job->operation, job->request, job->job.status,
+				  data, job->job.status == ANN_OK ? size : 0);
 	free(data);
 	(void) pthread_mutex_lock(&service->mutex);
 	service->pending_bytes -= job->charge;
@@ -1528,6 +1633,7 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	job->request = request;
 	job->payload = payload;
 	job->charge = (uint64_t) size + sizeof(AnnIndexHit) * k;
+	job->composite = submittingComposite;
 	if (Enqueue(service, connection, job))
 		return ANN_PENDING;
 	free(job->index.results);
@@ -1715,6 +1821,103 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 		return status;
 	return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
 						   dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+}
+
+/*
+ * Operation 25 payload: u32 parts, per part (u32 name length, name, u64
+ * generation, 0 for any), then as operation 22 after its name: u32
+ * dimensions, k, flags (no ANN_PREDICATE_ORDINALS: ordinals of different
+ * indexes don't mix), program length, program, FP32 query. Each part is
+ * submitted as an operation 22 job answering into one composite reply.
+ * Always ANN_PENDING: the composite replies, errors included.
+ */
+static AnnStatus
+SubmitCollection(Service *service, Connection *connection, int rdma, uint64_t request,
+				 unsigned char *payload, uint32_t size)
+{
+	uint32_t	parts;
+	size_t		offset = 4;
+	size_t		common;
+	uint32_t	k;
+	Composite  *composite;
+
+	if (size < 4 || (parts = (uint32_t) Read(payload, 4)) == 0 || parts > ANN_INDEX_MAX_SHARDS)
+		return ANN_INVALID;
+	for (uint32_t p = 0; p < parts; p++)
+	{
+		uint32_t	nameLength;
+
+		if ((uint64_t) offset + 4 > size || (nameLength = (uint32_t) Read(payload + offset, 4)) == 0 ||
+			nameLength > ANN_INDEX_NAME_MAX || (uint64_t) offset + 12 + nameLength > size)
+			return ANN_INVALID;
+		offset += 12 + nameLength;
+	}
+	common = offset;
+	if ((uint64_t) common + 16 > size)
+		return ANN_INVALID;
+	k = (uint32_t) Read(payload + common + 4, 4);
+	if (k == 0 || k > 10000 || (Read(payload + common + 8, 4) & ANN_PREDICATE_ORDINALS))
+		return ANN_INVALID;
+	composite = calloc(1, sizeof(*composite));
+	if (composite == NULL || (composite->hits = malloc(sizeof(AnnIndexHit) * (size_t) k * parts)) == NULL)
+	{
+		free(composite);
+		return ANN_NOMEM;
+	}
+	(void) pthread_mutex_init(&composite->mutex, NULL);
+	composite->remaining = parts;
+	composite->k = k;
+	composite->status = ANN_OK;
+	composite->connection = connection;
+	composite->rdma = rdma;
+	composite->request = request;
+	(void) pthread_mutex_lock(&connection->mutex);
+	connection->references++;	/* held until the composite replies */
+	(void) pthread_mutex_unlock(&connection->mutex);
+
+	offset = 4;
+	for (uint32_t p = 0; p < parts; p++)
+	{
+		uint32_t	nameLength = (uint32_t) Read(payload + offset, 4);
+		uint64_t	generation = Read(payload + offset + 4 + nameLength, 8);
+		char		name[ANN_INDEX_NAME_MAX + 1];
+		AnnIndexFile *file;
+		AnnStatus	status = ANN_OK;
+		unsigned char *part;
+		size_t		partSize = 4 + nameLength + (size - common);
+
+		memcpy(name, payload + offset + 4, nameLength);
+		name[nameLength] = '\0';
+		offset += 12 + nameLength;
+		if (memchr(name, '\0', nameLength))
+			status = ANN_INVALID;
+		else if ((file = AnnIndexGet(name)) == NULL)
+			status = ANN_STALE;
+		else
+		{
+			if (generation != 0 && file->generationValue != generation)
+				status = ANN_GENERATION;
+			AnnIndexPut(file);
+		}
+		if (status == ANN_OK && (part = malloc(partSize)) == NULL)
+			status = ANN_NOMEM;
+		if (status == ANN_OK)
+		{
+			/* An operation 22 payload: the part's name, then the shared rest. */
+			Write(part, nameLength, 4);
+			memcpy(part + 4, name, nameLength);
+			memcpy(part + 4 + nameLength, payload + common, size - common);
+			submittingComposite = composite;
+			status = SubmitPredicate(service, connection, rdma, request, part, (uint32_t) partSize);
+			submittingComposite = NULL;
+			if (status != ANN_PENDING)
+				free(part);
+		}
+		if (status != ANN_PENDING)
+			CompositeAnswer(composite, status, NULL, 0, 0);
+	}
+	free(payload);				/* the parts own their copies */
+	return ANN_PENDING;
 }
 
 /*
@@ -2013,6 +2216,8 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 		;
 	else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
 		status = SubmitPredicate(service, connection, 1, request, payload, length);
+	else if (operation == ANN_OP_COLLECTION_SEARCH)
+		status = SubmitCollection(service, connection, 1, request, payload, length);
 	else if (operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED)
 		status = SubmitIndex(service, connection, 1, operation, request, payload, length);
 	else if (operation == ANN_OP_INDEX_SEARCH_MATCH)
@@ -2203,6 +2408,13 @@ Reader(void *argument)
 		else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
 		{
 			status = SubmitPredicate(service, connection, 0, request, payload, length);
+			if (status == ANN_PENDING)
+				continue;
+			Reply(connection, operation, request, status, NULL, 0);
+		}
+		else if (operation == ANN_OP_COLLECTION_SEARCH)
+		{
+			status = SubmitCollection(service, connection, 0, request, payload, length);
 			if (status == ANN_PENDING)
 				continue;
 			Reply(connection, operation, request, status, NULL, 0);
