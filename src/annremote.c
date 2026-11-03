@@ -1618,6 +1618,11 @@ AnnRemoteInit(void)
 							"Trace every Nth collection request's send and reply times (0 for none).",
 							"Lines go to /tmp/ann-fanout-PID.trace; workers started with --trace record the same requests.",
 							&ann_worker_trace_sample, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("ann.collection_text_range_limit",
+							"Most strings a text range in an ann collection filter may match.",
+							"Ranges over text attributes become the set of the matching strings' codes; larger sets need bigger programs.",
+							&ann_collection_text_range_limit, 65536, 1, ANN_TEXT_RANGE_MAX, PGC_SUSET, 0, NULL,
+							AnnCollectionTextRangeLimitAssign, NULL);
 	DefineCustomIntVariable("ann.worker_overload_wait_ms",
 							"Time a loaded-index search retries while the GPU node is overloaded.",
 							"Retries back off from 0.5 to 16 ms; 0 reports overload at once.",

@@ -313,6 +313,12 @@ void		AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns);
 void		AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateColumns *columns);
 bool		AnnFrozenCachedColumns(Relation index, AnnPredicateColumns *columns);
 void		AnnFrozenStoreColumns(Relation index, const AnnPredicateColumns *columns);
+extern int	ann_collection_text_range_limit;
+extern uint64 ann_collection_program_epoch;
+void		AnnCollectionTextRangeLimitAssign(int value, void *extra);
+
+/* Program bytes bound a range's codes: 4 each, up to ANN_FILTER_MAX_PROGRAM. */
+#define ANN_TEXT_RANGE_MAX 250000
 bool		AnnFrozenTableFrozen(Oid relid);
 void		AnnFrozenTombstonesChanged(void);
 bool		AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *columns);

@@ -122,6 +122,18 @@ AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateC
 	columns->ncolumns = count;
 }
 
+/* Most strings a text range over a collection attribute may match. */
+int			ann_collection_text_range_limit = ANN_FILTER_MAX_VALUES;
+
+/* Bumped when a setting changes how filters translate: cached programs go. */
+uint64		ann_collection_program_epoch = 1;
+
+void
+AnnCollectionTextRangeLimitAssign(int value, void *extra)
+{
+	ann_collection_program_epoch++;
+}
+
 static void
 PutByte(StringInfo program, int value)
 {
@@ -417,18 +429,31 @@ PutCodeSet(Context *cxt, int column, int64 first, int64 last)
 		PutByte(cxt->program, ANN_FILTER_NONE);
 		return;
 	}
-	if (n > ANN_FILTER_MAX_VALUES)
+	if (n > ann_collection_text_range_limit ||
+		cxt->program->len + n * 4 + (n / ANN_FILTER_MAX_VALUES + 1) * (16 + NAMEDATALEN) > ANN_FILTER_MAX_PROGRAM)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("a text range over ann collection attribute \"%s\" matches more than %d strings",
-						cxt->columns->names[column], ANN_FILTER_MAX_VALUES)));
+				 errmsg("a text range over ann collection attribute \"%s\" matches %lld strings, more than %d",
+						cxt->columns->names[column], (long long) n,
+						Min(ann_collection_text_range_limit, ANN_TEXT_RANGE_MAX)),
+				 errhint("Raise ann.collection_text_range_limit (at most %d), or narrow the range.",
+						 ANN_TEXT_RANGE_MAX)));
 	codes = palloc(sizeof(int32) * n);
 	memcpy(codes, dictionary->codes + first, sizeof(int32) * n);
 	qsort(codes, n, sizeof(int32), Int32Order);
-	PutLeaf(cxt, ANN_FILTER_VALUES, column, false);
-	Put32(cxt->program, (uint32) n);
-	for (int64 i = 0; i < n; i++)
-		Put32(cxt->program, (uint32) codes[i]);
+
+	/* A leaf holds at most ANN_FILTER_MAX_VALUES values: OR the chunks. */
+	for (int64 start = 0; start < n; start += ANN_FILTER_MAX_VALUES)
+	{
+		int64		count = Min(n - start, ANN_FILTER_MAX_VALUES);
+
+		PutLeaf(cxt, ANN_FILTER_VALUES, column, false);
+		Put32(cxt->program, (uint32) count);
+		for (int64 i = start; i < start + count; i++)
+			Put32(cxt->program, (uint32) codes[i]);
+		if (start > 0)
+			PutByte(cxt->program, ANN_FILTER_OR);
+	}
 	pfree(codes);
 }
 

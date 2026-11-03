@@ -83,6 +83,7 @@ typedef struct Collection
 	AnnPredicateColumns columns;
 	HTAB	   *programs;
 	int			nprograms;
+	uint64		programEpoch;	/* ann_collection_program_epoch they match */
 	Oid			delta;			/* table of rows not yet in a part, or 0 */
 	char	   *deltaKey;
 	char	   *deltaVector;
@@ -297,6 +298,7 @@ LoadCollection(FunctionCallInfo fcinfo, const char *name)
 	LoadDictionaries(fcinfo, collection);
 	collection->programContext = AllocSetContextCreate(context, "ann collection programs", ALLOCSET_DEFAULT_SIZES);
 	CreateProgramCache(collection);
+	collection->programEpoch = ann_collection_program_epoch;
 	INSTR_TIME_SET_CURRENT(collection->loaded);
 	collection->valid = true;
 	return collection;
@@ -422,6 +424,14 @@ ProgramFor(Collection *collection, const char *filter, char **program, int *leng
 	bool		found;
 	StringInfoData built;
 
+	/* A setting changed how filters translate: drop the cached programs. */
+	if (collection->programEpoch != ann_collection_program_epoch)
+	{
+		FreeDeltaPlans(collection);
+		MemoryContextReset(collection->programContext);
+		CreateProgramCache(collection);
+		collection->programEpoch = ann_collection_program_epoch;
+	}
 	if (filter == NULL || filter[0] == '\0')
 	{
 		static char all = ANN_FILTER_ALL;

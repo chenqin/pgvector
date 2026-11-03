@@ -428,6 +428,13 @@ class CollectionTests(unittest.TestCase):
                                  (query, condition))
                 self.assertEqual(self.rows(query, 12, condition, 'lang text, tenant integer'),
                                  self.exact_rows(query, 12, condition, columns='lang, tenant'), (query, condition))
+        # ann.collection_text_range_limit bounds how many strings a range may match.
+        self.db.execute('SET ann.collection_text_range_limit = 2')
+        self.assertIn('matches 3 strings, more than 2', self.error(
+            'SELECT * FROM ann_collection_search(%s, %s, 5, %s)', (self.collection, '[1,2,3,4]', "lang < 'f'")))
+        self.db.execute('SET ann.collection_text_range_limit = 3')
+        self.assertEqual(self.search('[1,2,3,4]', 12, "lang < 'f'"), self.exact('[1,2,3,4]', 12, "lang < 'f'"))
+        self.db.execute('RESET ann.collection_text_range_limit')
         # Reloading a part keeps its codes; a second coordinator attaching adopts the nodes'.
         self.db.execute('SELECT ann_collection_load(%s, 1, %s, NULL, %s, 8, 15)',
                         (self.collection, self.collection + '_p1', c))
@@ -481,6 +488,34 @@ class CollectionTests(unittest.TestCase):
                         (self.collection, self.collection + '_p0v2', rebuilt, nodes))
         self.assertEqual(self.search('[1,2,3,4]', 10), exact('[1,2,3,4]', 10))
         del parts
+
+    def test_wide_text_ranges(self):
+        """A text range matching more than 65,536 strings becomes several OR'd value lists."""
+        self.db.execute('CREATE TABLE words (id bigint, word text, emb vector(4))')
+        self.db.execute("""INSERT INTO words SELECT i, 'w' || lpad(i::text, 6, '0'),
+                               ARRAY[sin(i) * 50, cos(i * 1.3) * 40, sin(i * 0.7) * 30, i % 9]::vector
+                           FROM generate_series(0, 79999) i""")
+        self.assertTrue(self.value("SELECT ann_freeze('words')"))
+        self.vacuum('words')
+        self.db.execute('CREATE INDEX words_ann ON words USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, word) WITH (frozen = true)')
+        export = os.path.join(self.directory.name, 'words-export')
+        self.db.execute('SELECT ann_index_export(%s, %s)', ('words_ann', export))
+        part = self.build('words-part', [export])
+        node = self.node('a')
+        self.collection = self.schema + '_words'
+        self.db.execute('SELECT ann_collection_create(%s, %s, %s)', (self.collection, f'{self.schema}.words', ['word']))
+        self.db.execute('SELECT ann_collection_load(%s, 0, %s, %s, %s)', (self.collection, self.collection, part, node))
+        self.db.execute('SET ann.collection_text_range_limit = 250000')
+        for condition in ["word < 'w070000'", "word >= 'w000100'", "word BETWEEN 'w010000' AND 'w079000'",
+                          "NOT (word < 'w075000')"]:
+            expected = [(key, round(distance, 3)) for key, distance in self.db.execute(
+                f"SELECT id, (emb <-> '[1,2,3,4]')::real AS d FROM words WHERE {condition} ORDER BY d, id LIMIT 10"
+            ).fetchall()]
+            self.assertEqual(self.search('[1,2,3,4]', 10, condition), expected, condition)
+        self.db.execute('RESET ann.collection_text_range_limit')
+        self.assertIn('more than 65536', self.error(
+            'SELECT * FROM ann_collection_search(%s, %s, 5, %s)', (self.collection, '[1,2,3,4]', "word < 'w070000'")))
 
     def test_catalog_checks(self):
         self.create(partitions=2)
