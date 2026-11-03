@@ -64,13 +64,36 @@ SELECT id, body FROM docs
 WHERE id = ANY(ARRAY(SELECT key FROM ann_collection_search('docs', $1, 10, 'tenant = 42')));
 ```
 
+**6. New rows (the delta):** rows not yet frozen into a part go to one delta table per collection, on the coordinator (or a foreign table on one delta host). Each search scores the delta exactly with the same filter, as SQL, while the nodes search, and merges it in under the same k. A key in both the delta and a part (a row being moved into a rebuilt part) is returned once, at its nearest. Keep the delta small, or index it: the delta query is `ORDER BY vector <-> query LIMIT k` over it with the filter as its `WHERE`, so a large delta without an index costs a scan per query.
+
+```sql
+CREATE TABLE docs_delta (id bigint, tenant int, category int, emb vector(1024));
+SELECT ann_collection_delta('docs', 'docs_delta', 'id', 'emb');
+INSERT INTO docs_delta VALUES (...);          -- found by the next search
+SELECT ann_collection_delta('docs', NULL);    -- no delta: no delta query
+```
+
+**7. Rolling rebuilds:** rebuild a part (its partitions re-frozen with their delta rows) and swap it in without a window where searches miss rows or fail.
+
+```sql
+-- 1. load the rebuilt part under a new name on its nodes; the catalog switches to it
+SELECT ann_collection_load('docs', 0, 'docs_p0_v2', '/data/ann/idx/part-0-v2', 'gpu1:7700,gpu3:7700', 0, 511);
+-- 2. remove the rows it now holds from the delta (until then, keys in both are returned once)
+DELETE FROM docs_delta WHERE id < 268435456;
+-- 3. unload the old index; each node frees it once the searches using it finish
+SELECT ann_index_unload('docs_p0', 'gpu1:7700,gpu3:7700');
+```
+
+Other coordinators reread the catalog within 10 s; a search one of them sends to the old name after it was unloaded gets "stale" back, rereads the catalog at once and retries, so step 3 needn't wait. The coordinator that ran steps 1 and 2 sees them immediately.
+
 ## How a search runs
 
 1. **Catalog.** The coordinator reads `ann_collection` and `ann_collection_part` once per backend (again after 10 s, or at once when a node answers that it serves another generation).
 2. **Program.** The filter is translated once per backend into a [predicate program](ann-frozen-index.md#predicates) against the source table's columns, and cached by its text. Collection attributes are integer, boolean and date columns; text needs a dictionary shared by all parts and is refused.
 3. **Placement.** When the collection is placed by an attribute, the coordinator runs the program over value ranges instead of rows: a leaf on the placement attribute gives its values, every other leaf all values, AND intersects, OR unites, NOT gives all values. Parts whose recorded range can't match are skipped. `tenant = 42`, `tenant IN (1, 900)` and `tenant BETWEEN 10 AND 20 AND category = 3` reach only the parts holding those tenants; `category = 3` reaches every part.
 4. **Fan-out.** One request per replica set, all in flight at once: parts with the same node list go together as one operation 25 (the node runs each part as an operation 22 job and merges them), a lone part as operation 22. So a node can hold several smaller parts, each rebuilt on its own, and still answer a query in one request. The coordinator keeps one connection per node, over RDMA when `ann.worker_rdma` is set, picks each request's replicas in rotation, and moves a request to the next replica when a node fails (a failed node is skipped for `ann.worker_retry_ms`). Each request carries the part's generation. Everything must answer within `ann.worker_timeout_ms`, or the statement fails.
-5. **Merge.** Each part returns its top k by key; the coordinator keeps the k nearest overall.
+5. **Delta.** With a delta, the coordinator runs its exact query after sending the requests and before reading the replies, so it overlaps the nodes' search.
+6. **Merge.** Each part returns its top k by key; the coordinator keeps the k nearest overall, each key once.
 
 A part's worker searches its shards as for any loaded index: one lane, every shard on its GPU, the per-shard tree merge, and same-filter grouping across concurrent searches.
 
@@ -143,7 +166,7 @@ Each backend keeps one TCP connection per node for authentication, heartbeats, l
 
 | Table | Columns |
 | --- | --- |
-| `ann_collection` | name, source (the table filters are written against), attributes, placement attribute |
+| `ann_collection` | name, source (the table filters are written against), attributes, placement attribute, delta table with its key and vector columns |
 | `ann_collection_part` | collection, part, index name on the nodes, nodes (replicas, `host:port` list), generation, rows, placement range |
 
 ## Measured: 16M × 1024 on one B200 host split into nodes
@@ -224,5 +247,5 @@ Throughput per copy scales from the measured per-node rates:
 
 ## Tests
 
-`test/ann/test_collection.py` (part of `make -C ann check`; `ANN_PG_DSN`, superuser) runs three CPU workers as nodes on their own TCP ports and checks that the builder combines exports in key order and refuses overlapping members; that searches equal exact SQL over the partitioned table for every filter shape, query and k; that a pinned tenant reaches only its part and replicas share the requests; that a stopped replica is skipped and a part without a live node is an error; and the catalog's checks. `benchmarks/ann/collection_bench.py` generates, sets up, benchmarks and checks recall as above.
+`test/ann/test_collection.py` (part of `make -C ann check`; `ANN_PG_DSN`, superuser) runs three CPU workers as nodes on their own TCP ports and checks that the builder combines exports in key order and refuses overlapping members; that searches equal exact SQL over the partitioned table for every filter shape, query and k; that a pinned tenant reaches only its part and replicas share the requests; that a stopped replica is skipped and a part without a live node is an error; that delta rows are found under one LIMIT for every filter (also when every part is pruned), and a key in both the delta and a part is returned once; that a rolling rebuild (load under a new name, unload the old) keeps searches exact, including from a session with the old catalog cached; and the catalog's checks. `benchmarks/ann/collection_bench.py` generates, sets up, benchmarks and checks recall as above.
 

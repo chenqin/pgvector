@@ -6,6 +6,9 @@ CREATE TABLE ann_collection (
 	source regclass NOT NULL,
 	attributes text[] NOT NULL,
 	placement text,
+	delta regclass,
+	delta_key name,
+	delta_vector name,
 	created_at timestamptz NOT NULL DEFAULT now()
 );
 
@@ -52,6 +55,21 @@ CREATE FUNCTION ann_collection_search(collection text, query vector, k integer, 
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 10;
 
 COMMENT ON FUNCTION ann_collection_search(text, vector, integer, text) IS 'the k nearest rows of an ann collection matching a filter over its attributes, searched on the parts'' GPU nodes in parallel';
+
+CREATE FUNCTION ann_collection_delta(collection text, delta regclass, key_column text DEFAULT 'id',
+	vector_column text DEFAULT 'embedding') RETURNS void
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION ann_collection_delta(text, regclass, text, text) IS 'set (or with NULL clear) the table of an ann collection''s rows not yet in a part, searched exactly with each query';
+
+REVOKE ALL ON FUNCTION ann_collection_delta(text, regclass, text, text) FROM PUBLIC;
+
+CREATE FUNCTION ann_index_unload(index_name text, nodes text DEFAULT NULL) RETURNS integer
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;
+
+COMMENT ON FUNCTION ann_index_unload(text, text) IS 'unload an index from GPU nodes once its searches finish, as after a part was replaced; returns the nodes that had it';
+
+REVOKE ALL ON FUNCTION ann_index_unload(text, text) FROM PUBLIC;
 
 CREATE FUNCTION ann_frozen_sizes(index regclass, OUT structure text, OUT pages bigint, OUT bytes bigint)
 	RETURNS SETOF record AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;

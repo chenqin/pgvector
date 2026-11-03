@@ -481,6 +481,8 @@ Finish(Service *service, Job *job)
 		free(job->ownedBitsets[s]);
 	if (job->bitmap)
 		AnnIndexBitmapRelease(job->bitmapFile, job->bitmap);
+	if (job->bitmapFile)
+		AnnIndexPut(job->bitmapFile);
 	free(job->payload);
 	free(job);
 }
@@ -1553,11 +1555,19 @@ SubmitCached(Service *service, Connection *connection, int rdma, uint64_t reques
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
 	bitmap = AnnIndexBitmapGet(file, id, ANN_BITMAP_PUSHED);
-	AnnIndexPut(file);
 	if (bitmap == NULL)
+	{
+		AnnIndexPut(file);
 		return ANN_MISSING;
-	return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
-						   dimensions, k, offset, ANN_OP_INDEX_SEARCH_CACHED, 0);
+	}
+	{
+		/* The job takes its own reference before this one goes. */
+		AnnStatus	status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
+											 dimensions, k, offset, ANN_OP_INDEX_SEARCH_CACHED, 0);
+
+		AnnIndexPut(file);
+		return status;
+	}
 }
 
 /*
@@ -1634,8 +1644,12 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	job->payload = payload;
 	job->charge = (uint64_t) size + sizeof(AnnIndexHit) * k;
 	job->composite = submittingComposite;
+	if (file)
+		AnnIndexHold(file);		/* until Finish: unloading waits for it */
 	if (Enqueue(service, connection, job))
 		return ANN_PENDING;
+	if (file)
+		AnnIndexPut(file);
 	free(job->index.results);
 	if (bitmap)
 		AnnIndexBitmapRelease(file, bitmap);
@@ -1810,17 +1824,14 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 		return ANN_STALE;
 	/* A program matching every row is a plain ANN search. */
 	if (programLength == 1 && payload[offset] == ANN_FILTER_ALL)
-	{
-		AnnIndexPut(file);
-		return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, NULL, name,
-							   dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
-	}
-	status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap);
+		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, NULL, name,
+								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+	else if ((status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap)) == ANN_OK)
+		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
+								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+	/* The job took its own reference before this one goes. */
 	AnnIndexPut(file);
-	if (status != ANN_OK)
-		return status;
-	return SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
-						   dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+	return status;
 }
 
 /*
@@ -2458,6 +2469,23 @@ Reader(void *argument)
 
 			Reply(connection, operation, request, status, (unsigned char *) message,
 				  status == ANN_OK ? textLength : 0);
+		}
+		else if (operation == ANN_OP_UNLOAD_INDEX)
+		{
+			/* u32 name length, name; freed after its searches */
+			char		name[ANN_INDEX_NAME_MAX + 1];
+			uint32_t	nameLength = length >= 4 ? (uint32_t) Read(payload, 4) : 0;
+
+			if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length != 4 + (uint64_t) nameLength ||
+				memchr(payload + 4, '\0', nameLength))
+				status = ANN_INVALID;
+			else
+			{
+				memcpy(name, payload + 4, nameLength);
+				name[nameLength] = '\0';
+				status = AnnIndexUnload(name);
+			}
+			Reply(connection, operation, request, status, NULL, 0);
 		}
 		else if (operation == ANN_OP_AUTH)
 			Reply(connection, operation, request, ANN_OK, NULL, 0);

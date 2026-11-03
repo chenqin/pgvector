@@ -259,6 +259,74 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(request([(names[0], 0), ('missing', 0)])[2], 3)
         self.assertEqual(request([(names[0], 0)], flags=1)[2], 1)
 
+    def test_delta_rows_are_searched(self):
+        """Rows not yet in a part sit in a delta table, scored exactly with the same filter and merged in."""
+        self.setup_collection()
+        self.db.execute('CREATE TABLE docs_delta (id bigint, tenant int, category int, emb vector(4))')
+        self.db.execute("""INSERT INTO docs_delta SELECT 900000 + i, i % 16, i % 5,
+                               ARRAY[1 + i * 0.01, 2, 3, 4 + i % 3]::vector FROM generate_series(0, 39) i""")
+        nearest = self.exact('[1,2,3,4]', 1)[0][0]
+        # A row moving into a part is briefly in both: returned once.
+        self.db.execute('INSERT INTO docs_delta SELECT id, tenant, category, emb FROM docs WHERE id = %s', (nearest,))
+        self.db.execute("SELECT ann_collection_delta(%s, 'docs_delta', 'id', 'emb')", (self.collection,))
+
+        def exact(query, k, condition=None):
+            where = f'WHERE {condition}' if condition else ''
+            return [(key, round(distance, 3)) for key, distance in self.db.execute(
+                f"""SELECT id, min(d) FROM (SELECT id, (emb <-> %s::vector)::real AS d FROM docs {where}
+                    UNION ALL SELECT id, (emb <-> %s::vector)::real FROM docs_delta {where}) s
+                    GROUP BY id ORDER BY 2, 1 LIMIT %s""", (query, query, k)).fetchall()]
+
+        for query in ['[1,2,3,4]', '[-30,10,5,0]']:
+            for condition in [None, 'tenant = 3', 'category = 2 AND tenant > 9', 'tenant IN (1, 12)']:
+                for k in [1, 10, 60]:
+                    self.assertEqual(self.search(query, k, condition), exact(query, k, condition),
+                                     (query, condition, k))
+        self.assertEqual(len([key for key, _ in self.search('[1,2,3,4]', 60) if key == nearest]), 1)
+        # A filter that prunes every part still scores the delta.
+        self.db.execute('INSERT INTO docs_delta VALUES (990000, 40, 1, %s)', ('[1,2,3,4]',))
+        self.assertEqual(self.search('[1,2,3,4]', 5, 'tenant = 40'), [(990000, 0.0)])
+        # Another session sees the delta too.
+        with self.psycopg.connect(DSN, autocommit=True) as other:
+            other.execute(self.sql.SQL('SET search_path = {}, public').format(self.sql.Identifier(self.schema)))
+            other.execute("SET ann.worker_auth_token = 'collection-test-token'")
+            self.assertEqual(other.execute('SELECT key FROM ann_collection_search(%s, %s, 1, %s)',
+                                           (self.collection, '[1,2,3,4]', 'tenant = 40')).fetchall(),
+                             [(990000,)])
+        self.assertIn('does not exist', self.error("SELECT ann_collection_delta('missing', 'docs_delta')"))
+        self.db.execute('SELECT ann_collection_delta(%s, NULL)', (self.collection,))
+        self.assertEqual(self.search('[1,2,3,4]', 10), self.exact('[1,2,3,4]', 10))
+
+    def test_rolling_rebuild(self):
+        """Load a rebuilt part under a new name, switch the catalog, unload the old one: searches stay exact."""
+        parts = self.setup_collection()
+        old = self.collection + '_p0'
+        expected = self.exact('[1,2,3,4]', 10, 'tenant < 8')
+        # A session that has the old catalog cached.
+        other = self.psycopg.connect(DSN, autocommit=True)
+        self.addCleanup(other.close)
+        other.execute(self.sql.SQL('SET search_path = {}, public').format(self.sql.Identifier(self.schema)))
+        other.execute("SET ann.worker_auth_token = 'collection-test-token'")
+
+        def search_other():
+            return [(key, round(distance, 3)) for key, distance in other.execute(
+                'SELECT key, distance FROM ann_collection_search(%s, %s, 10, %s) ORDER BY distance, key',
+                (self.collection, '[1,2,3,4]', 'tenant < 8')).fetchall()]
+
+        self.assertEqual(search_other(), expected)
+        rebuilt = self.build('part-0b', [os.path.join(self.directory.name, f'export-{p}') for p in (0, 1)])
+        nodes = f"{self.nodes['a'].address},{self.nodes['b'].address}"
+        self.db.execute('SELECT ann_collection_load(%s, 0, %s, %s, %s, 0, 7)',
+                        (self.collection, old + 'b', rebuilt, nodes))
+        self.assertEqual(self.search('[1,2,3,4]', 10, 'tenant < 8'), expected)
+        self.assertEqual(self.value('SELECT ann_index_unload(%s, %s)', (old, nodes)), 2)
+        self.assertEqual(self.value('SELECT ann_index_unload(%s, %s)', (old, nodes)), 0)
+        self.assertEqual(self.search('[1,2,3,4]', 10, 'tenant < 8'), expected)
+        # The cached catalog names the unloaded index: the node says stale and the session rereads it.
+        self.assertEqual(search_other(), expected)
+        self.assertEqual(self.search('[1,2,3,4]', 10), self.exact('[1,2,3,4]', 10))
+        del parts
+
     def test_catalog_checks(self):
         self.create(partitions=2)
         self.assertIn('must be smallint, integer', self.error(

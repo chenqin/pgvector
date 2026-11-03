@@ -55,11 +55,20 @@ AnnRemoteBroadcastTo(const char *nodes, uint16 operation, const char *payload, s
 int
 AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs)
 {
+	return AnnRemoteFanoutWhile(requests, count, timeoutMs, NULL, NULL);
+}
+
+int
+AnnRemoteFanoutWhile(AnnRemoteRequest *requests, int count, int timeoutMs, void (*whileWaiting) (void *),
+					 void *arg)
+{
 	for (int i = 0; i < count; i++)
 	{
 		requests[i].ok = false;
 		requests[i].done = true;
 	}
+	if (whileWaiting)
+		whileWaiting(arg);
 	return 0;
 }
 
@@ -1271,6 +1280,18 @@ FanoutPick(AnnRemoteRequest *request, int timeoutMs, bool *exhausted)
 int
 AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs)
 {
+	return AnnRemoteFanoutWhile(requests, count, timeoutMs, NULL, NULL);
+}
+
+/*
+ * AnnRemoteFanout, calling whileWaiting(arg) once the first requests are
+ * sent and before any reply is read: work of the caller's own (an exact
+ * query over local rows) overlaps the nodes'.
+ */
+int
+AnnRemoteFanoutWhile(AnnRemoteRequest *requests, int count, int timeoutMs, void (*whileWaiting) (void *),
+					 void *arg)
+{
 	FanoutNode *active[ANN_FANOUT_NODES];
 	int			nactive = 0;
 	int			pending = count;
@@ -1331,6 +1352,12 @@ AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs)
 				request->done = true;
 				pending--;
 			}
+		}
+		if (!started && whileWaiting)
+		{
+			/* Nothing is read until it returns; a reply waits in its socket. */
+			whileWaiting(arg);
+			whileWaiting = NULL;
 		}
 		if (pending == 0 || nactive == 0)
 			break;
@@ -1459,6 +1486,8 @@ AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs)
 			INSTR_TIME_SET_CURRENT(spinStart);
 		}
 	}
+	if (whileWaiting)
+		whileWaiting(arg);		/* no request was sent */
 	return answered;
 }
 

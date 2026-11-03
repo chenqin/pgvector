@@ -29,6 +29,9 @@ typedef struct Entry
 
 static pthread_mutex_t registryMutex = PTHREAD_MUTEX_INITIALIZER;
 static Entry *registry;
+static Entry *retired;			/* unloaded, freed at their last reference */
+
+void		(*AnnIndexDeviceDestroy) (void *device) = NULL;
 
 #define ANN_HUGE_PAGE (2 * 1024 * 1024)
 
@@ -1034,7 +1037,7 @@ AnnIndexFileClose(AnnIndexFile *file)
 	free(file);
 }
 
-/* Names are unique; replacing a loaded index requires a worker restart. */
+/* Names are unique; to replace an index, load the new one under another name and unload the old one. */
 AnnStatus
 AnnIndexRegister(AnnIndexFile *file)
 {
@@ -1078,9 +1081,34 @@ AnnIndexGet(const char *name)
 	return file;
 }
 
+/* Another reference to a file the caller already holds one on. */
+void
+AnnIndexHold(AnnIndexFile *file)
+{
+	(void) pthread_mutex_lock(&registryMutex);
+	for (Entry *entry = registry; entry; entry = entry->next)
+		if (entry->file == file)
+			entry->references++;
+	for (Entry *entry = retired; entry; entry = entry->next)
+		if (entry->file == file)
+			entry->references++;
+	(void) pthread_mutex_unlock(&registryMutex);
+}
+
+static void
+Destroy(AnnIndexFile *file)
+{
+	if (file->device && AnnIndexDeviceDestroy)
+		AnnIndexDeviceDestroy(file->device);
+	file->device = NULL;
+	AnnIndexFileClose(file);
+}
+
 void
 AnnIndexPut(AnnIndexFile *file)
 {
+	Entry	   *dead = NULL;
+
 	(void) pthread_mutex_lock(&registryMutex);
 	for (Entry *entry = registry; entry; entry = entry->next)
 		if (entry->file == file)
@@ -1088,7 +1116,50 @@ AnnIndexPut(AnnIndexFile *file)
 			entry->references--;
 			break;
 		}
+	for (Entry **link = &retired; *link; link = &(*link)->next)
+		if ((*link)->file == file)
+		{
+			if (--(*link)->references == 0)
+			{
+				dead = *link;
+				*link = dead->next;
+			}
+			break;
+		}
 	(void) pthread_mutex_unlock(&registryMutex);
+	if (dead)
+	{
+		fprintf(stderr, "ann index %s: unloaded\n", dead->file->name);
+		Destroy(dead->file);
+		free(dead);
+	}
+}
+
+/*
+ * Unload an index by name: new lookups no longer find it, and its memory
+ * (host and device) is freed once the last search or job referencing it is
+ * done. Returns ANN_STALE when no index of that name is loaded.
+ */
+AnnStatus
+AnnIndexUnload(const char *name)
+{
+	Entry	   *found = NULL;
+
+	(void) pthread_mutex_lock(&registryMutex);
+	for (Entry **link = &registry; *link; link = &(*link)->next)
+		if (strcmp((*link)->file->name, name) == 0)
+		{
+			found = *link;
+			*link = found->next;
+			found->next = retired;
+			retired = found;
+			break;
+		}
+	(void) pthread_mutex_unlock(&registryMutex);
+	if (found == NULL)
+		return ANN_STALE;
+	AnnIndexPut(found->file);	/* the registry's own reference */
+	return ANN_OK;
 }
 
 uint64_t

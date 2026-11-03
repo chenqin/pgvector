@@ -35,6 +35,7 @@
 
 #define ANN_OP_LOAD_INDEX 11
 #define ANN_OP_INDEX_INFO 15
+#define ANN_OP_UNLOAD_INDEX 26
 #define ANN_COLLECTION_LOAD_TIMEOUT_MS (30 * 60 * 1000)
 #define ANN_COLLECTION_MAX_PARTS 64
 #define ANN_COLLECTION_REFRESH_MS 10000
@@ -58,6 +59,7 @@ typedef struct ProgramEntry
 	char	   *filter;
 	char	   *program;
 	int			length;
+	SPIPlanPtr	deltaPlan;		/* the delta query with this filter, or NULL */
 } ProgramEntry;
 
 typedef struct Collection
@@ -75,6 +77,10 @@ typedef struct Collection
 	AnnPredicateColumns columns;
 	HTAB	   *programs;
 	int			nprograms;
+	Oid			delta;			/* table of rows not yet in a part, or 0 */
+	char	   *deltaKey;
+	char	   *deltaVector;
+	SPIPlanPtr	deltaAll;		/* the delta query without a filter */
 	instr_time	loaded;
 } Collection;
 
@@ -99,6 +105,27 @@ static uint64
 ParseGenerationText(const char *value)
 {
 	return value && strlen(value) == 16 ? strtou64(value, NULL, 16) : 0;
+}
+
+/* SPI plans live outside the collection's memory: free them before it goes. */
+static void
+FreeDeltaPlans(Collection *collection)
+{
+	HASH_SEQ_STATUS status;
+	ProgramEntry *entry;
+
+	if (collection->deltaAll)
+		SPI_freeplan(collection->deltaAll);
+	collection->deltaAll = NULL;
+	if (collection->programs == NULL)
+		return;
+	hash_seq_init(&status, collection->programs);
+	while ((entry = hash_seq_search(&status)) != NULL)
+		if (entry->deltaPlan)
+		{
+			SPI_freeplan(entry->deltaPlan);
+			entry->deltaPlan = NULL;
+		}
 }
 
 static void
@@ -145,7 +172,8 @@ LoadCollection(FunctionCallInfo fcinfo, const char *name)
 	values[0] = CStringGetTextDatum(name);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute_with_args(psprintf("SELECT source::oid, attributes, placement FROM %s WHERE name = $1",
+	if (SPI_execute_with_args(psprintf("SELECT source::oid, attributes, placement, delta::oid, delta_key, delta_vector "
+									   "FROM %s WHERE name = $1",
 									   CatalogTable(fcinfo, "ann_collection")),
 							  1, types, values, NULL, true, 1) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the ann collection catalog");
@@ -156,7 +184,12 @@ LoadCollection(FunctionCallInfo fcinfo, const char *name)
 
 	collection = hash_search(collections, name, HASH_ENTER, &found);
 	if (found && collection->valid)
+	{
+		FreeDeltaPlans(collection);
 		MemoryContextDelete(collection->context);
+	}
+	collection->programs = NULL;
+	collection->deltaAll = NULL;
 	collection->valid = false;
 	collection->context = context;
 	old = MemoryContextSwitchTo(context);
@@ -179,6 +212,14 @@ LoadCollection(FunctionCallInfo fcinfo, const char *name)
 		for (int i = 0; i < count; i++)
 			collection->attributes[i] = nulls[i] ? pstrdup("") : TextDatumGetCString(elements[i]);
 		placement = SPI_getvalue(tuple, desc, 3);
+		{
+			bool		deltaNull;
+			Datum		delta = SPI_getbinval(tuple, desc, 4, &deltaNull);
+
+			collection->delta = deltaNull ? InvalidOid : DatumGetObjectId(delta);
+			collection->deltaKey = SPI_getvalue(tuple, desc, 5);
+			collection->deltaVector = SPI_getvalue(tuple, desc, 6);
+		}
 		collection->placement = -1;
 		for (int i = 0; placement && i < count; i++)
 			if (strcmp(collection->attributes[i], placement) == 0)
@@ -264,6 +305,25 @@ GetCollection(FunctionCallInfo fcinfo, const char *name, bool refresh)
 	return LoadCollection(fcinfo, name);
 }
 
+/* Drop this backend's copy of a collection whose catalog it just changed. */
+static void
+ForgetCollection(const char *name)
+{
+	Collection *collection;
+
+	if (collections == NULL || strlen(name) >= ANN_COLLECTION_NAME)
+		return;
+	collection = hash_search(collections, name, HASH_FIND, NULL);
+	if (collection == NULL)
+		return;
+	if (collection->valid)
+	{
+		FreeDeltaPlans(collection);
+		MemoryContextDelete(collection->context);
+	}
+	hash_search(collections, name, HASH_REMOVE, NULL);
+}
+
 /* A filter's program, translated once per backend and cached. */
 static void
 ProgramFor(Collection *collection, const char *filter, char **program, int *length)
@@ -298,6 +358,7 @@ ProgramFor(Collection *collection, const char *filter, char **program, int *leng
 				 errhint("Use comparisons, IN, BETWEEN, IS NULL, AND, OR and NOT over the collection's attributes with constants.")));
 	if (collection->nprograms >= ANN_COLLECTION_PROGRAMS)
 	{
+		FreeDeltaPlans(collection);
 		MemoryContextReset(collection->programContext);
 		CreateProgramCache(collection);
 	}
@@ -311,6 +372,7 @@ ProgramFor(Collection *collection, const char *filter, char **program, int *leng
 	}
 	if (!found)
 	{
+		entry->deltaPlan = NULL;
 		entry->filter = MemoryContextStrdup(collection->programContext, filter);
 		entry->program = MemoryContextAlloc(collection->programContext, Max(built.len, 1));
 		memcpy(entry->program, built.data, built.len);
@@ -550,6 +612,87 @@ PartMatches(const CollectionPart *part, const RangeSet *ranges)
 	return false;
 }
 
+/*
+ * The exact search over a collection's delta (rows not yet in a part): the
+ * filter as SQL over the delta table, prepared once per filter.
+ */
+typedef struct DeltaSearch
+{
+	SPIPlanPtr	plan;
+	Datum		query;
+	int			k;
+	Hit		   *hits;
+	int			nhits;
+} DeltaSearch;
+
+/* The plan of a filter whose program is not cached. */
+static SPIPlanPtr scratchPlan = NULL;
+
+static SPIPlanPtr
+DeltaPlanFor(Collection *collection, const char *filter, Oid vectorType)
+{
+	SPIPlanPtr *slot = &collection->deltaAll;
+	Oid			types[2] = {vectorType, INT4OID};
+	char	   *table;
+	char	   *statement;
+	SPIPlanPtr	plan;
+
+	if (filter && filter[0] != '\0')
+	{
+		uint64		hash = hash_bytes_extended((const unsigned char *) filter, (int) strlen(filter), 0);
+		ProgramEntry *entry = hash_search(collection->programs, &hash, HASH_FIND, NULL);
+
+		slot = entry && strcmp(entry->filter, filter) == 0 ? &entry->deltaPlan : &scratchPlan;
+	}
+	if (*slot && slot != &scratchPlan)
+		return *slot;
+	table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(collection->delta)),
+									   get_rel_name(collection->delta));
+	statement = psprintf("SELECT (%s)::bigint, (%s <-> $1)::real FROM %s%s%s ORDER BY %s <-> $1 LIMIT $2",
+						 quote_identifier(collection->deltaKey), quote_identifier(collection->deltaVector), table,
+						 filter && filter[0] ? " WHERE " : "", filter && filter[0] ? filter : "",
+						 quote_identifier(collection->deltaVector));
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if ((plan = SPI_prepare(statement, 2, types)) == NULL)
+		elog(ERROR, "could not prepare the delta search of ann collection \"%s\": %s", collection->name,
+			 SPI_result_code_string(SPI_result));
+	if (SPI_keepplan(plan) != 0)
+		elog(ERROR, "could not keep the delta search of ann collection \"%s\"", collection->name);
+	SPI_finish();
+	if (slot == &scratchPlan && scratchPlan)
+		SPI_freeplan(scratchPlan);
+	*slot = plan;
+	return plan;
+}
+
+/* AnnRemoteFanoutWhile's callback: the delta's best k while the nodes search. */
+static void
+DeltaQuery(void *arg)
+{
+	DeltaSearch *delta = arg;
+	Datum		values[2] = {delta->query, Int32GetDatum(delta->k)};
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_plan(delta->plan, values, NULL, true, delta->k) != SPI_OK_SELECT)
+		elog(ERROR, "the delta search of an ann collection failed");
+	for (uint64 i = 0; i < SPI_processed && delta->nhits < delta->k; i++)
+	{
+		bool		keyNull;
+		bool		distanceNull;
+		Datum		key = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &keyNull);
+		Datum		distance = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &distanceNull);
+
+		if (keyNull || distanceNull)
+			continue;
+		delta->hits[delta->nhits].key = DatumGetInt64(key);
+		delta->hits[delta->nhits].distance = DatumGetFloat4(distance);
+		delta->nhits++;
+	}
+	SPI_finish();
+}
+
 static int
 HitCompare(const void *a, const void *b)
 {
@@ -633,6 +776,8 @@ ann_collection_search(PG_FUNCTION_ARGS)
 	int			nselected;
 	Hit		   *hits = NULL;
 	int			nhits = 0;
+	int			returned = 0;
+	DeltaSearch delta;
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
@@ -646,6 +791,7 @@ ann_collection_search(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("k must be between 1 and 10000")));
 	InitSetResult(fcinfo, &tupdesc, &store);
+	memset(&delta, 0, sizeof(delta));
 
 	for (int attempt = 0;; attempt++)
 	{
@@ -723,12 +869,23 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			requests[r].payload = payload.data;
 			requests[r].length = payload.len;
 		}
-		if (nselected == 0)
+		if (nselected == 0 && !OidIsValid(collection->delta))
 			break;
 
-		(void) AnnRemoteFanout(requests, nselected, ann_worker_timeout_ms);
+		/* The delta's exact search runs while the nodes search. */
+		memset(&delta, 0, sizeof(delta));
+		nhits = 0;
+		if (OidIsValid(collection->delta))
+		{
+			delta.plan = DeltaPlanFor(collection, filter, get_fn_expr_argtype(fcinfo->flinfo, 1));
+			delta.query = PointerGetDatum(query);
+			delta.k = k;
+			delta.hits = palloc(sizeof(Hit) * k);
+		}
+		(void) AnnRemoteFanoutWhile(requests, nselected, ann_worker_timeout_ms,
+									OidIsValid(collection->delta) ? DeltaQuery : NULL, &delta);
 
-		hits = palloc(sizeof(Hit) * ((Size) nselected * k));
+		hits = palloc(sizeof(Hit) * ((Size) nselected * k + k));
 		nhits = 0;
 		for (int r = 0; r < nselected; r++)
 		{
@@ -759,16 +916,29 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			break;
 	}
 
+	for (int i = 0; i < delta.nhits; i++)
+		hits[nhits++] = delta.hits[i];	/* room for k was allocated */
 	if (nhits > 1)
 		qsort(hits, nhits, sizeof(Hit), HitCompare);
-	for (int i = 0; i < Min(nhits, k); i++)
+
+	/*
+	 * A row moving from the delta into a rebuilt part can briefly be in both:
+	 * return each key once, at its nearest.
+	 */
+	for (int i = 0; i < nhits && returned < k; i++)
 	{
 		Datum		values[2];
 		bool		nulls[2] = {false, false};
+		bool		seen = false;
 
+		for (int j = 0; j < i && !seen; j++)
+			seen = hits[j].key == hits[i].key;
+		if (seen)
+			continue;
 		values[0] = Int64GetDatum(hits[i].key);
 		values[1] = Float4GetDatum(hits[i].distance);
 		tuplestore_putvalues(store, tupdesc, values, nulls);
+		returned++;
 	}
 	return (Datum) 0;
 }
@@ -971,5 +1141,93 @@ ann_collection_load(PG_FUNCTION_ARGS)
 							  7, types, values, valueNulls, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not record ann collection part %d", part);
 	SPI_finish();
+	ForgetCollection(text_to_cstring(collection));
 	PG_RETURN_INT64((int64) rows);
+}
+
+/*
+ * ann_collection_delta(collection, delta, key_column, vector_column): the
+ * table holding a collection's rows not yet frozen into a part (NULL for
+ * none). Searches score it exactly with the same filter, while the nodes
+ * search, and merge it in. Keep it small: re-freeze its rows into their
+ * partitions and rebuild those parts on a schedule.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_collection_delta);
+Datum
+ann_collection_delta(PG_FUNCTION_ARGS)
+{
+	Oid			types[4] = {TEXTOID, OIDOID, TEXTOID, TEXTOID};
+	Datum		values[4];
+	char		nulls[4] = {' ', ' ', ' ', ' '};
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("collection is required")));
+	values[0] = PG_GETARG_DATUM(0);
+	values[1] = PG_ARGISNULL(1) ? (Datum) 0 : PG_GETARG_DATUM(1);
+	values[2] = PG_ARGISNULL(2) ? CStringGetTextDatum("id") : PG_GETARG_DATUM(2);
+	values[3] = PG_ARGISNULL(3) ? CStringGetTextDatum("embedding") : PG_GETARG_DATUM(3);
+	if (PG_ARGISNULL(1))
+		nulls[1] = nulls[2] = nulls[3] = 'n';
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("UPDATE %s SET delta = $2::oid::regclass, delta_key = $3, delta_vector = $4 "
+									   "WHERE name = $1", CatalogTable(fcinfo, "ann_collection")),
+							  4, types, values, nulls, false, 0) != SPI_OK_UPDATE)
+		elog(ERROR, "could not record the delta of the ann collection");
+	if (SPI_processed != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("ann collection \"%s\" does not exist", TextDatumGetCString(values[0]))));
+	SPI_finish();
+	ForgetCollection(TextDatumGetCString(values[0]));
+	PG_RETURN_VOID();
+}
+
+/*
+ * ann_index_unload(index_name, nodes): unload a loaded index from every
+ * node of a host:port list (ann.worker_address when NULL), as after a
+ * collection part was replaced: each node frees it once the searches using
+ * it are done. Returns the nodes that had it loaded.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_index_unload);
+Datum
+ann_index_unload(PG_FUNCTION_ARGS)
+{
+	char	   *index;
+	char	   *nodes;
+	char	   *save = NULL;
+	StringInfoData payload;
+	uint32		length;
+	int32		unloaded = 0;
+
+	if (PG_ARGISNULL(0))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("index name is required")));
+	index = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	nodes = PG_ARGISNULL(1) ? pstrdup(ann_worker_address ? ann_worker_address : "") :
+		text_to_cstring(PG_GETARG_TEXT_PP(1));
+	length = strlen(index);
+	initStringInfo(&payload);
+	appendBinaryStringInfo(&payload, (char *) &length, 4);
+	appendBinaryStringInfo(&payload, index, length);
+	for (char *node = strtok_r(nodes, ", ", &save); node; node = strtok_r(NULL, ", ", &save))
+	{
+		AnnRemoteRequest request;
+
+		memset(&request, 0, sizeof(request));
+		request.nodes = node;
+		request.operation = ANN_OP_UNLOAD_INDEX;
+		request.payload = payload.data;
+		request.length = payload.len;
+		(void) AnnRemoteFanout(&request, 1, ann_worker_timeout_ms);
+		if (!request.ok)
+			ereport(WARNING,
+					(errmsg("ann node %s is unavailable; index \"%s\" stays loaded there", node, index)));
+		else if (request.status == ANN_STATUS_OK)
+			unloaded++;
+	}
+	PG_RETURN_INT32(unloaded);
 }

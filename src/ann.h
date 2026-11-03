@@ -209,6 +209,8 @@ typedef struct AnnRemoteRequest
 } AnnRemoteRequest;
 
 int			AnnRemoteFanout(AnnRemoteRequest *requests, int count, int timeoutMs);
+int			AnnRemoteFanoutWhile(AnnRemoteRequest *requests, int count, int timeoutMs,
+								 void (*whileWaiting) (void *), void *arg);
 int			AnnRemoteBroadcastTo(const char *nodes, uint16 operation, const char *payload, size_t length,
 								 int timeoutMs, uint32 *status, char **reply, uint32 *replyLength);
 int			AnnRemoteBroadcastEach(uint16 operation, const char *payload, size_t length, int timeoutMs,

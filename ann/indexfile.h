@@ -200,6 +200,11 @@ const char *AnnIndexQuantName(int quant);
 
 AnnStatus	AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result);
 void		AnnIndexFileClose(AnnIndexFile *file);
+void		AnnIndexHold(AnnIndexFile *file);
+AnnStatus	AnnIndexUnload(const char *name);
+
+/* Frees a loaded index's backend state (device memory) when it is unloaded. */
+extern void (*AnnIndexDeviceDestroy) (void *device);
 
 /*
  * Evaluate a predicate program (ann/filter.h) over the index's attribute

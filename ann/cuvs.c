@@ -866,6 +866,13 @@ DestroyIndexState(AnnCuvsIndex *state)
 	free(state);
 }
 
+/* AnnIndexDeviceDestroy: an unloaded index's shards and device arrays. */
+static void
+DestroyDevice(void *device)
+{
+	DestroyIndexState(device);
+}
+
 /*
  * Cached bitmaps are copied and freed on a non-blocking stream per device,
  * stream-ordered: cudaMalloc and cudaFree would wait for every lane's work
@@ -1062,6 +1069,7 @@ LoadIndex(const char *name, const char *directory)
 		return status;
 	AnnIndexBitmapDevice.upload = UploadBitmap;
 	AnnIndexBitmapDevice.release = ReleaseBitmap;
+	AnnIndexDeviceDestroy = DestroyDevice;
 	if (file->nshards == 0 || cudaGetDeviceCount(&devices) != cudaSuccess || devices <= 0)
 	{
 		/* No CAGRA shards or devices: serve exact results from the files. */
