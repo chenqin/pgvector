@@ -153,6 +153,7 @@ Search frames can bypass the kernel network stack over RDMA. The transport uses 
 - **Security:** the worker accepts RDMA frames only on queue pairs it connected for authenticated TCP connections. A queue pair is destroyed when its connection's last in-flight reply is done.
 - **Queue pairs:** every node a backend talks to over RDMA costs a reliable-connection queue pair at both ends, and an adapter's message rate and latency fall once thousands are active (on the test fabric, 0.61M 4 KB sends per second with 1,024 queue pairs, 0.22M with 4,096). So over RDMA a backend keeps to one replica of each part, chosen by its process ID, and moves to the next only when that one fails; over TCP it rotates over the replicas. Keep coordinator connections pooled: queue pairs grow with backends × nodes reached.
 - **Tracing:** `SET ann.worker_trace_sample = N` (superuser) writes every Nth fan-out request's send and reply times to `/tmp/ann-fanout-PID.trace`; a worker started with `--trace FILE --trace-sample N` writes the same requests' arrival, queueing, search and reply times. On one host the clocks agree and request IDs carry the backend's process ID, so `benchmarks/ann/fanout_trace.py` joins both and prints each stage's mean, median and p99.
+- **Learnings:** what limited RDMA throughput and when to prefer it over TCP are in [RDMA learnings](ann-rdma-learnings.md).
 - **Fallback:** frames that don't fit go over TCP. If the device can't be opened, the backend stays on TCP and logs at DEBUG1.
 
 ```sh
