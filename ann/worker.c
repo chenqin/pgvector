@@ -311,6 +311,10 @@ main(int argc, char **argv)
 			serveOptions.max_batch_jobs = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--delay-us") == 0)
 			serveOptions.delay_us = strtoull(value, NULL, 10);
+		else if (strcmp(argv[i], "--trace") == 0)
+			serveOptions.trace = value;
+		else if (strcmp(argv[i], "--trace-sample") == 0)
+			serveOptions.trace_sample = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--max-pending-mb") == 0)
 			serveOptions.max_pending_bytes = strtoull(value, NULL, 10) * 1024 * 1024;
 		else if (strcmp(argv[i], "--itopk") == 0)
@@ -530,7 +534,7 @@ main(int argc, char **argv)
 usage:
 #ifdef ANN_USE_CUVS
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
-			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N]\n"
+			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--quantized-scan on|off] [--quant-slack N] [--predicate-cache N]\n"
@@ -538,7 +542,7 @@ usage:
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
-			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N]\n"
+			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"

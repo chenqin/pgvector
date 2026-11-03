@@ -14,6 +14,7 @@ int			ann_worker_retry_ms = 10000;
 char	   *ann_worker_rdma = NULL;
 int			ann_worker_rdma_spin_us = 50;
 int			ann_worker_overload_wait_ms = 1000;
+int			ann_worker_trace_sample = 0;
 
 #if defined(WIN32) || defined(WORDS_BIGENDIAN)
 
@@ -990,6 +991,7 @@ typedef struct FanoutNode
 	uint64		request;
 	instr_time	used;
 	instr_time	down;			/* zero when believed healthy */
+	uint64		traceSent;		/* ann.worker_trace_sample: send time */
 	char		header[ANN_HEADER_SIZE];	/* TCP reply being read */
 	size_t		got;
 	char	   *body;
@@ -998,6 +1000,40 @@ typedef struct FanoutNode
 static FanoutNode fanoutNodes[ANN_FANOUT_NODES];
 static int	fanoutCount = 0;
 static uint64 fanoutRotation = 0;
+static FILE *traceFile = NULL;
+
+/* Realtime nanoseconds, comparable with a worker's --trace on this host. */
+static uint64
+TraceNow(void)
+{
+	struct timespec ts;
+
+	(void) clock_gettime(CLOCK_REALTIME, &ts);
+	return (uint64) ts.tv_sec * UINT64CONST(1000000000) + (uint64) ts.tv_nsec;
+}
+
+/*
+ * ann.worker_trace_sample: "C pid id node rdma fanout sent replied" per
+ * sampled request (ids that are multiples of the sample, as the worker
+ * picks them), in /tmp/ann-fanout-PID.trace.
+ */
+static void
+TraceReply(FanoutNode *node, uint64 fanoutStart)
+{
+	if (ann_worker_trace_sample <= 0 || node->request % (uint64) ann_worker_trace_sample != 0)
+		return;
+	if (traceFile == NULL)
+	{
+		char		path[MAXPGPATH];
+
+		snprintf(path, sizeof(path), "/tmp/ann-fanout-%d.trace", MyProcPid);
+		if ((traceFile = fopen(path, "a")) == NULL)
+			return;
+	}
+	fprintf(traceFile, "C %d " UINT64_FORMAT " %s %d " UINT64_FORMAT " " UINT64_FORMAT " " UINT64_FORMAT "\n",
+			MyProcPid, node->request, node->address, node->viaRdma ? 1 : 0, fanoutStart, node->traceSent,
+			TraceNow());
+}
 
 static void
 FanoutClose(FanoutNode *node)
@@ -1101,7 +1137,11 @@ FanoutSend(FanoutNode *node, AnnRemoteRequest *request, int owner, int timeoutMs
 	char		header[ANN_HEADER_SIZE];
 	instr_time	start;
 
+	/* Ids unique across backends, so traces of both ends join on them. */
+	if (remoteRequest >> 32 != (uint64) MyProcPid)
+		remoteRequest = ((uint64) MyProcPid << 32) + 1;
 	node->request = remoteRequest++;
+	node->traceSent = ann_worker_trace_sample > 0 ? TraceNow() : 0;
 	node->owner = owner;
 	node->got = 0;
 	node->body = NULL;
@@ -1298,6 +1338,17 @@ AnnRemoteFanoutWhile(AnnRemoteRequest *requests, int count, int timeoutMs, void 
 	int			answered = 0;
 	bool		started = false;
 	instr_time	start;
+	uint64		fanoutStart = ann_worker_trace_sample > 0 ? TraceNow() : 0;
+
+	/*
+	 * Over TCP, a backend rotates its requests over each part's replicas.
+	 * Over RDMA it keeps to one replica per part (by process ID, the next one
+	 * only when that fails): every node a backend uses costs a queue pair at
+	 * both ends, and past about a thousand active queue pairs the adapters'
+	 * message rate and latency fall (206k QPS at 256 clients against 172k at
+	 * 1,024, rotating over four replicas).
+	 */
+	bool		sticky = ann_worker_rdma != NULL && ann_worker_rdma[0] != '\0';
 
 	if (timeoutMs <= 0)
 		timeoutMs = ann_worker_timeout_ms;
@@ -1315,7 +1366,7 @@ AnnRemoteFanoutWhile(AnnRemoteRequest *requests, int count, int timeoutMs, void 
 		requests[i].reply = NULL;
 		requests[i].replyLength = 0;
 		requests[i].tried = 0;
-		requests[i].rotation = (uint64) MyProcPid + fanoutRotation++;
+		requests[i].rotation = sticky ? (uint64) MyProcPid : (uint64) MyProcPid + fanoutRotation++;
 	}
 
 	while (pending > 0)
@@ -1402,6 +1453,8 @@ AnnRemoteFanoutWhile(AnnRemoteRequest *requests, int count, int timeoutMs, void 
 				if (result > 0)
 				{
 					INSTR_TIME_SET_CURRENT(node->used);
+					if (ann_worker_trace_sample > 0)
+						TraceReply(node, fanoutStart);
 					request->ok = true;
 					request->done = true;
 					answered++;
@@ -1561,6 +1614,10 @@ AnnRemoteInit(void)
 							"Time a backend busy-polls for an RDMA reply before sleeping.",
 							"After this the backend waits on a completion channel and its TCP socket.",
 							&ann_worker_rdma_spin_us, 50, 0, 1000000, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("ann.worker_trace_sample",
+							"Trace every Nth collection request's send and reply times (0 for none).",
+							"Lines go to /tmp/ann-fanout-PID.trace; workers started with --trace record the same requests.",
+							&ann_worker_trace_sample, 0, 0, INT_MAX, PGC_SUSET, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("ann.worker_overload_wait_ms",
 							"Time a loaded-index search retries while the GPU node is overloaded.",
 							"Retries back off from 0.5 to 16 ms; 0 reports overload at once.",

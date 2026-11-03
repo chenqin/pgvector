@@ -45,6 +45,8 @@ typedef struct AnnServeOptions
 	uint32_t	rdma_lanes;		/* RDMA progress threads, each with its own
 								 * queues */
 	int			rdma_spin;		/* busy-poll completions instead of interrupts */
+	const char *trace;			/* per-request timings, appended to this file */
+	uint32_t	trace_sample;	/* trace requests whose id is a multiple */
 } AnnServeOptions;
 
 void		AnnServeDefaultOptions(AnnServeOptions *options);

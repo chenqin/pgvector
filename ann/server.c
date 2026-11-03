@@ -70,6 +70,9 @@ typedef struct Job
 	struct FilterEntry *filter; /* NULL for a job that cannot share a scan */
 	struct Composite *composite;	/* operation 25: the request this part
 									 * answers into */
+	uint64_t	arrived;		/* --trace: frame read (ns, realtime) */
+	uint64_t	queued;			/* decoded and queued */
+	uint64_t	started;		/* taken by a lane */
 } Job;
 
 /*
@@ -90,6 +93,15 @@ typedef struct Composite
 	int			rdma;
 	uint64_t	request;
 } Composite;
+
+/*
+ * --trace: one line per sampled request, "W id rdma arrived queued started
+ * done replied" in realtime nanoseconds, so a coordinator's trace of
+ * the same requests on this host lines up (benchmarks/ann/fanout_trace.py).
+ */
+static FILE *traceFile = NULL;
+static pthread_mutex_t traceMutex = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local uint64_t frameArrived = 0;
 
 /* Set while a reader or RDMA lane submits a composite's parts. */
 static _Thread_local Composite *submittingComposite = NULL;
@@ -171,6 +183,8 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 	options->max_batch_bytes = 32U * 1024U * 1024U;
 	options->max_pending_bytes = 512U * 1024U * 1024U;
 	options->delay_us = 0;
+	options->trace = NULL;
+	options->trace_sample = 64;
 	options->tcp = NULL;
 	options->token = NULL;
 	options->rdma = NULL;
@@ -401,6 +415,7 @@ Finish(Service *service, Job *job)
 {
 	unsigned char *data = NULL;
 	size_t		size = 0;
+	uint64_t	finished = traceFile ? Now() : 0;
 
 	if (job->composite)
 	{
@@ -466,6 +481,14 @@ Finish(Service *service, Job *job)
 	if (!job->composite)
 		SendReply(job->connection, job->rdma, job->operation, job->request, job->job.status,
 				  data, job->job.status == ANN_OK ? size : 0);
+	if (traceFile && job->request % service->options.trace_sample == 0)
+	{
+		(void) pthread_mutex_lock(&traceMutex);
+		fprintf(traceFile, "W %llu %d %llu %llu %llu %llu %llu\n", (unsigned long long) job->request, job->rdma,
+				(unsigned long long) job->arrived, (unsigned long long) job->queued,
+				(unsigned long long) job->started, (unsigned long long) finished, (unsigned long long) Now());
+		(void) pthread_mutex_unlock(&traceMutex);
+	}
 	free(data);
 	(void) pthread_mutex_lock(&service->mutex);
 	service->pending_bytes -= job->charge;
@@ -581,6 +604,8 @@ Take(Service *service, Job *job)
 	else
 		service->tail = job->prev;
 	service->queued--;
+	if (traceFile)
+		job->started = Now();
 	if (job->filter)
 		job->filter->queued--;
 	if (*head == job)
@@ -954,6 +979,11 @@ Enqueue(Service *service, Connection *connection, Job *job)
 	(void) pthread_mutex_lock(&connection->mutex);
 	connection->references++;
 	(void) pthread_mutex_unlock(&connection->mutex);
+	if (traceFile)
+	{
+		job->arrived = frameArrived;
+		job->queued = Now();
+	}
 	Append		(service, job);
 
 	(void) pthread_cond_signal(&service->condition);
@@ -2192,6 +2222,8 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 	unsigned char *payload;
 	AnnStatus	status;
 
+	if (traceFile)
+		frameArrived = Now();
 	if (size < 32 || memcmp(frame, "PVAN", 4) != 0 || Read(frame + 4, 2) != 1 ||
 		(length = (uint32_t) Read(frame + 24, 4)) != size - 32)
 	{
@@ -2279,6 +2311,8 @@ Reader(void *argument)
 			memcmp(header, "PVAN", 4) != 0 || Read(header + 4, 2) != 1 ||
 			Read(header + 28, 4) != 0 || (length = (uint32_t) Read(header + 24, 4)) > ANN_MAX_BYTES)
 			break;
+		if (traceFile)
+			frameArrived = Now();
 		operation = (uint16_t) Read(header + 6, 2);
 		request = Read(header + 8, 8);
 		generation = Read(header + 16, 8);
@@ -2536,6 +2570,17 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	}
 	service.backend = backend;
 	service.options = *options;
+	if (options->trace)
+	{
+		if ((traceFile = fopen(options->trace, "a")) == NULL)
+		{
+			fprintf(stderr, "could not open trace file %s\n", options->trace);
+			return 2;
+		}
+		(void) setvbuf(traceFile, NULL, _IOLBF, 0);
+		if (service.options.trace_sample == 0)
+			service.options.trace_sample = 1;
+	}
 	(void) pthread_mutex_init(&service.mutex, NULL);
 	(void) pthread_mutex_init(&service.peersMutex, NULL);
 	(void) pthread_cond_init(&service.condition, NULL);

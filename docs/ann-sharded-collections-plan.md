@@ -196,7 +196,7 @@ It doesn't help GPU-bound workloads, shard fetches or delta calls (libpq over TC
 If phase S3 shows the worker's request path binds, the work that would make RDMA pay:
 
 - Several queries per RDMA frame, so per-request costs are paid once per frame (statements with B > 1 vectors produce these naturally).
-- Queue pairs shared per coordinator instead of one per backend.
+- Queue pairs shared per coordinator instead of one per backend. Measured: this is the binding cost. Request latency on the wire grows with active queue pairs (20–35 µs at 2 clients, 3 ms at 4,096 queue pairs), and backends now keep to one replica per part over RDMA; layouts whose queries reach several nodes still need pooled backends or a shared-connection transport (DCT, XRC). See [collections](ann-collections.md#measured-16m--1024-on-one-b200-host-split-into-nodes).
 - Coordinators writing requests directly into ring buffers on the worker (RDMA write with immediate), so no lane receives them.
 
 Phase S4 measures RDMA against TCP across a switch at the same client counts. RDMA is adopted only if it raises R_proc or cuts worker CPU per request. First measurements on [collections](ann-collections.md#measured-16m--1024-on-one-b200-host-split-into-nodes) (across two InfiniBand ports of one host): RDMA cut p99 2–8× and came within about 10% of TCP's peak for one-node queries, but its total stayed near 200–240k frames per second (about 55k per node, against 100k over TCP). Lane count, polling mode on either side, and a separate worker peer lock did not move it, and waiting lanes helped layouts with copies; queue-pair scaling (one per backend per node) and RDMA batching on the GPUs are the next things to measure.
@@ -304,6 +304,12 @@ Gates: tenant-pinned queries touch one group (EXPLAIN shows it), and their QPS s
 ### Phase S6: deltas, rolling rebuilds and rebalancing
 
 Gates: rows inserted into the delta are found under one LIMIT. With a non-empty delta of 100k rows, QPS stays at least 90% of the empty-delta figure, and with an empty delta no delta call is made. Rebuilding one partition under load causes no errors and no stale results. Moving a partition leaves its generation and the GPU tier unchanged. Doubling P splits partitions without moving others.
+
+**TODO (deferred): index updates.** What exists: one delta table per collection, scored exactly by SQL with every search and merged in; rolling rebuilds that load a part under a new name and unload the old one (`ann_index_unload`). Measured on 16M × 1024 with 1,024 clients over TCP (tenant / category QPS): no delta 230.8k / 168.1k; 1k rows without an index 185.8k / 128.9k (−20% / −23%); 10k rows with HNSW 104.4k / 22.2k (−55% / −87%). The 100k-row gate above is not met. Left for later:
+
+- A delta group on the GPU tier (a small index of the delta's rows, rebuilt often) so a large delta stops costing coordinator SQL per search.
+- Updates and deletes of rows already in a part (a per-part tombstone list the worker filters, cleared by the next rebuild).
+- Scheduled re-freezing of the delta into its partitions, and rebalancing.
 
 ## 14. What exists and what is new
 
