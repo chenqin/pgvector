@@ -25,6 +25,7 @@
 
 /* Operation 22 flags. */
 #define ANN_PREDICATE_ORDINALS 1	/* reply with ordinals instead of keys */
+#define ANN_PREDICATE_ATTRIBUTES 2	/* append each hit's attribute values */
 
 typedef struct AnnServeOptions
 {

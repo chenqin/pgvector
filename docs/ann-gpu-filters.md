@@ -241,7 +241,7 @@ Results stayed identical to exact SQL (50 queries per filter size, all routes). 
 | 19 bitmap search | u32 name length, name, u32 dimensions, k, bitmap words; FP32 query; the bitmap | As operation 12 |
 | 20 cache bitmap | u32 name length, name, u64 filter id, u32 words; the bitmap | Empty; replaces a cached bitmap with the same id |
 | 21 cached bitmap search | u32 name length, name, u32 dimensions, k, u64 filter id; FP32 query | As operation 12, or status 11 (missing) when the id isn't cached |
-| 22 search by predicate | u32 name length, name, u32 dimensions, k, flags (1: ordinals), program length, a predicate program ([ann/filter.h](../ann/filter.h)); FP32 query | u32 count, u32 route, u64 eligible rows, then (i64 key or ordinal, f32 distance) per hit; see [frozen indexes](ann-frozen-index.md#worker-operations-and-caching) |
+| 22 search by predicate | u32 name length, name, u32 dimensions, k, flags (1: ordinals; 2: append each hit's attribute values: u32 attributes, then i32 per hit and attribute in the index's order, NULL as INT32_MIN), program length, a predicate program ([ann/filter.h](../ann/filter.h)); FP32 query | u32 count, u32 route, u64 eligible rows, then (i64 key or ordinal, f32 distance) per hit; see [frozen indexes](ann-frozen-index.md#worker-operations-and-caching) |
 | 23 evaluate predicate | u32 name length, name, program | u64 eligible rows, then the bitmap as u32 words |
 
 Operation 15 (index info) now ends with `bitmaps N bitmap_bytes B bitmap_device_bytes B generation G predicates on`. Requests may carry an index generation in the header's generation field; a worker serving another generation of that name answers status 12.

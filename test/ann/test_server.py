@@ -133,6 +133,24 @@ class ServerTests(unittest.TestCase):
         for connection in connections:
             connection.close()
 
+    def test_lost_device_exits_and_releases(self):
+        """A device context that is lost (a sticky CUDA error) makes the worker exit with status 70,
+        so its device and pinned memory go back to the driver, instead of failing every later search."""
+        lost = Server('--backend', 'mock-gpu', '--lanes', '1', env={'ANN_MOCK_GPU_LOST_AFTER': '2'})
+        try:
+            with lost.connect() as connection:
+                for request in (1, 2):
+                    connection.sendall(frame(GATHERED, request, gathered([0, 0], [[1, 0], [0, 1]], 1)))
+                    self.assertEqual(receive(connection)[2], 0)
+                connection.sendall(frame(GATHERED, 3, gathered([0, 0], [[1, 0], [0, 1]], 1)))
+                with self.assertRaises((EOFError, ConnectionError)):
+                    receive(connection)
+            self.assertEqual(lost.process.wait(10), 70)
+            self.assertIn(b'GPU context lost (simulated', lost.process.stderr.read())
+        finally:
+            lost.process.stderr.close()
+            lost.directory.cleanup()
+
     def test_ties_at_the_boundary_are_retained(self):
         with self.server.connect() as connection:
             vectors = [[1, 0], [0, 1], [-1, 0], [0, -1], [3, 3]]

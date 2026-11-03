@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0};
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
 
 typedef struct Entry
@@ -282,7 +282,9 @@ LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
 		attribute->keys[at] = file->keys[i];
 	}
 	free(fill);
-	(void) munmap((void *) data, bytes);
+	/* Kept mapped: hits return their rows' values (ANN_PREDICATE_ATTRIBUTES). */
+	attribute->column = column;
+	attribute->columnBytes = bytes;
 
 	for (uint32_t v = 0; file->nshards && v < nvalues; v++)
 	{
@@ -1024,6 +1026,8 @@ AnnIndexFileClose(AnnIndexFile *file)
 		free(attribute->postings);
 		free(attribute->keys);
 		free(attribute->ordinals);
+		if (attribute->column)
+			(void) munmap((void *) attribute->column, attribute->columnBytes);
 	}
 	for (uint32_t b = 0; b < ANN_INDEX_BITMAP_BUCKETS; b++)
 		while (file->bitmaps[b])

@@ -154,7 +154,7 @@ Without a worker for the generation (none loaded, the nodes unreachable, or a wo
 
 | Operation | Payload | Reply |
 | --- | --- | --- |
-| 22 search by predicate | u32 name length, name, u32 dimensions, k, flags (1: ordinals), program length, program; FP32 query | u32 count, u32 route, u64 eligible rows, then (i64 key or ordinal, f32 distance) per hit |
+| 22 search by predicate | u32 name length, name, u32 dimensions, k, flags (1: ordinals; 2: append each hit's attribute values: u32 attributes, then i32 per hit and attribute in the index's order, NULL as INT32_MIN), program length, program; FP32 query | u32 count, u32 route, u64 eligible rows, then (i64 key or ordinal, f32 distance) per hit |
 | 23 evaluate predicate | u32 name length, name, program | u64 eligible rows, then the bitmap as u32 words |
 
 The worker evaluates a program over its attribute postings (`attr-*.i32`, inverted at load) and caches the rows under the program's hash, as a bitmap entry like a pushed one (operation 20): per-shard bitsets, rows for the exact and gather routes, and device copies. Repeated predicates then cost a hash lookup, and searches over the same predicate group into one scan like any cached filter. A program being evaluated by one connection makes others wait for it rather than evaluate it again. Device copies are allocated and freed stream-ordered on a stream per device, so a new predicate doesn't stall the searches running there. Each result costs a bitmap over the index's rows (1.25 MB at 10M rows), its rows when a gather scan may read them, and device copies of what its routes read: bitsets only when filtered CAGRA may run it, rows only past the exact limit (smaller filters run exact on the CPU).

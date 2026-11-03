@@ -84,11 +84,16 @@ typedef struct Composite
 {
 	pthread_mutex_t mutex;
 	uint32_t	remaining;		/* parts not yet answered */
+	uint32_t	parts;
 	uint32_t	k;
 	AnnStatus	status;
 	uint64_t	eligible;
 	uint32_t	nhits;
-	AnnIndexHit *hits;			/* up to k per part */
+	AnnIndexHit *hits;			/* up to k per part; ordinal: position in
+								 * values */
+	int			attributes;		/* ANN_PREDICATE_ATTRIBUTES was asked */
+	int32_t		nattributes;	/* per hit; -1 until the first part answers */
+	int32_t    *values;			/* nattributes per hit, as received */
 	Connection *connection;		/* referenced until the reply */
 	int			rdma;
 	uint64_t	request;
@@ -348,6 +353,19 @@ HitCompare(const void *a, const void *b)
 }
 
 /*
+ * ANN_PREDICATE_ATTRIBUTES: each hit's attribute values (int32, the
+ * index's attribute order), read from the mapped columns by ordinal.
+ */
+static void
+HitAttributes(const AnnIndexFile *file, const AnnIndexHit *hits, uint32_t nhits, int32_t *out)
+{
+	for (uint32_t i = 0; i < nhits; i++)
+		for (uint32_t a = 0; a < file->nattributes; a++)
+			out[(size_t) i * file->nattributes + a] = hits[i].ordinal < file->rows && file->attributes[a].column ?
+				file->attributes[a].column[hits[i].ordinal] : INT32_MIN;
+}
+
+/*
  * A part of a composite is answered (status, its hits and eligible rows);
  * the last one replies with the k nearest of all parts: u32 count, u32
  * route (0), u64 eligible rows over every part, then (i64 key, f32
@@ -355,16 +373,33 @@ HitCompare(const void *a, const void *b)
  */
 static void
 CompositeAnswer(Composite *composite, AnnStatus status, const AnnIndexHit *hits, uint32_t nhits,
-				uint64_t eligible)
+				uint64_t eligible, const AnnIndexFile *file)
 {
 	int			last;
 
 	(void) pthread_mutex_lock(&composite->mutex);
+	if (status == ANN_OK && composite->attributes && file &&
+		composite->nattributes >= 0 && (uint32_t) composite->nattributes != file->nattributes)
+		status = ANN_INVALID;	/* parts with different attributes */
+	if (status == ANN_OK && composite->attributes && file && composite->values == NULL)
+	{
+		composite->nattributes = (int32_t) file->nattributes;
+		composite->values = malloc(sizeof(int32_t) * ((size_t) composite->k * composite->parts *
+													  (file->nattributes ? file->nattributes : 1)));
+		if (composite->values == NULL)
+			status = ANN_NOMEM;
+	}
 	if (status == ANN_OK)
 	{
 		uint32_t	n = nhits < composite->k ? nhits : composite->k;
 
 		memcpy(composite->hits + composite->nhits, hits, sizeof(AnnIndexHit) * n);
+		if (composite->attributes && file)
+		{
+			HitAttributes(file, hits, n, composite->values + (size_t) composite->nhits * file->nattributes);
+			for (uint32_t i = 0; i < n; i++)
+				composite->hits[composite->nhits + i].ordinal = composite->nhits + i;
+		}
 		composite->nhits += n;
 		composite->eligible += eligible;
 	}
@@ -376,7 +411,9 @@ CompositeAnswer(Composite *composite, AnnStatus status, const AnnIndexHit *hits,
 		return;
 	{
 		uint32_t	count = composite->nhits < composite->k ? composite->nhits : composite->k;
-		size_t		size = 16 + (size_t) count * 12;
+		uint32_t	nattributes = composite->nattributes > 0 ? (uint32_t) composite->nattributes : 0;
+		size_t		size = 16 + (size_t) count * 12 +
+			(composite->attributes ? 4 + (size_t) count * nattributes * 4 : 0);
 		unsigned char *data = NULL;
 		AnnStatus	result = composite->status;
 
@@ -398,6 +435,16 @@ CompositeAnswer(Composite *composite, AnnStatus status, const AnnIndexHit *hits,
 					Write(data + 16 + (size_t) i * 12, (uint64_t) composite->hits[i].key, 8);
 					Write(data + 24 + (size_t) i * 12, bits, 4);
 				}
+				if (composite->attributes)
+				{
+					unsigned char *at = data + 16 + (size_t) count * 12;
+
+					Write(at, nattributes, 4);
+					for (uint32_t i = 0; i < count; i++)
+						for (uint32_t a = 0; a < nattributes; a++)
+							Write(at + 4 + ((size_t) i * nattributes + a) * 4,
+								  (uint32_t) composite->values[composite->hits[i].ordinal * nattributes + a], 4);
+				}
 			}
 		}
 		SendReply(composite->connection, composite->rdma, ANN_OP_COLLECTION_SEARCH, composite->request, result,
@@ -406,6 +453,7 @@ CompositeAnswer(Composite *composite, AnnStatus status, const AnnIndexHit *hits,
 		Release(composite->connection);
 		(void) pthread_mutex_destroy(&composite->mutex);
 		free(composite->hits);
+		free(composite->values);
 		free(composite);
 	}
 }
@@ -421,7 +469,8 @@ Finish(Service *service, Job *job)
 	{
 		job->job.status = job->index.status;
 		CompositeAnswer(job->composite, job->index.status, job->index.results, job->index.nresults,
-						job->bitmap ? job->bitmap->count : job->bitmapFile ? job->bitmapFile->rows : 0);
+						job->bitmap ? job->bitmap->count : job->bitmapFile ? job->bitmapFile->rows : 0,
+						job->bitmapFile);
 	}
 	else if (job->kind == JOB_INDEX)
 	{
@@ -432,10 +481,17 @@ Finish(Service *service, Job *job)
 		 */
 		size_t		head = job->operation == ANN_OP_INDEX_SEARCH_PREDICATE ? 16 : 8;
 
+		uint32_t	nattributes = 0;
+
+		if (job->operation == ANN_OP_INDEX_SEARCH_PREDICATE && (job->flags & ANN_PREDICATE_ATTRIBUTES) &&
+			job->bitmapFile)
+			nattributes = job->bitmapFile->nattributes;
 		job->job.status = job->index.status;
 		if (job->index.status == ANN_OK)
 		{
 			size = head + (size_t) job->index.nresults * 12;
+			if (job->operation == ANN_OP_INDEX_SEARCH_PREDICATE && (job->flags & ANN_PREDICATE_ATTRIBUTES))
+				size += 4 + (size_t) job->index.nresults * nattributes * 4;
 			data = malloc(size);
 			if (data == NULL)
 				job->job.status = ANN_NOMEM;
@@ -455,6 +511,26 @@ Finish(Service *service, Job *job)
 					memcpy(&bits, &job->index.results[i].distance, sizeof(bits));
 					Write(data + head + (size_t) i * 12, id, 8);
 					Write(data + head + 8 + (size_t) i * 12, bits, 4);
+				}
+				if (job->operation == ANN_OP_INDEX_SEARCH_PREDICATE && (job->flags & ANN_PREDICATE_ATTRIBUTES))
+				{
+					unsigned char *at = data + head + (size_t) job->index.nresults * 12;
+					int32_t    *values = malloc(sizeof(int32_t) * ((size_t) job->index.nresults * nattributes + 1));
+
+					Write(at, nattributes, 4);
+					if (values == NULL)
+					{
+						free(data);
+						data = NULL;
+						job->job.status = ANN_NOMEM;
+					}
+					else
+					{
+						HitAttributes(job->bitmapFile, job->index.results, job->index.nresults, values);
+						for (size_t i = 0; i < (size_t) job->index.nresults * nattributes; i++)
+							Write(at + 4 + i * 4, (uint32_t) values[i], 4);
+						free(values);
+					}
 				}
 			}
 		}
@@ -693,6 +769,31 @@ Eligible(Service *service)
  * A lane takes the oldest job and every queued job that fits the batch
  * limits, optionally waiting delay_us for more, then makes one submission.
  */
+/*
+ * A batch that failed in the backend may mean a device's context is lost:
+ * then every later search on it fails too, and the process keeps its device
+ * and pinned memory. Exit instead (without atexit handlers, which could call
+ * into the broken context): the memory goes back to the driver, clients fail
+ * over to other replicas on the closed connections, and a supervisor
+ * restarts the worker.
+ */
+static void
+DeviceLostCheck(Service *service, Job **batch, uint32_t count)
+{
+	const char *why;
+	int			failed = 0;
+
+	for (uint32_t i = 0; i < count && !failed; i++)
+		failed = (batch[i]->kind == JOB_INDEX ? batch[i]->index.status : batch[i]->job.status) ==
+			ANN_BACKEND_ERROR;
+	if (!failed || service->backend->lost == NULL || (why = service->backend->lost()) == NULL)
+		return;
+	fprintf(stderr, "ann worker: GPU context lost (%s); exiting with status %d to release its memory\n",
+			why, ANN_EXIT_DEVICE_LOST);
+	fflush(stderr);
+	_exit(ANN_EXIT_DEVICE_LOST);
+}
+
 static void *
 Lane(void *argument)
 {
@@ -821,6 +922,7 @@ Lane(void *argument)
 			for (uint32_t i = 0; i < count; i++)
 				batch[i]->job = jobs[i];
 		}
+		DeviceLostCheck(service, batch, count);
 		for (uint32_t i = 0; i < count; i++)
 			Finish(service, batch[i]);
 		if (owns)
@@ -1907,7 +2009,10 @@ SubmitCollection(Service *service, Connection *connection, int rdma, uint64_t re
 	}
 	(void) pthread_mutex_init(&composite->mutex, NULL);
 	composite->remaining = parts;
+	composite->parts = parts;
 	composite->k = k;
+	composite->attributes = (Read(payload + common + 8, 4) & ANN_PREDICATE_ATTRIBUTES) != 0;
+	composite->nattributes = -1;
 	composite->status = ANN_OK;
 	composite->connection = connection;
 	composite->rdma = rdma;
@@ -1955,7 +2060,7 @@ SubmitCollection(Service *service, Connection *connection, int rdma, uint64_t re
 				free(part);
 		}
 		if (status != ANN_PENDING)
-			CompositeAnswer(composite, status, NULL, 0, 0);
+			CompositeAnswer(composite, status, NULL, 0, 0, NULL);
 	}
 	free(payload);				/* the parts own their copies */
 	return ANN_PENDING;

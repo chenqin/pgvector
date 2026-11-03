@@ -405,7 +405,7 @@ AnnCpuBackend(void)
 {
 	static const AnnBackend backend = {
 		"cpu-exact", 7, 7, "flat", "fp32", 1, 0, UINT32_MAX, Build, Search, Destroy,
-		SearchGathered, NULL, LoadIndex, SearchIndex
+		SearchGathered, NULL, LoadIndex, SearchIndex, NULL
 	};
 
 	return &backend;

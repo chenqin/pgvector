@@ -866,11 +866,34 @@ DestroyIndexState(AnnCuvsIndex *state)
 	free(state);
 }
 
-/* AnnIndexDeviceDestroy: an unloaded index's shards and device arrays. */
+/*
+ * AnnIndexDeviceDestroy: an unloaded index's shards and device arrays. Its
+ * cached bitmaps were freed into the default pool, which keeps freed blocks
+ * (see UploadStream): trim that. Memory cuVS freed into the RMM pool stays
+ * with this process for later loads; with --device-allocator plain it goes
+ * back to the device at once. An unload costs one device-wide
+ * sync per device it used, so its frees land before the trim.
+ */
 static void
 DestroyDevice(void *device)
 {
-	DestroyIndexState(device);
+	AnnCuvsIndex *state = device;
+	int			used[ANN_INDEX_MAX_SHARDS] = {0};
+
+	for (uint32_t s = 0; state && state->shards && s < state->nshards * state->copies; s++)
+		if (state->shards[s].device >= 0 && state->shards[s].device < ANN_INDEX_MAX_SHARDS)
+			used[state->shards[s].device] = 1;
+	DestroyIndexState(state);
+	for (int d = 0; d < ANN_INDEX_MAX_SHARDS; d++)
+	{
+		cudaMemPool_t pool;
+
+		if (!used[d] || cudaSetDevice(d) != cudaSuccess)
+			continue;
+		(void) cudaDeviceSynchronize();
+		if (cudaDeviceGetDefaultMemPool(&pool, d) == cudaSuccess)
+			(void) cudaMemPoolTrimTo(pool, 0);
+	}
 }
 
 /*
@@ -1107,13 +1130,20 @@ LoadIndex(const char *name, const char *directory)
 	 * creation. Allocations outside lane pools (cuVS allocates temporaries
 	 * per filtered search) use stream-ordered allocation, which avoids
 	 * device-wide syncs, or with --memory-pool an RMM pool per GPU, which
-	 * also avoids the driver allocator's process-wide locks.
+	 * also avoids the driver allocator's process-wide locks. The pool (the
+	 * default, --memory-pool 80) reserves a quarter of its cap up front (21%
+	 * of each GPU) and never shrinks, so loads take that much and unloads
+	 * return nothing to the device: three collection layouts held 99.6 GB per
+	 * GPU against 37.6 GB with --device-allocator plain (cudaMalloc), which
+	 * costs unfiltered throughput (about a quarter lower) but sizes memory to
+	 * the indexes and returns it on unload.
 	 */
 	for (int d = 0; d < devices; d++)
 		if (cudaSetDevice(d) != cudaSuccess ||
 			(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess &&
 			 cudaGetLastError() != cudaErrorSetOnActiveProcess) ||
-			(AnnIndexConfig.memory_pool ?
+			(AnnIndexConfig.plain_allocator ? cuvsRMMMemoryResourceReset() :
+			 AnnIndexConfig.memory_pool ?
 			 cuvsRMMPoolMemoryResourceEnable((int) AnnIndexConfig.memory_pool / 4 + 1,
 											 (int) AnnIndexConfig.memory_pool, false) :
 			 cuvsRMMAsyncMemoryResourceEnable()) != CUVS_SUCCESS)
@@ -2461,12 +2491,53 @@ DeviceJobs(void)
 	return atomic_load(&deviceJobs);
 }
 
+/*
+ * AnnBackend.lost: a sticky error on any device. These errors poison the
+ * context: every later call on the device returns them.
+ */
+static const char *
+Lost(void)
+{
+	static char why[160];
+	int			devices = 0;
+
+	if (cudaGetDeviceCount(&devices) != cudaSuccess)
+		return "no CUDA devices";
+	for (int d = 0; d < devices && d < ANN_INDEX_MAX_SHARDS; d++)
+	{
+		cudaError_t error;
+
+		if (cudaSetDevice(d) != cudaSuccess)
+			error = cudaGetLastError();
+		else
+			error = cudaDeviceSynchronize();
+		switch (error)
+		{
+			case cudaErrorIllegalAddress:
+			case cudaErrorLaunchFailure:
+			case cudaErrorHardwareStackError:
+			case cudaErrorIllegalInstruction:
+			case cudaErrorMisalignedAddress:
+			case cudaErrorInvalidAddressSpace:
+			case cudaErrorInvalidPc:
+			case cudaErrorAssert:
+			case cudaErrorECCUncorrectable:
+			case cudaErrorDevicesUnavailable:
+				snprintf(why, sizeof(why), "device %d: %s", d, cudaGetErrorString(error));
+				return why;
+			default:
+				break;
+		}
+	}
+	return NULL;
+}
+
 const AnnBackend *
 AnnCuvsBackend(void)
 {
 	static const AnnBackend backend = {
 		"cuvs", 1, 7, "cagra", "fp32", 0, 128, 1024, Build, Search, Destroy,
-		SearchGathered, DeviceJobs, LoadIndex, SearchIndex
+		SearchGathered, DeviceJobs, LoadIndex, SearchIndex, Lost
 	};
 
 	return &backend;

@@ -354,6 +354,15 @@ main(int argc, char **argv)
 			AnnIndexConfig.bitset_gather_limit = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--memory-pool") == 0)
 			AnnIndexConfig.memory_pool = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--device-allocator") == 0)
+		{
+			if (strcmp(value, "plain") != 0 && strcmp(value, "async") != 0)
+			{
+				fprintf(stderr, "--device-allocator takes async or plain\n");
+				return 2;
+			}
+			AnnIndexConfig.plain_allocator = strcmp(value, "plain") == 0;
+		}
 		else if (strcmp(argv[i], "--device-bitmaps") == 0)
 			AnnIndexConfig.device_bitmaps = strcmp(value, "off") != 0;
 		else if (strcmp(argv[i], "--filtered-iterations") == 0)
@@ -536,7 +545,7 @@ usage:
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
-			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
+			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--quantized-scan on|off] [--quant-slack N] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
@@ -544,7 +553,7 @@ usage:
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
-			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
+			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"cuvs, hipvs, and fused-nvfp4 require vendor adapters\n");
 #endif

@@ -54,6 +54,11 @@ WORKLOADS = {
     # non-covering: rows fetched from the shard hosts through postgres_fdw
     'fetch': ("SELECT id, category FROM docs WHERE id = ANY(ARRAY("
               "SELECT key FROM ann_collection_search(:'coll', :v::vector, 10, 'tenant = ' || :t)));"),
+    # the same answer with the attributes from the GPU nodes: no shard fetch
+    'rows': ("SELECT * FROM ann_collection_search_rows(:'coll', :v::vector, 10, 'tenant = ' || :t) "
+             "AS r(key bigint, distance real, category integer);"),
+    'category-rows': ("SELECT * FROM ann_collection_search_rows(:'coll', :v::vector, 10, 'category = ' || :c) "
+                      "AS r(key bigint, distance real, tenant integer, category integer);"),
 }
 
 

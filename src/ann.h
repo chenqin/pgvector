@@ -317,6 +317,7 @@ Relation	AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode);
 #define ANN_OP_COLLECTION_SEARCH 25
 #define ANN_OP_INDEX_PREDICATE 23
 #define ANN_PREDICATE_ORDINALS 1
+#define ANN_PREDICATE_ATTRIBUTES 2
 
 bool		AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs,
 						 uint32 *status, char **reply, uint32 *replyLength);

@@ -67,6 +67,8 @@ typedef struct AnnIndexAttribute
 	AnnIndexPosting *postings;	/* sorted by value */
 	int64_t    *keys;			/* rows grouped by value, key order within */
 	uint64_t   *ordinals;
+	const int32_t *column;		/* the value of each row, by ordinal (mapped) */
+	size_t		columnBytes;
 } AnnIndexAttribute;
 
 /*
@@ -192,6 +194,9 @@ typedef struct AnnIndexOptions
 										 * per index */
 	int			prewarm;		/* read index files into memory at load */
 	int			lock_memory;	/* mlock them */
+	int			plain_allocator;	/* --device-allocator plain: cuVS
+									 * allocates with cudaMalloc, no pool
+									 * (last: the initializer is positional) */
 } AnnIndexOptions;
 
 extern AnnIndexOptions AnnIndexConfig;

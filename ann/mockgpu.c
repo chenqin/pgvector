@@ -12,6 +12,8 @@
  */
 static uint64_t launchNs = 100000;
 static double bytesPerNs = 12.0;
+static uint64_t lostAfter = 0;	/* ANN_MOCK_GPU_LOST_AFTER */
+static uint64_t submissions = 0;	/* atomic */
 
 static void
 Wait(uint64_t ns)
@@ -32,6 +34,16 @@ SearchGathered(AnnGatheredJob *jobs, uint32_t count)
 	Wait(launchNs + (uint64_t) (bytes / bytesPerNs));
 	for (uint32_t i = 0; i < count; i++)
 		AnnGatheredExact(&jobs[i]);
+	if (lostAfter && __atomic_add_fetch(&submissions, 1, __ATOMIC_RELAXED) > lostAfter)
+		for (uint32_t i = 0; i < count; i++)
+			jobs[i].status = ANN_BACKEND_ERROR;
+}
+
+/* ANN_MOCK_GPU_LOST_AFTER=N: the device is lost after N submissions (tests). */
+static const char *
+Lost(void)
+{
+	return lostAfter && __atomic_load_n(&submissions, __ATOMIC_RELAXED) > lostAfter ? "simulated: ANN_MOCK_GPU_LOST_AFTER" : NULL;
 }
 
 const AnnBackend *
@@ -49,10 +61,13 @@ AnnMockGpuBackend(void)
 			launchNs = strtoull(launch, NULL, 10) * 1000;
 		if (bandwidth && strtod(bandwidth, NULL) > 0)
 			bytesPerNs = strtod(bandwidth, NULL);
+		if (getenv("ANN_MOCK_GPU_LOST_AFTER"))
+			lostAfter = strtoull(getenv("ANN_MOCK_GPU_LOST_AFTER"), NULL, 10);
 		backend = *AnnCpuBackend();
 		backend.name = "mock-gpu";
 		backend.storage = "fp32-mock-device";
 		backend.search_gathered = SearchGathered;
+		backend.lost = Lost;
 	}
 	return &backend;
 }

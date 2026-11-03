@@ -121,7 +121,18 @@ typedef struct AnnBackend
 	/* Load an immutable index directory under a name; search loaded ones. */
 	AnnStatus	(*load_index) (const char *, const char *);
 	void		(*search_index) (AnnIndexJob *, uint32_t);
+
+	/*
+	 * After a failed search: why a device's context is lost (a sticky CUDA
+	 * error such as an illegal address), or NULL while every device works. A
+	 * lost context fails every later call, so the worker exits instead; see
+	 * ANN_EXIT_DEVICE_LOST.
+	 */
+	const char *(*lost) (void);
 } AnnBackend;
+
+/* The worker's exit status when a device context is lost. */
+#define ANN_EXIT_DEVICE_LOST 70
 
 #define ANN_GATHERED_TOLERANCE 1e-3
 

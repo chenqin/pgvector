@@ -13,6 +13,7 @@
 #include "portability/instr_time.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -59,7 +60,8 @@ typedef struct ProgramEntry
 	char	   *filter;
 	char	   *program;
 	int			length;
-	SPIPlanPtr	deltaPlan;		/* the delta query with this filter, or NULL */
+	SPIPlanPtr	deltaPlan[2];	/* the delta query with this filter, without
+								 * and with the attribute columns, or NULL */
 } ProgramEntry;
 
 typedef struct Collection
@@ -80,7 +82,7 @@ typedef struct Collection
 	Oid			delta;			/* table of rows not yet in a part, or 0 */
 	char	   *deltaKey;
 	char	   *deltaVector;
-	SPIPlanPtr	deltaAll;		/* the delta query without a filter */
+	SPIPlanPtr	deltaAll[2];	/* the delta query without a filter */
 	instr_time	loaded;
 } Collection;
 
@@ -90,6 +92,8 @@ typedef struct Hit
 {
 	int64		key;
 	float		distance;
+	Datum	   *values;			/* the collection's attributes, when asked */
+	bool	   *nulls;
 } Hit;
 
 /* Schema-qualified name of a catalog table, in the extension's schema. */
@@ -114,18 +118,22 @@ FreeDeltaPlans(Collection *collection)
 	HASH_SEQ_STATUS status;
 	ProgramEntry *entry;
 
-	if (collection->deltaAll)
-		SPI_freeplan(collection->deltaAll);
-	collection->deltaAll = NULL;
+	for (int rows = 0; rows < 2; rows++)
+	{
+		if (collection->deltaAll[rows])
+			SPI_freeplan(collection->deltaAll[rows]);
+		collection->deltaAll[rows] = NULL;
+	}
 	if (collection->programs == NULL)
 		return;
 	hash_seq_init(&status, collection->programs);
 	while ((entry = hash_seq_search(&status)) != NULL)
-		if (entry->deltaPlan)
-		{
-			SPI_freeplan(entry->deltaPlan);
-			entry->deltaPlan = NULL;
-		}
+		for (int rows = 0; rows < 2; rows++)
+			if (entry->deltaPlan[rows])
+			{
+				SPI_freeplan(entry->deltaPlan[rows]);
+				entry->deltaPlan[rows] = NULL;
+			}
 }
 
 static void
@@ -189,7 +197,7 @@ LoadCollection(FunctionCallInfo fcinfo, const char *name)
 		MemoryContextDelete(collection->context);
 	}
 	collection->programs = NULL;
-	collection->deltaAll = NULL;
+	collection->deltaAll[0] = collection->deltaAll[1] = NULL;
 	collection->valid = false;
 	collection->context = context;
 	old = MemoryContextSwitchTo(context);
@@ -372,7 +380,7 @@ ProgramFor(Collection *collection, const char *filter, char **program, int *leng
 	}
 	if (!found)
 	{
-		entry->deltaPlan = NULL;
+		entry->deltaPlan[0] = entry->deltaPlan[1] = NULL;
 		entry->filter = MemoryContextStrdup(collection->programContext, filter);
 		entry->program = MemoryContextAlloc(collection->programContext, Max(built.len, 1));
 		memcpy(entry->program, built.data, built.len);
@@ -621,19 +629,27 @@ typedef struct DeltaSearch
 	SPIPlanPtr	plan;
 	Datum		query;
 	int			k;
+	int			nattributes;	/* attribute columns after key and distance */
+	MemoryContext context;		/* the hits' values outlive SPI */
 	Hit		   *hits;
 	int			nhits;
 } DeltaSearch;
 
-/* The plan of a filter whose program is not cached. */
-static SPIPlanPtr scratchPlan = NULL;
+/* Plans of a filter whose program is not cached. */
+static SPIPlanPtr scratchPlan[2] = {NULL, NULL};
 
+/*
+ * The delta query for a filter: key, distance and, for rows, the
+ * collection's attribute columns, cast to the source table's types.
+ */
 static SPIPlanPtr
-DeltaPlanFor(Collection *collection, const char *filter, Oid vectorType)
+DeltaPlanFor(Collection *collection, const char *filter, Oid vectorType, bool rows)
 {
-	SPIPlanPtr *slot = &collection->deltaAll;
+	SPIPlanPtr *slot = &collection->deltaAll[rows];
+	bool		scratch = false;
 	Oid			types[2] = {vectorType, INT4OID};
 	char	   *table;
+	StringInfoData columns;
 	char	   *statement;
 	SPIPlanPtr	plan;
 
@@ -642,16 +658,21 @@ DeltaPlanFor(Collection *collection, const char *filter, Oid vectorType)
 		uint64		hash = hash_bytes_extended((const unsigned char *) filter, (int) strlen(filter), 0);
 		ProgramEntry *entry = hash_search(collection->programs, &hash, HASH_FIND, NULL);
 
-		slot = entry && strcmp(entry->filter, filter) == 0 ? &entry->deltaPlan : &scratchPlan;
+		scratch = !(entry && strcmp(entry->filter, filter) == 0);
+		slot = scratch ? &scratchPlan[rows] : &entry->deltaPlan[rows];
 	}
-	if (*slot && slot != &scratchPlan)
+	if (*slot && !scratch)
 		return *slot;
+	initStringInfo(&columns);
+	for (int a = 0; rows && a < collection->nattributes; a++)
+		appendStringInfo(&columns, ", (%s)::%s", quote_identifier(collection->attributes[a]),
+						 format_type_be(collection->columns.types[a]));
 	table = quote_qualified_identifier(get_namespace_name(get_rel_namespace(collection->delta)),
 									   get_rel_name(collection->delta));
-	statement = psprintf("SELECT (%s)::bigint, (%s <-> $1)::real FROM %s%s%s ORDER BY %s <-> $1 LIMIT $2",
-						 quote_identifier(collection->deltaKey), quote_identifier(collection->deltaVector), table,
-						 filter && filter[0] ? " WHERE " : "", filter && filter[0] ? filter : "",
-						 quote_identifier(collection->deltaVector));
+	statement = psprintf("SELECT (%s)::bigint, (%s <-> $1)::real%s FROM %s%s%s ORDER BY %s <-> $1 LIMIT $2",
+						 quote_identifier(collection->deltaKey), quote_identifier(collection->deltaVector),
+						 columns.data, table, filter && filter[0] ? " WHERE " : "",
+						 filter && filter[0] ? filter : "", quote_identifier(collection->deltaVector));
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	if ((plan = SPI_prepare(statement, 2, types)) == NULL)
@@ -660,8 +681,8 @@ DeltaPlanFor(Collection *collection, const char *filter, Oid vectorType)
 	if (SPI_keepplan(plan) != 0)
 		elog(ERROR, "could not keep the delta search of ann collection \"%s\"", collection->name);
 	SPI_finish();
-	if (slot == &scratchPlan && scratchPlan)
-		SPI_freeplan(scratchPlan);
+	if (scratch && *slot)
+		SPI_freeplan(*slot);
 	*slot = plan;
 	return plan;
 }
@@ -679,15 +700,35 @@ DeltaQuery(void *arg)
 		elog(ERROR, "the delta search of an ann collection failed");
 	for (uint64 i = 0; i < SPI_processed && delta->nhits < delta->k; i++)
 	{
+		HeapTuple	tuple = SPI_tuptable->vals[i];
+		TupleDesc	desc = SPI_tuptable->tupdesc;
 		bool		keyNull;
 		bool		distanceNull;
-		Datum		key = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &keyNull);
-		Datum		distance = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &distanceNull);
+		Datum		key = SPI_getbinval(tuple, desc, 1, &keyNull);
+		Datum		distance = SPI_getbinval(tuple, desc, 2, &distanceNull);
+		Hit		   *hit = &delta->hits[delta->nhits];
 
 		if (keyNull || distanceNull)
 			continue;
-		delta->hits[delta->nhits].key = DatumGetInt64(key);
-		delta->hits[delta->nhits].distance = DatumGetFloat4(distance);
+		hit->key = DatumGetInt64(key);
+		hit->distance = DatumGetFloat4(distance);
+		hit->values = NULL;
+		hit->nulls = NULL;
+		if (delta->nattributes > 0)
+		{
+			MemoryContext old = MemoryContextSwitchTo(delta->context);
+
+			hit->values = palloc(sizeof(Datum) * delta->nattributes);
+			hit->nulls = palloc(sizeof(bool) * delta->nattributes);
+			for (int a = 0; a < delta->nattributes; a++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(desc, 2 + a);
+				Datum		value = SPI_getbinval(tuple, desc, 3 + a, &hit->nulls[a]);
+
+				hit->values[a] = hit->nulls[a] ? (Datum) 0 : datumCopy(value, attr->attbyval, attr->attlen);
+			}
+			MemoryContextSwitchTo(old);
+		}
 		delta->nhits++;
 	}
 	SPI_finish();
@@ -756,9 +797,56 @@ CheckPartStatus(const Collection *collection, const CollectionPart *part, const 
  * over every part of a collection that can match the filter, as (key,
  * distance).
  */
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_collection_search);
-Datum
-ann_collection_search(PG_FUNCTION_ARGS)
+/* The column definition list of ann_collection_search_rows: key, distance, then attributes. */
+static void
+CheckRowsResult(TupleDesc tupdesc)
+{
+	if (tupdesc->natts < 2 || TupleDescAttr(tupdesc, 0)->atttypid != INT8OID ||
+		TupleDescAttr(tupdesc, 1)->atttypid != FLOAT4OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("ann_collection_search_rows returns key bigint, distance real, then attribute columns"),
+				 errhint("Use a column definition list: AS r(key bigint, distance real, tenant integer, ...).")));
+}
+
+/* Each result column after key and distance names an attribute, of its type. */
+static int *
+RowsMap(const Collection *collection, TupleDesc tupdesc)
+{
+	int		   *map = palloc0(sizeof(int) * tupdesc->natts);
+
+	for (int c = 2; c < tupdesc->natts; c++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, c);
+		int			a;
+
+		for (a = 0; a < collection->nattributes; a++)
+			if (strcmp(collection->attributes[a], NameStr(attr->attname)) == 0)
+				break;
+		if (a == collection->nattributes)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("\"%s\" is not an attribute of ann collection \"%s\"", NameStr(attr->attname),
+							collection->name)));
+		if (attr->atttypid != collection->columns.types[a])
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("attribute \"%s\" of ann collection \"%s\" is %s, not %s", NameStr(attr->attname),
+							collection->name, format_type_be(collection->columns.types[a]),
+							format_type_be(attr->atttypid))));
+		map[c] = a;
+	}
+	return map;
+}
+
+/*
+ * The search behind ann_collection_search and ann_collection_search_rows.
+ * With rows, the result columns after key and distance name collection
+ * attributes (a column definition list); the nodes return those values with
+ * each hit (ANN_PREDICATE_ATTRIBUTES) and the delta query selects them.
+ */
+static Datum
+CollectionSearch(FunctionCallInfo fcinfo, bool rows)
 {
 	char	   *name;
 	Vector	   *query;
@@ -778,6 +866,8 @@ ann_collection_search(PG_FUNCTION_ARGS)
 	int			nhits = 0;
 	int			returned = 0;
 	DeltaSearch delta;
+	int		   *map = NULL;		/* result column -> attribute */
+	int			nattributes = 0;	/* attributes per hit, when rows */
 
 	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
 		PG_RETURN_NULL();
@@ -792,12 +882,19 @@ ann_collection_search(PG_FUNCTION_ARGS)
 				 errmsg("k must be between 1 and 10000")));
 	InitSetResult(fcinfo, &tupdesc, &store);
 	memset(&delta, 0, sizeof(delta));
+	if (rows)
+		CheckRowsResult(tupdesc);
 
 	for (int attempt = 0;; attempt++)
 	{
 		bool		stale = false;
 
 		collection = GetCollection(fcinfo, name, attempt > 0);
+		if (rows)
+		{
+			map = RowsMap(collection, tupdesc);
+			nattributes = collection->nattributes;
+		}
 		ProgramFor(collection, filter, &program, &programLength);
 		if (collection->placement >= 0 &&
 			!PlacementRanges(program, programLength, collection->attributes[collection->placement], &ranges))
@@ -857,7 +954,7 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			}
 			header[0] = query->dim;
 			header[1] = (uint32) k;
-			header[2] = 0;		/* keys, not ordinals */
+			header[2] = rows ? ANN_PREDICATE_ATTRIBUTES : 0;	/* keys, not ordinals */
 			header[3] = (uint32) programLength;
 			appendBinaryStringInfo(&payload, (char *) header, sizeof(header));
 			appendBinaryStringInfo(&payload, program, programLength);
@@ -877,9 +974,11 @@ ann_collection_search(PG_FUNCTION_ARGS)
 		nhits = 0;
 		if (OidIsValid(collection->delta))
 		{
-			delta.plan = DeltaPlanFor(collection, filter, get_fn_expr_argtype(fcinfo->flinfo, 1));
+			delta.plan = DeltaPlanFor(collection, filter, get_fn_expr_argtype(fcinfo->flinfo, 1), rows);
 			delta.query = PointerGetDatum(query);
 			delta.k = k;
+			delta.nattributes = nattributes;
+			delta.context = CurrentMemoryContext;
 			delta.hits = palloc(sizeof(Hit) * k);
 		}
 		(void) AnnRemoteFanoutWhile(requests, nselected, ann_worker_timeout_ms,
@@ -903,12 +1002,36 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			if (!request->ok || request->status != ANN_STATUS_OK)
 				CheckPartStatus(collection, part, request);
 			if (request->replyLength < 16 || (count = *(uint32 *) request->reply) > (uint32) k ||
-				(Size) count * 12 + 16 != request->replyLength)
+				(Size) count * 12 + 16 + (rows ? 4 + (Size) count * nattributes * 4 : 0) != request->replyLength)
 				elog(ERROR, "malformed reply from ann collection \"%s\" part %d", name, part->part);
+			if (rows && *(uint32 *) (request->reply + 16 + (Size) count * 12) != (uint32) nattributes)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("ann collection \"%s\" part %d has %u attributes on its nodes, not %d",
+								name, part->part, *(uint32 *) (request->reply + 16 + (Size) count * 12),
+								nattributes)));
 			for (uint32 i = 0; i < count; i++)
 			{
 				memcpy(&hits[nhits].key, request->reply + 16 + (Size) i * 12, 8);
 				memcpy(&hits[nhits].distance, request->reply + 24 + (Size) i * 12, 4);
+				hits[nhits].values = NULL;
+				hits[nhits].nulls = NULL;
+				if (rows)
+				{
+					const char *codes = request->reply + 20 + (Size) count * 12 + (Size) i * nattributes * 4;
+
+					hits[nhits].values = palloc(sizeof(Datum) * Max(nattributes, 1));
+					hits[nhits].nulls = palloc(sizeof(bool) * Max(nattributes, 1));
+					for (int a = 0; a < nattributes; a++)
+					{
+						int32		code;
+
+						memcpy(&code, codes + (Size) a * 4, 4);
+						hits[nhits].nulls[a] = code == ANN_FROZEN_NULL;
+						hits[nhits].values[a] = hits[nhits].nulls[a] ? (Datum) 0 :
+							AnnFrozenAttributeDatum(code, collection->columns.types[a]);
+					}
+				}
 				nhits++;
 			}
 		}
@@ -927,8 +1050,8 @@ ann_collection_search(PG_FUNCTION_ARGS)
 	 */
 	for (int i = 0; i < nhits && returned < k; i++)
 	{
-		Datum		values[2];
-		bool		nulls[2] = {false, false};
+		Datum	   *values = palloc(sizeof(Datum) * tupdesc->natts);
+		bool	   *nulls = palloc0(sizeof(bool) * tupdesc->natts);
 		bool		seen = false;
 
 		for (int j = 0; j < i && !seen; j++)
@@ -937,10 +1060,37 @@ ann_collection_search(PG_FUNCTION_ARGS)
 			continue;
 		values[0] = Int64GetDatum(hits[i].key);
 		values[1] = Float4GetDatum(hits[i].distance);
+		for (int c = 2; rows && c < tupdesc->natts; c++)
+		{
+			values[c] = hits[i].values[map[c]];
+			nulls[c] = hits[i].nulls[map[c]];
+		}
 		tuplestore_putvalues(store, tupdesc, values, nulls);
 		returned++;
 	}
 	return (Datum) 0;
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_collection_search);
+Datum
+ann_collection_search(PG_FUNCTION_ARGS)
+{
+	return CollectionSearch(fcinfo, false);
+}
+
+/*
+ * ann_collection_search_rows(collection, query, k, filter): as
+ * ann_collection_search, with the hits' attribute values from the nodes, so
+ * a query needing only attributes doesn't fetch rows from the shard hosts:
+ *
+ *   SELECT * FROM ann_collection_search_rows('docs', $1, 10, 'tenant = 7')
+ *       AS r(key bigint, distance real, category integer, tenant integer);
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_collection_search_rows);
+Datum
+ann_collection_search_rows(PG_FUNCTION_ARGS)
+{
+	return CollectionSearch(fcinfo, true);
 }
 
 /*

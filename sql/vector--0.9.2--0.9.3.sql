@@ -56,6 +56,11 @@ CREATE FUNCTION ann_collection_search(collection text, query vector, k integer, 
 
 COMMENT ON FUNCTION ann_collection_search(text, vector, integer, text) IS 'the k nearest rows of an ann collection matching a filter over its attributes, searched on the parts'' GPU nodes in parallel';
 
+CREATE FUNCTION ann_collection_search_rows(collection text, query vector, k integer, filter text DEFAULT NULL)
+	RETURNS SETOF record AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 10;
+
+COMMENT ON FUNCTION ann_collection_search_rows(text, vector, integer, text) IS 'as ann_collection_search, with attribute values from the GPU nodes: AS r(key bigint, distance real, <attribute> <type>, ...)';
+
 CREATE FUNCTION ann_collection_delta(collection text, delta regclass, key_column text DEFAULT 'id',
 	vector_column text DEFAULT 'embedding') RETURNS void
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

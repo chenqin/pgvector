@@ -154,6 +154,17 @@ class CollectionTests(unittest.TestCase):
             f'SELECT id, (emb <-> %s::vector)::real AS d FROM docs {where} ORDER BY d, id LIMIT %s',
             (query, k)).fetchall()]
 
+    def rows(self, query, k, condition=None, columns='tenant integer, category integer'):
+        return [(key, round(distance, 3), *rest) for key, distance, *rest in self.db.execute(
+            f'SELECT * FROM ann_collection_search_rows(%s, %s, %s, %s) AS r(key bigint, distance real, {columns}) '
+            'ORDER BY distance, key', (self.collection, query, k, condition)).fetchall()]
+
+    def exact_rows(self, query, k, condition=None, table='docs', columns='tenant, category'):
+        where = f'WHERE {condition}' if condition else ''
+        return [(key, round(distance, 3), *rest) for key, distance, *rest in self.db.execute(
+            f'SELECT id, (emb <-> %s::vector)::real AS d, {columns} FROM {table} {where} ORDER BY d, id LIMIT %s',
+            (query, k)).fetchall()]
+
     def test_builder_combines_exports(self):
         exports = self.create()
         path = self.build('combined', exports[:2])
@@ -234,6 +245,8 @@ class CollectionTests(unittest.TestCase):
             for condition in [None, 'category = 3', 'tenant BETWEEN 2 AND 6', 'tenant IN (1, 12)']:
                 self.assertEqual(self.search(query, 9, condition), self.exact(query, 9, condition),
                                  (query, condition))
+                self.assertEqual(self.rows(query, 9, condition), self.exact_rows(query, 9, condition),
+                                 (query, condition))
         # Straight to a node: both parts in one request.
         generations = {name: int(g, 16) for name, g in self.db.execute(
             'SELECT index_name, generation FROM ann_collection_part WHERE collection = %s',
@@ -258,6 +271,15 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(request([(names[0], generations[names[0]] ^ 1), (names[1], 0)])[2], 12)
         self.assertEqual(request([(names[0], 0), ('missing', 0)])[2], 3)
         self.assertEqual(request([(names[0], 0)], flags=1)[2], 1)
+        # With ANN_PREDICATE_ATTRIBUTES: u32 attributes, then each hit's values.
+        _, _, status, payload = request([(names[0], 0), (names[1], 0)], flags=2)
+        self.assertEqual(status, 0)
+        count = struct.unpack_from('<I', payload)[0]
+        (nattributes,) = struct.unpack_from('<I', payload, 16 + count * 12)
+        self.assertEqual(nattributes, 2)
+        values = struct.unpack_from(f'<{count * 2}i', payload, 20 + count * 12)
+        self.assertEqual([(values[2 * i], values[2 * i + 1]) for i in range(count)],
+                         [tuple(r[2:]) for r in self.exact_rows('[1,2,3,4]', 5, 'tenant < 8')])
 
     def test_delta_rows_are_searched(self):
         """Rows not yet in a part sit in a delta table, scored exactly with the same filter and merged in."""
@@ -326,6 +348,39 @@ class CollectionTests(unittest.TestCase):
         self.assertEqual(search_other(), expected)
         self.assertEqual(self.search('[1,2,3,4]', 10), self.exact('[1,2,3,4]', 10))
         del parts
+
+    def test_rows_carry_attributes(self):
+        """Hits bring their attribute values from the nodes: no fetch from the shard hosts."""
+        self.setup_collection()
+        for query in ['[1,2,3,4]', '[-30,10,5,0]']:
+            for condition in [None, 'tenant = 3', 'category = 2 AND tenant > 9', 'tenant IN (1, 12)']:
+                self.assertEqual(self.rows(query, 10, condition), self.exact_rows(query, 10, condition),
+                                 (query, condition))
+        # Any subset, in any order.
+        self.assertEqual(self.rows('[1,2,3,4]', 5, 'tenant < 8', 'category integer'),
+                         self.exact_rows('[1,2,3,4]', 5, 'tenant < 8', columns='category'))
+        self.assertEqual(self.rows('[1,2,3,4]', 5, None, 'category integer, tenant integer'),
+                         self.exact_rows('[1,2,3,4]', 5, None, columns='category, tenant'))
+        self.assertEqual(self.rows('[1,2,3,4]', 5, None, 'tenant integer')[0][:2],
+                         self.search('[1,2,3,4]', 5)[0])
+        # The delta's rows carry theirs too.
+        self.db.execute('CREATE TABLE docs_delta (id bigint, tenant int, category int, emb vector(4))')
+        self.db.execute("INSERT INTO docs_delta VALUES (990000, 3, 4, '[1,2,3,4]'), (990001, 12, 1, '[1,2,3,5]')")
+        self.db.execute("SELECT ann_collection_delta(%s, 'docs_delta', 'id', 'emb')", (self.collection,))
+        both = '(SELECT id, tenant, category, emb FROM docs UNION ALL SELECT * FROM docs_delta) b'
+        for condition in [None, 'tenant = 3', 'tenant IN (1, 12)']:
+            self.assertEqual(self.rows('[1,2,3,4]', 10, condition),
+                             self.exact_rows('[1,2,3,4]', 10, condition, table=both), condition)
+        # The column definition list is checked.
+        self.assertIn('is not an attribute', self.error(
+            'SELECT * FROM ann_collection_search_rows(%s, %s, 5) AS r(key bigint, distance real, body text)',
+            (self.collection, '[1,2,3,4]')))
+        self.assertIn('is integer, not bigint', self.error(
+            'SELECT * FROM ann_collection_search_rows(%s, %s, 5) AS r(key bigint, distance real, tenant bigint)',
+            (self.collection, '[1,2,3,4]')))
+        self.assertIn('returns key bigint, distance real', self.error(
+            'SELECT * FROM ann_collection_search_rows(%s, %s, 5) AS r(key integer, distance real)',
+            (self.collection, '[1,2,3,4]')))
 
     def test_catalog_checks(self):
         self.create(partitions=2)
