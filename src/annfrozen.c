@@ -96,6 +96,17 @@ FindGuard(Relation heap)
 	return InvalidOid;
 }
 
+/* Whether a table has the guard trigger (ann_freeze). */
+bool
+AnnFrozenTableFrozen(Oid relid)
+{
+	Relation	heap = table_open(relid, AccessShareLock);
+	bool		frozen = OidIsValid(FindGuard(heap));
+
+	table_close(heap, AccessShareLock);
+	return frozen;
+}
+
 /*
  * ann_freeze(table): install the guard trigger, firing even under
  * session_replication_role = replica. Returns false if it is already there.

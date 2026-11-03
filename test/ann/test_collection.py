@@ -382,10 +382,110 @@ class CollectionTests(unittest.TestCase):
             'SELECT * FROM ann_collection_search_rows(%s, %s, 5) AS r(key integer, distance real)',
             (self.collection, '[1,2,3,4]')))
 
+    def test_text_attributes(self):
+        """Text attributes: each part has its own dictionary; the collection keeps one, maps each part's
+        codes to it at load, and translates text filters (including ranges) through it."""
+        self.db.execute('CREATE TABLE docs (id bigint, tenant int, category int, lang text, emb vector(4)) '
+                        'PARTITION BY RANGE (id)')
+        languages = [["'en'", "'fr'"], ["'en'", "'de'"], ["'zh'", "'fr'", "'ja'"], ['NULL', "'es'", "'en'"]]
+        exports = []
+        for p in range(4):
+            self.db.execute(f'CREATE TABLE docs_{p} PARTITION OF docs FOR VALUES FROM ({p * 4000}) TO ({(p + 1) * 4000})')
+            options = ', '.join(languages[p])
+            self.db.execute(f"""INSERT INTO docs_{p} SELECT t * 1000 + j, t, (t * 7 + j) % 5,
+                                    (ARRAY[{options}]::text[])[1 + j % {len(languages[p])}],
+                                    ARRAY[sin(t * 1000 + j) * 50, cos((t * 1000 + j) * 1.3) * 40,
+                                          sin((t * 1000 + j) * 0.7) * 30, j % 9]::vector
+                                FROM generate_series({p * 4}, {p * 4 + 3}) t, generate_series(0, {PER_TENANT - 1}) j""")
+            self.assertTrue(self.value(f"SELECT ann_freeze('docs_{p}')"))
+            self.vacuum(f'docs_{p}')
+            self.db.execute(f'CREATE INDEX docs_{p}_ann ON docs_{p} USING ann (emb vector_l2_ops) '
+                            'INCLUDE (id, tenant, category, lang) WITH (frozen = true)')
+            export = os.path.join(self.directory.name, f'export-{p}')
+            self.db.execute('SELECT ann_index_export(%s, %s)', (f'docs_{p}_ann', export))
+            exports.append(export)
+        parts = [self.build('text-0', exports[:2]), self.build('text-1', exports[2:])]
+        a, b, c = self.node('a'), self.node('b'), self.node('c')
+        self.collection = self.schema + '_text'
+        self.assertIn('must not be text', self.error(
+            'SELECT ann_collection_create(%s, %s, %s, %s)',
+            (self.collection, f'{self.schema}.docs', ['tenant', 'lang'], 'lang')))
+        self.db.execute('SELECT ann_collection_create(%s, %s, %s, %s)',
+                        (self.collection, f'{self.schema}.docs', ['tenant', 'category', 'lang'], 'tenant'))
+        self.db.execute('SELECT ann_collection_load(%s, 0, %s, %s, %s, 0, 7)',
+                        (self.collection, self.collection + '_p0', parts[0], f'{a},{b}'))
+        self.db.execute('SELECT ann_collection_load(%s, 1, %s, %s, %s, 8, 15)',
+                        (self.collection, self.collection + '_p1', parts[1], c))
+        codes = dict(self.db.execute('SELECT value, code FROM ann_collection_dictionary WHERE collection = %s',
+                                     (self.collection,)).fetchall())
+        self.assertEqual(set(codes), {'en', 'fr', 'de', 'zh', 'ja', 'es'})
+        self.assertEqual(sorted(codes.values()), list(range(6)))
+        for query in ['[1,2,3,4]', '[-30,10,5,0]']:
+            for condition in ["lang = 'fr'", "lang = 'xx'", "lang IN ('de', 'zh')", "lang < 'f'", "lang >= 'fr'",
+                              "lang BETWEEN 'de' AND 'fr'", "lang <> 'en' AND tenant < 8", "lang IS NULL",
+                              "NOT (lang > 'e') OR category = 3", "lang NOT IN ('en', 'fr')"]:
+                self.assertEqual(self.search(query, 12, condition), self.exact(query, 12, condition),
+                                 (query, condition))
+                self.assertEqual(self.rows(query, 12, condition, 'lang text, tenant integer'),
+                                 self.exact_rows(query, 12, condition, columns='lang, tenant'), (query, condition))
+        # Reloading a part keeps its codes; a second coordinator attaching adopts the nodes'.
+        self.db.execute('SELECT ann_collection_load(%s, 1, %s, NULL, %s, 8, 15)',
+                        (self.collection, self.collection + '_p1', c))
+        self.assertEqual(dict(self.db.execute('SELECT value, code FROM ann_collection_dictionary '
+                                              'WHERE collection = %s', (self.collection,)).fetchall()), codes)
+        # A node serving the part without the collection's map answers stale (3) to collection codes.
+        name = 'unmapped_' + self.schema
+        with self.nodes['c'].connect() as connection:
+            connection.sendall(frame(11, 1, struct.pack('<I', len(name)) + name.encode() + parts[1].encode()))
+            self.assertEqual(receive(connection)[2], 0)
+            payload = (struct.pack('<I', len(name)) + name.encode() + struct.pack('<IIII', 4, 5, 4, 1) +
+                       bytes([8]) + struct.pack('<4f', 1, 2, 3, 4))
+            connection.sendall(frame(22, 2, payload))
+            self.assertEqual(receive(connection)[2], 3)
+
+    def test_unload_previous(self):
+        """ann_collection_load(..., unload_previous => true) frees the replaced index on its nodes."""
+        parts = self.setup_collection()
+        old = self.collection + '_p0'
+        nodes = f"{self.nodes['a'].address},{self.nodes['b'].address}"
+        expected = self.exact('[1,2,3,4]', 10, 'tenant < 8')
+        self.db.execute('SELECT ann_collection_load(%s, 0, %s, %s, %s, 0, 7, true)',
+                        (self.collection, old + 'b', parts[0], nodes))
+        self.assertEqual(self.search('[1,2,3,4]', 10, 'tenant < 8'), expected)
+        self.assertEqual(self.value('SELECT ann_index_unload(%s, %s)', (old, nodes)), 0)  # already gone
+        # Reloading under the same name keeps it.
+        self.db.execute('SELECT ann_collection_load(%s, 0, %s, NULL, %s, 0, 7, true)', (self.collection, old + 'b', nodes))
+        self.assertEqual(self.search('[1,2,3,4]', 10, 'tenant < 8'), expected)
+
+    def test_tombstones(self):
+        """ann_collection_delete: deleted keys leave every part's searches, and parts loaded later get them."""
+        parts = self.setup_collection()
+        deleted = [key for key, _ in self.exact('[1,2,3,4]', 4)] + [key for key, _ in self.exact('[1,2,3,4]', 3, 'tenant = 12')]
+        # Keys the collection doesn't hold are recorded too (the catalog can't tell); nodes ignore them.
+        self.assertEqual(self.value('SELECT ann_collection_delete(%s, %s)', (self.collection, deleted + [999999])), 8)
+        self.assertEqual(self.value('SELECT ann_collection_delete(%s, %s)', (self.collection, deleted)), 0)
+
+        def exact(query, k, condition=None):
+            where = f'AND ({condition})' if condition else ''
+            return [(key, round(distance, 3)) for key, distance in self.db.execute(
+                f'SELECT id, (emb <-> %s::vector)::real AS d FROM docs WHERE id <> ALL(%s) {where} '
+                'ORDER BY d, id LIMIT %s', (query, deleted, k)).fetchall()]
+
+        for query in ['[1,2,3,4]', '[-30,10,5,0]']:
+            for condition in [None, 'tenant = 12', 'category = 2', 'tenant IN (1, 12)']:
+                self.assertEqual(self.search(query, 10, condition), exact(query, 10, condition), (query, condition))
+        # A rebuilt part loaded later (here from the same exports, so it still holds the rows) gets them.
+        nodes = f"{self.nodes['a'].address},{self.nodes['b'].address}"
+        rebuilt = self.build('part-0-again', [os.path.join(self.directory.name, f'export-{p}') for p in (0, 1)])
+        self.db.execute('SELECT ann_collection_load(%s, 0, %s, %s, %s, 0, 7, true)',
+                        (self.collection, self.collection + '_p0v2', rebuilt, nodes))
+        self.assertEqual(self.search('[1,2,3,4]', 10), exact('[1,2,3,4]', 10))
+        del parts
+
     def test_catalog_checks(self):
         self.create(partitions=2)
         self.assertIn('must be smallint, integer', self.error(
-            'SELECT ann_collection_create(%s, %s, %s)', (self.schema + '_x', f'{self.schema}.docs', ['body'])))
+            'SELECT ann_collection_create(%s, %s, %s)', (self.schema + '_x', f'{self.schema}.docs', ['emb'])))
         self.assertIn('is not one of', self.error(
             'SELECT ann_collection_create(%s, %s, %s, %s)',
             (self.schema + '_x', f'{self.schema}.docs', ['tenant'], 'category')))

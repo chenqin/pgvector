@@ -268,6 +268,20 @@ void		AnnFrozenVectorReaderInit(AnnFrozenVectorReader *reader, Relation index, c
 struct Vector *AnnFrozenVectorRead(AnnFrozenVectorReader *reader, uint64 ordinal);
 void		AnnFrozenVectorReaderEnd(AnnFrozenVectorReader *reader);
 
+/*
+ * A collection's dictionary for a text attribute: codes are assigned as
+ * strings first appear (append-only), so unlike a frozen index's they don't
+ * follow the collation; sorted gives the collation order for comparisons.
+ */
+typedef struct AnnTextDictionary
+{
+	int			count;
+	text	  **sorted;			/* in the column's collation */
+	int32	   *codes;			/* code of each sorted string */
+	text	  **byCode;			/* string of each code, NULL for gaps */
+	int32		ncodes;
+} AnnTextDictionary;
+
 /* Predicates over a frozen index's attribute columns (annpred.c). */
 typedef struct AnnPredicateColumns
 {
@@ -279,6 +293,8 @@ typedef struct AnnPredicateColumns
 	char	   *names[INDEX_MAX_KEYS];
 	Relation	index;			/* for text dictionaries */
 	AnnFrozenMetaData *meta;
+	AnnTextDictionary *dictionaries[INDEX_MAX_KEYS];	/* collections: text
+														 * columns' codes */
 } AnnPredicateColumns;
 
 /*
@@ -297,6 +313,8 @@ void		AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns);
 void		AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateColumns *columns);
 bool		AnnFrozenCachedColumns(Relation index, AnnPredicateColumns *columns);
 void		AnnFrozenStoreColumns(Relation index, const AnnPredicateColumns *columns);
+bool		AnnFrozenTableFrozen(Oid relid);
+void		AnnFrozenTombstonesChanged(void);
 bool		AnnPredicateSupported(List *clauses, Index varno, const AnnPredicateColumns *columns);
 void		AnnPredicateBuild(List *clauses, Index varno, const AnnPredicateColumns *columns,
 							  PlanState *parent, ExprContext *econtext, StringInfo program);
@@ -316,6 +334,8 @@ Relation	AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode);
 #define ANN_OP_INDEX_SEARCH_PREDICATE 22
 #define ANN_OP_COLLECTION_SEARCH 25
 #define ANN_OP_INDEX_PREDICATE 23
+#define ANN_OP_DELETE_KEYS 29
+#define ANN_TOMBSTONE_BATCH 100000	/* keys per delete request */
 #define ANN_PREDICATE_ORDINALS 1
 #define ANN_PREDICATE_ATTRIBUTES 2
 

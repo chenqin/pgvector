@@ -60,6 +60,8 @@ typedef struct Job
 	int			rdma;			/* reply over RDMA, as requested */
 	uint16_t	operation;
 	uint32_t	flags;			/* operation 22 flags */
+	uint32_t	wanted;			/* hits to return when over-fetching past
+								 * tombstones, else 0 */
 	uint64_t	request;
 	unsigned char *payload;
 	uint64_t	charge;
@@ -108,6 +110,9 @@ static FILE *traceFile = NULL;
 static pthread_mutex_t traceMutex = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local uint64_t frameArrived = 0;
 
+/* Hits to return when SubmitBitmapJob's caller over-fetches (else 0). */
+static _Thread_local uint32_t submittingWanted = 0;
+
 /* Set while a reader or RDMA lane submits a composite's parts. */
 static _Thread_local Composite *submittingComposite = NULL;
 
@@ -146,6 +151,7 @@ typedef struct Service
 	int			stopping;
 	uint64_t	jobs;
 	uint64_t	rejected;
+	uint64_t	rejected_index; /* of those, over an index's share */
 	uint64_t	failed;
 	uint64_t	batches;
 	uint64_t	max_batch;
@@ -188,6 +194,7 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 	options->max_batch_bytes = 32U * 1024U * 1024U;
 	options->max_pending_bytes = 512U * 1024U * 1024U;
 	options->delay_us = 0;
+	options->index_pending_share = 100;
 	options->trace = NULL;
 	options->trace_sample = 64;
 	options->tcp = NULL;
@@ -465,6 +472,20 @@ Finish(Service *service, Job *job)
 	size_t		size = 0;
 	uint64_t	finished = traceFile ? Now() : 0;
 
+	/* Tombstoned rows never come back, whichever route found them. */
+	if (job->kind == JOB_INDEX && job->bitmapFile && job->index.status == ANN_OK &&
+		__atomic_load_n(&job->bitmapFile->ndeleted, __ATOMIC_ACQUIRE) > 0)
+	{
+		uint32_t	kept = 0;
+
+		for (uint32_t i = 0; i < job->index.nresults; i++)
+			if (!AnnIndexIsDeleted(job->bitmapFile, job->index.results[i].ordinal))
+				job->index.results[kept++] = job->index.results[i];
+		job->index.nresults = kept;
+	}
+	if (job->kind == JOB_INDEX && job->wanted && job->index.nresults > job->wanted)
+		job->index.nresults = job->wanted;
+
 	if (job->composite)
 	{
 		job->job.status = job->index.status;
@@ -568,6 +589,8 @@ Finish(Service *service, Job *job)
 	free(data);
 	(void) pthread_mutex_lock(&service->mutex);
 	service->pending_bytes -= job->charge;
+	if (job->kind == JOB_INDEX && job->bitmapFile)
+		job->bitmapFile->pendingBytes -= job->charge;
 	if (job->job.status != ANN_OK)
 		service->failed++;
 	(void) pthread_mutex_unlock(&service->mutex);
@@ -1070,6 +1093,8 @@ Attach(Connection *connection, const unsigned char *name, uint32_t size)
 static int
 Enqueue(Service *service, Connection *connection, Job *job)
 {
+	AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
+
 	(void) pthread_mutex_lock(&service->mutex);
 	if (service->pending_bytes + job->charge > service->options.max_pending_bytes)
 	{
@@ -1077,6 +1102,22 @@ Enqueue(Service *service, Connection *connection, Job *job)
 		(void) pthread_mutex_unlock(&service->mutex);
 		return 0;
 	}
+
+	/*
+	 * --index-pending-share: one index's searches may hold only part of the
+	 * budget, so a flood on one index leaves room for the others.
+	 */
+	if (file && service->options.index_pending_share < 100 &&
+		file->pendingBytes + job->charge >
+		service->options.max_pending_bytes / 100 * service->options.index_pending_share)
+	{
+		service->rejected++;
+		service->rejected_index++;
+		(void) pthread_mutex_unlock(&service->mutex);
+		return 0;
+	}
+	if (file)
+		file->pendingBytes += job->charge;
 	service->pending_bytes += job->charge;
 	(void) pthread_mutex_lock(&connection->mutex);
 	connection->references++;
@@ -1776,6 +1817,7 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	job->payload = payload;
 	job->charge = (uint64_t) size + sizeof(AnnIndexHit) * k;
 	job->composite = submittingComposite;
+	job->wanted = submittingWanted;
 	if (file)
 		AnnIndexHold(file);		/* until Finish: unloading waits for it */
 	if (Enqueue(service, connection, job))
@@ -1954,10 +1996,30 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 		return ANN_INVALID;
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
-	/* A program matching every row is a plain ANN search. */
-	if (programLength == 1 && payload[offset] == ANN_FILTER_ALL)
+	if ((flags & ANN_PREDICATE_COLLECTION_CODES) && !AnnIndexRemapped(file))
+	{
+		/* Loaded but not mapped to the collection's dictionary (yet). */
+		AnnIndexPut(file);
+		return ANN_STALE;
+	}
+
+	/*
+	 * A program matching every row is a plain ANN search. With tombstones, it
+	 * asks for that many more hits and drops them (Finish), or, past the
+	 * backend's k, runs as a filtered search whose rows leave them out.
+	 */
+	if (programLength == 1 && payload[offset] == ANN_FILTER_ALL &&
+		(uint64_t) k + __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) <=
+		(service->backend->max_k < 10000 ? service->backend->max_k : 10000))
+	{
+		uint64_t	deleted = __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE);
+
+		submittingWanted = deleted ? k : 0;
 		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, NULL, name,
-								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+								 dimensions, (uint32_t) (k + deleted), offset + programLength,
+								 ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+		submittingWanted = 0;
+	}
 	else if ((status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap)) == ANN_OK)
 		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
 								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
@@ -2394,6 +2456,62 @@ typedef struct ReaderArgs
 	Connection *connection;
 } ReaderArgs;
 
+/*
+ * Operation 27: u32 name length, name, u32 attribute length, attribute;
+ * reply: the text attribute's dictionary (AnnIndexDictionary). Operation
+ * 28: the same, then u32 count and count i32 collection codes, one per
+ * dictionary string (AnnIndexRemap).
+ */
+static AnnStatus
+DictionaryOperation(uint16_t operation, const unsigned char *payload, uint32_t length,
+					unsigned char **reply, size_t *replyLength)
+{
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	char		attribute[64];
+	uint32_t	nameLength,
+				attributeLength,
+				count = 0;
+	size_t		offset;
+	AnnIndexFile *file;
+	AnnStatus	status;
+	int32_t    *map = NULL;
+
+	if (length < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 || nameLength > ANN_INDEX_NAME_MAX ||
+		(uint64_t) length < 8 + (uint64_t) nameLength ||
+		(attributeLength = (uint32_t) Read(payload + 4 + nameLength, 4)) == 0 || attributeLength > 63 ||
+		(uint64_t) length < 8 + (uint64_t) nameLength + attributeLength)
+		return ANN_INVALID;
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
+	memcpy(attribute, payload + 8 + nameLength, attributeLength);
+	attribute[attributeLength] = '\0';
+	if (strlen(name) != nameLength || strlen(attribute) != attributeLength)
+		return ANN_INVALID;
+	offset = 8 + (size_t) nameLength + attributeLength;
+	if (operation == ANN_OP_REMAP)
+	{
+		if ((uint64_t) length < offset + 4 ||
+			(uint64_t) length != offset + 4 + (uint64_t) (count = (uint32_t) Read(payload + offset, 4)) * 4)
+			return ANN_INVALID;
+		if ((map = malloc(sizeof(int32_t) * (count ? count : 1))) == NULL)
+			return ANN_NOMEM;
+		for (uint32_t i = 0; i < count; i++)
+			map[i] = (int32_t) (uint32_t) Read(payload + offset + 4 + (size_t) i * 4, 4);
+	}
+	else if (length != offset)
+		return ANN_INVALID;
+	if ((file = AnnIndexGet(name)) == NULL)
+	{
+		free(map);
+		return ANN_STALE;
+	}
+	status = operation == ANN_OP_DICTIONARY ? AnnIndexDictionary(file, attribute, reply, replyLength) :
+		AnnIndexRemap(file, attribute, map, count);
+	AnnIndexPut(file);
+	free(map);
+	return status;
+}
+
 static void *
 Reader(void *argument)
 {
@@ -2501,7 +2619,7 @@ Reader(void *argument)
 			else
 				size = snprintf(message, sizeof(message),
 								"{\"jobs\":%llu,\"batches\":%llu,\"max_batch\":%llu,\"rows\":%llu,"
-								"\"rejected\":%llu,\"failed\":%llu,\"pending_bytes\":%llu,\"device_jobs\":%llu,"
+								"\"rejected\":%llu,\"rejected_index\":%llu,\"failed\":%llu,\"pending_bytes\":%llu,\"device_jobs\":%llu,"
 								"\"rdma_frames\":%llu,\"rdma_fallbacks\":%llu,\"rdma_lanes\":%d,"
 								"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu,\"predicate_hits\":%llu,"
 								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
@@ -2509,8 +2627,8 @@ Reader(void *argument)
 								"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu}",
 								(unsigned long long) service->jobs, (unsigned long long) service->batches,
 								(unsigned long long) service->max_batch, (unsigned long long) service->rows,
-								(unsigned long long) service->rejected, (unsigned long long) service->failed,
-								(unsigned long long) service->pending_bytes,
+								(unsigned long long) service->rejected, (unsigned long long) service->rejected_index,
+								(unsigned long long) service->failed, (unsigned long long) service->pending_bytes,
 								(unsigned long long) (service->backend->device_jobs ?
 													  service->backend->device_jobs() : 0),
 								(unsigned long long) __atomic_load_n(&service->rdma_frames, __ATOMIC_RELAXED),
@@ -2608,6 +2726,53 @@ Reader(void *argument)
 
 			Reply(connection, operation, request, status, (unsigned char *) message,
 				  status == ANN_OK ? textLength : 0);
+		}
+		else if (operation == ANN_OP_DELETE_KEYS)
+		{
+			/* u32 name length, name, u32 count, keys; reply: added, total */
+			char		name[ANN_INDEX_NAME_MAX + 1];
+			uint32_t	nameLength = length >= 4 ? (uint32_t) Read(payload, 4) : 0;
+			uint32_t	count = 0;
+			unsigned char answer[16];
+			AnnIndexFile *file = NULL;
+			uint64_t	added = 0;
+
+			if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length < 8 + (uint64_t) nameLength ||
+				(uint64_t) length != 8 + (uint64_t) nameLength +
+				8 * (uint64_t) (count = (uint32_t) Read(payload + 4 + nameLength, 4)) ||
+				memchr(payload + 4, '\0', nameLength))
+				status = ANN_INVALID;
+			else
+			{
+				int64_t    *keys = malloc(sizeof(int64_t) * (count ? count : 1));
+
+				memcpy(name, payload + 4, nameLength);
+				name[nameLength] = '\0';
+				if (keys == NULL)
+					status = ANN_NOMEM;
+				else if ((file = AnnIndexGet(name)) == NULL)
+					status = ANN_STALE;
+				else
+				{
+					for (uint32_t i = 0; i < count; i++)
+						keys[i] = (int64_t) Read(payload + 8 + nameLength + (size_t) i * 8, 8);
+					status = AnnIndexDelete(file, keys, count, &added);
+					Write(answer, added, 8);
+					Write(answer + 8, __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE), 8);
+					AnnIndexPut(file);
+				}
+				free(keys);
+			}
+			Reply(connection, operation, request, status, answer, status == ANN_OK ? 16 : 0);
+		}
+		else if (operation == ANN_OP_DICTIONARY || operation == ANN_OP_REMAP)
+		{
+			unsigned char *data = NULL;
+			size_t		dataLength = 0;
+
+			status = DictionaryOperation(operation, payload, length, &data, &dataLength);
+			Reply(connection, operation, request, status, data, status == ANN_OK ? dataLength : 0);
+			free(data);
 		}
 		else if (operation == ANN_OP_UNLOAD_INDEX)
 		{

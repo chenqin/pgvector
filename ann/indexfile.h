@@ -67,8 +67,22 @@ typedef struct AnnIndexAttribute
 	AnnIndexPosting *postings;	/* sorted by value */
 	int64_t    *keys;			/* rows grouped by value, key order within */
 	uint64_t   *ordinals;
-	const int32_t *column;		/* the value of each row, by ordinal (mapped) */
+	const int32_t *column;		/* the value of each row, by ordinal */
+	const void *mapped;			/* the column file's mapping */
 	size_t		columnBytes;
+	/* text attributes: the dictionary the codes index (manifest "dictionary") */
+	char		stringsFile[256];
+	char		startsFile[256];
+	uint32_t	nstrings;
+	uint32_t   *starts;			/* nstrings + 1 offsets into strings */
+	char	   *strings;
+	/* AnnIndexRemap: the codes rewritten into a collection's dictionary */
+	int32_t    *remap;			/* the map, by part code; NULL until remapped */
+	int32_t    *ownedColumn;	/* the remapped column (column points here) */
+	AnnIndexPosting *oldPostings;	/* the arrays before the remap: searches */
+	int64_t    *oldKeys;		/* that started then may still read them */
+	uint64_t   *oldOrdinals;
+	uint32_t	oldValues;
 } AnnIndexAttribute;
 
 /*
@@ -152,6 +166,10 @@ struct AnnIndexFile
 	uint64_t	predicateBytes; /* host memory they hold */
 	uint64_t	predicateDeviceBytes;	/* device memory they hold */
 	uint64_t	predicateEvictions;
+	uint64_t	pendingBytes;	/* its queued and running searches' charge,
+								 * under the scheduler's mutex */
+	uint32_t   *deleted;		/* tombstones: a bit per ordinal, set only */
+	uint64_t	ndeleted;		/* bits set (atomic reads) */
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
 	size_t		keysBytes;		/* mapped or reserved bytes, for munmap */
@@ -207,6 +225,36 @@ AnnStatus	AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile
 void		AnnIndexFileClose(AnnIndexFile *file);
 void		AnnIndexHold(AnnIndexFile *file);
 AnnStatus	AnnIndexUnload(const char *name);
+
+/*
+ * Text attributes of indexes serving a collection: the part's dictionary
+ * (u32 count, count + 1 u32 offsets, the strings' bytes, then u32 1 and the
+ * count collection codes if remapped, else u32 0), and rewriting the
+ * part's codes into the collection's (map[part code] = collection code, one
+ * per dictionary string). A remap is done once, before searches use the
+ * index's predicates; repeating it with the same map is allowed.
+ */
+AnnStatus	AnnIndexDictionary(AnnIndexFile *file, const char *attribute, unsigned char **reply, size_t *length);
+
+/*
+ * Tombstones: rows deleted from a frozen index's table, by key, until the
+ * index is rebuilt without them. Searches never return them: predicate
+ * results leave them out (cached results are dropped when rows are
+ * deleted), and hits of every route are checked. Keys the index doesn't
+ * hold are ignored. *added counts the rows newly deleted.
+ */
+AnnStatus	AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t *added);
+
+static inline int
+AnnIndexIsDeleted(const AnnIndexFile *file, uint64_t ordinal)
+{
+	const uint32_t *deleted = __atomic_load_n(&file->deleted, __ATOMIC_ACQUIRE);
+
+	return deleted && ordinal < file->rows &&
+		((__atomic_load_n(&deleted[ordinal / 32], __ATOMIC_RELAXED) >> (ordinal % 32)) & 1);
+}
+AnnStatus	AnnIndexRemap(AnnIndexFile *file, const char *attribute, const int32_t *map, uint32_t count);
+int			AnnIndexRemapped(const AnnIndexFile *file);
 
 /* Frees a loaded index's backend state (device memory) when it is unloaded. */
 extern void (*AnnIndexDeviceDestroy) (void *device);

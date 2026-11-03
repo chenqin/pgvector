@@ -18,6 +18,7 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/ruleutils.h"
 #include "utils/tuplestore.h"
 #include "vector.h"
 
@@ -37,6 +38,9 @@
 #define ANN_OP_LOAD_INDEX 11
 #define ANN_OP_INDEX_INFO 15
 #define ANN_OP_UNLOAD_INDEX 26
+#define ANN_OP_DICTIONARY 27
+#define ANN_OP_REMAP 28
+#define ANN_PREDICATE_COLLECTION_CODES 4
 #define ANN_COLLECTION_LOAD_TIMEOUT_MS (30 * 60 * 1000)
 #define ANN_COLLECTION_MAX_PARTS 64
 #define ANN_COLLECTION_REFRESH_MS 10000
@@ -83,10 +87,15 @@ typedef struct Collection
 	char	   *deltaKey;
 	char	   *deltaVector;
 	SPIPlanPtr	deltaAll[2];	/* the delta query without a filter */
+	bool		hasText;		/* has text attributes (collection codes) */
 	instr_time	loaded;
 } Collection;
 
 static HTAB *collections = NULL;
+
+static void LoadDictionaries(FunctionCallInfo fcinfo, Collection *collection);
+static void PushCollectionTombstones(FunctionCallInfo fcinfo, const char *name, const char *index,
+									 const char *nodes);
 
 typedef struct Hit
 {
@@ -285,11 +294,83 @@ LoadCollection(FunctionCallInfo fcinfo, const char *name)
 	}
 	PG_END_TRY();
 
+	LoadDictionaries(fcinfo, collection);
 	collection->programContext = AllocSetContextCreate(context, "ann collection programs", ALLOCSET_DEFAULT_SIZES);
 	CreateProgramCache(collection);
 	INSTR_TIME_SET_CURRENT(collection->loaded);
 	collection->valid = true;
 	return collection;
+}
+
+/*
+ * The collection's dictionary of each text attribute, in the column's
+ * collation order (for comparisons) and by code (for returned values).
+ */
+static void
+LoadDictionaries(FunctionCallInfo fcinfo, Collection *collection)
+{
+	collection->hasText = false;
+	for (int a = 0; a < collection->nattributes; a++)
+	{
+		Oid			types[2] = {TEXTOID, TEXTOID};
+		Datum		values[2];
+		AnnTextDictionary *dictionary;
+		MemoryContext old;
+
+		if (!AnnFrozenTextType(collection->columns.types[a]))
+			continue;
+		collection->hasText = true;
+		values[0] = CStringGetTextDatum(collection->name);
+		values[1] = CStringGetTextDatum(collection->attributes[a]);
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute_with_args(psprintf("SELECT code, value FROM %s WHERE collection = $1 AND attribute = $2 "
+										   "ORDER BY value COLLATE %s",
+										   CatalogTable(fcinfo, "ann_collection_dictionary"),
+										   generate_collation_name(collection->columns.collations[a])),
+								  2, types, values, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not read the dictionary of ann collection \"%s\"", collection->name);
+		old = MemoryContextSwitchTo(collection->context);
+		dictionary = palloc0(sizeof(AnnTextDictionary));
+		dictionary->count = (int) SPI_processed;
+		dictionary->sorted = palloc(sizeof(text *) * Max(dictionary->count, 1));
+		dictionary->codes = palloc(sizeof(int32) * Max(dictionary->count, 1));
+		for (int i = 0; i < dictionary->count; i++)
+		{
+			bool		isnull;
+
+			dictionary->codes[i] = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1,
+															   &isnull));
+			dictionary->sorted[i] = DatumGetTextPCopy(SPI_getbinval(SPI_tuptable->vals[i],
+																	SPI_tuptable->tupdesc, 2, &isnull));
+			dictionary->ncodes = Max(dictionary->ncodes, dictionary->codes[i] + 1);
+		}
+		dictionary->byCode = palloc0(sizeof(text *) * Max(dictionary->ncodes, 1));
+		for (int i = 0; i < dictionary->count; i++)
+			dictionary->byCode[dictionary->codes[i]] = dictionary->sorted[i];
+		collection->columns.dictionaries[a] = dictionary;
+		MemoryContextSwitchTo(old);
+		SPI_finish();
+	}
+}
+
+/* An attribute's value from its code: a dictionary string for text. */
+static Datum
+CollectionValue(const Collection *collection, int a, int32 code, bool *isnull)
+{
+	const AnnTextDictionary *dictionary = collection->columns.dictionaries[a];
+
+	*isnull = code == ANN_FROZEN_NULL;
+	if (*isnull)
+		return (Datum) 0;
+	if (!AnnFrozenTextType(collection->columns.types[a]))
+		return AnnFrozenAttributeDatum(code, collection->columns.types[a]);
+	if (dictionary == NULL || code < 0 || code >= dictionary->ncodes || dictionary->byCode[code] == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("ann collection \"%s\" has no string for code %d of attribute \"%s\"", collection->name,
+						code, collection->attributes[a])));
+	return PointerGetDatum(dictionary->byCode[code]);
 }
 
 static Collection *
@@ -954,7 +1035,9 @@ CollectionSearch(FunctionCallInfo fcinfo, bool rows)
 			}
 			header[0] = query->dim;
 			header[1] = (uint32) k;
-			header[2] = rows ? ANN_PREDICATE_ATTRIBUTES : 0;	/* keys, not ordinals */
+			/* keys, not ordinals */
+			header[2] = (rows ? ANN_PREDICATE_ATTRIBUTES : 0) |
+				(collection->hasText ? ANN_PREDICATE_COLLECTION_CODES : 0);
 			header[3] = (uint32) programLength;
 			appendBinaryStringInfo(&payload, (char *) header, sizeof(header));
 			appendBinaryStringInfo(&payload, program, programLength);
@@ -1027,9 +1110,7 @@ CollectionSearch(FunctionCallInfo fcinfo, bool rows)
 						int32		code;
 
 						memcpy(&code, codes + (Size) a * 4, 4);
-						hits[nhits].nulls[a] = code == ANN_FROZEN_NULL;
-						hits[nhits].values[a] = hits[nhits].nulls[a] ? (Datum) 0 :
-							AnnFrozenAttributeDatum(code, collection->columns.types[a]);
+						hits[nhits].values[a] = CollectionValue(collection, a, code, &hits[nhits].nulls[a]);
 					}
 				}
 				nhits++;
@@ -1144,6 +1225,11 @@ ann_collection_create(PG_FUNCTION_ARGS)
 	rel = table_open(source, AccessShareLock);
 	AnnPredicateColumnsForTable(rel, count, names, &columns);
 	table_close(rel, AccessShareLock);
+	for (int i = 0; placement && i < count; i++)
+		if (strcmp(names[i], placement) == 0 && AnnFrozenTextType(columns.types[i]))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("placement attribute \"%s\" must not be text", placement)));
 
 	values[0] = PointerGetDatum(name);
 	values[1] = ObjectIdGetDatum(source);
@@ -1190,6 +1276,273 @@ IndexInfoOn(const char *node, const char *index, uint64 *rows, char *generation)
 		elog(ERROR, "unexpected ann node reply: %s", request.reply);
 }
 
+/* One request to one node; false when it couldn't be reached. */
+static bool
+NodeCall(const char *node, uint16 operation, const char *payload, uint32 length, uint32 *status, char **reply,
+		 uint32 *replyLength)
+{
+	AnnRemoteRequest request;
+
+	memset(&request, 0, sizeof(request));
+	request.nodes = (char *) node;
+	request.operation = operation;
+	request.payload = (char *) payload;
+	request.length = length;
+	(void) AnnRemoteFanout(&request, 1, ann_worker_timeout_ms);
+	*status = request.status;
+	*reply = request.reply;
+	*replyLength = request.replyLength;
+	return request.ok;
+}
+
+/* Deleted keys to every node of a list, in batches; nodes ignore keys they don't hold. */
+static void
+SendCollectionTombstones(const char *index, const char *nodes, const int64 *keys, int count)
+{
+	for (int first = 0; first < count; first += ANN_TOMBSTONE_BATCH)
+	{
+		int			n = Min(count - first, ANN_TOMBSTONE_BATCH);
+		StringInfoData payload;
+		uint32		length = strlen(index);
+		char	   *list = pstrdup(nodes);
+		char	   *position = NULL;
+
+		initStringInfo(&payload);
+		appendBinaryStringInfo(&payload, (char *) &length, 4);
+		appendBinaryStringInfo(&payload, index, length);
+		length = (uint32) n;
+		appendBinaryStringInfo(&payload, (char *) &length, 4);
+		appendBinaryStringInfo(&payload, (char *) (keys + first), sizeof(int64) * n);
+		for (char *node = strtok_r(list, ", ", &position); node; node = strtok_r(NULL, ", ", &position))
+		{
+			uint32		status;
+			char	   *reply;
+			uint32		replyLength;
+
+			if (!NodeCall(node, ANN_OP_DELETE_KEYS, payload.data, payload.len, &status, &reply, &replyLength) ||
+				status != ANN_STATUS_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not send deleted rows of ann index \"%s\" to ann node %s (status %u)", index,
+								node, status),
+						 errhint("Searches there would still return them; retry when the node is back.")));
+		}
+	}
+}
+
+/* After loading a part: the collection's tombstones to its nodes. */
+static void
+PushCollectionTombstones(FunctionCallInfo fcinfo, const char *name, const char *index, const char *nodes)
+{
+	Oid			types[1] = {TEXTOID};
+	Datum		values[1] = {CStringGetTextDatum(name)};
+	int64	   *keys;
+	int			count;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("SELECT key FROM %s WHERE collection = $1",
+									   CatalogTable(fcinfo, "ann_collection_tombstone")),
+							  1, types, values, NULL, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann collection tombstones");
+	count = (int) SPI_processed;
+	keys = MemoryContextAlloc(TopTransactionContext, sizeof(int64) * Max(count, 1));
+	for (int i = 0; i < count; i++)
+	{
+		bool		isnull;
+
+		keys[i] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	SPI_finish();
+	if (count > 0)
+		SendCollectionTombstones(index, nodes, keys, count);
+}
+
+static void
+PutName(StringInfo payload, const char *name)
+{
+	uint32		length = strlen(name);
+
+	appendBinaryStringInfo(payload, (char *) &length, 4);
+	appendBinaryStringInfo(payload, name, length);
+}
+
+/*
+ * Map a part's text attributes to the collection's dictionaries: read each
+ * node's dictionary (and the collection codes it already holds), record new
+ * strings with the next codes (codes are never reused or reordered, so other
+ * parts keep theirs), and send every node the part's map. A coordinator
+ * attaching parts another one loaded adopts the codes the nodes hold; a
+ * string holding another code in this catalog is an error.
+ */
+static void
+MapTextAttributes(FunctionCallInfo fcinfo, const char *name, const char *index, const char *nodes)
+{
+	Collection *collection = GetCollection(fcinfo, name, true);
+	char	   *dictionary = CatalogTable(fcinfo, "ann_collection_dictionary");
+
+	for (int a = 0; a < collection->nattributes; a++)
+	{
+		const char *attribute = collection->attributes[a];
+		char	   *list = pstrdup(nodes);
+		char	   *save = NULL;
+		uint32		count = 0;
+		Datum	   *strings = NULL;
+		StringInfoData request;
+		StringInfoData remap;
+		int			nnodes = 0;
+
+		if (!AnnFrozenTextType(collection->columns.types[a]))
+			continue;
+		initStringInfo(&request);
+		PutName(&request, index);
+		PutName(&request, attribute);
+		initStringInfo(&remap); /* outside SPI: sent after SPI_finish */
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		{
+			Oid			types[1] = {TEXTOID};
+			Datum		values[1] = {CStringGetTextDatum(name)};
+
+			/* One coordinator at a time assigns codes. */
+			if (SPI_execute_with_args(psprintf("SELECT 1 FROM %s WHERE name = $1 FOR UPDATE",
+											   CatalogTable(fcinfo, "ann_collection")),
+									  1, types, values, NULL, false, 1) != SPI_OK_SELECT ||
+				SPI_processed != 1)
+				elog(ERROR, "could not lock ann collection \"%s\"", name);
+		}
+		for (char *node = strtok_r(list, ", ", &save); node; node = strtok_r(NULL, ", ", &save))
+		{
+			uint32		status;
+			char	   *reply;
+			uint32		length;
+			uint32		n;
+			uint32		remapped;
+			const uint32 *starts;
+			const char *bytes;
+			Size		head;
+
+			if (!NodeCall(node, ANN_OP_DICTIONARY, request.data, request.len, &status, &reply, &length) ||
+				status != ANN_STATUS_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_CONNECTION_FAILURE),
+						 errmsg("could not read the dictionary of attribute \"%s\" of \"%s\" from ann node %s (status %u)",
+								attribute, index, node, status),
+						 errhint("Build the part from exports of version 0.9.3 or later, which carry text dictionaries.")));
+			memcpy(&n, reply, 4);
+			head = 4 + ((Size) n + 1) * 4;
+			if (length < head)
+				elog(ERROR, "malformed dictionary from ann node %s", node);
+			starts = (const uint32 *) (reply + 4);
+			bytes = reply + head;
+			if (length < head + starts[n] + 4)
+				elog(ERROR, "malformed dictionary from ann node %s", node);
+			memcpy(&remapped, reply + head + starts[n], 4);
+			if (nnodes == 0)
+			{
+				count = n;
+				strings = palloc(sizeof(Datum) * Max(n, 1));
+				for (uint32 i = 0; i < n; i++)
+					strings[i] = PointerGetDatum(cstring_to_text_with_len(bytes + starts[i], starts[i + 1] - starts[i]));
+			}
+			else if (n != count)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("the nodes of \"%s\" hold different dictionaries for attribute \"%s\"", index,
+								attribute)));
+			if (remapped)
+			{
+				/* Adopt the codes this node holds. */
+				Datum	   *codes = palloc(sizeof(Datum) * Max(n, 1));
+				Oid			types[4] = {TEXTOID, TEXTOID, INT4ARRAYOID, TEXTARRAYOID};
+				Datum		values[4];
+
+				if (length != head + starts[n] + 4 + (Size) n * 4)
+					elog(ERROR, "malformed dictionary from ann node %s", node);
+				for (uint32 i = 0; i < n; i++)
+				{
+					int32		code;
+
+					memcpy(&code, reply + head + starts[n] + 4 + (Size) i * 4, 4);
+					codes[i] = Int32GetDatum(code);
+				}
+				values[0] = CStringGetTextDatum(name);
+				values[1] = CStringGetTextDatum(attribute);
+				values[2] = PointerGetDatum(construct_array(codes, n, INT4OID, 4, true, TYPALIGN_INT));
+				values[3] = PointerGetDatum(construct_array(strings, n, TEXTOID, -1, false, TYPALIGN_INT));
+				if (SPI_execute_with_args(psprintf("INSERT INTO %s (collection, attribute, code, value) "
+												   "SELECT $1, $2, c, v FROM unnest($3, $4) u(c, v) "
+												   "ON CONFLICT DO NOTHING", dictionary),
+										  4, types, values, NULL, false, 0) != SPI_OK_INSERT ||
+					SPI_execute_with_args(psprintf("SELECT 1 FROM unnest($3, $4) u(c, v) JOIN %s d ON "
+												   "d.collection = $1 AND d.attribute = $2 AND "
+												   "(d.value = u.v) <> (d.code = u.c) LIMIT 1", dictionary),
+										  4, types, values, NULL, false, 1) != SPI_OK_SELECT)
+					elog(ERROR, "could not record the dictionary of ann collection \"%s\"", name);
+				if (SPI_processed > 0)
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							 errmsg("ann node %s codes attribute \"%s\" of \"%s\" differently from this coordinator's catalog",
+									node, attribute, index),
+							 errhint("Load a collection's parts from one coordinator and attach them (NULL path) on the others.")));
+			}
+			nnodes++;
+		}
+
+		/* New strings get the next codes; then the part's map, in its order. */
+		{
+			Oid			types[3] = {TEXTOID, TEXTOID, TEXTARRAYOID};
+			Datum		values[3];
+			uint32		n = count;
+
+			values[0] = CStringGetTextDatum(name);
+			values[1] = CStringGetTextDatum(attribute);
+			values[2] = PointerGetDatum(construct_array(strings, count, TEXTOID, -1, false, TYPALIGN_INT));
+			if (SPI_execute_with_args(psprintf("INSERT INTO %s (collection, attribute, code, value) "
+											   "SELECT $1, $2, (SELECT coalesce(max(code), -1) FROM %s "
+											   "WHERE collection = $1 AND attribute = $2) + row_number() OVER (ORDER BY o), v "
+											   "FROM unnest($3) WITH ORDINALITY u(v, o) WHERE NOT EXISTS "
+											   "(SELECT 1 FROM %s d WHERE d.collection = $1 AND d.attribute = $2 "
+											   "AND d.value = u.v)", dictionary, dictionary, dictionary),
+									  3, types, values, NULL, false, 0) != SPI_OK_INSERT ||
+				SPI_execute_with_args(psprintf("SELECT d.code FROM unnest($3) WITH ORDINALITY u(v, o) JOIN %s d "
+											   "ON d.collection = $1 AND d.attribute = $2 AND d.value = u.v "
+											   "ORDER BY o", dictionary),
+									  3, types, values, NULL, false, 0) != SPI_OK_SELECT ||
+				SPI_processed != count)
+				elog(ERROR, "could not code the dictionary of ann collection \"%s\"", name);
+			PutName(&remap, index);
+			PutName(&remap, attribute);
+			appendBinaryStringInfo(&remap, (char *) &n, 4);
+			for (uint64 i = 0; i < SPI_processed; i++)
+			{
+				bool		isnull;
+				int32		code = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1,
+															   &isnull));
+
+				appendBinaryStringInfo(&remap, (char *) &code, 4);
+			}
+		}
+		SPI_finish();
+		list = pstrdup(nodes);
+		save = NULL;
+		for (char *node = strtok_r(list, ", ", &save); node; node = strtok_r(NULL, ", ", &save))
+		{
+			uint32		status;
+			char	   *reply;
+			uint32		length;
+
+			if (!NodeCall(node, ANN_OP_REMAP, remap.data, remap.len, &status, &reply, &length) ||
+				status != ANN_STATUS_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						 errmsg("could not map attribute \"%s\" of \"%s\" to the collection's dictionary on ann node %s (status %u)",
+								attribute, index, node, status),
+						 errhint("Status 1: the node holds another map, or searched the index before it was mapped; reload it.")));
+		}
+	}
+}
+
 /*
  * ann_collection_load(collection, part, index_name, path, nodes,
  * placement_low, placement_high): load a part's index directory on every
@@ -1211,6 +1564,8 @@ ann_collection_load(PG_FUNCTION_ARGS)
 	char	   *save = NULL;
 	int			nnodes = 0;
 	Oid			types[7] = {TEXTOID, INT4OID, TEXTOID, TEXTOID, TEXTOID, INT4OID, INT4OID};
+	char	   *previousIndex = NULL;
+	char	   *previousNodes = NULL;
 	Datum		values[7];
 	char		valueNulls[7] = {' ', ' ', ' ', ' ', ' ', ' ', ' '};
 
@@ -1269,6 +1624,31 @@ ann_collection_load(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 				 errmsg("no nodes given for ann collection part %d", part)));
+	MapTextAttributes(fcinfo, text_to_cstring(collection), index, nodes);
+	PushCollectionTombstones(fcinfo, text_to_cstring(collection), index, nodes);
+
+	/* The index this part used until now, for unload_previous. */
+	if (PG_NARGS() > 7 && !PG_ARGISNULL(7) && PG_GETARG_BOOL(7))
+	{
+		Oid			keyTypes[2] = {TEXTOID, INT4OID};
+		Datum		keyValues[2] = {PointerGetDatum(collection), Int32GetDatum(part)};
+
+		if (SPI_connect() != SPI_OK_CONNECT)
+			elog(ERROR, "SPI_connect failed");
+		if (SPI_execute_with_args(psprintf("SELECT index_name, nodes FROM %s WHERE collection = $1 AND part = $2",
+										   CatalogTable(fcinfo, "ann_collection_part")),
+								  2, keyTypes, keyValues, NULL, false, 1) != SPI_OK_SELECT)
+			elog(ERROR, "could not read the ann collection catalog");
+		if (SPI_processed == 1)
+		{
+			MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+
+			previousIndex = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
+			previousNodes = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2));
+			MemoryContextSwitchTo(old);
+		}
+		SPI_finish();
+	}
 
 	values[0] = PointerGetDatum(collection);
 	values[1] = Int32GetDatum(part);
@@ -1290,7 +1670,49 @@ ann_collection_load(PG_FUNCTION_ARGS)
 									   CatalogTable(fcinfo, "ann_collection_part"), (unsigned long long) rows),
 							  7, types, values, valueNulls, false, 0) != SPI_OK_INSERT)
 		elog(ERROR, "could not record ann collection part %d", part);
+
+	/*
+	 * unload_previous: free the replaced index on its nodes, unless another
+	 * part still names it. Searches of other coordinators whose catalogs
+	 * still name it get "stale" and reread theirs; attach the new part there
+	 * first.
+	 */
+	if (previousIndex && strcmp(previousIndex, index) != 0)
+	{
+		Oid			nameTypes[1] = {TEXTOID};
+		Datum		nameValues[1] = {CStringGetTextDatum(previousIndex)};
+
+		if (SPI_execute_with_args(psprintf("SELECT 1 FROM %s WHERE index_name = $1 LIMIT 1",
+										   CatalogTable(fcinfo, "ann_collection_part")),
+								  1, nameTypes, nameValues, NULL, false, 1) != SPI_OK_SELECT)
+			elog(ERROR, "could not read the ann collection catalog");
+		if (SPI_processed > 0)
+			previousIndex = NULL;
+	}
+	else
+		previousIndex = NULL;
 	SPI_finish();
+	if (previousIndex)
+	{
+		StringInfoData payload;
+		uint32		length = strlen(previousIndex);
+		char	   *position = NULL;
+
+		initStringInfo(&payload);
+		appendBinaryStringInfo(&payload, (char *) &length, 4);
+		appendBinaryStringInfo(&payload, previousIndex, length);
+		for (char *node = strtok_r(previousNodes, ", ", &position); node; node = strtok_r(NULL, ", ", &position))
+		{
+			uint32		status;
+			char	   *reply;
+			uint32		replyLength;
+
+			if (!NodeCall(node, ANN_OP_UNLOAD_INDEX, payload.data, payload.len, &status, &reply, &replyLength))
+				ereport(WARNING,
+						(errmsg("ann node %s is unavailable; replaced index \"%s\" stays loaded there", node,
+								previousIndex)));
+		}
+	}
 	ForgetCollection(text_to_cstring(collection));
 	PG_RETURN_INT64((int64) rows);
 }
@@ -1337,9 +1759,11 @@ ann_collection_delta(PG_FUNCTION_ARGS)
 
 /*
  * ann_index_unload(index_name, nodes): unload a loaded index from every
- * node of a host:port list (ann.worker_address when NULL), as after a
- * collection part was replaced: each node frees it once the searches using
- * it are done. Returns the nodes that had it loaded.
+ * node of a host:port list, as after a collection part was replaced, or
+ * with NULL from this host's worker (ann.worker_address, else
+ * ann.worker_socket), as after a frozen table's generation switch, removing
+ * its ann_index_catalog row. Each node frees it once the searches using it
+ * are done. Returns the nodes that had it loaded.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_index_unload);
 Datum
@@ -1357,12 +1781,47 @@ ann_index_unload(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
 				 errmsg("index name is required")));
 	index = text_to_cstring(PG_GETARG_TEXT_PP(0));
-	nodes = PG_ARGISNULL(1) ? pstrdup(ann_worker_address ? ann_worker_address : "") :
-		text_to_cstring(PG_GETARG_TEXT_PP(1));
 	length = strlen(index);
 	initStringInfo(&payload);
 	appendBinaryStringInfo(&payload, (char *) &length, 4);
 	appendBinaryStringInfo(&payload, index, length);
+	if (PG_ARGISNULL(1))
+	{
+		/*
+		 * This host's own worker (ann.worker_address or ann.worker_socket):
+		 * the index was loaded with ann_index_load, so its catalog row goes.
+		 */
+		if (AnnRemoteConfigured())
+			nodes = pstrdup(ann_worker_address);
+		else
+		{
+			uint32		status = 0;
+			char	   *reply = NULL;
+			uint32		replyLength = 0;
+
+			nodes = pstrdup("");
+			if (!AnnWorkerCall(ANN_OP_UNLOAD_INDEX, payload.data, payload.len, ann_worker_timeout_ms, &status,
+							   &reply, &replyLength))
+				ereport(WARNING,
+						(errmsg("the ann worker is unavailable; index \"%s\" stays loaded there", index)));
+			else if (status == ANN_STATUS_OK)
+				unloaded++;
+		}
+		{
+			Oid			types[1] = {TEXTOID};
+			Datum		values[1] = {CStringGetTextDatum(index)};
+
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			if (SPI_execute_with_args(psprintf("DELETE FROM %s WHERE name = $1",
+											   CatalogTable(fcinfo, "ann_index_catalog")),
+									  1, types, values, NULL, false, 0) != SPI_OK_DELETE)
+				elog(ERROR, "could not update the ann index catalog");
+			SPI_finish();
+		}
+	}
+	else
+		nodes = text_to_cstring(PG_GETARG_TEXT_PP(1));
 	for (char *node = strtok_r(nodes, ", ", &save); node; node = strtok_r(NULL, ", ", &save))
 	{
 		AnnRemoteRequest request;
@@ -1380,4 +1839,67 @@ ann_index_unload(PG_FUNCTION_ARGS)
 			unloaded++;
 	}
 	PG_RETURN_INT32(unloaded);
+}
+
+/*
+ * ann_collection_delete(collection, keys): delete a collection's rows by
+ * key without touching its frozen partitions: recorded in
+ * ann_collection_tombstone and sent to every part's nodes, which leave them
+ * out of searches; parts loaded later get them too. Rebuild the partitions
+ * without them, then delete their tombstones. Deleted keys still in the
+ * delta table are the delta's to delete. Returns how many were newly
+ * recorded.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_collection_delete);
+Datum
+ann_collection_delete(PG_FUNCTION_ARGS)
+{
+	Oid			types[2] = {TEXTOID, INT8ARRAYOID};
+	Datum		values[2];
+	ArrayType  *array;
+	Datum	   *elements;
+	bool	   *nulls;
+	int			count;
+	int64	   *keys;
+	int			nkeys = 0;
+	int64		recorded;
+	List	   *parts = NIL;
+	ListCell   *cell;
+
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("collection and keys are required")));
+	values[0] = PG_GETARG_DATUM(0);
+	values[1] = PG_GETARG_DATUM(1);
+	array = PG_GETARG_ARRAYTYPE_P(1);
+	deconstruct_array(array, INT8OID, 8, true, TYPALIGN_DOUBLE, &elements, &nulls, &count);
+	keys = palloc(sizeof(int64) * Max(count, 1));
+	for (int i = 0; i < count; i++)
+		if (!nulls[i])
+			keys[nkeys++] = DatumGetInt64(elements[i]);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("INSERT INTO %s (collection, key) SELECT $1, k FROM unnest($2) k "
+									   "WHERE k IS NOT NULL ON CONFLICT DO NOTHING",
+									   CatalogTable(fcinfo, "ann_collection_tombstone")),
+							  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not record the ann collection tombstones");
+	recorded = (int64) SPI_processed;
+	if (SPI_execute_with_args(psprintf("SELECT index_name, nodes FROM %s WHERE collection = $1",
+									   CatalogTable(fcinfo, "ann_collection_part")),
+							  1, types, values, NULL, false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann collection catalog");
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		MemoryContext old = MemoryContextSwitchTo(TopTransactionContext);
+
+		parts = lappend(parts, pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+		parts = lappend(parts, pstrdup(SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2)));
+		MemoryContextSwitchTo(old);
+	}
+	SPI_finish();
+	for (cell = list_head(parts); cell; cell = lnext(parts, lnext(parts, cell)))
+		SendCollectionTombstones(lfirst(cell), lfirst(lnext(parts, cell)), keys, nkeys);
+	PG_RETURN_INT64(recorded);
 }

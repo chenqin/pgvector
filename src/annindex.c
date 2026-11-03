@@ -184,6 +184,7 @@ BitmapTableName(FunctionCallInfo fcinfo)
 }
 
 static int64 PushAllBitmaps(FunctionCallInfo fcinfo, const char *name);
+static void PushTombstones(FunctionCallInfo fcinfo, const char *name, const char *source);
 
 /*
  * A filter's cache id: a hash of the index name and the filter's text. Every
@@ -517,6 +518,8 @@ ann_index_load(PG_FUNCTION_ARGS)
 	CheckSource(&info);
 	CheckGeneration(&info);
 	RecordCatalog(fcinfo, name, &info);
+	if (strcmp(info.source, "-") != 0)
+		PushTombstones(fcinfo, name, QualifiedSource(info.source));
 
 	/* Freshly started nodes have no bitmaps: cache the stored ones. */
 	{
@@ -552,6 +555,8 @@ ann_index_attach(PG_FUNCTION_ARGS)
 	CheckSource(&info);
 	CheckGeneration(&info);
 	RecordCatalog(fcinfo, name, &info);
+	if (strcmp(info.source, "-") != 0)
+		PushTombstones(fcinfo, name, QualifiedSource(info.source));
 
 	/* Freshly started nodes have no bitmaps: cache the stored ones. */
 	{
@@ -1532,4 +1537,134 @@ AnnCatalogNameFor(Oid relid, uint64 generation)
 	}
 	SPI_finish();
 	return name;
+}
+
+/*
+ * Tombstones (ann_frozen_tombstone): deleted rows of a frozen table, by
+ * key, that searches leave out until the table is rebuilt without them.
+ * Sent to every worker of this host for a loaded name, in batches; a worker
+ * ignores keys its index doesn't hold.
+ */
+static void
+SendTombstones(const char *name, const int64 *keys, int count)
+{
+	for (int first = 0; first < count; first += ANN_TOMBSTONE_BATCH)
+	{
+		int			n = Min(count - first, ANN_TOMBSTONE_BATCH);
+		StringInfoData payload;
+		uint32		length = strlen(name);
+		uint32		status = 0;
+		char	   *reply = NULL;
+		uint32		replyLength = 0;
+		bool		ok;
+
+		initStringInfo(&payload);
+		appendBinaryStringInfo(&payload, (char *) &length, 4);
+		appendBinaryStringInfo(&payload, name, length);
+		length = (uint32) n;
+		appendBinaryStringInfo(&payload, (char *) &length, 4);
+		appendBinaryStringInfo(&payload, (char *) (keys + first), sizeof(int64) * n);
+		if (AnnRemoteConfigured())
+			ok = AnnRemoteBroadcast(ANN_OP_DELETE_KEYS, payload.data, payload.len, ann_worker_timeout_ms,
+									&status, &reply, &replyLength) >= 0 && status == ANN_STATUS_OK;
+		else
+			ok = AnnWorkerCall(ANN_OP_DELETE_KEYS, payload.data, payload.len, ann_worker_timeout_ms,
+							   &status, &reply, &replyLength) && status == ANN_STATUS_OK;
+		if (!ok)
+			ereport(ERROR,
+					(errcode(ERRCODE_CONNECTION_FAILURE),
+					 errmsg("could not send deleted rows of ann index \"%s\" to the ann worker (status %u)", name,
+							status)));
+	}
+}
+
+static char *
+TombstoneTable(FunctionCallInfo fcinfo)
+{
+	char	   *schema = get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid));
+
+	return psprintf("%s.ann_frozen_tombstone", quote_identifier(schema));
+}
+
+/* After a load or attach: the table's tombstones to the loaded name. */
+static void
+PushTombstones(FunctionCallInfo fcinfo, const char *name, const char *source)
+{
+	Oid			types[1] = {TEXTOID};
+	Datum		values[1] = {CStringGetTextDatum(source)};
+	int64	   *keys;
+	int			count;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("SELECT key FROM %s WHERE source = $1::regclass", TombstoneTable(fcinfo)),
+							  1, types, values, NULL, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann tombstones");
+	count = (int) SPI_processed;
+	keys = MemoryContextAlloc(TopTransactionContext, sizeof(int64) * Max(count, 1));
+	for (int i = 0; i < count; i++)
+	{
+		bool		isnull;
+
+		keys[i] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+	}
+	SPI_finish();
+	if (count > 0)
+		SendTombstones(name, keys, count);
+}
+
+/*
+ * ann_frozen_delete(table, keys): delete rows of a frozen table by key
+ * without touching it: they're recorded in ann_frozen_tombstone and sent to
+ * every loaded export of the table, and the frozen route leaves them out.
+ * Other scans of the table still see them; rebuild the table without them
+ * (then clear their tombstones) to remove them for good. Returns how many
+ * were newly recorded.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_delete);
+Datum
+ann_frozen_delete(PG_FUNCTION_ARGS)
+{
+	Oid			table = PG_GETARG_OID(0);
+	ArrayType  *array = PG_GETARG_ARRAYTYPE_P(1);
+	Oid			types[2] = {OIDOID, INT8ARRAYOID};
+	Datum		values[2] = {ObjectIdGetDatum(table), PointerGetDatum(array)};
+	int64		recorded;
+	List	   *names = NIL;
+	Datum	   *elements;
+	bool	   *nulls;
+	int			count;
+	int64	   *keys;
+	int			nkeys = 0;
+	ListCell   *cell;
+
+	RequireSuperuser("delete from");
+	if (!AnnFrozenTableFrozen(table))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("\"%s\" is not a frozen table", get_rel_name(table)),
+				 errhint("Delete from it as usual.")));
+	deconstruct_array(array, INT8OID, 8, true, TYPALIGN_DOUBLE, &elements, &nulls, &count);
+	keys = palloc(sizeof(int64) * Max(count, 1));
+	for (int i = 0; i < count; i++)
+		if (!nulls[i])
+			keys[nkeys++] = DatumGetInt64(elements[i]);
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("INSERT INTO %s (source, key) SELECT $1, k FROM unnest($2) k "
+									   "WHERE k IS NOT NULL ON CONFLICT DO NOTHING", TombstoneTable(fcinfo)),
+							  2, types, values, NULL, false, 0) != SPI_OK_INSERT)
+		elog(ERROR, "could not record the ann tombstones");
+	recorded = (int64) SPI_processed;
+	if (SPI_execute_with_args(psprintf("SELECT name FROM %s WHERE source = $1", CatalogName(fcinfo)),
+							  1, types, values, NULL, false, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann index catalog");
+	for (uint64 i = 0; i < SPI_processed; i++)
+		names = lappend(names, MemoryContextStrdup(TopTransactionContext,
+												   SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
+	SPI_finish();
+	foreach(cell, names)
+		SendTombstones(lfirst(cell), keys, nkeys);
+	AnnFrozenTombstonesChanged();
+	PG_RETURN_INT64(recorded);
 }

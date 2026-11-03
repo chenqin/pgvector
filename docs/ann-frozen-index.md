@@ -169,7 +169,7 @@ The stats reply (operation 8) adds `predicate_hits`, `predicate_evaluations`, `p
 
 ## Export
 
-`ann_index_export(index, directory)` writes `manifest` (with `shards 0` and `generation G`), `keys.i64`, `vectors.f32` without the `Vector` headers, and one `attr-COLUMN.i32` per attribute: integers as themselves, booleans as 0/1, dates as days, text as its dictionary codes (so `ann_attribute_search` on a text attribute takes codes; the frozen route translates strings itself). Names that a manifest can't hold (spaces, slashes, more than 63 bytes) are refused. The directory must be absolute and new or empty, and the manifest is written last with `durable_rename`. It needs superuser or `pg_write_server_files`, plus `SELECT` on the table. `build_cuvs_index.py --from-export` hard-links the files into the index directory (copying across file systems), keeps the export's `source`, `key`, `vector`, `attribute` and `generation` lines, and adds shards, `dtype` and `quant`; one export can feed several builds.
+`ann_index_export(index, directory)` writes `manifest` (with `shards 0` and `generation G`), `keys.i64`, `vectors.f32` without the `Vector` headers, and one `attr-COLUMN.i32` per attribute: integers as themselves, booleans as 0/1, dates as days, text as its dictionary codes (so `ann_attribute_search` on a text attribute takes codes; the frozen route translates strings itself), with the dictionary in `attr-COLUMN.strings` (the strings' bytes in code order) and `attr-COLUMN.starts` (u32 offsets) and a `dictionary COLUMN STRINGS STARTS` manifest line, which [collections](ann-collections.md#text-attributes) map to their own codes. Names that a manifest can't hold (spaces, slashes, more than 63 bytes) are refused. The directory must be absolute and new or empty, and the manifest is written last with `durable_rename`. It needs superuser or `pg_write_server_files`, plus `SELECT` on the table. `build_cuvs_index.py --from-export` hard-links the files into the index directory (copying across file systems), keeps the export's `source`, `key`, `vector`, `attribute` and `generation` lines, and adds shards, `dtype` and `quant`; one export can feed several builds.
 
 `ann_frozen_info`, `ann_frozen_keys`, `ann_frozen_filter` and `ann_index_filter` need `SELECT` on the table and refuse tables with row-level security, since they return rows without applying policies.
 
@@ -204,7 +204,17 @@ PostgreSQL merges the two ordered inputs under one `LIMIT`, with its own MVCC fo
 1. Build the next base: `CREATE TABLE docs_base2 AS SELECT * FROM docs` (base and delta), then `ann_freeze`, `VACUUM (FREEZE)`, `CREATE INDEX ... WITH (frozen = true)`: generation G2.
 2. Export, build and `ann_index_load('docs_g2', ...)`. The catalog now has a row for G2. Queries keep using G1, because the route looks up the worker by the generation of the table it scans.
 3. In one transaction, detach `docs_base` and the delta, attach `docs_base2` and a new empty delta (or delete the moved rows from the old delta). Queries planned after it scan G2 with the G2 worker; no request can reach a bitmap of the other generation, since ids and headers carry it.
-4. Drop the old base table: its index and guard trigger go with it. The worker keeps the old name loaded until it restarts.
+4. Drop the old base table (its index and guard trigger go with it) and free the old export on the worker: `SELECT ann_index_unload('docs_g1')` unloads it from this host's worker (`ann.worker_address`, else `ann.worker_socket`) once its running searches finish, and removes its `ann_index_catalog` row.
+
+## Deleting rows
+
+A frozen table refuses `DELETE`, but `ann_frozen_delete(table, keys)` removes rows from searches without touching it:
+
+```sql
+SELECT ann_frozen_delete('docs_base', ARRAY[42, 1043]);   -- returns how many keys were new
+```
+
+The keys go into `ann_frozen_tombstone` and to every loaded export of the table (operation 29; `ann_index_load` and `ann_index_attach` send them to exports loaded later). The frozen route leaves them out on both paths: the worker drops them from its predicate results and hits, and the pages route skips their ordinals (each backend rereads the table's tombstones at most once a second, at once after its own delete). Other scans of the table, such as sequential scans or the access method's ordered index scans, still return them: query through the frozen route, or use a `UNION ALL` view that filters them out. To remove them for good, rebuild the table without them (as when [publishing a new generation](#new-rows-a-frozen-base-and-a-delta)) and delete their tombstones.
 
 ## Measurements
 

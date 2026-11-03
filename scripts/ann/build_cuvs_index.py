@@ -128,7 +128,7 @@ def read_export(directory):
     """Manifest lines, keys and memory-mapped vectors of an ann_index_export directory."""
     with open(os.path.join(directory, 'manifest')) as manifest:
         lines = [line.rstrip('\n') for line in manifest if line.strip()]
-    fields = dict(line.split(' ', 1) for line in lines if not line.startswith('attribute '))
+    fields = dict(line.split(' ', 1) for line in lines if not line.startswith(('attribute ', 'dictionary ')))
     if fields.get('pgvector-ann-index') != '1' or 'generation' not in fields or fields.get('shards') != '0':
         raise SystemExit(f'{directory} is not an ann_index_export directory')
     rows, dimensions = int(fields['rows']), int(fields['dimensions'])
@@ -137,6 +137,45 @@ def read_export(directory):
     if len(keys) != rows:
         raise SystemExit(f'{directory}/keys.i64 does not hold {rows} keys')
     return lines, keys, vectors
+
+
+NULL_CODE = -2 ** 31
+
+
+def read_dictionary(directory, lines, name):
+    """A text attribute's strings (bytes) in code order, from its dictionary line."""
+    _, _, strings_file, starts_file = next(line.split() for line in lines
+                                           if line.startswith('dictionary ') and line.split()[1] == name)
+    starts = np.fromfile(os.path.join(directory, starts_file), dtype='<u4')
+    with open(os.path.join(directory, strings_file), 'rb') as source:
+        data = source.read()
+    return [data[starts[i]:starts[i + 1]] for i in range(len(starts) - 1)]
+
+
+def merge_dictionary(name, parts, out):
+    """One dictionary for a text attribute over every member, in first-appearance order, and
+    the members' codes rewritten to it. Collections map part codes to their own dictionary
+    at load, so these codes need not follow the collation."""
+    strings, codes = [], {}
+    with open(os.path.join(out, f'attr-{name}.i32'), 'wb') as target:
+        for part in parts:
+            member = read_dictionary(part[1], part[2], name)
+            remap = np.empty(len(member), dtype='<i4')
+            for i, string in enumerate(member):
+                if string not in codes:
+                    codes[string] = len(strings)
+                    strings.append(string)
+                remap[i] = codes[string]
+            column_file = dict((column, file) for column, file in part[4])[name]
+            values = np.fromfile(os.path.join(part[1], column_file), dtype='<i4')
+            coded = values != NULL_CODE
+            values[coded] = remap[values[coded]]
+            values.tofile(target)
+    starts = np.zeros(len(strings) + 1, dtype='<u4')
+    starts[1:] = np.cumsum([len(string) for string in strings])
+    starts.tofile(os.path.join(out, f'attr-{name}.starts'))
+    with open(os.path.join(out, f'attr-{name}.strings'), 'wb') as target:
+        target.write(b''.join(strings))
 
 
 def combine_exports(directories, out):
@@ -148,7 +187,7 @@ def combine_exports(directories, out):
     parts = []
     for directory in directories:
         lines, keys, vectors = read_export(directory)
-        fields = dict(line.split(' ', 1) for line in lines if not line.startswith('attribute '))
+        fields = dict(line.split(' ', 1) for line in lines if not line.startswith(('attribute ', 'dictionary ')))
         attributes = [line.split()[1:] for line in lines if line.startswith('attribute ')]
         parts.append((keys[0] if len(keys) else 0, directory, lines, fields, attributes, keys, vectors))
     parts.sort(key=lambda part: part[0])
@@ -167,7 +206,13 @@ def combine_exports(directories, out):
         members.append((fields.get('source', '-'), first, len(keys), fields['generation']))
         digest.update(f'{fields["generation"]} {len(keys)};'.encode())
         first += len(keys)
-    names = ['keys.i64', 'vectors.f32'] + [f'attr-{name}.i32' for name in attributes]
+    dictionaries = {line.split()[1] for line in parts[0][2] if line.startswith('dictionary ')}
+    for part in parts:
+        if {line.split()[1] for line in part[2] if line.startswith('dictionary ')} != dictionaries:
+            raise SystemExit(f'{part[1]} has other text attributes than {parts[0][1]}')
+    for name in sorted(dictionaries):
+        merge_dictionary(name, parts, out)
+    names = ['keys.i64', 'vectors.f32'] + [f'attr-{name}.i32' for name in attributes if name not in dictionaries]
     for name in names:
         source_names = {'keys.i64': 'keys.i64', 'vectors.f32': 'vectors.f32'}
         with open(os.path.join(out, name), 'wb') as target:
@@ -179,6 +224,7 @@ def combine_exports(directories, out):
     rows = first
     lines = [line for line in parts[0][2] if line.split(' ', 1)[0] in ('source', 'key', 'vector')]
     lines += [f'attribute {name} attr-{name}.i32' for name in attributes]
+    lines += [f'dictionary {name} attr-{name}.strings attr-{name}.starts' for name in sorted(dictionaries)]
     lines.append(f'generation {digest.hexdigest()[:16]}')
     keys = np.fromfile(os.path.join(out, 'keys.i64'), dtype='<i8')
     vectors = np.memmap(os.path.join(out, 'vectors.f32'), dtype='<f4', mode='r', shape=(rows, dimensions))
@@ -321,9 +367,9 @@ def main():
         exported, keys, vectors = read_export(args.from_export[0])
         rows, dimensions = vectors.shape
         for line in exported:
-            if line.startswith('attribute '):
-                link_or_copy(os.path.join(args.from_export[0], line.split()[2]),
-                             os.path.join(args.out, line.split()[2]))
+            for file in (line.split()[2:3] if line.startswith('attribute ') else
+                         line.split()[2:4] if line.startswith('dictionary ') else []):
+                link_or_copy(os.path.join(args.from_export[0], file), os.path.join(args.out, file))
         for name in ('keys.i64', 'vectors.f32'):
             link_or_copy(os.path.join(args.from_export[0], name), os.path.join(args.out, name))
         log(f'linked the export of {rows} rows x {dimensions} dims')
@@ -365,17 +411,18 @@ def main():
     # The manifest is written last, so a partial build is never loadable.
     if exported:
         # Keep the export's table, columns, attributes and generation.
-        kept = [line for line in exported if line.split(' ', 1)[0] in ('source', 'key', 'vector', 'attribute')]
+        kept = [line for line in exported
+                if line.split(' ', 1)[0] in ('source', 'key', 'vector', 'attribute', 'dictionary')]
         generation = [line for line in exported if line.startswith('generation ')]
     else:
         kept = [f'source {args.table}', f'key {args.key}', f'vector {args.vector}']
         kept += [f'attribute {column} attr-{column}.i32' for column in args.attribute]
         generation = []
     lines = ['pgvector-ann-index 1', f'dimensions {dimensions}', f'rows {rows}', 'metric l2',
-             f'dtype {args.dtype}'] + [line for line in kept if not line.startswith('attribute ')]
+             f'dtype {args.dtype}'] + [line for line in kept if not line.startswith(('attribute ', 'dictionary '))]
     lines += [f'shards {len(shards)}']
     lines += [f'shard {i} {first} {n} shard-{i}.cagra' for i, first, n in shards]
-    lines += [line for line in kept if line.startswith('attribute ')] + generation
+    lines += [line for line in kept if line.startswith(('attribute ', 'dictionary '))] + generation
     lines += [f'# member {source} {first} {n} {member_generation}' for source, first, n, member_generation in members]
     if args.quantize:
         lines.append(f'quant {args.quantize}')

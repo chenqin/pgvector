@@ -611,6 +611,48 @@ class FrozenTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_tombstones(self):
+        """ann_frozen_delete: deleted keys leave the frozen route, on the pages and on the worker, and reach
+        exports loaded later; the table itself is untouched."""
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            query = '[1,2,3,4]'
+            nearest = [row[0] for row in self.db.execute(
+                "SELECT id FROM docs ORDER BY emb <-> %s::vector, id LIMIT 6", (query,)).fetchall()]
+            deleted = nearest[:3] + [999999]  # an unknown key is ignored
+            self.assertEqual(self.value('SELECT ann_frozen_delete(%s, %s)', ('docs', deleted)), 4)
+            self.assertEqual(self.value('SELECT ann_frozen_delete(%s, %s)', ('docs', deleted)), 0)
+            self.assertEqual(self.value('SELECT count(*) FROM docs WHERE id = ANY(%s)', (deleted,)), 3)
+
+            def expected(predicate, limit):
+                return [row[0] for row in self.db.execute(
+                    f'SELECT id FROM docs WHERE ({predicate}) AND id <> ALL(%s) '
+                    f'ORDER BY emb <-> %s::vector, id LIMIT {limit}', (deleted, query)).fetchall()]
+
+            for predicate in ['true', 'tenant < 7', 'category IS NOT NULL']:
+                actual, plan = self.route(predicate, query, 10)          # pages: no worker yet
+                self.assertIn('AnnFrozenSearch', plan)
+                self.assertEqual([row[0] for row in actual], expected(predicate, 10), predicate)
+            name = 'frozen_' + uuid.uuid4().hex[:8]
+            self.load(server, name)                                       # tombstones go with the load
+            for predicate in ['true', 'tenant < 7', 'category IS NOT NULL']:
+                actual, plan = self.route(predicate, query, 10)
+                self.assertIn(f'GPU worker "{name}"', plan, predicate)
+                self.assertEqual([row[0] for row in actual], expected(predicate, 10), predicate)
+            # Deleting while loaded reaches the worker at once, and drops its cached predicate results.
+            more = expected('tenant < 7', 2)
+            self.db.execute('SELECT ann_frozen_delete(%s, %s)', ('docs', more))
+            deleted += more
+            actual, _ = self.route('tenant < 7', query, 10)
+            self.assertEqual([row[0] for row in actual], expected('tenant < 7', 10))
+            self.assertIn('is not a frozen table', self.error('SELECT ann_frozen_delete(%s, %s)',
+                                                              ('pg_class', [1])))
+        finally:
+            server.close()
+
     def test_generation_mismatch_and_switch(self):
         subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)

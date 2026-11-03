@@ -183,8 +183,9 @@ WriteExactVectors(Relation index, const AnnFrozenMetaData *meta, const char *dir
 /*
  * ann_index_export(index, directory): write a frozen index's rows in the
  * worker's directory format: keys.i64, vectors.f32, one attr-COLUMN.i32 per
- * INCLUDE column after the key, and a manifest with the index's generation
- * and no CAGRA shards. scripts/ann/build_cuvs_index.py --from-export adds
+ * INCLUDE column after the key (for text, codes of the index's dictionary,
+ * written as attr-COLUMN.strings and attr-COLUMN.starts), and a manifest
+ * with the index's generation and no CAGRA shards. scripts/ann/build_cuvs_index.py --from-export adds
  * the shards; ann_index_load checks the generation against the table.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_index_export);
@@ -236,6 +237,8 @@ ann_index_export(PG_FUNCTION_ARGS)
 		const char *name = ManifestWord(NameStr(AnnFrozenGetNames(meta)[c]), 63, "column");
 
 		appendStringInfo(&manifest, "attribute %s attr-%s.i32\n", name, name);
+		if (AnnFrozenTextType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
+			appendStringInfo(&manifest, "dictionary %s attr-%s.strings attr-%s.starts\n", name, name, name);
 	}
 	appendStringInfo(&manifest, "generation %016llx\n", (unsigned long long) meta->generation);
 
@@ -247,8 +250,19 @@ ann_index_export(PG_FUNCTION_ARGS)
 	else
 		WriteExactVectors(index, meta, directory);
 	for (uint32 c = 0; c < meta->ncolumns; c++)
-		WriteArrayFile(index, &meta->columns[c].values, directory,
-					   psprintf("attr-%s.i32", NameStr(AnnFrozenGetNames(meta)[c])), 0, sizeof(int32));
+	{
+		const char *name = NameStr(AnnFrozenGetNames(meta)[c]);
+
+		WriteArrayFile(index, &meta->columns[c].values, directory, psprintf("attr-%s.i32", name), 0, sizeof(int32));
+		if (AnnFrozenTextType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
+		{
+			/* the strings in code (collation) order, and their starts */
+			WriteArrayFile(index, &AnnFrozenGetExtra(meta)[c].strings, directory,
+						   psprintf("attr-%s.strings", name), 0, 1);
+			WriteArrayFile(index, &AnnFrozenGetExtra(meta)[c].starts, directory,
+						   psprintf("attr-%s.starts", name), 0, sizeof(uint32));
+		}
+	}
 
 	/* The manifest comes last, so a partial export is never loadable. */
 	temporary = psprintf("%s/manifest.tmp", directory);

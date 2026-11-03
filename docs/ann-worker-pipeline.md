@@ -34,6 +34,7 @@ The worker must run on the database host as a user that can create sockets where
 | `--max-batch` | 64 | Jobs per submission. Lanes leave queued work for idle lanes. |
 | `--delay-us` | 0 | Optional wait to fill a partial batch while no lane is idle. |
 | `--max-pending-mb` | 512 | Admission budget for queued and running work across all connections. |
+| `--index-pending-share PERCENT` | 100 | The share of that budget one loaded index's searches may hold, so a flood on one index can't starve the others; refusals count in `rejected` and `rejected_index`. Use 25–50 on workers serving several indexes or collection parts. |
 | `--trace FILE`, `--trace-sample N` | off, 64 | Append arrival, queued, started, finished and replied times of requests whose ID is a multiple of N ([tracing](ann-networked.md#rdma-infiniband-roce)). |
 
 `ANN_MOCK_GPU_LAUNCH_US` (default 100) and `ANN_MOCK_GPU_GBPS` (default 12) tune the mock device.

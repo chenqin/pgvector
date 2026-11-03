@@ -9,6 +9,8 @@
 #include "ann/filter.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
+#include "executor/spi.h"
 #include "executor/executor.h"
 #include "miscadmin.h"
 #include "nodes/extensible.h"
@@ -21,7 +23,9 @@
 #include "optimizer/paths.h"
 #include "optimizer/restrictinfo.h"
 #include "port/pg_bitutils.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/hsearch.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
@@ -86,6 +90,8 @@ typedef struct FrozenScanState
 	bool		exhausted;
 	uint64	   *returned;		/* ordinals already returned, for refills */
 	uint64		nreturned;
+	const uint64 *tombstones;	/* deleted rows' ordinals, sorted */
+	int			ntombstones;
 
 	/* EXPLAIN ANALYZE counters */
 	uint64		eligible;
@@ -96,6 +102,7 @@ typedef struct FrozenScanState
 } FrozenScanState;
 
 static char *WorkerName(Oid relid, uint64 generation, bool refresh);
+static void LoadTombstones(FrozenScanState *state);
 static Plan *PlanFrozenPath(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 							List *tlist, List *clauses, List *custom_plans);
 static Node *CreateFrozenScanState(CustomScan *scan);
@@ -307,6 +314,7 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 	state->workerRoute = -1;
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
 		return;
+	LoadTombstones(state);
 	state->fetch = table_index_fetch_begin(node->ss.ss_currentRelation);
 	state->heapSlot = table_slot_create(node->ss.ss_currentRelation, NULL);
 	if (AnnRemoteConfigured() || (ann_worker_socket && ann_worker_socket[0]))
@@ -327,6 +335,115 @@ typedef struct WorkerEntry
 } WorkerEntry;
 
 static HTAB *workerNames = NULL;
+
+/*
+ * Tombstones (ann_frozen_tombstone) of each frozen index's table, as this
+ * generation's ordinals, cached per backend: read again after a second, or
+ * at once after ann_frozen_delete in this backend.
+ */
+typedef struct TombstoneEntry
+{
+	Oid			indexOid;
+	uint64		generation;
+	uint64		epoch;
+	TimestampTz checked;
+	uint64	   *ordinals;
+	int			count;
+} TombstoneEntry;
+
+static HTAB *tombstoneCache = NULL;
+static uint64 tombstoneEpoch = 1;
+
+void
+AnnFrozenTombstonesChanged(void)
+{
+	tombstoneEpoch++;
+}
+
+static int	OrdinalCompare(const void *a, const void *b);
+
+static void
+LoadTombstones(FrozenScanState *state)
+{
+	Oid			indexOid = RelationGetRelid(state->index);
+	TombstoneEntry *entry;
+	bool		found;
+	TimestampTz now = GetCurrentTimestamp();
+	Oid			extension = get_extension_oid("vector", true);
+	Oid			schema = OidIsValid(extension) ? get_extension_schema(extension) : InvalidOid;
+	Oid			types[1] = {OIDOID};
+	Datum		values[1] = {ObjectIdGetDatum(state->index->rd_index->indrelid)};
+	uint64	   *ordinals;
+	int			count = 0;
+
+	if (tombstoneCache == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof(ctl));
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(TombstoneEntry);
+		tombstoneCache = hash_create("ann frozen tombstones", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+	}
+	entry = hash_search(tombstoneCache, &indexOid, HASH_ENTER, &found);
+	if (found && entry->generation == state->meta->generation && entry->epoch == tombstoneEpoch &&
+		!TimestampDifferenceExceeds(entry->checked, now, 1000))
+	{
+		state->tombstones = entry->ordinals;
+		state->ntombstones = entry->count;
+		return;
+	}
+	if (found && entry->ordinals)
+		pfree(entry->ordinals);
+	entry->ordinals = NULL;
+	entry->count = 0;
+	entry->generation = state->meta->generation;
+	entry->epoch = tombstoneEpoch;
+	entry->checked = now;
+	if (!OidIsValid(schema) || !OidIsValid(get_relname_relid("ann_frozen_tombstone", schema)))
+		return;
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	if (SPI_execute_with_args(psprintf("SELECT key FROM %s.ann_frozen_tombstone WHERE source = $1",
+									   quote_identifier(get_namespace_name(schema))),
+							  1, types, values, NULL, true, 0) != SPI_OK_SELECT)
+		elog(ERROR, "could not read the ann tombstones");
+	ordinals = MemoryContextAlloc(TopMemoryContext, sizeof(uint64) * Max(SPI_processed, 1));
+	for (uint64 i = 0; i < SPI_processed; i++)
+	{
+		bool		isnull;
+		int64		key = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		uint64		low = 0;
+		uint64		high = state->meta->rows;
+
+		/* the key's ordinal: keys are sorted */
+		while (low < high)
+		{
+			uint64		middle = low + (high - low) / 2;
+			int64		probe;
+
+			AnnArrayRead(&state->keys, middle, &probe);
+			if (probe < key)
+				low = middle + 1;
+			else
+				high = middle;
+		}
+		if (low < state->meta->rows)
+		{
+			int64		probe;
+
+			AnnArrayRead(&state->keys, low, &probe);
+			if (probe == key)
+				ordinals[count++] = low;
+		}
+	}
+	SPI_finish();
+	qsort(ordinals, count, sizeof(uint64), OrdinalCompare);
+	entry->ordinals = ordinals;
+	entry->count = count;
+	state->tombstones = ordinals;
+	state->ntombstones = count;
+}
 
 static char *
 WorkerName(Oid relid, uint64 generation, bool refresh)
@@ -677,6 +794,9 @@ FrozenNext(ScanState *node)
 		ordinal = state->ordinals[state->next++];
 		if (ordinal >= state->meta->rows || AlreadyReturned(state, ordinal))
 			continue;
+		if (state->ntombstones &&
+			bsearch(&ordinal, state->tombstones, state->ntombstones, sizeof(uint64), OrdinalCompare))
+			continue;			/* deleted (ann_frozen_delete) */
 		AnnArrayRead(&state->tids, ordinal, &tid);
 		if (!ItemPointerIsValid(&tid))
 			continue;

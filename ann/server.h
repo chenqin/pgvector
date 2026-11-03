@@ -21,11 +21,16 @@
 #define ANN_OP_INDEX_SEARCH_PREDICATE 22
 #define ANN_OP_COLLECTION_SEARCH 25
 #define ANN_OP_UNLOAD_INDEX 26
+#define ANN_OP_DICTIONARY 27
+#define ANN_OP_REMAP 28
+#define ANN_OP_DELETE_KEYS 29
 #define ANN_OP_INDEX_PREDICATE 23
 
 /* Operation 22 flags. */
 #define ANN_PREDICATE_ORDINALS 1	/* reply with ordinals instead of keys */
 #define ANN_PREDICATE_ATTRIBUTES 2	/* append each hit's attribute values */
+/* Text codes are the collection's: an unmapped index answers stale. */
+#define ANN_PREDICATE_COLLECTION_CODES 4
 
 typedef struct AnnServeOptions
 {
@@ -38,6 +43,9 @@ typedef struct AnnServeOptions
 								 * applies; 0 for three quarters of lanes */
 	uint64_t	max_batch_bytes;	/* vector bytes per submission */
 	uint64_t	max_pending_bytes;	/* queued and running payload bytes */
+	uint32_t	index_pending_share;	/* percent of max_pending_bytes one
+										 * loaded index may hold; 100 for no
+										 * limit */
 	uint64_t	delay_us;		/* wait for more jobs before a partial batch */
 	const char *tcp;			/* optional "host:port" network listener */
 	const char *token;			/* shared secret network clients must send */

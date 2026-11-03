@@ -178,6 +178,79 @@ class IndexWorkerTests(unittest.TestCase):
         connection.sendall(data)
         return receive(connection)
 
+    def test_index_pending_share(self):
+        """--index-pending-share: a flood on one index is refused past its share of the pending budget,
+        while searches of another index are still admitted."""
+        self.server.close()
+        self.server = Server('--backend', self.backend, '--lanes', '1', '--max-pending-mb', '1',
+                             '--index-pending-share', '50', executable=self.worker)
+        busy, _, _ = self.fixture('busy', rows=20000, dimensions=32, shards=1)
+        quiet, _, _ = self.fixture('quiet', rows=50, dimensions=32, shards=1, seed=4)
+
+        def predicate(request, name, k):
+            payload = (struct.pack('<I', len(name)) + name.encode() + struct.pack('<IIII', 32, k, 0, 1) +
+                       bytes([8]) + struct.pack('<32f', *([0.5] * 32)))
+            return frame(22, request, payload)
+
+        with self.server.connect() as connection:
+            self.assertEqual(self.call(connection, load_frame(1, 'busy', busy))[2], 0)
+            self.assertEqual(self.call(connection, load_frame(2, 'quiet', quiet))[2], 0)
+            # Each busy search charges about 240 KB (k = 10,000 hits): two fit in half of 1 MB.
+            for request in range(10, 16):
+                connection.sendall(predicate(request, 'busy', 10000))
+            connection.sendall(predicate(20, 'quiet', 10))
+            statuses = {}
+            while len(statuses) < 7:
+                _, request, status, _ = receive(connection)
+                statuses[request] = status
+            self.assertEqual(statuses[20], 0)
+            self.assertIn(7, [statuses[r] for r in range(10, 16)])  # ANN_OVERLOADED
+            self.assertIn(0, [statuses[r] for r in range(10, 16)])
+            stats = json.loads(self.call(connection, frame(STATS, 30))[3])
+            self.assertGreater(stats['rejected_index'], 0)
+            self.assertEqual(stats['pending_bytes'], 0)
+
+    def test_tombstones(self):
+        """Operation 29 deletes rows by key: unfiltered searches over-fetch past them (or, past 10,000
+        hits, run as filtered searches), filtered ones leave them out, and cached predicate results
+        that held them are dropped."""
+        path, keys, vectors = self.fixture('dead', rows=12000, dimensions=4, shards=3)
+        query = [0.5, -0.25, 1.0, 0.0]
+
+        def predicate(request, k, program=bytes([8])):
+            payload = (struct.pack('<I', 4) + b'dead' + struct.pack('<IIII', 4, k, 0, len(program)) + program +
+                       struct.pack('<4f', *query))
+            return frame(22, request, payload)
+
+        def search(connection, request, k, program=bytes([8])):
+            _, _, status, payload = self.call(connection, predicate(request, k, program))
+            self.assertEqual(status, 0)
+            count = struct.unpack_from('<I', payload)[0]
+            return [struct.unpack_from('<q', payload, 16 + i * 12)[0] for i in range(count)]
+
+        def delete(connection, request, gone):
+            payload = struct.pack('<I', 4) + b'dead' + struct.pack('<I', len(gone)) + struct.pack(f'<{len(gone)}q', *gone)
+            _, _, status, reply = self.call(connection, frame(29, request, payload))
+            self.assertEqual(status, 0)
+            return struct.unpack('<QQ', reply)
+
+        with self.server.connect() as connection:
+            self.assertEqual(self.call(connection, load_frame(1, 'dead', path))[2], 0)
+            order = [key for _, key in exact(keys, vectors, query, len(keys))]
+            self.assertEqual(search(connection, 2, 10), order[:10])
+            self.assertEqual(delete(connection, 3, order[:5] + [123]), (5, 5))
+            self.assertEqual(delete(connection, 4, order[:5]), (0, 5))
+            self.assertEqual(search(connection, 5, 10), order[5:15])
+            # Past 10,000 hits with the tombstones, the search runs filtered: still exact on the CPU.
+            many = order[5:9000]
+            self.assertEqual(delete(connection, 6, many), (8995, 9000))
+            hits = search(connection, 7, 1500)
+            # float32 ties may order a few hits differently from the double-precision reference
+            self.assertEqual(set(hits), set(order[9000:10500]))
+            self.assertFalse(set(hits) & set(order[:9000]))
+            stats = json.loads(self.call(connection, frame(STATS, 8))[3])
+            self.assertGreater(stats['predicate_evaluations'], 0)
+
     def test_sharded_tree_merge_matches_exact(self):
         path, keys, vectors = self.fixture(shards=5)
         rng = random.Random(9)
@@ -578,6 +651,19 @@ class IndexSqlTests(unittest.TestCase):
         self.assertIn('unavailable', self.psql(
             "SET ann.worker_socket = '/nonexistent/ann.sock'; "
             f"SELECT * FROM ann_index_search('{self.name}', '[1,1,1,1]', 3)", check=False))
+
+    def test_unload_frees_the_name_and_catalog_row(self):
+        """ann_index_unload(name) without nodes unloads from this host's worker and drops the catalog row,
+        as after switching a frozen table to a new generation."""
+        name = self.name + '_old'
+        self.psql(f"SELECT ann_index_load('{name}', '{self.path}')")
+        self.assertEqual(self.psql(f"SELECT count(*) FROM ann_index_catalog WHERE name = '{name}'").strip(), '1')
+        self.assertEqual(self.psql(f"SELECT ann_index_unload('{name}')").strip(), '1')
+        self.assertEqual(self.psql(f"SELECT count(*) FROM ann_index_catalog WHERE name = '{name}'").strip(), '0')
+        self.assertEqual(self.psql(f"SELECT ann_index_unload('{name}')").strip(), '0')
+        # The name is free again.
+        self.psql(f"SELECT ann_index_load('{name}', '{self.path}')")
+        self.assertEqual(self.psql(f"SELECT ann_index_unload('{name}')").strip(), '1')
 
     def test_stale_index_is_refused(self):
         self.psql(f"INSERT INTO {self.table} VALUES (-1, 0, '[0,0,0,0]')")

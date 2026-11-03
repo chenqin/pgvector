@@ -88,12 +88,22 @@ DELETE FROM docs_delta WHERE id < 268435456;
 SELECT ann_index_unload('docs_p0', 'gpu1:7700,gpu3:7700');
 ```
 
-Other coordinators reread the catalog within 10 s; a search one of them sends to the old name after it was unloaded gets "stale" back, rereads the catalog at once and retries, so step 3 needn't wait. The coordinator that ran steps 1 and 2 sees them immediately.
+With one coordinator, step 3 can go with step 1: `ann_collection_load(..., unload_previous => true)` unloads the replaced index from its nodes unless another part names it. With several, attach the new part on every coordinator first, then unload. Other coordinators reread the catalog within 10 s; a search one of them sends to the old name after it was unloaded gets "stale" back, rereads the catalog at once and retries, so step 3 needn't wait. The coordinator that ran steps 1 and 2 sees them immediately.
+
+**8. Deleting rows:** frozen partitions can't change, so deletes are tombstones until the partitions are rebuilt without the rows.
+
+```sql
+SELECT ann_collection_delete('docs', ARRAY[42, 1043]);   -- gone from every search at once
+-- later: rebuild the partitions without them, load the parts, then
+DELETE FROM ann_collection_tombstone WHERE collection = 'docs' AND key IN (42, 1043);
+```
+
+The keys are recorded in `ann_collection_tombstone` and sent to every part's nodes (operation 29), which ignore keys their index doesn't hold. A node leaves deleted rows out of every search: predicate results drop them (and cached results are dropped when rows are deleted), unfiltered searches ask for that many more hits and drop them (or, past the backend's largest k, run as filtered searches), and hits of every route are checked once more. Every part loaded later, including after a node restart, gets the collection's tombstones. A node that can't be reached fails the delete, since it would keep returning the rows; retry it when the node is back. Rows in the delta table are deleted from it as usual.
 
 ## How a search runs
 
 1. **Catalog.** The coordinator reads `ann_collection` and `ann_collection_part` once per backend (again after 10 s, or at once when a node answers that it serves another generation).
-2. **Program.** The filter is translated once per backend into a [predicate program](ann-frozen-index.md#predicates) against the source table's columns, and cached by its text. Collection attributes are integer, boolean and date columns; text needs a dictionary shared by all parts and is refused.
+2. **Program.** The filter is translated once per backend into a [predicate program](ann-frozen-index.md#predicates) against the source table's columns, and cached by its text. Collection attributes are integer, boolean, date, text and varchar columns; text values travel as codes of the collection's dictionary (below).
 3. **Placement.** When the collection is placed by an attribute, the coordinator runs the program over value ranges instead of rows: a leaf on the placement attribute gives its values, every other leaf all values, AND intersects, OR unites, NOT gives all values. Parts whose recorded range can't match are skipped. `tenant = 42`, `tenant IN (1, 900)` and `tenant BETWEEN 10 AND 20 AND category = 3` reach only the parts holding those tenants; `category = 3` reaches every part.
 4. **Fan-out.** One request per replica set, all in flight at once: parts with the same node list go together as one operation 25 (the node runs each part as an operation 22 job and merges them), a lone part as operation 22. So a node can hold several smaller parts, each rebuilt on its own, and still answer a query in one request. The coordinator keeps one connection per node, over RDMA when `ann.worker_rdma` is set, picks each request's replicas in rotation, and moves a request to the next replica when a node fails (a failed node is skipped for `ann.worker_retry_ms`). Each request carries the part's generation. Everything must answer within `ann.worker_timeout_ms`, or the statement fails.
 5. **Delta.** With a delta, the coordinator runs its exact query after sending the requests and before reading the replies, so it overlaps the nodes' search.
@@ -166,12 +176,23 @@ flowchart LR
 
 Each backend keeps one TCP connection per node for authentication, heartbeats, loads and frames too large for RDMA, plus one queue pair per node when `ann.worker_rdma` names a local device (here `mlx5_2`; the worker listens on the device given by `--rdma`, here `mlx5_0`). Device names are the kernel's names for the InfiniBand adapters (`ibv_devices` lists them); the two ends must be on a routed InfiniBand or RoCE subnet.
 
+## Text attributes
+
+Each frozen index codes a text column by its own dictionary (codes in the column's collation), so the same string has different codes in different partitions. A collection keeps one dictionary per text attribute in `ann_collection_dictionary`:
+
+- **Exports and parts carry their dictionaries.** `ann_index_export` writes `attr-COLUMN.strings` and `attr-COLUMN.starts` beside the codes, and the builder merges its members' dictionaries into the part's, rewriting their codes.
+- **Loading a part maps it.** `ann_collection_load` reads the part's dictionary from each node (operation 27), gives strings the collection hasn't seen the next codes, and sends every node the part's map from its codes to the collection's (operation 28); the node rewrites its attribute column and postings. Codes are never reused or reordered, so loading a part never changes another part's. Searches carry a flag (4) that makes a node holding an unmapped copy of the part answer "stale" instead of matching the wrong strings.
+- **Several coordinators.** Load parts from one coordinator and attach them (NULL path) on the others: an attaching coordinator adopts the codes the nodes hold, and refuses a string its catalog codes differently.
+- **Filters.** Collection codes follow the order strings first appeared, not the collation, so comparisons translate through the dictionary sorted in the column's collation: `lang = 'fr'` and `IN` lists are codes, `lang < 'f'` and `BETWEEN` are the sets of codes of the strings in range (at most 1,024 per range). `ann_collection_search_rows` returns the strings.
+- A text attribute can't be the placement attribute (placement prunes parts by integer ranges). New strings appear in other coordinators' backends within the 10-second catalog refresh.
+
 ## Catalog
 
 | Table | Columns |
 | --- | --- |
 | `ann_collection` | name, source (the table filters are written against), attributes, placement attribute, delta table with its key and vector columns |
 | `ann_collection_part` | collection, part, index name on the nodes, nodes (replicas, `host:port` list), generation, rows, placement range |
+| `ann_collection_dictionary` | collection, attribute, code, string: the codes of text attributes' strings |
 
 ## Measured: 16M × 1024 on one B200 host split into nodes
 

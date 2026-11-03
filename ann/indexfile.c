@@ -230,25 +230,21 @@ FindValue(const AnnIndexAttribute *attribute, int32_t value)
  * come out sorted. Values with more than bitset_min rows also get per-shard
  * bitsets.
  */
+/*
+ * Invert a column (a value per row, by ordinal) into the attribute's
+ * postings, key and ordinal arrays and, for frequent values, per-shard
+ * bitsets. Replaces the attribute's arrays without freeing them.
+ */
 static int
-LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
+InvertAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute, const int32_t *column)
 {
-	const void *data;
-	size_t		bytes;
-	const int32_t *column;
 	int32_t    *sorted;
 	uint64_t   *fill;
 	uint32_t	nvalues = 0;
 
-	if (!MapFile(file->directory, attribute->file, file->rows * sizeof(int32_t), &data, &bytes))
-		return 0;
-	column = data;
-	sorted = malloc(sizeof(int32_t) * file->rows);
+	sorted = malloc(sizeof(int32_t) * (file->rows ? file->rows : 1));
 	if (sorted == NULL)
-	{
-		(void) munmap((void *) data, bytes);
 		return 0;
-	}
 	memcpy(sorted, column, sizeof(int32_t) * file->rows);
 	qsort(sorted, file->rows, sizeof(int32_t), Int32Compare);
 	for (uint64_t i = 0; i < file->rows; i++)
@@ -256,14 +252,13 @@ LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
 			sorted[nvalues++] = sorted[i];
 	attribute->nvalues = nvalues;
 	attribute->postings = calloc(nvalues ? nvalues : 1, sizeof(AnnIndexPosting));
-	attribute->keys = malloc(sizeof(int64_t) * file->rows);
-	attribute->ordinals = malloc(sizeof(uint64_t) * file->rows);
+	attribute->keys = malloc(sizeof(int64_t) * (file->rows ? file->rows : 1));
+	attribute->ordinals = malloc(sizeof(uint64_t) * (file->rows ? file->rows : 1));
 	fill = calloc(nvalues ? nvalues : 1, sizeof(uint64_t));
 	if (attribute->postings == NULL || attribute->keys == NULL || attribute->ordinals == NULL || fill == NULL)
 	{
 		free(sorted);
 		free(fill);
-		(void) munmap((void *) data, bytes);
 		return 0;
 	}
 	for (uint32_t v = 0; v < nvalues; v++)
@@ -282,9 +277,6 @@ LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
 		attribute->keys[at] = file->keys[i];
 	}
 	free(fill);
-	/* Kept mapped: hits return their rows' values (ANN_PREDICATE_ATTRIBUTES). */
-	attribute->column = column;
-	attribute->columnBytes = bytes;
 
 	for (uint32_t v = 0; file->nshards && v < nvalues; v++)
 	{
@@ -309,6 +301,205 @@ LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
 			posting->bitsets[s][ordinal / 32] |= UINT32_C(1) << (ordinal % 32);
 		}
 	}
+	return 1;
+}
+
+/* A text attribute's dictionary: "dictionary NAME STRINGS STARTS". */
+static int
+DictionaryLine(AnnIndexFile *file, const char *line)
+{
+	char		name[64];
+	char		strings[256];
+	char		starts[256];
+
+	if (sscanf(line, "%*s %63s %255s %255s", name, strings, starts) != 3 || strchr(strings, '/') ||
+		strchr(starts, '/'))
+		return 0;
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		if (strcmp(file->attributes[a].name, name) == 0)
+		{
+			strcpy(file->attributes[a].stringsFile, strings);
+			strcpy(file->attributes[a].startsFile, starts);
+			return 1;
+		}
+	return 0;
+}
+
+/* Read a text attribute's dictionary into memory; codes must index it. */
+static int
+LoadDictionary(AnnIndexFile *file, AnnIndexAttribute *attribute)
+{
+	char		path[1400];
+	FILE	   *in;
+	long		size;
+
+	snprintf(path, sizeof(path), "%s/%s", file->directory, attribute->startsFile);
+	if ((in = fopen(path, "rb")) == NULL || fseek(in, 0, SEEK_END) != 0 || (size = ftell(in)) < 4 ||
+		size % 4 != 0 || size / 4 - 1 > INT32_MAX || fseek(in, 0, SEEK_SET) != 0 ||
+		(attribute->starts = malloc((size_t) size)) == NULL ||
+		fread(attribute->starts, 1, (size_t) size, in) != (size_t) size)
+	{
+		if (in)
+			fclose(in);
+		return 0;
+	}
+	fclose(in);
+	attribute->nstrings = (uint32_t) (size / 4 - 1);
+	for (uint32_t i = 0; i < attribute->nstrings; i++)
+		if (attribute->starts[i] > attribute->starts[i + 1])
+			return 0;
+	snprintf(path, sizeof(path), "%s/%s", file->directory, attribute->stringsFile);
+	if ((in = fopen(path, "rb")) == NULL || fseek(in, 0, SEEK_END) != 0 || (size = ftell(in)) < 0 ||
+		(uint64_t) size != attribute->starts[attribute->nstrings] || fseek(in, 0, SEEK_SET) != 0 ||
+		(attribute->strings = malloc((size_t) size + 1)) == NULL ||
+		fread(attribute->strings, 1, (size_t) size, in) != (size_t) size)
+	{
+		if (in)
+			fclose(in);
+		return 0;
+	}
+	fclose(in);
+	for (uint64_t i = 0; i < file->rows; i++)
+		if (attribute->column[i] != INT32_MIN && (attribute->column[i] < 0 ||
+												  (uint32_t) attribute->column[i] >= attribute->nstrings))
+			return 0;
+	return 1;
+}
+
+static int
+LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
+{
+	const void *data;
+	size_t		bytes;
+
+	if (!MapFile(file->directory, attribute->file, file->rows * sizeof(int32_t), &data, &bytes))
+		return 0;
+	/* Kept mapped: hits return their rows' values (ANN_PREDICATE_ATTRIBUTES). */
+	attribute->column = data;
+	attribute->mapped = data;
+	attribute->columnBytes = bytes;
+	if (!InvertAttribute(file, attribute, attribute->column))
+		return 0;
+	return attribute->stringsFile[0] == '\0' || LoadDictionary(file, attribute);
+}
+
+AnnStatus
+AnnIndexDictionary(AnnIndexFile *file, const char *name, unsigned char **reply, size_t *length)
+{
+	for (uint32_t a = 0; a < file->nattributes; a++)
+	{
+		AnnIndexAttribute *attribute = &file->attributes[a];
+		size_t		size;
+
+		if (strcmp(attribute->name, name) != 0)
+			continue;
+		if (attribute->starts == NULL)
+			return ANN_INVALID; /* not a text attribute */
+		{
+			size_t		head = 4 + (size_t) (attribute->nstrings + 1) * 4;
+			size_t		bytes = attribute->starts[attribute->nstrings];
+			uint32_t	remapped;
+
+			(void) pthread_mutex_lock(&file->bitmapMutex);
+			remapped = attribute->remap != NULL;
+			size = head + bytes + 4 + (remapped ? (size_t) attribute->nstrings * 4 : 0);
+			if ((*reply = malloc(size)) == NULL)
+			{
+				(void) pthread_mutex_unlock(&file->bitmapMutex);
+				return ANN_NOMEM;
+			}
+			memcpy(*reply, &attribute->nstrings, 4);
+			memcpy(*reply + 4, attribute->starts, head - 4);
+			memcpy(*reply + head, attribute->strings, bytes);
+			memcpy(*reply + head + bytes, &remapped, 4);
+			if (remapped)
+				memcpy(*reply + head + bytes + 4, attribute->remap, (size_t) attribute->nstrings * 4);
+			(void) pthread_mutex_unlock(&file->bitmapMutex);
+		}
+		*length = size;
+		return ANN_OK;
+	}
+	return ANN_INVALID;
+}
+
+AnnStatus
+AnnIndexRemap(AnnIndexFile *file, const char *name, const int32_t *map, uint32_t count)
+{
+	AnnIndexAttribute *attribute = NULL;
+	AnnIndexAttribute rebuilt;
+	int32_t    *column;
+	int32_t    *copy;
+	AnnStatus	status = ANN_OK;
+
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		if (strcmp(file->attributes[a].name, name) == 0)
+			attribute = &file->attributes[a];
+	if (attribute == NULL || attribute->starts == NULL || count != attribute->nstrings)
+		return ANN_INVALID;
+	for (uint32_t i = 0; i < count; i++)
+		if (map[i] < 0)
+			return ANN_INVALID;
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	if (attribute->remap)
+	{
+		/* Done before: the same map again is fine, another one isn't. */
+		status = memcmp(attribute->remap, map, sizeof(int32_t) * count) == 0 ? ANN_OK : ANN_INVALID;
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		return status;
+	}
+	if (file->predicateEntries > 0)
+	{
+		/* Cached results hold rows selected by the old codes. */
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		return ANN_INVALID;
+	}
+	column = malloc(sizeof(int32_t) * (file->rows ? file->rows : 1));
+	copy = malloc(sizeof(int32_t) * (count ? count : 1));
+	memset(&rebuilt, 0, sizeof(rebuilt));
+	if (column == NULL || copy == NULL)
+		status = ANN_NOMEM;
+	else
+	{
+		for (uint64_t i = 0; i < file->rows; i++)
+			column[i] = attribute->column[i] == INT32_MIN ? INT32_MIN : map[attribute->column[i]];
+		if (!InvertAttribute(file, &rebuilt, column))
+			status = ANN_NOMEM;
+	}
+	if (status != ANN_OK)
+	{
+		free(column);
+		free(copy);
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		return status;
+	}
+	memcpy(copy, map, sizeof(int32_t) * count);
+
+	/*
+	 * Evaluations that started before see the old arrays whole: they stay
+	 * allocated until the index is destroyed.
+	 */
+	attribute->oldPostings = attribute->postings;
+	attribute->oldKeys = attribute->keys;
+	attribute->oldOrdinals = attribute->ordinals;
+	attribute->oldValues = attribute->nvalues;
+	attribute->ownedColumn = column;
+	__atomic_store_n(&attribute->column, (const int32_t *) column, __ATOMIC_RELEASE);
+	attribute->keys = rebuilt.keys;
+	attribute->ordinals = rebuilt.ordinals;
+	attribute->nvalues = rebuilt.nvalues;
+	__atomic_store_n(&attribute->postings, rebuilt.postings, __ATOMIC_RELEASE);
+	attribute->remap = copy;
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	return ANN_OK;
+}
+
+/* Every text attribute rewritten into a collection's dictionary. */
+int
+AnnIndexRemapped(const AnnIndexFile *file)
+{
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		if (file->attributes[a].starts && file->attributes[a].remap == NULL)
+			return 0;
 	return 1;
 }
 
@@ -644,11 +835,93 @@ SourceBitmap(void *arg, uint64_t id, uint32_t *words)
 	return 1;
 }
 
+/* Keys are sorted: each key's ordinal by binary search, or -1. */
+static int64_t
+OrdinalOf(const AnnIndexFile *file, int64_t key)
+{
+	uint64_t	low = 0;
+	uint64_t	high = file->rows;
+
+	while (low < high)
+	{
+		uint64_t	middle = low + (high - low) / 2;
+
+		if (file->keys[middle] < key)
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return low < file->rows && file->keys[low] == key ? (int64_t) low : -1;
+}
+
+AnnStatus
+AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t *added)
+{
+	AnnIndexBitmap **victims = NULL;
+	uint64_t	nvictims = 0;
+
+	*added = 0;
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	if (file->deleted == NULL)
+	{
+		uint32_t   *deleted = calloc(((size_t) file->rows + 31) / 32 + 1, sizeof(uint32_t));
+
+		if (deleted == NULL)
+		{
+			(void) pthread_mutex_unlock(&file->bitmapMutex);
+			return ANN_NOMEM;
+		}
+		__atomic_store_n(&file->deleted, deleted, __ATOMIC_RELEASE);
+	}
+	for (uint32_t i = 0; i < count; i++)
+	{
+		int64_t		ordinal = OrdinalOf(file, keys[i]);
+		uint32_t	bit;
+
+		if (ordinal < 0)
+			continue;
+		bit = UINT32_C(1) << (ordinal % 32);
+		if (__atomic_fetch_or(&file->deleted[ordinal / 32], bit, __ATOMIC_RELAXED) & bit)
+			continue;
+		(*added)++;
+	}
+	__atomic_add_fetch(&file->ndeleted, *added, __ATOMIC_RELEASE);
+
+	/* Cached predicate results may hold the rows just deleted: drop them. */
+	if (*added > 0 && file->predicateEntries > 0 &&
+		(victims = malloc(sizeof(*victims) * file->predicateEntries)) != NULL)
+	{
+		for (uint32_t b = 0; b < ANN_INDEX_BITMAP_BUCKETS; b++)
+		{
+			for (AnnIndexBitmap **link = &file->bitmaps[b]; *link;)
+			{
+				if ((*link)->kind == ANN_BITMAP_PREDICATE)
+				{
+					AnnIndexBitmap *victim = *link;
+
+					*link = victim->next;
+					Account(file, victim, -1);
+					victims[nvictims++] = victim;
+				}
+				else
+					link = &(*link)->next;
+			}
+		}
+	}
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	for (uint64_t v = 0; v < nvictims; v++)
+		AnnIndexBitmapRelease(file, victims[v]);
+	free(victims);
+	return ANN_OK;
+}
+
 int
 AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 				 uint32_t *words, uint64_t *count)
 {
 	AnnFilterSource source;
+	int			code;
+	const uint32_t *deleted = __atomic_load_n(&file->deleted, __ATOMIC_ACQUIRE);
 
 	memset(&source, 0, sizeof(source));
 	source.arg = file;
@@ -659,7 +932,22 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.start = SourceStart;
 	source.postings = SourcePostings;
 	source.bitmap = SourceBitmap;
-	return AnnFilterEvaluate(&source, program, size, words, count);
+	code = AnnFilterEvaluate(&source, program, size, words, count);
+	if (code == ANN_FILTER_OK && deleted)
+	{
+		/* Tombstoned rows never qualify. */
+		uint64_t	removed = 0;
+
+		for (size_t w = 0; w < ((size_t) file->rows + 31) / 32; w++)
+		{
+			uint32_t	gone = words[w] & __atomic_load_n(&deleted[w], __ATOMIC_RELAXED);
+
+			removed += (uint64_t) __builtin_popcount(gone);
+			words[w] &= ~gone;
+		}
+		*count -= removed;
+	}
+	return code;
 }
 
 /* The host budget for predicate results: the option, else a quarter of RAM. */
@@ -852,6 +1140,8 @@ ParseManifest(AnnIndexFile *file)
 				 sscanf(line, "%*s %63s %255s", file->attributes[file->nattributes].name, text) == 2 &&
 				 !strchr(text, '/'))
 			strcpy(file->attributes[file->nattributes++].file, text);
+		else if (strcmp(key, "dictionary") == 0 && DictionaryLine(file, line))
+			continue;
 		else if (strcmp(key, "quant") == 0 && sscanf(line, "%*s %15s", text) == 1 &&
 				 (strcmp(text, "nvfp4") == 0 || strcmp(text, "fp8") == 0))
 			file->quant = strcmp(text, "nvfp4") == 0 ? ANN_QUANT_NVFP4 : ANN_QUANT_FP8;
@@ -1026,8 +1316,22 @@ AnnIndexFileClose(AnnIndexFile *file)
 		free(attribute->postings);
 		free(attribute->keys);
 		free(attribute->ordinals);
-		if (attribute->column)
-			(void) munmap((void *) attribute->column, attribute->columnBytes);
+		if (attribute->mapped)
+			(void) munmap((void *) attribute->mapped, attribute->columnBytes);
+		for (uint32_t v = 0; attribute->oldPostings && v < attribute->oldValues; v++)
+			if (attribute->oldPostings[v].bitsets)
+			{
+				for (uint32_t s = 0; s < file->nshards; s++)
+					free(attribute->oldPostings[v].bitsets[s]);
+				free(attribute->oldPostings[v].bitsets);
+			}
+		free(attribute->oldPostings);
+		free(attribute->oldKeys);
+		free(attribute->oldOrdinals);
+		free(attribute->ownedColumn);
+		free(attribute->remap);
+		free(attribute->starts);
+		free(attribute->strings);
 	}
 	for (uint32_t b = 0; b < ANN_INDEX_BITMAP_BUCKETS; b++)
 		while (file->bitmaps[b])
@@ -1102,6 +1406,7 @@ AnnIndexHold(AnnIndexFile *file)
 static void
 Destroy(AnnIndexFile *file)
 {
+	free(file->deleted);
 	if (file->device && AnnIndexDeviceDestroy)
 		AnnIndexDeviceDestroy(file->device);
 	file->device = NULL;

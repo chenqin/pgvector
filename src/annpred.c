@@ -18,6 +18,7 @@
 #include "utils/lsyscache.h"
 #include "utils/plancache.h"
 #include "utils/rel.h"
+#include "utils/varlena.h"
 
 /*
  * Predicates over a frozen index's INCLUDE attributes become ann/filter.h
@@ -78,8 +79,8 @@ AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns)
 /*
  * The predicate columns of a table's attribute columns, by name, for
  * programs only GPU nodes evaluate (no frozen index on this host): integer,
- * boolean and date columns. Text needs a dictionary shared by the nodes and
- * is refused.
+ * boolean, date and text columns. Text columns translate through
+ * dictionaries[] (the collection's), which the caller attaches.
  */
 void
 AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateColumns *columns)
@@ -109,12 +110,13 @@ AnnPredicateColumnsForTable(Relation rel, int count, char **names, AnnPredicateC
 		columns->types[c] = TupleDescAttr(desc, attno - 1)->atttypid;
 		columns->collations[c] = TupleDescAttr(desc, attno - 1)->attcollation;
 		columns->names[c] = names[c];
-		if (!AnnFrozenAttributeType(columns->types[c]) || AnnFrozenTextType(columns->types[c]))
+		if (!AnnFrozenAttributeType(columns->types[c]))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("ann collection attribute \"%s\" must be smallint, integer, bigint, boolean or date",
+					 errmsg("ann collection attribute \"%s\" must be smallint, integer, bigint, boolean, date, text or varchar",
 							names[c])));
-		opclass = GetDefaultOpClass(columns->types[c], BTREE_AM_OID);
+		opclass = GetDefaultOpClass(AnnFrozenTextType(columns->types[c]) ? TEXTOID : columns->types[c],
+									BTREE_AM_OID);
 		columns->families[c] = OidIsValid(opclass) ? get_opclass_family(opclass) : InvalidOid;
 	}
 	columns->ncolumns = count;
@@ -351,32 +353,129 @@ SameCollation(Context *cxt, int column, Oid collation)
 }
 
 /*
- * A text comparison over the dictionary's codes: codes follow the
- * collation, so the strings below, at or above a value are code ranges.
+ * Position of the first string at or after the value (after it when upper)
+ * in the column's collation order: a frozen index's dictionary, or a
+ * collection's sorted strings.
+ */
+static int64
+TextPosition(Context *cxt, int column, text *value, bool upper)
+{
+	AnnTextDictionary *dictionary = cxt->columns->dictionaries[column];
+	int64		low = 0;
+	int64		high;
+
+	if (dictionary == NULL)
+		return AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
+								   cxt->columns->collations[column], value, upper);
+	high = dictionary->count;
+	while (low < high)
+	{
+		int64		middle = low + (high - low) / 2;
+		text	   *probe = dictionary->sorted[middle];
+		int			cmp = varstr_cmp(VARDATA_ANY(probe), VARSIZE_ANY_EXHDR(probe), VARDATA_ANY(value),
+									 VARSIZE_ANY_EXHDR(value), cxt->columns->collations[column]);
+
+		if (cmp < 0 || (upper && cmp == 0))
+			low = middle + 1;
+		else
+			high = middle;
+	}
+	return low;
+}
+
+/* The code of the string at a position of the collation order. */
+static int64
+TextCode(Context *cxt, int column, int64 position)
+{
+	AnnTextDictionary *dictionary = cxt->columns->dictionaries[column];
+
+	return dictionary ? dictionary->codes[position] : position;
+}
+
+static int
+Int32Order(const void *a, const void *b)
+{
+	int32		x = *(const int32 *) a;
+	int32		y = *(const int32 *) b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * The strings at positions first .. last - 1 of a collection's collation
+ * order, as the set of their codes (which don't follow the collation).
+ */
+static void
+PutCodeSet(Context *cxt, int column, int64 first, int64 last)
+{
+	AnnTextDictionary *dictionary = cxt->columns->dictionaries[column];
+	int32	   *codes;
+	int64		n = last - first;
+
+	if (n <= 0)
+	{
+		PutByte(cxt->program, ANN_FILTER_NONE);
+		return;
+	}
+	if (n > ANN_FILTER_MAX_VALUES)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("a text range over ann collection attribute \"%s\" matches more than %d strings",
+						cxt->columns->names[column], ANN_FILTER_MAX_VALUES)));
+	codes = palloc(sizeof(int32) * n);
+	memcpy(codes, dictionary->codes + first, sizeof(int32) * n);
+	qsort(codes, n, sizeof(int32), Int32Order);
+	PutLeaf(cxt, ANN_FILTER_VALUES, column, false);
+	Put32(cxt->program, (uint32) n);
+	for (int64 i = 0; i < n; i++)
+		Put32(cxt->program, (uint32) codes[i]);
+	pfree(codes);
+}
+
+/*
+ * A text comparison over the dictionary's codes. A frozen index's codes
+ * follow the collation, so the strings below, at or above a value are code
+ * ranges; a collection's are sets of codes.
  */
 static void
 PutTextComparison(Context *cxt, int column, int strategy, text *value)
 {
-	int64		lower = AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
-											cxt->columns->collations[column], value, false);
-	int64		upper = AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
-											cxt->columns->collations[column], value, true);
+	int64		lower = TextPosition(cxt, column, value, false);
+	int64		upper = TextPosition(cxt, column, value, true);
 	bool		found = upper > lower;
+	AnnTextDictionary *dictionary = cxt->columns->dictionaries[column];
 
+	if (strategy == BTEqualStrategyNumber || strategy == STRATEGY_NE)
+	{
+		if (found)
+			PutComparison(cxt, column, strategy, TextCode(cxt, column, lower));
+		else if (strategy == BTEqualStrategyNumber)
+			PutByte(cxt->program, ANN_FILTER_NONE);
+		else
+			PutLeaf(cxt, ANN_FILTER_NULL, column, true);
+		return;
+	}
+	if (dictionary)
+	{
+		switch (strategy)
+		{
+			case BTLessStrategyNumber:
+				PutCodeSet(cxt, column, 0, lower);
+				break;
+			case BTLessEqualStrategyNumber:
+				PutCodeSet(cxt, column, 0, upper);
+				break;
+			case BTGreaterStrategyNumber:
+				PutCodeSet(cxt, column, upper, dictionary->count);
+				break;
+			default:
+				PutCodeSet(cxt, column, lower, dictionary->count);
+				break;
+		}
+		return;
+	}
 	switch (strategy)
 	{
-		case BTEqualStrategyNumber:
-			if (found)
-				PutComparison(cxt, column, strategy, lower);
-			else
-				PutByte(cxt->program, ANN_FILTER_NONE);
-			break;
-		case STRATEGY_NE:
-			if (found)
-				PutComparison(cxt, column, strategy, lower);
-			else
-				PutLeaf(cxt, ANN_FILTER_NULL, column, true);
-			break;
 		case BTLessStrategyNumber:
 			PutComparison(cxt, column, BTLessStrategyNumber, lower);
 			break;
@@ -498,13 +597,11 @@ TranslateArray(Context *cxt, ScalarArrayOpExpr *op, bool negate)
 		{
 			/* a string's code, or none when it is not in the dictionary */
 			text	   *string = DatumGetTextPP(elements[i]);
-			int64		lower = AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
-													cxt->columns->collations[column], string, false);
+			int64		lower = TextPosition(cxt, column, string, false);
 
-			if (AnnFrozenTextSearch(cxt->columns->index, cxt->columns->meta, column,
-									cxt->columns->collations[column], string, true) == lower)
+			if (TextPosition(cxt, column, string, true) == lower)
 				continue;
-			v = lower;
+			v = TextCode(cxt, column, lower);
 		}
 		else
 			v = IntegerValue(elements[i], type);
