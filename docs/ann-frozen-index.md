@@ -12,6 +12,54 @@ The GPU worker already numbers rows by key rank (`keys.i64` is sorted), so the e
 
 This implements the [plan](ann-immutable-indexes-plan.md), phases 1 to 4.
 
+## How it fits together
+
+**1. Build** (once per table generation, on the PostgreSQL host):
+
+```mermaid
+flowchart LR
+    T["docs table<br/>COPY rows"] -->|"ann_freeze + VACUUM (FREEZE)"| F["frozen table<br/>guard trigger, all-frozen pages"]
+    F -->|"CREATE INDEX ... USING ann<br/>INCLUDE (id, tenant, category, lang)<br/>WITH (frozen = true)"| I["frozen index<br/>forward pages: ordinal → TID, key, vector, attributes<br/>inverted pages: value → ordinals, text dictionary<br/>generation: content hash"]
+    I -->|"ann_index_export"| E["export directory<br/>keys.i64, vectors.f32, attr-*.i32,<br/>attr-*.strings/.starts, manifest"]
+    E -->|"build_cuvs_index.py --from-export"| D["index directory<br/>+ CAGRA shard per GPU<br/>+ NVFP4/FP8 copy"]
+```
+
+**2. Start and load:**
+
+```mermaid
+sequenceDiagram
+    participant W as GPU worker (ann-worker-cuvs)
+    participant P as PostgreSQL
+    Note over W: ann-worker-cuvs --listen /run/ann.sock<br/>[--listen-tcp 0.0.0.0:7700]
+    Note over P: pg_ctl start<br/>ann.worker_socket = '/run/ann.sock'<br/>(or ann.worker_address for networked nodes)
+    P->>W: op 11 ann_index_load('docs_g1', '/data/idx')
+    Note over W: map and prewarm files<br/>invert attribute columns into postings<br/>CAGRA shards into GPU memory
+    W-->>P: rows, dimensions, source, generation
+    Note over P: check the generation matches the table<br/>record in ann_index_catalog<br/>resend tombstones and stored bitmaps
+```
+
+**3. A filtered query:**
+
+```sql
+SELECT id, tenant, lang FROM docs
+WHERE tenant = 7 AND category IN (1, 2) AND lang = 'fr'
+ORDER BY emb <-> $1 LIMIT 10;
+```
+
+```mermaid
+sequenceDiagram
+    participant B as PostgreSQL backend
+    participant W as GPU worker
+    Note over B: planner: WHERE translates → Custom Scan (AnnFrozenSearch)<br/>WHERE → predicate program (cached; 'fr' → dictionary code)<br/>worker for (table, generation) from ann_index_catalog
+    B->>W: op 22: program + query vector, generation in the header
+    Note over W: generation matches? (else "stale")<br/>program in the predicate cache? else evaluate over postings<br/>→ eligible rows, minus tombstones
+    Note over W: route by eligible rows:<br/>≤ 2,000: exact CPU scan<br/>≤ gather limit: GPU gather scan (same-filter queries grouped on tensor cores)<br/>larger: filtered CAGRA · every row: plain CAGRA<br/>FP32 re-score → top k
+    W-->>B: ordinals, distances, eligible count
+    Note over B: ordinal → TID<br/>every column in the index and page all-visible → row from index pages<br/>else heap fetch · recheck quals · skip tombstones<br/>refill if an approximate route came back short → LIMIT 10
+```
+
+Without a worker (none loaded for this generation, or unreachable), the backend evaluates the program over the inverted pages (with the shared filter cache) and scores the eligible rows exactly from the vector pages, then returns rows the same way. Across many hosts, [collections](ann-collections.md) replace the single worker call with one request per replica set and merge the parts' hits.
+
 ## Usage
 
 ```sql
