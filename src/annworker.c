@@ -81,6 +81,7 @@ AnnWorkerCall(uint16 operation, const char *payload, size_t length, int timeoutM
  * reconnects rather than reading them.
  */
 static int	workerFd = -1;
+static char workerPath[sizeof(((struct sockaddr_un *) 0)->sun_path)];
 static uint32 outstanding = 0;
 static uint64 nextRequest = 1;
 static char *recvBuffer = NULL;
@@ -104,6 +105,7 @@ Disconnect(void)
 	if (workerFd >= 0)
 		close(workerFd);
 	workerFd = -1;
+	workerPath[0] = '\0';
 	outstanding = 0;
 	recvLength = 0;
 	if (shared)
@@ -182,7 +184,7 @@ Connect(void)
 	waitTimeoutMs = ann_worker_timeout_ms;
 	if (ann_worker_socket == NULL || ann_worker_socket[0] == '\0')
 		return false;
-	if (outstanding > 0)
+	if (outstanding > 0 || (workerFd >= 0 && strcmp(workerPath, ann_worker_socket) != 0))
 		Disconnect();
 	if (sharedDetached)
 		Unmap();
@@ -224,6 +226,7 @@ Connect(void)
 		recvCapacity = 64 * 1024;
 		recvBuffer = MemoryContextAlloc(TopMemoryContext, recvCapacity);
 	}
+	strlcpy(workerPath, ann_worker_socket, sizeof(workerPath));
 	AttachShared();
 	return workerFd >= 0;
 }

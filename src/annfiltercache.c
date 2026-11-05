@@ -8,6 +8,7 @@
 #include "miscadmin.h"
 #include "port/pg_bitutils.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 
 #if PG_VERSION_NUM >= 170000
 #include "lib/dshash.h"
@@ -33,11 +34,16 @@ int			ann_frozen_filter_cache_mb = 4096;
 
 typedef struct FilterCacheKey
 {
+	Oid			database;
 	Oid			index;
 	uint32		length;			/* program bytes */
+	uint32		reserved;		/* explicit zero bytes: no struct padding in the hash key */
 	uint64		generation;
 	uint64		hash;			/* of the program */
 } FilterCacheKey;
+
+StaticAssertDecl(sizeof(FilterCacheKey) == 32 && offsetof(FilterCacheKey, generation) == 16,
+				 "ann filter cache keys must not contain implicit padding");
 
 typedef struct FilterCacheEntry
 {
@@ -67,6 +73,128 @@ typedef struct FilterCacheControl
 static FilterCacheControl *control = NULL;
 static dsa_area *area = NULL;
 static dshash_table *table = NULL;
+
+/*
+ * Backend-local immutable copies remove all shared locks from hot lookups.
+ * Direct mapping bounds lookup work and memory; eviction by other backends
+ * cannot reclaim these copies. Large or cold results use the shared cache.
+ * The local budget defaults to 16 MB, and never exceeds the shared budget.
+ */
+#define LOCAL_FILTER_SLOTS 256
+static int	localCacheMb = 16;
+
+typedef struct LocalFilterEntry
+{
+	FilterCacheKey key;
+	size_t		nwords;
+	uint64		eligible;
+	uint64		bytes;
+	bool		sparse;
+	char	   *program;
+	uint32	   *words;
+} LocalFilterEntry;
+
+static LocalFilterEntry localFilters[LOCAL_FILTER_SLOTS];
+static uint64 localBytes = 0;
+
+static bool Sparse(uint64 nwords, uint64 eligible);
+
+static void
+LocalClear(void)
+{
+	for (int i = 0; i < LOCAL_FILTER_SLOTS; i++)
+	{
+		if (localFilters[i].program)
+		{
+			pfree(localFilters[i].program);
+			pfree(localFilters[i].words);
+		}
+	}
+	memset(localFilters, 0, sizeof(localFilters));
+	localBytes = 0;
+}
+
+static uint64
+LocalBudget(void)
+{
+	uint64		budget = (uint64) Min(localCacheMb, ann_frozen_filter_cache_mb) * 1024 * 1024;
+
+	if (localBytes > budget)
+		LocalClear();
+	return budget;
+}
+
+static void
+CopyWords(uint32 *out, const uint32 *in, size_t nwords, uint64 eligible, bool sparse)
+{
+	if (sparse)
+	{
+		memset(out, 0, nwords * sizeof(uint32));
+		for (uint64 i = 0; i < eligible; i++)
+			out[in[i] / 32] |= UINT32_C(1) << (in[i] % 32);
+	}
+	else
+		memcpy(out, in, nwords * sizeof(uint32));
+}
+
+static bool
+LocalGet(const FilterCacheKey *key, const char *program, uint32 *words, size_t nwords, uint64 *eligible)
+{
+	LocalFilterEntry *entry = &localFilters[key->hash % LOCAL_FILTER_SLOTS];
+
+	if (LocalBudget() == 0 || !entry->program || entry->nwords != nwords ||
+		memcmp(&entry->key, key, sizeof(*key)) != 0 ||
+		memcmp(entry->program, program, key->length) != 0)
+		return false;
+	CopyWords(words, entry->words, nwords, entry->eligible, entry->sparse);
+	*eligible = entry->eligible;
+	return true;
+}
+
+static void
+LocalPut(const FilterCacheKey *key, const char *program, const uint32 *words,
+		 size_t nwords, uint64 eligible, bool sparse)
+{
+	LocalFilterEntry *entry = &localFilters[key->hash % LOCAL_FILTER_SLOTS];
+	uint64		bytes = key->length + Max(sparse ? eligible : nwords, 1) * sizeof(uint32);
+	uint64		budget = LocalBudget();
+	MemoryContext old;
+
+	if (bytes > budget)
+		return;
+	if (entry->program)
+	{
+		localBytes -= entry->bytes;
+		pfree(entry->program);
+		pfree(entry->words);
+		memset(entry, 0, sizeof(*entry));
+	}
+	if (bytes > budget - localBytes)
+		return;
+	old = MemoryContextSwitchTo(TopMemoryContext);
+	entry->words = MemoryContextAllocExtended(TopMemoryContext,
+											  Max(sparse ? eligible : nwords, 1) * sizeof(uint32), MCXT_ALLOC_NO_OOM);
+	entry->program = MemoryContextAllocExtended(TopMemoryContext, Max(key->length, 1), MCXT_ALLOC_NO_OOM);
+	if (entry->words == NULL || entry->program == NULL)
+	{
+		if (entry->words)
+			pfree(entry->words);
+		if (entry->program)
+			pfree(entry->program);
+		memset(entry, 0, sizeof(*entry));
+		MemoryContextSwitchTo(old);
+		return;
+	}
+	memcpy(entry->words, words, (sparse ? eligible : nwords) * sizeof(uint32));
+	memcpy(entry->program, program, key->length);
+	entry->key = *key;
+	entry->nwords = nwords;
+	entry->eligible = eligible;
+	entry->sparse = sparse;
+	entry->bytes = bytes;
+	localBytes += bytes;
+	MemoryContextSwitchTo(old);
+}
 
 static dshash_parameters
 Parameters(int tranche)
@@ -119,7 +247,7 @@ Attach(void)
 	if (table)
 		return true;
 	oldCtx = MemoryContextSwitchTo(TopMemoryContext);
-	control = GetNamedDSMSegment("ann_filter_cache", sizeof(FilterCacheControl), InitControl, &found);
+	control = GetNamedDSMSegment("ann_filter_cache_v2", sizeof(FilterCacheControl), InitControl, &found);
 	LWLockRegisterTranche(control->tranche, "ann_filter_cache");
 	area = dsa_attach(control->area);
 	dsa_pin_mapping(area);
@@ -135,6 +263,7 @@ MakeKey(Oid index, uint64 generation, const char *program, size_t size)
 	FilterCacheKey key;
 
 	memset(&key, 0, sizeof(key));
+	key.database = MyDatabaseId;
 	key.index = index;
 	key.length = (uint32) size;
 	key.generation = generation;
@@ -151,25 +280,29 @@ AnnFilterCacheGet(Oid index, uint64 generation, const char *program, size_t size
 	FilterCacheEntry *entry;
 	bool		hit = false;
 
+	if (ann_frozen_filter_cache_mb <= 0)
+	{
+		LocalClear();
+		return false;
+	}
+	key = MakeKey(index, generation, program, size);
+	if (LocalGet(&key, program, words, nwords, eligible))
+	{
+		pg_atomic_fetch_add_u64(&control->hits, 1);
+		return true;
+	}
 	if (!Attach())
 		return false;
-	key = MakeKey(index, generation, program, size);
 	entry = dshash_find(table, &key, false);
 	if (entry)
 	{
 		if (entry->nwords == nwords &&
 			memcmp(dsa_get_address(area, entry->program), program, size) == 0)
 		{
-			if (entry->sparse)
-			{
-				const uint32 *ordinals = dsa_get_address(area, entry->words);
+			const uint32 *cached = dsa_get_address(area, entry->words);
 
-				memset(words, 0, nwords * sizeof(uint32));
-				for (uint64 i = 0; i < entry->eligible; i++)
-					words[ordinals[i] / 32] |= UINT32_C(1) << (ordinals[i] % 32);
-			}
-			else
-				memcpy(words, dsa_get_address(area, entry->words), nwords * sizeof(uint32));
+			CopyWords(words, cached, nwords, entry->eligible, entry->sparse);
+			LocalPut(&key, program, cached, nwords, entry->eligible, entry->sparse);
 			*eligible = entry->eligible;
 			pg_atomic_write_u64(&entry->used, pg_atomic_add_fetch_u64(&control->clock, 1));
 			hit = true;
@@ -395,6 +528,12 @@ ann_frozen_cache(PG_FUNCTION_ARGS)
 void
 AnnFilterCacheInit(void)
 {
+#if PG_VERSION_NUM >= 170000
+	DefineCustomIntVariable("ann.frozen_filter_local_cache_mb",
+							"Per-backend memory for immutable predicate copies; hot hits take no shared locks (0 disables).",
+							NULL, &localCacheMb, 16, 0, 1024, PGC_USERSET,
+							GUC_UNIT_MB, NULL, NULL, NULL);
+#endif
 	DefineCustomIntVariable("ann.frozen_filter_cache_mb",
 							"Shared memory for predicate results over frozen ann indexes (0 disables).",
 							NULL, &ann_frozen_filter_cache_mb, 4096, 0, INT_MAX / 2, PGC_SUSET,

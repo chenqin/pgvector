@@ -1,6 +1,7 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/xact.h"
 #include "ann.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
@@ -18,6 +19,7 @@
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/regproc.h"
 #include "utils/rel.h"
 #include "utils/tuplestore.h"
@@ -1578,6 +1580,134 @@ SendTombstones(const char *name, const int64 *keys, int count)
 	}
 }
 
+/*
+ * Operation 29 cannot be undone. Publish only after PostgreSQL commits,
+ * retaining subtransaction ownership so a savepoint rollback discards it.
+ * The durable SQL tombstones remain the source of truth if a node is down;
+ * loading/attaching the export again resynchronizes it.
+ */
+typedef struct PendingTombstones
+{
+	struct PendingTombstones *next;
+	SubTransactionId subid;
+	char	   *name;
+	char	   *address;
+	char	   *socket;
+	char	   *token;
+	int			count;
+	int64	   *keys;
+} PendingTombstones;
+
+static PendingTombstones *pendingTombstones = NULL;
+static MemoryContext tombstoneContext = NULL;
+static bool changedTombstones = false;
+
+static void
+TombstoneTransaction(XactEvent event, void *arg)
+{
+	if (event == XACT_EVENT_PRE_PREPARE && pendingTombstones)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot prepare a transaction with pending ann worker tombstones")));
+	if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT && event != XACT_EVENT_PREPARE &&
+		event != XACT_EVENT_PARALLEL_ABORT)
+		return;
+	if (changedTombstones)
+		AnnFrozenTombstonesChanged();
+	if (event == XACT_EVENT_COMMIT)
+	{
+		for (PendingTombstones *p = pendingTombstones; p; p = p->next)
+		{
+			char	   *address = ann_worker_address;
+			char	   *socket = ann_worker_socket;
+			char	   *token = ann_worker_auth_token;
+			MemoryContext old = CurrentMemoryContext;
+
+			ann_worker_address = p->address;
+			ann_worker_socket = p->socket;
+			ann_worker_auth_token = p->token;
+			PG_TRY();
+			{
+				SendTombstones(p->name, p->keys, p->count);
+			}
+			PG_CATCH();
+			{
+				/* The SQL commit is already durable; never throw from here. */
+				MemoryContextSwitchTo(old);
+				FlushErrorState();
+				ereport(WARNING,
+						(errmsg("committed tombstones could not be sent to ann worker index \"%s\"", p->name),
+						 errhint("Load or attach the index again to synchronize its committed tombstones.")));
+			}
+			PG_END_TRY();
+			ann_worker_address = address;
+			ann_worker_socket = socket;
+			ann_worker_auth_token = token;
+		}
+	}
+	pendingTombstones = NULL;
+	changedTombstones = false;
+	if (tombstoneContext)
+		MemoryContextReset(tombstoneContext);
+}
+
+static void
+TombstoneSubtransaction(SubXactEvent event, SubTransactionId subid,
+						SubTransactionId parent, void *arg)
+{
+	if (event != SUBXACT_EVENT_ABORT_SUB && event != SUBXACT_EVENT_COMMIT_SUB)
+		return;
+	for (PendingTombstones **link = &pendingTombstones; *link;)
+	{
+		PendingTombstones *p = *link;
+
+		if (p->subid == subid)
+		{
+			if (event == SUBXACT_EVENT_ABORT_SUB)
+			{
+				*link = p->next;
+				continue;
+			}
+			p->subid = parent;
+		}
+		link = &p->next;
+	}
+	if (changedTombstones)
+		AnnFrozenTombstonesChanged();
+}
+
+static void
+QueueTombstones(const char *name, const int64 *keys, int count)
+{
+	PendingTombstones *p;
+	MemoryContext old;
+
+	if (tombstoneContext == NULL)
+	{
+		tombstoneContext = AllocSetContextCreate(TopMemoryContext, "Ann pending tombstones", ALLOCSET_DEFAULT_SIZES);
+		RegisterXactCallback(TombstoneTransaction, NULL);
+		RegisterSubXactCallback(TombstoneSubtransaction, NULL);
+	}
+	/* Register callbacks even without a worker, to invalidate on abort. */
+	if (name == NULL)
+		changedTombstones = true;
+	if (count == 0 || name == NULL)
+		return;
+	old = MemoryContextSwitchTo(tombstoneContext);
+	p = palloc0(sizeof(*p));
+	p->subid = GetCurrentSubTransactionId();
+	p->name = pstrdup(name);
+	p->address = pstrdup(ann_worker_address ? ann_worker_address : "");
+	p->socket = pstrdup(ann_worker_socket ? ann_worker_socket : "");
+	p->token = pstrdup(ann_worker_auth_token ? ann_worker_auth_token : "");
+	p->count = count;
+	p->keys = palloc(sizeof(int64) * count);
+	memcpy(p->keys, keys, sizeof(int64) * count);
+	p->next = pendingTombstones;
+	pendingTombstones = p;
+	MemoryContextSwitchTo(old);
+}
+
 static char *
 TombstoneTable(FunctionCallInfo fcinfo)
 {
@@ -1610,7 +1740,7 @@ PushTombstones(FunctionCallInfo fcinfo, const char *name, const char *source)
 	}
 	SPI_finish();
 	if (count > 0)
-		SendTombstones(name, keys, count);
+		QueueTombstones(name, keys, count);
 }
 
 /*
@@ -1663,8 +1793,9 @@ ann_frozen_delete(PG_FUNCTION_ARGS)
 		names = lappend(names, MemoryContextStrdup(TopTransactionContext,
 												   SPI_getvalue(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1)));
 	SPI_finish();
+	QueueTombstones(NULL, NULL, 0);
 	foreach(cell, names)
-		SendTombstones(lfirst(cell), keys, nkeys);
+		QueueTombstones(lfirst(cell), keys, nkeys);
 	AnnFrozenTombstonesChanged();
 	PG_RETURN_INT64(recorded);
 }

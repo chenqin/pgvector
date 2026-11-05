@@ -1181,6 +1181,13 @@ DecodeKeys(const unsigned char *data, uint32_t bytes, uint64_t count, int64_t *k
  * Index search payload: u32 name length, name, u32 dimensions, k, filter
  * count (UINT32_MAX for none); FP32 query; i64 filter keys in any order.
  */
+static AnnStatus SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t request,
+								 unsigned char *payload, uint32_t size, AnnIndexFile *file,
+								 AnnIndexBitmap *bitmap, const char *name, uint32_t dimensions,
+								 uint32_t k, size_t offset, uint16_t operation, uint32_t flags);
+static AnnStatus PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program,
+								 uint32_t size, AnnIndexBitmap **result);
+
 static AnnStatus
 SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operation, uint64_t request,
 			unsigned char *payload, uint32_t size)
@@ -1217,6 +1224,27 @@ SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operati
 		memchr(payload + 4, '\0', nameLength) ||
 		(uint64_t) size != offset + (uint64_t) dimensions * 4 + (packed ? packedBytes : keys * 8))
 		return ANN_INVALID;
+	if (nfilter == UINT32_MAX)
+	{
+		char name[ANN_INDEX_NAME_MAX + 1];
+		AnnIndexFile *file;
+		AnnIndexBitmap *bitmap = NULL;
+		AnnStatus status = ANN_OK;
+		const unsigned char all = ANN_FILTER_ALL;
+
+		memcpy(name, payload + 4, nameLength);
+		name[nameLength] = '\0';
+		if ((file = AnnIndexGet(name)) == NULL)
+			return ANN_STALE;
+		/* Legacy searches must honor the same tombstones as operation 22. */
+		if (__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) > 0)
+			status = PredicateBitmap(service, file, &all, 1, &bitmap);
+		if (status == ANN_OK)
+			status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap,
+									 name, dimensions, k, offset, operation, 0);
+		AnnIndexPut(file);
+		return status;
+	}
 	job = calloc(1, sizeof(*job));
 	if (job == NULL)
 		return ANN_NOMEM;
@@ -1685,11 +1713,6 @@ PutBitmap(const unsigned char *payload, uint32_t size)
 	free(bitmap);
 	return status;
 }
-
-static AnnStatus SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t request,
-								 unsigned char *payload, uint32_t size, AnnIndexFile *file,
-								 AnnIndexBitmap *bitmap, const char *name, uint32_t dimensions,
-								 uint32_t k, size_t offset, uint16_t operation, uint32_t flags);
 
 /*
  * Cached bitmap search payload: u32 name length, name, u32 dimensions, k,

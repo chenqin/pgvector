@@ -15,6 +15,7 @@
 #include "ann.h"
 #include "ann/filter.h"
 #include "access/stratnum.h"
+#include "catalog/dependency.h"
 #include "catalog/pg_opfamily_d.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_trigger.h"
@@ -50,9 +51,9 @@ StaticAssertDecl(MAXALIGN(SizeOfPageHeaderData) + MAXALIGN(sizeof(AnnMetaPageDat
 				 "frozen ann metapage does not fit");
 
 /*
- * The guard keeps a frozen table frozen: a BEFORE statement trigger on
- * INSERT, UPDATE, DELETE and TRUNCATE that always fails. Frozen builds
- * require it, so the rows the GPU index was built from stay the table's rows.
+ * The statement guard rejects direct writes, including TRUNCATE and empty
+ * statements; the row guard also rejects writes through a parent relation.
+ * Frozen builds require both, so exported rows remain the table's rows.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_guard);
 Datum
@@ -72,7 +73,7 @@ ann_frozen_guard(PG_FUNCTION_ARGS)
 
 /* The guard trigger's OID, or InvalidOid when the table has no valid guard. */
 static Oid
-FindGuard(Relation heap)
+FindGuardKind(Relation heap, bool row)
 {
 	TriggerDesc *desc = heap->trigdesc;
 
@@ -85,15 +86,21 @@ FindGuard(Relation heap)
 		FmgrInfo	flinfo;
 
 		if (trigger->tgenabled != TRIGGER_FIRES_ALWAYS || trigger->tgnattr > 0 ||
-			trigger->tgqual != NULL || TRIGGER_FOR_ROW(type) || !TRIGGER_FOR_BEFORE(type) ||
+			trigger->tgqual != NULL || TRIGGER_FOR_ROW(type) != row || !TRIGGER_FOR_BEFORE(type) ||
 			!TRIGGER_FOR_INSERT(type) || !TRIGGER_FOR_UPDATE(type) ||
-			!TRIGGER_FOR_DELETE(type) || !TRIGGER_FOR_TRUNCATE(type))
+			!TRIGGER_FOR_DELETE(type) || (!row && !TRIGGER_FOR_TRUNCATE(type)))
 			continue;
 		fmgr_info(trigger->tgfoid, &flinfo);
 		if (flinfo.fn_addr == ann_frozen_guard)
 			return trigger->tgoid;
 	}
 	return InvalidOid;
+}
+
+static Oid
+FindGuard(Relation heap)
+{
+	return OidIsValid(FindGuardKind(heap, true)) ? FindGuardKind(heap, false) : InvalidOid;
 }
 
 /* Whether a table has the guard trigger (ann_freeze). */
@@ -119,6 +126,8 @@ ann_freeze(PG_FUNCTION_ARGS)
 	Relation	heap = table_open(relid, ShareRowExclusiveLock);
 	char	   *table;
 	char	   *function;
+	Oid			statementGuard;
+	bool		rowGuard;
 
 	if (heap->rd_rel->relkind != RELKIND_RELATION)
 		ereport(ERROR,
@@ -129,6 +138,8 @@ ann_freeze(PG_FUNCTION_ARGS)
 		table_close(heap, NoLock);
 		PG_RETURN_BOOL(false);
 	}
+	statementGuard = FindGuardKind(heap, false);
+	rowGuard = OidIsValid(FindGuardKind(heap, true));
 	table = quote_qualified_identifier(get_namespace_name(RelationGetNamespace(heap)),
 									   RelationGetRelationName(heap));
 	function = quote_qualified_identifier(get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid)),
@@ -136,12 +147,30 @@ ann_freeze(PG_FUNCTION_ARGS)
 	table_close(heap, NoLock);
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
-	if (SPI_execute(psprintf("CREATE TRIGGER ann_frozen_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE "
-							 "ON %s FOR EACH STATEMENT EXECUTE FUNCTION %s()", table, function),
-					false, 0) != SPI_OK_UTILITY ||
-		SPI_execute(psprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER ann_frozen_guard", table),
-					false, 0) != SPI_OK_UTILITY)
-		elog(ERROR, "could not create the ann_frozen_guard trigger");
+	if (!OidIsValid(statementGuard))
+	{
+		if (SPI_execute(psprintf("CREATE TRIGGER ann_frozen_guard BEFORE INSERT OR UPDATE OR DELETE OR TRUNCATE "
+								 "ON %s FOR EACH STATEMENT EXECUTE FUNCTION %s()", table, function),
+						false, 0) != SPI_OK_UTILITY ||
+			SPI_execute(psprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER ann_frozen_guard", table),
+						false, 0) != SPI_OK_UTILITY)
+			elog(ERROR, "could not create the ann_frozen_guard trigger");
+		statementGuard = get_trigger_oid(relid, "ann_frozen_guard", false);
+	}
+	if (!rowGuard)
+	{
+		ObjectAddress child;
+		ObjectAddress parent;
+
+		if (SPI_execute(psprintf("CREATE TRIGGER ann_frozen_row_guard BEFORE INSERT OR UPDATE OR DELETE "
+								 "ON %s FOR EACH ROW EXECUTE FUNCTION %s()", table, function), false, 0) != SPI_OK_UTILITY ||
+			SPI_execute(psprintf("ALTER TABLE %s ENABLE ALWAYS TRIGGER ann_frozen_row_guard", table), false, 0) != SPI_OK_UTILITY)
+			elog(ERROR, "could not create the ann_frozen_row_guard trigger");
+		/* Dropping the statement guard also removes its row guard. */
+		ObjectAddressSet(child, TriggerRelationId, get_trigger_oid(relid, "ann_frozen_row_guard", false));
+		ObjectAddressSet(parent, TriggerRelationId, statementGuard);
+		recordDependencyOn(&child, &parent, DEPENDENCY_AUTO);
+	}
 	SPI_finish();
 	PG_RETURN_BOOL(true);
 }

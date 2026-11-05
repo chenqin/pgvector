@@ -35,6 +35,8 @@ class FrozenTests(unittest.TestCase):
         self.db = psycopg.connect(DSN, autocommit=True)
         # VACUUM can mark pages all-visible only once their commits are flushed.
         self.db.execute('SET synchronous_commit = on')
+        # The tables are tiny: without a free call, a sort over them is cheaper than the route.
+        self.db.execute('SET ann.frozen_setup_cost = 0')
         self.schema = 'ann_frozen_' + uuid.uuid4().hex[:12]
         self.db.execute(sql.SQL('CREATE SCHEMA {}').format(sql.Identifier(self.schema)))
         self.db.execute(sql.SQL('SET search_path = {}, public').format(sql.Identifier(self.schema)))
@@ -301,8 +303,16 @@ class FrozenTests(unittest.TestCase):
         self.db.execute(f"""INSERT INTO parts SELECT {5 * ROWS} + i, i % 13, (i % 7)::smallint, 'new ' || i,
                                ARRAY[cos(i) * 50, sin(i * 1.1) * 40, cos(i * 0.3) * 30, i % 5]::vector
                            FROM generate_series(1, 400) i""")
-        self.assertIn('cannot insert into frozen ann index',
+        self.assertIn('is frozen for ann indexes',
                       self.error("INSERT INTO parts VALUES (1, 1, 1, '', '[1,2,3,4]')"))
+        for statement in ["DELETE FROM parts WHERE id = 5",
+                          "UPDATE parts SET body = 'changed' WHERE id = 5"]:
+            self.assertIn('is frozen for ann indexes', self.error(statement))
+        self.db.execute('SET session_replication_role = replica')
+        try:
+            self.assertIn('is frozen for ann indexes', self.error('DELETE FROM parts WHERE id = 5'))
+        finally:
+            self.db.execute('RESET session_replication_role')
         for predicate in ['tenant = 3', 'category IN (1, 2) AND tenant < 9', 'true']:
             statement = f"SELECT id FROM parts WHERE {predicate} ORDER BY emb <-> '[3,1,4,1]' LIMIT 30"
             plan = self.plan(statement)
@@ -455,6 +465,15 @@ class FrozenTests(unittest.TestCase):
                                   ('docs_ann', 'category <> 4 AND tenant IN (2, 7)')).fetchone()
         self.assertEqual((swapped[0], bytes(swapped[1])), (first[0], bytes(first[1])))
         self.assertEqual(self.cache_stats()[2], hits + 1)
+        # The backend-local copy is independent of shared-cache reclamation.
+        self.db.execute('SET ann.frozen_filter_local_cache_mb = 0')
+        self.assert_filter('docs_ann', predicate)
+        self.db.execute('SET ann.frozen_filter_local_cache_mb = 1')
+        for _ in range(3):
+            self.assert_filter('docs_ann', predicate)
+        self.db.execute('SET ann.frozen_filter_cache_mb = 0')
+        self.assert_filter('docs_ann', predicate)
+        self.db.execute('RESET ann.frozen_filter_cache_mb')
         # A sparse result (under 1/64 of the rows) is kept as ordinals and rebuilt on a hit.
         sparse = 'tenant = 7 AND category = 3'
         hits = self.cache_stats()[2]
@@ -651,6 +670,130 @@ class FrozenTests(unittest.TestCase):
             self.assertIn('is not a frozen table', self.error('SELECT ann_frozen_delete(%s, %s)',
                                                               ('pg_class', [1])))
         finally:
+            server.close()
+
+    def test_sampled_relation(self):
+        self.create()
+        self.db.execute('SET enable_sort = off')
+        try:
+            statement = "SELECT id FROM docs TABLESAMPLE SYSTEM(0) ORDER BY emb <-> '[1,2,3,4]' LIMIT 3"
+            self.assertNotIn('AnnFrozenSearch', self.plan(statement))
+            self.assertEqual(self.db.execute(statement).fetchall(), [])
+        finally:
+            self.db.execute('RESET enable_sort')
+
+    def test_route_is_costed(self):
+        self.create()
+        self.db.execute('CREATE INDEX docs_tenant ON docs (tenant)')
+        self.db.execute('ANALYZE docs')
+        statement = "SELECT id FROM docs WHERE tenant = 3 ORDER BY emb <-> '[1,2,3,4]', id LIMIT 10"
+        routed = self.plan(statement)
+        self.assertIn('AnnFrozenSearch', routed)
+        expected = self.db.execute(statement).fetchall()
+        # At the default call cost, a sort of the 230 rows the btree finds is cheaper.
+        self.db.execute('RESET ann.frozen_setup_cost')
+        try:
+            plan = self.plan(statement)
+            self.assertNotIn('AnnFrozenSearch', plan)
+            self.assertIn('docs_tenant', plan)
+            self.assertEqual(self.db.execute(statement).fetchall(), expected)
+        finally:
+            self.db.execute('SET ann.frozen_setup_cost = 0')
+
+    def test_upgrade_guard(self):
+        self.create(index=False)
+        self.db.execute('DROP TRIGGER ann_frozen_row_guard ON docs')
+        self.assertTrue(self.value("SELECT ann_freeze('docs')"))
+        self.assertFalse(self.value("SELECT ann_freeze('docs')"))
+        self.db.execute('CREATE INDEX docs_ann ON docs USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, tenant, category) WITH (frozen = true)')
+        # The row guard follows the statement guard's lifecycle.
+        self.db.execute('DROP INDEX docs_ann')
+        self.db.execute('DROP TRIGGER ann_frozen_guard ON docs')
+        self.db.execute("UPDATE docs SET body = 'changed' WHERE id = 5")
+
+    def test_tombstone_delivery_failure(self):
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        self.create()
+        server = Server('--backend', 'cpu-exact')
+        name = 'delivery_' + uuid.uuid4().hex[:8]
+        notices = []
+        self.db.add_notice_handler(lambda notice: notices.append(notice.message_primary))
+        try:
+            self.load(server, name)
+            self.db.execute('SET ann.worker_timeout_ms = 100')
+            with self.db.transaction():
+                self.db.execute("SELECT ann_frozen_delete('docs', ARRAY[5]::bigint[])")
+                server.close()
+                server = None
+            self.assertEqual(self.value("SELECT count(*) FROM ann_frozen_tombstone WHERE source='docs'::regclass"), 1)
+            self.assertTrue(any('committed tombstones could not be sent' in notice for notice in notices))
+            server = Server('--backend', 'cpu-exact')
+            self.db.execute("SELECT set_config('ann.worker_socket', %s, false)", (server.path,))
+            self.db.execute('SELECT ann_index_load(%s, %s)', (name, os.path.join(self.directory.name, name)))
+            self.assertEqual(self.value('SELECT eligible FROM ann_index_filter(%s, %s)', (name, 'true')), ROWS - 1)
+        finally:
+            if server:
+                server.close()
+
+    def test_tombstone_cursor_lifetime(self):
+        self.create()
+        query = '[1,2,3,4]'
+        deleted = [r[0] for r in self.db.execute(
+            'SELECT id FROM docs ORDER BY emb <-> %s::vector OFFSET 10 LIMIT 10', (query,))]
+        self.db.execute("SELECT ann_frozen_delete('docs', %s)", (deleted,))
+        with self.db.transaction():
+            self.db.execute("DECLARE frozen_cursor NO SCROLL CURSOR FOR SELECT id FROM docs "
+                            "ORDER BY emb <-> '[1,2,3,4]'")
+            first = self.db.execute('FETCH 1 FROM frozen_cursor').fetchall()
+            # Grow beyond the old allocation's size class, then refresh in another scan.
+            self.db.execute("SELECT ann_frozen_delete('docs', ARRAY(SELECT generate_series(100000,100200))::bigint[])")
+            self.db.execute("SELECT id FROM docs ORDER BY emb <-> '[1,2,3,4]' LIMIT 1")
+            rest = self.db.execute('FETCH ALL FROM frozen_cursor').fetchall()
+            self.assertEqual(len(first) + len(rest), ROWS - len(deleted))
+            self.assertFalse(set(deleted) & {r[0] for r in first + rest})
+
+    def test_tombstone_rollback(self):
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        self.create()
+        query = '[1,2,3,4]'
+        nearest, _ = self.route('true', query, 10)
+        deleted = [r[0] for r in nearest[:3]]
+        server = Server('--backend', 'cpu-exact')
+        name = 'rollback_' + uuid.uuid4().hex[:8]
+        try:
+            self.load(server, name)
+            self.db.execute('BEGIN')
+            self.db.execute("SELECT ann_frozen_delete('docs', %s)", (deleted,))
+            self.assertFalse(set(deleted) & {r[0] for r in self.route('true', query, 10)[0]})
+            self.db.execute('ROLLBACK')
+            self.assertEqual(self.value('SELECT count(*) FROM ann_frozen_tombstone WHERE source = %s::regclass',
+                                        ('docs',)), 0)
+            actual, _ = self.route('true', query, 10)
+            self.assertEqual(actual, nearest)
+            # A savepoint rollback must discard its worker notification too.
+            with self.db.transaction():
+                self.db.execute('SAVEPOINT deleted')
+                self.db.execute("SELECT ann_frozen_delete('docs', %s)", (deleted,))
+                self.route('true', query, 10)  # populate this transaction's local cache
+                self.db.execute('ROLLBACK TO deleted')
+            self.assertEqual(self.route('true', query, 10)[0], nearest)
+            # Committing a surviving child transaction publishes the delete.
+            with self.db.transaction():
+                self.db.execute('SAVEPOINT deleted')
+                self.db.execute("SELECT ann_frozen_delete('docs', %s)", (deleted,))
+                self.db.execute('RELEASE deleted')
+                # Delivery uses the destination captured by the delete.
+                self.db.execute("SET LOCAL ann.worker_socket = '/tmp/ann-no-such-worker.sock'")
+            eligible = self.value('SELECT eligible FROM ann_index_filter(%s, %s)', (name, 'true'))
+            self.assertEqual(eligible, ROWS - len(deleted))
+            hits = self.db.execute('SELECT id FROM ann_index_search(%s, %s::vector, 10)', (name, query)).fetchall()
+            self.assertEqual(len(hits), 10)
+            self.assertFalse(set(deleted) & {r[0] for r in hits})
+        finally:
+            self.db.execute('ROLLBACK')
             server.close()
 
     def test_generation_mismatch_and_switch(self):
@@ -876,7 +1019,29 @@ class FrozenCuvsTests(unittest.TestCase):
                     FROM {table} q WHERE q.id % 900 = 0) x""").fetchone()
             self.assertEqual(mismatches, 0)
             self.assertGreaterEqual(recall, 0.9)
+            # k=500, with 750 eligible rows: above this worker's exact CPU
+            # limit, so rollback and committed deletes exercise the GPU route.
+            query = db.execute(f'SELECT emb::text FROM {table} WHERE id=3').fetchone()[0]
+            statement = f'SELECT id FROM {table} WHERE tenant=1 ORDER BY emb <-> %s::vector LIMIT 500'
+            before = db.execute(statement, (query,)).fetchall()
+            self.assertEqual(len(before), 500)
+            deleted = [r[0] for r in before[:3]]
+            db.execute('BEGIN')
+            db.execute('SELECT ann_frozen_delete(%s,%s)', (table, deleted))
+            own = db.execute(statement, (query,)).fetchall()
+            self.assertFalse(set(deleted) & {r[0] for r in own})
+            db.execute('ROLLBACK')
+            self.assertEqual(db.execute(statement, (query,)).fetchall(), before)
+            self.assertEqual(db.execute('SELECT eligible FROM ann_index_filter(%s,%s)',
+                                       (table, 'true')).fetchone()[0], 30000)
+            db.execute('SELECT ann_frozen_delete(%s,%s)', (table, deleted))
+            hits = db.execute('SELECT id FROM ann_index_search(%s,%s::vector,500)', (table, query)).fetchall()
+            self.assertEqual(len(hits), 500)
+            self.assertFalse(set(deleted) & {r[0] for r in hits})
+            db.execute('SELECT ann_index_unload(%s)', (table,))
         finally:
+            db.execute('ROLLBACK')
+            db.execute('DELETE FROM ann_frozen_tombstone WHERE source=to_regclass(%s)', (table,))
             db.execute(f'DROP TABLE IF EXISTS {table}')
             db.close()
             server.close()

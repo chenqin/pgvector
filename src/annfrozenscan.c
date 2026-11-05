@@ -1,5 +1,6 @@
 #include "postgres.h"
 
+#include <float.h>
 #include <math.h>
 
 #include "access/relscan.h"
@@ -49,6 +50,7 @@
 #define ANN_FROZEN_DEFAULT_K 100
 
 bool		ann_enable_frozen_search = true;
+static double ann_frozen_setup_cost = 1000.0;
 static set_rel_pathlist_hook_type previous_pathlist_hook = NULL;
 
 typedef struct FrozenScanState
@@ -200,10 +202,11 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	int			k;
 	CustomPath *path;
 	int			member;
+	QualCost	recheck;
 
 	if (previous_pathlist_hook)
 		previous_pathlist_hook(root, rel, rti, rte);
-	if (!ann_enable_frozen_search || rte->rtekind != RTE_RELATION || rte->inh ||
+	if (!ann_enable_frozen_search || rte->rtekind != RTE_RELATION || rte->inh || rte->tablesample ||
 		(rel->reloptkind != RELOPT_BASEREL && rel->reloptkind != RELOPT_OTHER_MEMBER_REL) ||
 		root->query_pathkeys == NIL || rel->indexlist == NIL)
 		return;
@@ -247,8 +250,21 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	path->path.parent = rel;
 	path->path.pathtarget = rel->reltarget;
 	path->path.rows = rel->rows;
-	path->path.startup_cost = 10.0;
-	path->path.total_cost = 10.0 + rel->rows * cpu_tuple_cost;
+
+	/*
+	 * Cost the route so the planner can choose it or an ordinary plan. The
+	 * call (the GPU round trip, or evaluating the program from the pages)
+	 * comes before the first row: a fixed setup cost plus scoring every row
+	 * the predicate selects. Each row returned then costs its fetch (from the
+	 * index pages when covering, otherwise a heap page) and the qual recheck.
+	 * Keeping rows = rel->rows lets a LIMIT charge only the rows it takes.
+	 */
+	cost_qual_eval(&recheck, quals, root);
+	path->path.startup_cost = ann_frozen_setup_cost + recheck.startup +
+		rel->rows * cpu_operator_cost;
+	path->path.total_cost = path->path.startup_cost +
+		rel->rows * (cpu_tuple_cost + recheck.per_tuple +
+					 (covering ? cpu_index_tuple_cost : random_page_cost));
 	path->path.pathkeys = list_make1(pathkey);
 	path->methods = &FrozenPathMethods;
 	path->custom_private = list_make3(list_make1_oid(index->indexoid), list_make2_int(covering, k),
@@ -362,6 +378,21 @@ AnnFrozenTombstonesChanged(void)
 
 static int	OrdinalCompare(const void *a, const void *b);
 
+/* A cache refresh must not reclaim another active scan's tombstones. */
+static void
+CopyTombstones(FrozenScanState *state, const TombstoneEntry *entry)
+{
+	state->ntombstones = entry->count;
+	if (entry->count > 0)
+	{
+		uint64	   *copy = MemoryContextAlloc(state->css.ss.ps.state->es_query_cxt,
+											  sizeof(uint64) * entry->count);
+
+		memcpy(copy, entry->ordinals, sizeof(uint64) * entry->count);
+		state->tombstones = copy;
+	}
+}
+
 static void
 LoadTombstones(FrozenScanState *state)
 {
@@ -386,20 +417,20 @@ LoadTombstones(FrozenScanState *state)
 		tombstoneCache = hash_create("ann frozen tombstones", 16, &ctl, HASH_ELEM | HASH_BLOBS);
 	}
 	entry = hash_search(tombstoneCache, &indexOid, HASH_ENTER, &found);
+	if (!found)
+	{
+		entry->ordinals = NULL;
+		entry->count = 0;
+		entry->generation = 0;
+		entry->epoch = 0;
+		entry->checked = 0;
+	}
 	if (found && entry->generation == state->meta->generation && entry->epoch == tombstoneEpoch &&
 		!TimestampDifferenceExceeds(entry->checked, now, 1000))
 	{
-		state->tombstones = entry->ordinals;
-		state->ntombstones = entry->count;
+		CopyTombstones(state, entry);
 		return;
 	}
-	if (found && entry->ordinals)
-		pfree(entry->ordinals);
-	entry->ordinals = NULL;
-	entry->count = 0;
-	entry->generation = state->meta->generation;
-	entry->epoch = tombstoneEpoch;
-	entry->checked = now;
 	if (!OidIsValid(schema) || !OidIsValid(get_relname_relid("ann_frozen_tombstone", schema)))
 		return;
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -439,10 +470,15 @@ LoadTombstones(FrozenScanState *state)
 	}
 	SPI_finish();
 	qsort(ordinals, count, sizeof(uint64), OrdinalCompare);
+	/* Publish only a complete refresh; an ERROR must not cache an empty set. */
+	if (entry->ordinals)
+		pfree(entry->ordinals);
 	entry->ordinals = ordinals;
 	entry->count = count;
-	state->tombstones = ordinals;
-	state->ntombstones = count;
+	entry->generation = state->meta->generation;
+	entry->epoch = tombstoneEpoch;
+	entry->checked = now;
+	CopyTombstones(state, entry);
 }
 
 static char *
@@ -901,6 +937,10 @@ AnnFrozenScanInit(void)
 	DefineCustomBoolVariable("ann.enable_frozen_search",
 							 "Answer ordered searches of tables with frozen ann indexes from the index and the GPU worker.",
 							 NULL, &ann_enable_frozen_search, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomRealVariable("ann.frozen_setup_cost",
+							 "Sets the planner's estimate of the cost of one frozen search call.",
+							 "The GPU worker round trip or the evaluation from the pages, before the first row.",
+							 &ann_frozen_setup_cost, 1000.0, 0.0, DBL_MAX, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("ann.frozen_mmap",
 							 "Read frozen ann index pages through read-only mappings of the index files.",
 							 NULL, &ann_frozen_mmap, true, PGC_USERSET, 0, NULL, NULL, NULL);
