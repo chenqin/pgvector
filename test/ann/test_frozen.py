@@ -345,12 +345,19 @@ class FrozenTests(unittest.TestCase):
             self.assertEqual(columns(), mutable)
             self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_guard')
             self.assertEqual(columns(), immutable)
+            # The row guard counts too: without it, writes through a parent relation get in.
+            self.db.execute('ALTER TABLE docs DISABLE TRIGGER ann_frozen_row_guard')
+            self.assertEqual(columns(), mutable)
+            self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_row_guard')
+            self.assertEqual(columns(), immutable)
 
             # Rows deleted under a disabled guard leave pages not all-visible: they come from the heap,
             # even once the guard fires again.
             self.db.execute('ALTER TABLE docs DISABLE TRIGGER ann_frozen_guard')
+            self.db.execute('ALTER TABLE docs DISABLE TRIGGER ann_frozen_row_guard')
             self.db.execute('DELETE FROM docs WHERE tenant = 4 AND id % 10 = 0')
             self.assertNotIn('Heap Fetches: 0', matches_sql())
+            self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_row_guard')
             self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_guard')
             self.assertEqual(columns(), mutable)
             self.assertNotIn('Heap Fetches: 0', matches_sql())
