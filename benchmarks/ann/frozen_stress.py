@@ -146,6 +146,7 @@ def main():
     parser.add_argument('--plan-cache-mode', choices=['auto', 'force_generic_plan', 'force_custom_plan'],
                         default='force_generic_plan')
     parser.add_argument('--setup-cost', type=float, default=1000.0)
+    parser.add_argument('--prefetch-distance', type=int, choices=range(65))
     parser.add_argument('--profile-library', help='optional session preload library for isolated debugger runs')
     parser.add_argument('--count-only', action='store_true', help='diagnostic: aggregate the 500 rows on the server')
     args = parser.parse_args()
@@ -179,6 +180,8 @@ def main():
                                       f'-c statement_timeout=30000 -c plan_cache_mode={args.plan_cache_mode}'))
                 if args.profile_library:
                     env['PGOPTIONS'] += f' -c session_preload_libraries={args.profile_library}'
+                if args.prefetch_distance is not None:
+                    env['PGOPTIONS'] += f' -c ann.frozen_prefetch_distance={args.prefetch_distance}'
                 command = ['pgbench', args.dsn, '-n', '-M', 'prepared', '-c', str(clients),
                            '-j', str(min(clients, args.threads)), '-T', str(args.seconds), '-r',
                            '-f', str(script), '-l', '--sampling-rate=0.05', '--log-prefix', str(Path(directory) / 'latency')]
@@ -212,6 +215,7 @@ def main():
                                 pass
                 row = dict(label=args.label, workload=workload, clients=clients, k=args.k,
                            plan_cache_mode=args.plan_cache_mode, setup_cost=args.setup_cost,
+                           prefetch_distance=args.prefetch_distance,
                            mmap=args.mmap, local_cache_mb=args.local_cache_mb,
                            client_threads=min(clients,args.threads), table=args.table, query_table=args.queries,
                            count_only=args.count_only, seconds=elapsed,

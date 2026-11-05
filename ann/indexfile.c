@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 8};
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
 
 /*

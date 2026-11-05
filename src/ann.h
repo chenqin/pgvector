@@ -239,6 +239,7 @@ void		AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray 
 char	   *AnnArrayLockPage(AnnArrayReader *reader, BlockNumber page, uint32 *count);
 void		AnnArrayUnlockPage(AnnArrayReader *reader);
 void		AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out);
+void		AnnArrayPrefetch(AnnArrayReader *reader, uint64 element);
 void		AnnArrayReaderEnd(AnnArrayReader *reader);
 const char *AnnFrozenColumnName(Relation index, int column);
 Oid			AnnFrozenColumnCollation(Relation index, int column);

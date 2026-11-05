@@ -213,8 +213,10 @@ typedef struct AnnIndexOptions
 	int			prewarm;		/* read index files into memory at load */
 	int			lock_memory;	/* mlock them */
 	int			plain_allocator;	/* --device-allocator plain: cuVS
-									 * allocates with cudaMalloc, no pool
-									 * (last: the initializer is positional) */
+									 * allocates with cudaMalloc, no pool */
+	uint32_t	rerank_prefetch;	/* candidate lookahead for host vector
+									 * reads; last: the initializer is
+									 * positional */
 } AnnIndexOptions;
 
 extern AnnIndexOptions AnnIndexConfig;

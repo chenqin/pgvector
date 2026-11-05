@@ -692,6 +692,26 @@ class FrozenTests(unittest.TestCase):
         finally:
             self.db.execute('RESET enable_sort')
 
+    def test_prefetch_boundaries(self):
+        self.create(rows=17)
+        statement = ("SELECT id, emb::text, tenant, category FROM docs "
+                     "ORDER BY emb <-> '[1,2,3,4]', id LIMIT %s")
+        self.db.execute('SET ann.enable_frozen_search = off')
+        expected = self.db.execute(statement, (30,)).fetchall()
+        self.db.execute('RESET ann.enable_frozen_search')
+        for distance in (0, 1, 4, 64):
+            self.db.execute("SELECT set_config('ann.frozen_prefetch_distance', %s, false)", (str(distance),))
+            self.assertIn('AnnFrozenSearch', self.plan(statement, (17,)))
+            for limit in (0, 1, 17, 30):
+                self.assertEqual(self.db.execute(statement, (limit,)).fetchall(), expected[:limit])
+        # A new backend with mmap disabled must retain the buffered fallback.
+        with self.psycopg.connect(DSN, autocommit=True) as other:
+            other.execute(f'SET search_path = {self.schema}, public')
+            other.execute('SET ann.frozen_setup_cost = 0')
+            other.execute('SET ann.frozen_mmap = off')
+            other.execute('SET ann.frozen_prefetch_distance = 64')
+            self.assertEqual(other.execute(statement, (30,)).fetchall(), expected)
+
     def test_route_is_costed(self):
         self.create()
         self.db.execute('CREATE INDEX docs_tenant ON docs (tenant)')

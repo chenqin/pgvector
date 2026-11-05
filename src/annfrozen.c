@@ -492,6 +492,26 @@ AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array
 		reader->map = map;
 }
 
+/* CPU-cache hints only for immutable mapped arrays; never bypass TID locks. */
+void
+AnnArrayPrefetch(AnnArrayReader *reader, uint64 element)
+{
+#if defined(__GNUC__) || defined(__clang__)
+	const AnnArray *array = reader->array;
+	const char *data;
+
+	if (reader->map == NULL || element >= array->count)
+		return;
+	data = PageGetContents(MappedPage(reader->map, array->start + element / array->perPage)) +
+		(size_t) (element % array->perPage) * array->width;
+	for (size_t offset = 0; offset < array->width; offset += PG_CACHE_LINE_SIZE)
+		__builtin_prefetch(data + offset, 0, 3);
+#else
+	(void) reader;
+	(void) element;
+#endif
+}
+
 /*
  * Pin and share-lock one page of the array; returns its first element and
  * sets count to the elements on it. The lock lasts until the next call or

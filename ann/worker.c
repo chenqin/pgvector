@@ -359,6 +359,18 @@ main(int argc, char **argv)
 			AnnIndexConfig.quantized_scan = strcmp(value, "off") != 0;
 		else if (strcmp(argv[i], "--quant-slack") == 0)
 			AnnIndexConfig.quant_slack = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--rerank-prefetch") == 0)
+		{
+			char	   *end;
+			unsigned long distance = strtoul(value, &end, 10);
+
+			if (value[0] == '\0' || value[0] == '-' || *end || distance > 64)
+			{
+				fprintf(stderr, "--rerank-prefetch takes 0..64 candidates\n");
+				return 2;
+			}
+			AnnIndexConfig.rerank_prefetch = (uint32_t) distance;
+		}
 		else if (strcmp(argv[i], "--bitset-gather-limit") == 0)
 			AnnIndexConfig.bitset_gather_limit = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--memory-pool") == 0)
@@ -555,7 +567,7 @@ usage:
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
-			"  [--quantized-scan on|off] [--quant-slack N] [--predicate-cache N]\n"
+			"  [--quantized-scan on|off] [--quant-slack N] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else

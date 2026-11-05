@@ -1236,6 +1236,24 @@ ExactDistance(const AnnIndexFile *file, uint64_t row, const float *query)
 	return (float) sqrt(sum);
 }
 
+/* Host memory hints only; keep ExactDistance's arithmetic unchanged. */
+static void
+PrefetchExactVector(const AnnIndexFile *file, uint64_t row)
+{
+#if defined(__GNUC__) || defined(__clang__)
+	const float *vector;
+
+	if (row >= file->rows)
+		return;
+	vector = file->vectors + row * file->dimensions;
+	for (uint32_t d = 0; d < file->dimensions; d += 16)
+		__builtin_prefetch(vector + d, 0, 3);
+#else
+	(void) file;
+	(void) row;
+#endif
+}
+
 /*
  * Turn one shard's CAGRA neighbours into a sorted hit list, re-scoring each
  * with FP32 vectors so FP16 datasets still return exact distances. Rows
@@ -1250,6 +1268,15 @@ ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint3
 	for (uint32_t i = 0; i < n; i++)
 	{
 		uint32_t	local = neighbors[i];
+		uint32_t	distance = AnnIndexConfig.rerank_prefetch;
+
+		if (distance && n - i > distance)
+		{
+			uint32_t	future = neighbors[i + distance];
+
+			if (future < file->shards[s].rows)
+				PrefetchExactVector(file, file->shards[s].first + future);
+		}
 
 		if (local >= file->shards[s].rows ||
 			(bitset && !(bitset[local / 32] & (UINT32_C(1) << (local % 32)))))
@@ -1875,6 +1902,15 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			int64_t		key;
 			uint64_t	low = first,
 						high = first + file->shards[s].rows;
+			uint32_t	distance = AnnIndexConfig.rerank_prefetch;
+
+			if (distance && job->ordinals && wanted[s] - i > distance)
+			{
+				int64_t		future = found[i + distance];
+
+				if (future >= 0 && (uint64_t) future < eligible[s])
+					PrefetchExactVector(file, job->ordinals[start[s] + (uint64_t) future]);
+			}
 
 			if (found[i] < 0 || (uint64_t) found[i] >= eligible[s])
 				continue;

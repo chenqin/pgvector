@@ -52,6 +52,7 @@
 
 bool		ann_enable_frozen_search = true;
 static double ann_frozen_setup_cost = 1000.0;
+static int	ann_frozen_prefetch_distance = 4;
 static set_rel_pathlist_hook_type previous_pathlist_hook = NULL;
 
 typedef struct FrozenScanState
@@ -829,6 +830,21 @@ FrozenAllVisible(FrozenScanState *state, Relation heap, BlockNumber block)
 	return VM_ALL_VISIBLE(heap, block, &state->vmbufs[slot]);
 }
 
+/* Issue cache hints in result order without reading mutable TIDs or VM bits. */
+static void
+PrefetchResult(FrozenScanState *state, uint64 position)
+{
+	uint64		ordinal = state->ordinals[position];
+
+	if (ordinal >= state->meta->rows)
+		return;
+	if (state->vectorMode == ANN_FROZEN_VECTORS_FLOAT)
+		AnnArrayPrefetch(&state->vectors, ordinal);
+	AnnArrayPrefetch(&state->keys, ordinal);
+	for (uint32 c = 0; c < state->meta->ncolumns; c++)
+		AnnArrayPrefetch(&state->values[c], ordinal);
+}
+
 static TupleTableSlot *
 FrozenNext(ScanState *node)
 {
@@ -847,6 +863,16 @@ FrozenNext(ScanState *node)
 		}
 		if (state->next >= state->nresults)
 			return ExecClearTuple(slot);
+		if (state->covering && ann_frozen_prefetch_distance > 0)
+		{
+			uint64		distance = (uint64) ann_frozen_prefetch_distance;
+
+			if (state->next == 0)
+				for (uint64 i = 0; i < Min(distance, state->nresults); i++)
+					PrefetchResult(state, i);
+			if (state->nresults - state->next > distance)
+				PrefetchResult(state, state->next + distance);
+		}
 		ordinal = state->ordinals[state->next++];
 		if (ordinal >= state->meta->rows || AlreadyReturned(state, ordinal))
 			continue;
@@ -955,6 +981,10 @@ ExplainFrozenScan(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 AnnFrozenScanInit(void)
 {
+	DefineCustomIntVariable("ann.frozen_prefetch_distance",
+							"Result rows ahead to prefetch immutable mapped columns (0 disables).",
+							NULL, &ann_frozen_prefetch_distance, 4, 0, 64, PGC_USERSET,
+							0, NULL, NULL, NULL);
 	DefineCustomBoolVariable("ann.enable_frozen_search",
 							 "Answer ordered searches of tables with frozen ann indexes from the index and the GPU worker.",
 							 NULL, &ann_enable_frozen_search, true, PGC_USERSET, 0, NULL, NULL, NULL);
