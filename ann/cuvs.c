@@ -1600,17 +1600,6 @@ GatherBuffers(AnnCuvsDevice *lane, size_t rows, size_t top)
 
 static atomic_ullong gatherRepairs;
 
-/* Whether n selected positions are all different; n is at most k + slack. */
-static int
-DistinctPositions(const int64_t *positions, uint32_t n)
-{
-	for (uint32_t i = 1; i < n; i++)
-		for (uint32_t j = 0; j < i; j++)
-			if (positions[i] == positions[j] && positions[i] >= 0)
-				return 0;
-	return 1;
-}
-
 /*
  * Exact top k of one filtered query by gather scan. Keys are sorted and
  * unique; each shard's slice goes to its device, where a lookup kernel finds
@@ -1861,7 +1850,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		 * Distinct selected positions are cheap to check; a shard that fails
 		 * is scored again exactly on the CPU.
 		 */
-		if (!DistinctPositions(found, wanted[s]))
+		if (!AnnIndexPositionsDistinct(found, wanted[s]))
 		{
 			uint64_t   *ordinals = malloc(sizeof(uint64_t) * (eligible[s] ? eligible[s] : 1));
 			AnnIndexJob part = *job;
@@ -1890,15 +1879,23 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			if (found[i] < 0 || (uint64_t) found[i] >= eligible[s])
 				continue;
 			key = keys[start[s] + (uint64_t) found[i]];
-			while (low < high)
+			if (job->ordinals)
 			{
-				uint64_t	middle = low + (high - low) / 2;
-
-				if (file->keys[middle] < key)
-					low = middle + 1;
-				else
-					high = middle;
+				/* Cached filters already pair each key with its ordinal. */
+				low = job->ordinals[start[s] + (uint64_t) found[i]];
+				if (low < first || low >= high)
+					continue;
 			}
+			else
+				while (low < high)
+				{
+					uint64_t	middle = low + (high - low) / 2;
+
+					if (file->keys[middle] < key)
+						low = middle + 1;
+					else
+						high = middle;
+				}
 			if (low == first + file->shards[s].rows || file->keys[low] != key)
 				continue;
 			hits[counts[s]].key = key;
@@ -2332,7 +2329,7 @@ SearchGatherGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 				AnnBlackwellResults(shards[s].device, s, j, &positions, &unused);
 				for (uint32_t i = 0; i < ANN_BLACKWELL_TOP; i++)
 					distinct[i] = positions[i] == UINT32_MAX ? -1 : (int64_t) positions[i];
-				if (!DistinctPositions(distinct, ANN_BLACKWELL_TOP))
+				if (!AnnIndexPositionsDistinct(distinct, ANN_BLACKWELL_TOP))
 				{
 					AnnIndexJob part = *job;
 

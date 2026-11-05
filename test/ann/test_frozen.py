@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import uuid
 
@@ -657,6 +658,15 @@ class FrozenTests(unittest.TestCase):
                 self.assertEqual([row[0] for row in actual], expected(predicate, 10), predicate)
             name = 'frozen_' + uuid.uuid4().hex[:8]
             self.load(server, name)                                       # tombstones go with the load
+            # Earlier page scans cached that no worker was loaded. Discovery
+            # refreshes that negative entry after a second, not at load time.
+            deadline = time.monotonic() + 5
+            while True:
+                _, plan = self.route('true', query, 10)
+                if f'GPU worker "{name}"' in plan or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.05)
+            self.assertIn(f'GPU worker "{name}"', plan)
             for predicate in ['true', 'tenant < 7', 'category IS NOT NULL']:
                 actual, plan = self.route(predicate, query, 10)
                 self.assertIn(f'GPU worker "{name}"', plan, predicate)
@@ -809,6 +819,7 @@ class FrozenTests(unittest.TestCase):
                             (first,))
             other = self.psycopg.connect(DSN, autocommit=True)
             try:
+                other.execute('SET ann.frozen_setup_cost = 0')
                 other.execute('SET ann.worker_socket = %s' % self.sql.Literal(server.path).as_string(other))
                 other.execute(f'SET search_path = {self.schema}, public')
                 with self.assertRaises(self.psycopg.Error) as caught:
@@ -990,6 +1001,7 @@ class FrozenCuvsTests(unittest.TestCase):
         table = 'ann_frozen_cuvs_' + uuid.uuid4().hex[:8]
         try:
             db.execute('SET synchronous_commit = on')
+            db.execute('SET ann.frozen_setup_cost = 0')
             db.execute(f'CREATE TABLE {table} (id bigint, tenant int, emb vector(32))')
             db.execute('SELECT setseed(0.3)')
             db.execute(f"""INSERT INTO {table} SELECT i * 3, i % 40,

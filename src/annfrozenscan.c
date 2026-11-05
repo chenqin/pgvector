@@ -48,6 +48,7 @@
  */
 #define ANN_FROZEN_WORKER_MAX_K 10000
 #define ANN_FROZEN_DEFAULT_K 100
+#define ANN_FROZEN_VM_BUFFERS 32
 
 bool		ann_enable_frozen_search = true;
 static double ann_frozen_setup_cost = 1000.0;
@@ -71,7 +72,7 @@ typedef struct FrozenScanState
 	bool		workerShort;	/* the worker returned fewer than asked */
 	IndexFetchTableData *fetch;
 	TupleTableSlot *heapSlot;	/* heap fetches, copied to the scan slot */
-	Buffer		vmbuf;
+	Buffer		vmbufs[ANN_FROZEN_VM_BUFFERS];
 	AnnArrayReader tids;
 	AnnArrayReader keys;
 	AnnArrayReader vectors;
@@ -316,7 +317,8 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 	state->queryState = ExecInitExpr(linitial(scan->custom_exprs), &node->ss.ps);
 	state->quals = list_copy_tail(scan->custom_exprs, 1);
 	state->distance = index_getprocinfo(state->index, 1, ANN_DISTANCE_PROC);
-	state->vmbuf = InvalidBuffer;
+	for (int i = 0; i < ANN_FROZEN_VM_BUFFERS; i++)
+		state->vmbufs[i] = InvalidBuffer;
 	state->resultCtx = AllocSetContextCreate(estate->es_query_cxt, "Ann frozen search results",
 											 ALLOCSET_DEFAULT_SIZES);
 	AnnArrayReaderInit(&state->tids, state->index, &state->meta->tids, NULL);
@@ -809,6 +811,24 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 	ExecStoreVirtualTuple(slot);
 }
 
+/*
+ * Distance-ordered hits jump among heap blocks. Keep a bounded set of VM
+ * pages pinned instead of releasing and pinning one page for every jump.
+ * Only the pins are reused: VM_ALL_VISIBLE still reads the current bit for
+ * every tuple, including after a rescan or a concurrent visibility change.
+ * The slot calculation follows PostgreSQL's visibility-map page layout;
+ * visibilitymap_get_status itself validates each supplied buffer's tag.
+ */
+static bool
+FrozenAllVisible(FrozenScanState *state, Relation heap, BlockNumber block)
+{
+	uint32		blocksPerPage = (BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) *
+		(BITS_PER_BYTE / BITS_PER_HEAPBLOCK);
+	uint32		slot = (block / blocksPerPage) % ANN_FROZEN_VM_BUFFERS;
+
+	return VM_ALL_VISIBLE(heap, block, &state->vmbufs[slot]);
+}
+
 static TupleTableSlot *
 FrozenNext(ScanState *node)
 {
@@ -837,7 +857,7 @@ FrozenNext(ScanState *node)
 		if (!ItemPointerIsValid(&tid))
 			continue;
 		if (state->covering &&
-			VM_ALL_VISIBLE(node->ss_currentRelation, ItemPointerGetBlockNumber(&tid), &state->vmbuf))
+			FrozenAllVisible(state, node->ss_currentRelation, ItemPointerGetBlockNumber(&tid)))
 		{
 			StoreFromPages(state, slot, ordinal);
 			slot->tts_tid = tid;
@@ -905,8 +925,9 @@ EndFrozenScan(CustomScanState *node)
 		table_index_fetch_end(state->fetch);
 	if (state->heapSlot)
 		ExecDropSingleTupleTableSlot(state->heapSlot);
-	if (BufferIsValid(state->vmbuf))
-		ReleaseBuffer(state->vmbuf);
+	for (int i = 0; i < ANN_FROZEN_VM_BUFFERS; i++)
+		if (BufferIsValid(state->vmbufs[i]))
+			ReleaseBuffer(state->vmbufs[i]);
 	index_close(state->index, AccessShareLock);
 	MemoryContextDelete(state->resultCtx);
 }

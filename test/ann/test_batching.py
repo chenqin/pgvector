@@ -35,6 +35,9 @@ class NativeBatchTests(unittest.TestCase):
     def test_backend_error_propagation(self):
         self.scenario('errors')
 
+    def test_selection_positions_are_unique(self):
+        self.scenario('positions')
+
 
 if __name__ == '__main__':
     unittest.main()

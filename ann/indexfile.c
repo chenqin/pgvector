@@ -20,6 +20,67 @@
 AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0};
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
 
+/*
+ * Reject repeated nonnegative GPU selection positions without changing their
+ * order. Small lists need no scratch setup; larger lists use an open addressed
+ * set, with bounded stack space and an allocation-failure fallback.
+ */
+int
+AnnIndexPositionsDistinct(const int64_t *positions, uint32_t n)
+{
+	int64_t		local[2048];
+	int64_t    *slots = local;
+	size_t		capacity = 64;
+	int			unique = 1;
+
+	if (n <= 32)
+		goto small;
+	while ((uint64_t) capacity < (uint64_t) n * 2)
+	{
+		if (capacity > SIZE_MAX / 2)
+			goto small;
+		capacity *= 2;
+	}
+	if (capacity > sizeof(local) / sizeof(local[0]))
+	{
+		if (capacity > SIZE_MAX / sizeof(*slots) ||
+			(slots = malloc(capacity * sizeof(*slots))) == NULL)
+			goto small;
+	}
+	memset(slots, 0xff, capacity * sizeof(*slots));
+	for (uint32_t i = 0; i < n; i++)
+	{
+		uint64_t	value;
+		size_t		slot;
+
+		if (positions[i] < 0)
+			continue;
+		value = (uint64_t) positions[i];
+		value ^= value >> 33;
+		value *= UINT64_C(0xff51afd7ed558ccd);
+		value ^= value >> 33;
+		slot = (size_t) value & (capacity - 1);
+		while (slots[slot] >= 0 && slots[slot] != positions[i])
+			slot = (slot + 1) & (capacity - 1);
+		if (slots[slot] == positions[i])
+		{
+			unique = 0;
+			break;
+		}
+		slots[slot] = positions[i];
+	}
+	if (slots != local)
+		free(slots);
+	return unique;
+
+small:
+	for (uint32_t i = 1; i < n; i++)
+		for (uint32_t j = 0; j < i; j++)
+			if (positions[i] >= 0 && positions[i] == positions[j])
+				return 0;
+	return 1;
+}
+
 typedef struct Entry
 {
 	AnnIndexFile *file;

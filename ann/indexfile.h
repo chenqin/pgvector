@@ -322,6 +322,9 @@ void		AnnIndexBitmapRelease(AnnIndexFile *file, AnnIndexBitmap *bitmap);
 uint64_t	AnnIndexOrdinals(const AnnIndexFile *file, const int64_t *keys, uint32_t nkeys,
 							 uint64_t *ordinals);
 
+/* Whether selected positions are unique, ignoring negative padding. */
+int			AnnIndexPositionsDistinct(const int64_t *positions, uint32_t n);
+
 /* Exact search over all rows, or over sorted global ordinals when given. */
 void		AnnIndexExact(const AnnIndexFile *file, AnnIndexJob *job,
 						  const uint64_t *ordinals, uint64_t nordinals);

@@ -2,6 +2,7 @@
 #define _POSIX_C_SOURCE 200809L
 #endif
 #include "batching.h"
+#include "indexfile.h"
 
 #include <assert.h>
 #include <pthread.h>
@@ -338,6 +339,51 @@ Validate(void)
 	AnnRequestRelease(request);
 }
 
+static void
+Positions(void)
+{
+	int64_t		positions[10000];
+	int64_t		saved[10000];
+	const uint32_t sizes[] = {0, 1, 2, 31, 32, 33, 500, 1024, 1025, 10000};
+
+	for (size_t s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++)
+	{
+		uint32_t	n = sizes[s];
+
+		for (uint32_t i = 0; i < n; i++)
+			positions[i] = (int64_t) i * 1048576;
+		memcpy(saved, positions, n * sizeof(*positions));
+		assert(AnnIndexPositionsDistinct(positions, n));
+		assert(memcmp(saved, positions, n * sizeof(*positions)) == 0);
+		if (n >= 2)
+		{
+			positions[n - 1] = positions[0];
+			assert(!AnnIndexPositionsDistinct(positions, n));
+			positions[0] = positions[n - 1] = -1;
+			assert(AnnIndexPositionsDistinct(positions, n));
+			positions[0] = positions[n - 1] = INT64_MAX;
+			assert(!AnnIndexPositionsDistinct(positions, n));
+		}
+	}
+	/* Compare with the simple reference for shuffled, colliding inputs. */
+	for (uint32_t trial = 0; trial < 1000; trial++)
+	{
+		uint32_t	n = trial % 600;
+		int			unique = 1;
+		uint32_t	seed = trial + 1;
+
+		for (uint32_t i = 0; i < n; i++)
+		{
+			seed = seed * UINT32_C(1664525) + UINT32_C(1013904223);
+			positions[i] = (int64_t) (seed % (trial % 2 ? 100000 : 100)) - 3;
+			for (uint32_t j = 0; j < i; j++)
+				if (positions[i] >= 0 && positions[i] == positions[j])
+					unique = 0;
+		}
+		assert(AnnIndexPositionsDistinct(positions, n) == unique);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -357,6 +403,8 @@ main(int argc, char **argv)
 		Lifetime();
 	else if (!strcmp(argv[1], "errors"))
 		Errors();
+	else if (!strcmp(argv[1], "positions"))
+		Positions();
 	else
 		return 2;
 	puts("ok");
