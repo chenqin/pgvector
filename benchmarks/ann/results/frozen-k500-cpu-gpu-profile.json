@@ -1,0 +1,3471 @@
+{
+  "description": "CPU and GPU profiles; candidate validation and ordinal reuse; optimized k=500 stress tests",
+  "environment": {
+    "gpus": "8 NVIDIA B200",
+    "logical_cpus": 224,
+    "cpus": "2 Intel Xeon Platinum 8570",
+    "ram": "2 TiB",
+    "postgresql": "17.6",
+    "extension": "0.9.3",
+    "cuvs": "26.10",
+    "compiler": "GCC 13.3",
+    "driver": "580.126.09"
+  },
+  "dataset": {
+    "rows": 10000000,
+    "dimensions": 128,
+    "query_vectors": 1000,
+    "query_seed": 999,
+    "load_seeds": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "heap_bytes": 5851660288,
+    "frozen_index_bytes": 5762555904,
+    "storage": "tmpfs /dev/shm",
+    "shards": 1,
+    "replicas": 8,
+    "gpu_dtype": "float16",
+    "quantized_copy": "nvfp4",
+    "filters_precomputed": 210
+  },
+  "method": {
+    "sql_clients": 256,
+    "k": 500,
+    "worker_lanes": 32,
+    "max_batch": 32,
+    "setup_cost": 1000,
+    "sql_main_seconds": 60,
+    "sql_repeat_seconds": 30,
+    "direct_seconds": 20,
+    "cpu_profiler": "GNU gprofng, 10 ms timer samples; hardware perf blocked by host setting 4",
+    "gpu_profiler": "Nsight Systems 2026.3.2, CUDA APIs/kernels/memory; about six seconds per workload",
+    "initial_worker_cpu_caveat": "Concurrent Nsight capture adds CUPTI overhead; follow-up profile excludes Nsight",
+    "cpu_caveat": "CPU captures include startup/load and are diagnostic; inclusive CPU categories overlap",
+    "gpu_caveat": "Kernel busy is interval union per device / global kernel window; neither SM occupancy nor unprofiled utilization",
+    "throughput": "All credited throughput runs exclude gprofng and Nsight; full 500-row results",
+    "direct_caveat": "Same query/filter distributions but different pairings; bypasses SQL/MVCC",
+    "changes": [
+      "Expected-linear candidate-position uniqueness check for n>32; reference fallback on OOM",
+      "Use cached global ordinals with shard/key validation instead of per-hit binary search"
+    ],
+    "numerical_change": false
+  },
+  "source_sha256": {
+    "ann/cuvs.c": "1d74875baa743f1c742f70958b0626626fd3a9c0e65a4f4851d542aa8664a824",
+    "ann/indexfile.c": "69503908bceacd518450d3818a71c0d8d7cda11698c20f152f27bbc91b92e16f",
+    "ann/indexfile.h": "1aa240221401439918fa5acdf2ecff209ecfef01a5d51e3811f49dd6e40b1596",
+    "src/annfrozenscan.c": "4785c0752b1e268cf216eb3833d7604c5bffc38abaed1227527b3f55b7701e87",
+    "benchmarks/ann/frozen_stress.py": "df1878fbe976b96ea75f807992c15d04699434aeb7e4de85009fdf7e603baaf6"
+  },
+  "gpu_profiles": {
+    "10pct": {
+      "cuda_gpu_kern_sum": [
+        {
+          "Time (%)": "94.6",
+          "Total Time (ns)": "47639069656",
+          "Instances": "80864",
+          "Avg (ns)": "589125.8",
+          "Med (ns)": "546752.5",
+          "Min (ns)": "381953",
+          "Max (ns)": "1481187",
+          "StdDev (ns)": "145346.6",
+          "Name": "search_multi_cta"
+        },
+        {
+          "Time (%)": "3.9",
+          "Total Time (ns)": "1955102704",
+          "Instances": "80854",
+          "Avg (ns)": "24180.7",
+          "Med (ns)": "16448.0",
+          "Min (ns)": "10592",
+          "Max (ns)": "218656",
+          "StdDev (ns)": "16360.4",
+          "Name": "void cuvs::neighbors::cagra::detail::kern_topk_cta_11<(int)8, (int)2, (int)512, (int)128, unsigned int>(unsigned int, unsigned int, unsigned int, const unsigned int *, unsigned int, const T5 *, unsigned int, unsigned int *, unsigned int, T5 *, unsigned int, unsigned char *, unsigned int *, bool)"
+        },
+        {
+          "Time (%)": "0.9",
+          "Total Time (ns)": "466096593",
+          "Instances": "80864",
+          "Avg (ns)": "5764.0",
+          "Med (ns)": "4480.0",
+          "Min (ns)": "2592",
+          "Max (ns)": "111936",
+          "StdDev (ns)": "4559.7",
+          "Name": "void raft::linalg::detail::coalescedSumThickKernel<raft::linalg::detail::ReductionThickPolicy<(int)256, (int)64>, unsigned int, long, long, void raft::detail::popc<unsigned int, long>(const raft::resources &, cuda::std::__4::mdspan<const T1, cuda::std::__4::extents<T2, (unsigned long)18446744073709551615>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<const T1>, (raft::memory_type)2>>, cuda::std::__4::mdspan<const T2, cuda::std::__4::extents<T2, (unsigned long)1>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<const T2>, (raft::memory_type)0>>, cuda::std::__4::mdspan<T2, cuda::std::__4::extents<unsigned int, (unsigned long)1>, cuda::std::__4::layout_right, raft::host_device_accessor<cuda::std::__4::default_accessor<T2>, (raft::memory_type)2>>)::[lambda(unsigned int, long) (instance 1)]>(T3 *, const T2 *, T4, T4, T3, T5)"
+        },
+        {
+          "Time (%)": "0.3",
+          "Total Time (ns)": "155025341",
+          "Instances": "80863",
+          "Avg (ns)": "1917.1",
+          "Med (ns)": "1952.0",
+          "Min (ns)": "1088",
+          "Max (ns)": "4480",
+          "StdDev (ns)": "267.4",
+          "Name": "void raft::linalg::detail::coalescedSumThinKernel<raft::linalg::detail::ReductionThinPolicy<(int)32, (int)128, (int)1, (bool)0>, long, long, long, raft::identity_op, raft::identity_op>(T3 *, const T2 *, T4, T4, T3, T5, T6, bool)"
+        },
+        {
+          "Time (%)": "0.3",
+          "Total Time (ns)": "131921038",
+          "Instances": "80864",
+          "Avg (ns)": "1631.4",
+          "Med (ns)": "1408.0",
+          "Min (ns)": "1024",
+          "Max (ns)": "55136",
+          "StdDev (ns)": "1362.5",
+          "Name": "void cuvs::neighbors::cagra::detail::set_value_batch_kernel<unsigned int>(T1 *, unsigned long, T1, unsigned long, unsigned long)"
+        }
+      ],
+      "cuda_api_sum": [
+        {
+          "Time (%)": "51.3",
+          "Total Time (ns)": "9700807266",
+          "Num Calls": "161733",
+          "Avg (ns)": "59980.4",
+          "Med (ns)": "26528.0",
+          "Min (ns)": "2503",
+          "Max (ns)": "6811352",
+          "StdDev (ns)": "140434.6",
+          "Name": "cudaMemcpyAsync_ptsz"
+        },
+        {
+          "Time (%)": "15.9",
+          "Total Time (ns)": "3007785107",
+          "Num Calls": "161730",
+          "Avg (ns)": "18597.6",
+          "Med (ns)": "8713.0",
+          "Min (ns)": "3376",
+          "Max (ns)": "15574985",
+          "StdDev (ns)": "113309.1",
+          "Name": "cudaMemcpyAsync"
+        },
+        {
+          "Time (%)": "9.1",
+          "Total Time (ns)": "1725535245",
+          "Num Calls": "161732",
+          "Avg (ns)": "10669.1",
+          "Med (ns)": "9201.0",
+          "Min (ns)": "3521",
+          "Max (ns)": "10549070",
+          "StdDev (ns)": "32495.3",
+          "Name": "cudaLaunchKernelExC_ptsz"
+        },
+        {
+          "Time (%)": "8.2",
+          "Total Time (ns)": "1544286588",
+          "Num Calls": "161728",
+          "Avg (ns)": "9548.7",
+          "Med (ns)": "8272.0",
+          "Min (ns)": "3769",
+          "Max (ns)": "7582975",
+          "StdDev (ns)": "30009.0",
+          "Name": "cudaLaunchKernel_ptsz"
+        },
+        {
+          "Time (%)": "7.7",
+          "Total Time (ns)": "1453178840",
+          "Num Calls": "566050",
+          "Avg (ns)": "2567.2",
+          "Med (ns)": "1989.0",
+          "Min (ns)": "474",
+          "Max (ns)": "10002951",
+          "StdDev (ns)": "19285.9",
+          "Name": "cudaEventRecord_ptsz"
+        },
+        {
+          "Time (%)": "3.8",
+          "Total Time (ns)": "716132045",
+          "Num Calls": "80864",
+          "Avg (ns)": "8856.0",
+          "Med (ns)": "7853.0",
+          "Min (ns)": "3727",
+          "Max (ns)": "10361434",
+          "StdDev (ns)": "42937.8",
+          "Name": "cudaLaunchKernelExC"
+        },
+        {
+          "Time (%)": "1.7",
+          "Total Time (ns)": "321793053",
+          "Num Calls": "80876",
+          "Avg (ns)": "3978.8",
+          "Med (ns)": "3409.0",
+          "Min (ns)": "839",
+          "Max (ns)": "497142",
+          "StdDev (ns)": "9368.7",
+          "Name": "cudaStreamWaitEvent_ptsz"
+        },
+        {
+          "Time (%)": "1.6",
+          "Total Time (ns)": "298180278",
+          "Num Calls": "249227",
+          "Avg (ns)": "1196.4",
+          "Med (ns)": "1020.0",
+          "Min (ns)": "489",
+          "Max (ns)": "391283",
+          "StdDev (ns)": "3572.5",
+          "Name": "cudaStreamQuery_ptsz"
+        },
+        {
+          "Time (%)": "0.8",
+          "Total Time (ns)": "144025142",
+          "Num Calls": "242771",
+          "Avg (ns)": "593.3",
+          "Med (ns)": "407.0",
+          "Min (ns)": "93",
+          "Max (ns)": "5470884",
+          "StdDev (ns)": "11377.8",
+          "Name": "cuKernelGetName"
+        },
+        {
+          "Time (%)": "0.1",
+          "Total Time (ns)": "10652242",
+          "Num Calls": "28136",
+          "Avg (ns)": "378.6",
+          "Med (ns)": "306.0",
+          "Min (ns)": "186",
+          "Max (ns)": "388281",
+          "StdDev (ns)": "2420.9",
+          "Name": "cudaGetDevice"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "1811076",
+          "Num Calls": "1521",
+          "Avg (ns)": "1190.7",
+          "Med (ns)": "880.0",
+          "Min (ns)": "288",
+          "Max (ns)": "17859",
+          "StdDev (ns)": "961.2",
+          "Name": "cudaSetDevice"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "1067602",
+          "Num Calls": "762",
+          "Avg (ns)": "1401.1",
+          "Med (ns)": "1244.5",
+          "Min (ns)": "497",
+          "Max (ns)": "25353",
+          "StdDev (ns)": "1096.4",
+          "Name": "cudaPointerGetAttributes"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "505663",
+          "Num Calls": "765",
+          "Avg (ns)": "661.0",
+          "Med (ns)": "604.0",
+          "Min (ns)": "247",
+          "Max (ns)": "2252",
+          "StdDev (ns)": "280.6",
+          "Name": "cudaDeviceGetAttribute"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "254137",
+          "Num Calls": "1520",
+          "Avg (ns)": "167.2",
+          "Med (ns)": "138.0",
+          "Min (ns)": "87",
+          "Max (ns)": "2365",
+          "StdDev (ns)": "123.7",
+          "Name": "cudaPeekAtLastError"
+        }
+      ],
+      "cuda_gpu_mem_time_sum": [
+        {
+          "Time (%)": "74.3",
+          "Total Time (ns)": "548965012",
+          "Count": "162635",
+          "Avg (ns)": "3375.4",
+          "Med (ns)": "3424.0",
+          "Min (ns)": "2112",
+          "Max (ns)": "10560",
+          "StdDev (ns)": "350.7",
+          "Operation": "[CUDA memcpy Device-to-Host]"
+        },
+        {
+          "Time (%)": "25.7",
+          "Total Time (ns)": "190166593",
+          "Count": "162650",
+          "Avg (ns)": "1169.2",
+          "Med (ns)": "1024.0",
+          "Min (ns)": "672",
+          "Max (ns)": "8032",
+          "StdDev (ns)": "358.8",
+          "Operation": "[CUDA memcpy Host-to-Device]"
+        }
+      ],
+      "kernel_window_seconds": 6.138303456,
+      "kernel_busy_by_device": {
+        "0": {
+          "kernel_busy_fraction": 0.76343869077039,
+          "kernel_busy_seconds": 4.686218354,
+          "kernel_instances": 52745
+        },
+        "1": {
+          "kernel_busy_fraction": 0.7659096261206413,
+          "kernel_busy_seconds": 4.701385705,
+          "kernel_instances": 52919
+        },
+        "2": {
+          "kernel_busy_fraction": 0.7651113136821759,
+          "kernel_busy_seconds": 4.696485421,
+          "kernel_instances": 52548
+        },
+        "3": {
+          "kernel_busy_fraction": 0.7617212077434315,
+          "kernel_busy_seconds": 4.675675922,
+          "kernel_instances": 52503
+        },
+        "4": {
+          "kernel_busy_fraction": 0.7362250791923051,
+          "kernel_busy_seconds": 4.519172948,
+          "kernel_instances": 50314
+        },
+        "5": {
+          "kernel_busy_fraction": 0.7214116668786601,
+          "kernel_busy_seconds": 4.428243728,
+          "kernel_instances": 48717
+        },
+        "6": {
+          "kernel_busy_fraction": 0.6712358672936876,
+          "kernel_busy_seconds": 4.120249444,
+          "kernel_instances": 44589
+        },
+        "7": {
+          "kernel_busy_fraction": 0.7296014566732427,
+          "kernel_busy_seconds": 4.478515143,
+          "kernel_instances": 49974
+        }
+      },
+      "copy_bytes": 840487720,
+      "copy_count": 325285
+    },
+    "1pct": {
+      "cuda_gpu_kern_sum": [
+        {
+          "Time (%)": "64.9",
+          "Total Time (ns)": "5584421236",
+          "Instances": "369857",
+          "Avg (ns)": "15098.9",
+          "Med (ns)": "16576.0",
+          "Min (ns)": "4448",
+          "Max (ns)": "35584",
+          "StdDev (ns)": "6737.3",
+          "Name": "void raft::matrix::detail::select::radix::impl::radix_kernel<float, long, (int)11, (int)512, (bool)0, raft::matrix::detail::select::dense_layout<long>>(const T1 *, const T2 *, unsigned long, unsigned long, T1 *, T2 *, raft::matrix::detail::select::radix::impl::Counter<T1, T2> *, T2 *, T2, const T2 *, T2, bool, int)"
+        },
+        {
+          "Time (%)": "21.0",
+          "Total Time (ns)": "1803433492",
+          "Instances": "184930",
+          "Avg (ns)": "9752.0",
+          "Med (ns)": "9344.0",
+          "Min (ns)": "8736",
+          "Max (ns)": "13888",
+          "StdDev (ns)": "679.3",
+          "Name": "score_nvfp4"
+        },
+        {
+          "Time (%)": "14.1",
+          "Total Time (ns)": "1215833929",
+          "Instances": "184928",
+          "Avg (ns)": "6574.6",
+          "Med (ns)": "6240.0",
+          "Min (ns)": "1184",
+          "Max (ns)": "15137",
+          "StdDev (ns)": "1650.9",
+          "Name": "void raft::matrix::detail::select::radix::impl::radix_kernel<float, long, (int)11, (int)512, (bool)1, raft::matrix::detail::select::dense_layout<long>>(const T1 *, const T2 *, unsigned long, unsigned long, T1 *, T2 *, raft::matrix::detail::select::radix::impl::Counter<T1, T2> *, T2 *, T2, const T2 *, T2, bool, int)"
+        }
+      ],
+      "cuda_api_sum": [
+        {
+          "Time (%)": "31.4",
+          "Total Time (ns)": "3425594912",
+          "Num Calls": "554787",
+          "Avg (ns)": "6174.6",
+          "Med (ns)": "5475.0",
+          "Min (ns)": "2993",
+          "Max (ns)": "409670",
+          "StdDev (ns)": "4658.8",
+          "Name": "cudaLaunchKernelExC_ptsz"
+        },
+        {
+          "Time (%)": "24.8",
+          "Total Time (ns)": "2705233082",
+          "Num Calls": "369860",
+          "Avg (ns)": "7314.2",
+          "Med (ns)": "6811.0",
+          "Min (ns)": "3803",
+          "Max (ns)": "1952964",
+          "StdDev (ns)": "5143.1",
+          "Name": "cudaMemcpyAsync"
+        },
+        {
+          "Time (%)": "19.1",
+          "Total Time (ns)": "2086243359",
+          "Num Calls": "369859",
+          "Avg (ns)": "5640.6",
+          "Med (ns)": "5110.0",
+          "Min (ns)": "2676",
+          "Max (ns)": "419367",
+          "StdDev (ns)": "4229.0",
+          "Name": "cudaMemsetAsync_ptsz"
+        },
+        {
+          "Time (%)": "13.3",
+          "Total Time (ns)": "1451590458",
+          "Num Calls": "185048",
+          "Avg (ns)": "7844.4",
+          "Med (ns)": "7069.0",
+          "Min (ns)": "3557",
+          "Max (ns)": "606360",
+          "StdDev (ns)": "5725.9",
+          "Name": "cuLaunchKernel"
+        },
+        {
+          "Time (%)": "9.3",
+          "Total Time (ns)": "1018803024",
+          "Num Calls": "554787",
+          "Avg (ns)": "1836.4",
+          "Med (ns)": "1455.0",
+          "Min (ns)": "440",
+          "Max (ns)": "813157",
+          "StdDev (ns)": "4073.1",
+          "Name": "cudaEventRecord_ptsz"
+        },
+        {
+          "Time (%)": "1.5",
+          "Total Time (ns)": "160218748",
+          "Num Calls": "370096",
+          "Avg (ns)": "432.9",
+          "Med (ns)": "340.0",
+          "Min (ns)": "104",
+          "Max (ns)": "2314428",
+          "StdDev (ns)": "3888.0",
+          "Name": "cuCtxSetCurrent"
+        },
+        {
+          "Time (%)": "0.4",
+          "Total Time (ns)": "41125379",
+          "Num Calls": "42616",
+          "Avg (ns)": "965.0",
+          "Med (ns)": "691.0",
+          "Min (ns)": "467",
+          "Max (ns)": "342582",
+          "StdDev (ns)": "2320.7",
+          "Name": "cudaStreamQuery_ptsz"
+        },
+        {
+          "Time (%)": "0.1",
+          "Total Time (ns)": "6020817",
+          "Num Calls": "18957",
+          "Avg (ns)": "317.6",
+          "Med (ns)": "231.0",
+          "Min (ns)": "187",
+          "Max (ns)": "14378",
+          "StdDev (ns)": "353.2",
+          "Name": "cudaGetDevice"
+        },
+        {
+          "Time (%)": "0.1",
+          "Total Time (ns)": "5914981",
+          "Num Calls": "4218",
+          "Avg (ns)": "1402.3",
+          "Med (ns)": "1287.0",
+          "Min (ns)": "697",
+          "Max (ns)": "112922",
+          "StdDev (ns)": "1799.3",
+          "Name": "cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "3112850",
+          "Num Calls": "4215",
+          "Avg (ns)": "738.5",
+          "Med (ns)": "737.0",
+          "Min (ns)": "252",
+          "Max (ns)": "10055",
+          "StdDev (ns)": "515.7",
+          "Name": "cudaSetDevice"
+        }
+      ],
+      "cuda_gpu_mem_time_sum": [
+        {
+          "Time (%)": "45.7",
+          "Total Time (ns)": "619316139",
+          "Count": "185818",
+          "Avg (ns)": "3332.9",
+          "Med (ns)": "3360.0",
+          "Min (ns)": "2368",
+          "Max (ns)": "9664",
+          "StdDev (ns)": "267.0",
+          "Operation": "[CUDA memcpy Device-to-Host]"
+        },
+        {
+          "Time (%)": "34.4",
+          "Total Time (ns)": "466598086",
+          "Count": "370576",
+          "Avg (ns)": "1259.1",
+          "Med (ns)": "1216.0",
+          "Min (ns)": "768",
+          "Max (ns)": "5696",
+          "StdDev (ns)": "328.7",
+          "Operation": "[CUDA memset]"
+        },
+        {
+          "Time (%)": "19.9",
+          "Total Time (ns)": "269191659",
+          "Count": "185820",
+          "Avg (ns)": "1448.7",
+          "Med (ns)": "1600.0",
+          "Min (ns)": "704",
+          "Max (ns)": "5792",
+          "StdDev (ns)": "342.1",
+          "Operation": "[CUDA memcpy Host-to-Device]"
+        }
+      ],
+      "kernel_window_seconds": 6.166300202,
+      "kernel_busy_by_device": {
+        "0": {
+          "kernel_busy_fraction": 0.16265382565621642,
+          "kernel_busy_seconds": 1.002972318,
+          "kernel_instances": 94118
+        },
+        "1": {
+          "kernel_busy_fraction": 0.16678304806931618,
+          "kernel_busy_seconds": 1.028434343,
+          "kernel_instances": 95964
+        },
+        "2": {
+          "kernel_busy_fraction": 0.1689805711473533,
+          "kernel_busy_seconds": 1.04198493,
+          "kernel_instances": 95836
+        },
+        "3": {
+          "kernel_busy_fraction": 0.16132036008843023,
+          "kernel_busy_seconds": 0.994749769,
+          "kernel_instances": 90368
+        },
+        "4": {
+          "kernel_busy_fraction": 0.1623348552954542,
+          "kernel_busy_seconds": 1.001005451,
+          "kernel_instances": 90768
+        },
+        "5": {
+          "kernel_busy_fraction": 0.16138354854621462,
+          "kernel_busy_seconds": 0.995139408,
+          "kernel_instances": 90500
+        },
+        "6": {
+          "kernel_busy_fraction": 0.15939996088435657,
+          "kernel_busy_seconds": 0.982908011,
+          "kernel_instances": 90157
+        },
+        "7": {
+          "kernel_busy_fraction": 0.16332226943368008,
+          "kernel_busy_seconds": 1.007094143,
+          "kernel_instances": 92004
+        }
+      },
+      "copy_bytes": 1218967104,
+      "copy_count": 371638
+    },
+    "0.1pct": {
+      "cuda_gpu_kern_sum": [
+        {
+          "Time (%)": "97.1",
+          "Total Time (ns)": "20090156333",
+          "Instances": "224291",
+          "Avg (ns)": "89571.8",
+          "Med (ns)": "90240.0",
+          "Min (ns)": "68672",
+          "Max (ns)": "143712",
+          "StdDev (ns)": "6057.0",
+          "Name": "void raft::matrix::detail::select::radix::impl::radix_topk_one_block_kernel<float, long, (int)11, (int)512, raft::matrix::detail::select::dense_layout<long>>(const T1 *, const T2 *, T2, const T2 *, T2, T1 *, T2 *, bool, unsigned long, unsigned long)"
+        },
+        {
+          "Time (%)": "2.9",
+          "Total Time (ns)": "609573786",
+          "Instances": "224291",
+          "Avg (ns)": "2717.8",
+          "Med (ns)": "2688.0",
+          "Min (ns)": "2400",
+          "Max (ns)": "3904",
+          "StdDev (ns)": "97.7",
+          "Name": "score_nvfp4"
+        }
+      ],
+      "cuda_api_sum": [
+        {
+          "Time (%)": "43.2",
+          "Total Time (ns)": "3012587763",
+          "Num Calls": "448584",
+          "Avg (ns)": "6715.8",
+          "Med (ns)": "6307.0",
+          "Min (ns)": "3754",
+          "Max (ns)": "2012822",
+          "StdDev (ns)": "7377.1",
+          "Name": "cudaMemcpyAsync"
+        },
+        {
+          "Time (%)": "23.2",
+          "Total Time (ns)": "1614979356",
+          "Num Calls": "224424",
+          "Avg (ns)": "7196.1",
+          "Med (ns)": "6660.0",
+          "Min (ns)": "3266",
+          "Max (ns)": "1405603",
+          "StdDev (ns)": "4901.1",
+          "Name": "cuLaunchKernel"
+        },
+        {
+          "Time (%)": "20.8",
+          "Total Time (ns)": "1453261578",
+          "Num Calls": "224291",
+          "Avg (ns)": "6479.4",
+          "Med (ns)": "5989.0",
+          "Min (ns)": "3704",
+          "Max (ns)": "199035",
+          "StdDev (ns)": "3991.1",
+          "Name": "cudaLaunchKernelExC_ptsz"
+        },
+        {
+          "Time (%)": "8.6",
+          "Total Time (ns)": "602883547",
+          "Num Calls": "224292",
+          "Avg (ns)": "2687.9",
+          "Med (ns)": "2281.0",
+          "Min (ns)": "967",
+          "Max (ns)": "370221",
+          "StdDev (ns)": "4459.6",
+          "Name": "cudaEventRecord_ptsz"
+        },
+        {
+          "Time (%)": "2.8",
+          "Total Time (ns)": "196965454",
+          "Num Calls": "448848",
+          "Avg (ns)": "438.8",
+          "Med (ns)": "330.0",
+          "Min (ns)": "103",
+          "Max (ns)": "92677",
+          "StdDev (ns)": "645.0",
+          "Name": "cuCtxSetCurrent"
+        },
+        {
+          "Time (%)": "1.2",
+          "Total Time (ns)": "85292700",
+          "Num Calls": "100239",
+          "Avg (ns)": "850.9",
+          "Med (ns)": "729.0",
+          "Min (ns)": "478",
+          "Max (ns)": "102834",
+          "StdDev (ns)": "958.8",
+          "Name": "cudaStreamQuery_ptsz"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "2130584",
+          "Num Calls": "1574",
+          "Avg (ns)": "1353.6",
+          "Med (ns)": "1292.0",
+          "Min (ns)": "823",
+          "Max (ns)": "9922",
+          "StdDev (ns)": "425.8",
+          "Name": "cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "2080097",
+          "Num Calls": "3149",
+          "Avg (ns)": "660.6",
+          "Med (ns)": "618.0",
+          "Min (ns)": "254",
+          "Max (ns)": "122789",
+          "StdDev (ns)": "2211.0",
+          "Name": "cudaSetDevice"
+        },
+        {
+          "Time (%)": "0.0",
+          "Total Time (ns)": "1527073",
+          "Num Calls": "4723",
+          "Avg (ns)": "323.3",
+          "Med (ns)": "247.0",
+          "Min (ns)": "188",
+          "Max (ns)": "7177",
+          "StdDev (ns)": "274.9",
+          "Name": "cudaGetDevice"
+        }
+      ],
+      "cuda_gpu_mem_time_sum": [
+        {
+          "Time (%)": "70.2",
+          "Total Time (ns)": "753279824",
+          "Count": "225107",
+          "Avg (ns)": "3346.3",
+          "Med (ns)": "3360.0",
+          "Min (ns)": "2368",
+          "Max (ns)": "15168",
+          "StdDev (ns)": "261.0",
+          "Operation": "[CUDA memcpy Device-to-Host]"
+        },
+        {
+          "Time (%)": "29.8",
+          "Total Time (ns)": "320447999",
+          "Count": "225110",
+          "Avg (ns)": "1423.5",
+          "Med (ns)": "1568.0",
+          "Min (ns)": "896",
+          "Max (ns)": "17472",
+          "StdDev (ns)": "357.3",
+          "Operation": "[CUDA memcpy Host-to-Device]"
+        }
+      ],
+      "kernel_window_seconds": 6.339804281,
+      "kernel_busy_by_device": {
+        "0": {
+          "kernel_busy_fraction": 0.353511433581115,
+          "kernel_busy_seconds": 2.2411933,
+          "kernel_instances": 56970
+        },
+        "1": {
+          "kernel_busy_fraction": 0.34971653646227124,
+          "kernel_busy_seconds": 2.217134395,
+          "kernel_instances": 56182
+        },
+        "2": {
+          "kernel_busy_fraction": 0.35569861214143056,
+          "kernel_busy_seconds": 2.255059584,
+          "kernel_instances": 57344
+        },
+        "3": {
+          "kernel_busy_fraction": 0.34777219426279005,
+          "kernel_busy_seconds": 2.204807646,
+          "kernel_instances": 55376
+        },
+        "4": {
+          "kernel_busy_fraction": 0.35071790964646027,
+          "kernel_busy_seconds": 2.223482905,
+          "kernel_instances": 56314
+        },
+        "5": {
+          "kernel_busy_fraction": 0.3466447220754511,
+          "kernel_busy_seconds": 2.197659693,
+          "kernel_instances": 55216
+        },
+        "6": {
+          "kernel_busy_fraction": 0.34463766942271634,
+          "kernel_busy_seconds": 2.184935372,
+          "kernel_instances": 55272
+        },
+        "7": {
+          "kernel_busy_fraction": 0.349974066967573,
+          "kernel_busy_seconds": 2.218767088,
+          "kernel_instances": 55908
+        }
+      },
+      "copy_bytes": 1476703456,
+      "copy_count": 450217
+    }
+  },
+  "cpu_reports": {
+    "postgres-functions.txt": "Print limit set to 60\nFunctions sorted by metric: Exclusive Total CPU Time\n\nExcl. Total CPU  Incl. Total CPU   Name\n\n    sec.      %      sec.      %\n1365.480 100.00  1365.480 100.00   <Total>\n 534.720  39.16   534.720  39.16   <static>@0x188021 (<libc.so.6>)\n 127.270   9.32   143.050  10.48   PinBuffer\n 112.140   8.21   112.140   8.21   LWLockAttemptLock\n  87.770   6.43    87.770   6.43   AnnCheckPage\n  33.400   2.45    34.580   2.53   AllocSetReset\n  32.620   2.39    35.690   2.61   hash_search_with_hash_value\n  30.530   2.24    30.530   2.24   BufferGetBlockNumber\n  28.330   2.07    28.350   2.08   LWLockRelease\n  26.390   1.93    26.390   1.93   send\n  23.000   1.68    23.740   1.74   l2_distance\n  21.340   1.56    48.140   3.53   ExecInterpExpr\n  17.480   1.28    21.350   1.56   UnpinBufferNoOwner\n  15.520   1.14    19.480   1.43   <static>@0x50e56 (<libc.so.6>)\n  14.170   1.04   939.670  68.82   AnnArrayReadRange\n  13.190   0.97    13.190   0.97   recv\n  10.780   0.79  1032.400  75.61   FrozenNext\n   9.430   0.69   294.190  21.54   StartReadBuffer\n   9.050   0.66     9.050   0.66   epoll_wait\n   7.730   0.57   402.160  29.45   AnnArrayLockPage\n   7.530   0.55    50.180   3.67   visibilitymap_get_status\n   7.090   0.52     7.090   0.52   hash_bytes\n   6.770   0.50    20.500   1.50   socket_putmessage\n   5.670   0.42     5.670   0.42   poll\n   5.660   0.41    18.730   1.37   GetPrivateRefCountEntry\n   5.520   0.40     5.520   0.40   ExecEvalParamExtern\n   5.250   0.38     6.310   0.46   SearchCatCacheInternal\n   4.550   0.33     7.310   0.54   ReleaseBuffer\n   4.500   0.33    84.890   6.22   printtup\n   4.370   0.32  1042.810  76.37   ExecScan\n   4.330   0.32     4.330   0.32   ResourceOwnerForget\n   4.310   0.32     4.310   0.32   <static>@0xdc00 (<vector.so>)\n   4.310   0.32     4.310   0.32   pg_ulltoa_n.part.0\n   3.980   0.29    36.660   2.68   MemoryContextReset\n   3.920   0.29     3.920   0.29   tts_virtual_clear\n   3.800   0.28  1046.340  76.63   ExecLimit\n   3.120   0.23   115.230   8.44   LWLockAcquire\n   3.100   0.23     3.100   0.23   AllocSetAlloc\n   3.080   0.23  1042.360  76.34   ExecResult\n   2.820   0.21     2.820   0.21   palloc\n   2.720   0.20     3.270   0.24   enlargeStringInfo\n   2.700   0.20     3.060   0.22   <static>@0xaaa3b (<libc.so.6>)\n   2.570   0.19     2.570   0.19   <static>@0x5890c (<libc.so.6>)\n   2.560   0.19   298.260  21.84   ReadBufferExtended\n   2.140   0.16     2.500   0.18   ExecFilterJunk\n   2.080   0.15     3.930   0.29   hash_search\n   2.060   0.15     2.060   0.15   <static>@0xd70a0 (<postgres>)\n   1.990   0.15    24.110   1.77   WorkerSearch.constprop.0\n   1.940   0.14  1251.280  91.64   PostgresMain\n   1.850   0.14     1.850   0.14   AllocSetFree\n   1.620   0.12     2.580   0.19   palloc0\n   1.610   0.12     1.860   0.14   ExprEvalPushStep\n   1.560   0.11    22.300   1.63   vector_in\n   1.530   0.11     1.530   0.11   ResourceOwnerEnlarge\n   1.530   0.11  1141.730  83.61   standard_ExecutorRun\n   1.520   0.11     1.520   0.11   uint32_hash\n   1.500   0.11     1.500   0.11   pread\n   1.480   0.11    11.660   0.85   int8out\n   1.410   0.10     3.160   0.23   RelationIdGetRelation\n   1.380   0.10     1.380   0.10   FlushRelationBuffers\n\n",
+    "postgres-calltree.txt": "Print limit set to 100\nFunctions Call Tree. Metric: Attributed Total CPU Time\n\nAttr. Total CPU   Name\n\n    sec.      %\n1365.480 100.00   +-<Total>\n1251.280  91.64     +-PostgresMain\n1142.650  83.68     |  +-PortalRun\n1142.540  83.67     |  |  +-PortalRunSelect\n1141.650  83.61     |  |  |  +-standard_ExecutorRun\n1043.800  76.44     |  |  |  |  +-ExecLimit\n1042.360  76.34     |  |  |  |  |  +-ExecResult\n1035.550  75.84     |  |  |  |  |  |  +-ExecScan\n1026.080  75.14     |  |  |  |  |  |  |  +-FrozenNext\n 939.670  68.82     |  |  |  |  |  |  |  |  +-AnnArrayReadRange\n 514.590  37.69     |  |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n 402.160  29.45     |  |  |  |  |  |  |  |  |  +-AnnArrayLockPage\n 281.790  20.64     |  |  |  |  |  |  |  |  |  |  +-ReadBufferExtended\n 277.880  20.35     |  |  |  |  |  |  |  |  |  |  |  +-StartReadBuffer\n 124.120   9.09     |  |  |  |  |  |  |  |  |  |  |  |  +-PinBuffer\n  14.240   1.04     |  |  |  |  |  |  |  |  |  |  |  |  |  +-GetPrivateRefCountEntry\n   9.570   0.70     |  |  |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search_with_hash_value\n   2.040   0.15     |  |  |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search\n   0.980   0.07     |  |  |  |  |  |  |  |  |  |  |  |  |  |    +-uint32_hash\n   0.610   0.04     |  |  |  |  |  |  |  |  |  |  |  |  |  +-ResourceOwnerRemember\n  99.520   7.29     |  |  |  |  |  |  |  |  |  |  |  |  +-LWLockAcquire\n  98.160   7.19     |  |  |  |  |  |  |  |  |  |  |  |  |  +-LWLockAttemptLock\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |  +-PGSemaphoreLock\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |    +-sem_wait\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |      +-pthread_testcancel\n  18.160   1.33     |  |  |  |  |  |  |  |  |  |  |  |  +-BufTableLookup\n  17.900   1.31     |  |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search_with_hash_value\n   2.070   0.15     |  |  |  |  |  |  |  |  |  |  |  |  |    +-<static>@0x188021 (<libc.so.6>)\n  17.730   1.30     |  |  |  |  |  |  |  |  |  |  |  |  +-LWLockRelease\n   6.080   0.45     |  |  |  |  |  |  |  |  |  |  |  |  +-hash_bytes\n   1.250   0.09     |  |  |  |  |  |  |  |  |  |  |  |  +-ResourceOwnerEnlarge\n   1.090   0.08     |  |  |  |  |  |  |  |  |  |  |  |  +-ReservePrivateRefCountEntry\n   0.080   0.01     |  |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search_with_hash_value\n   0.020   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search\n   0.020   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |    +-uint32_hash\n   0.930   0.07     |  |  |  |  |  |  |  |  |  |  |  |  +-get_hash_value\n   0.700   0.05     |  |  |  |  |  |  |  |  |  |  |  |  +-pgstat_count_io_op\n   0.340   0.02     |  |  |  |  |  |  |  |  |  |  |  |  +-IOContextForStrategy\n   0.270   0.02     |  |  |  |  |  |  |  |  |  |  |  |  +-BufTableHashCode\n   1.500   0.11     |  |  |  |  |  |  |  |  |  |  |  +-WaitReadBuffers\n   1.490   0.11     |  |  |  |  |  |  |  |  |  |  |    +-mdreadv\n   1.490   0.11     |  |  |  |  |  |  |  |  |  |  |    |  +-FileReadV\n   1.490   0.11     |  |  |  |  |  |  |  |  |  |  |    |    +-pread\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |    +-ConditionVariableBroadcast\n  87.770   6.43     |  |  |  |  |  |  |  |  |  |  +-AnnCheckPage\n  12.220   0.89     |  |  |  |  |  |  |  |  |  |  +-UnpinBufferNoOwner\n   2.510   0.18     |  |  |  |  |  |  |  |  |  |  |  +-GetPrivateRefCountEntry\n   0.050   0.00     |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search_with_hash_value\n   0.020   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  +-hash_search\n   0.020   0.00     |  |  |  |  |  |  |  |  |  |  |  +-hash_search_with_hash_value\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  +-hash_search\n   7.470   0.55     |  |  |  |  |  |  |  |  |  |  +-LWLockAcquire\n   6.190   0.45     |  |  |  |  |  |  |  |  |  |  |  +-LWLockAttemptLock\n   4.730   0.35     |  |  |  |  |  |  |  |  |  |  +-ReleaseBuffer\n   2.340   0.17     |  |  |  |  |  |  |  |  |  |  |  +-ResourceOwnerForget\n   0.320   0.02     |  |  |  |  |  |  |  |  |  |  +-LockBuffer\n   0.130   0.01     |  |  |  |  |  |  |  |  |  |  +-<static>@0xdc00 (<vector.so>)\n   8.210   0.60     |  |  |  |  |  |  |  |  |  +-LWLockRelease\n   0.370   0.03     |  |  |  |  |  |  |  |  |  +-LockBuffer\n   0.170   0.01     |  |  |  |  |  |  |  |  |  +-<static>@0xdc00 (<vector.so>)\n  50.180   3.67     |  |  |  |  |  |  |  |  +-visibilitymap_get_status\n  30.410   2.23     |  |  |  |  |  |  |  |  |  +-BufferGetBlockNumber\n  12.240   0.90     |  |  |  |  |  |  |  |  |  +-vm_readbuf\n  11.800   0.86     |  |  |  |  |  |  |  |  |    +-ReadBufferExtended\n  11.740   0.86     |  |  |  |  |  |  |  |  |      +-StartReadBuffer\n   5.310   0.39     |  |  |  |  |  |  |  |  |        +-PinBuffer\n   0.690   0.05     |  |  |  |  |  |  |  |  |        |  +-GetPrivateRefCountEntry\n   0.560   0.04     |  |  |  |  |  |  |  |  |        |  |  +-hash_search_with_hash_value\n   0.080   0.01     |  |  |  |  |  |  |  |  |        |  |  +-hash_search\n   0.020   0.00     |  |  |  |  |  |  |  |  |        |  |    +-uint32_hash\n   0.020   0.00     |  |  |  |  |  |  |  |  |        |  +-ResourceOwnerRemember\n   2.640   0.19     |  |  |  |  |  |  |  |  |        +-LWLockAcquire\n   2.600   0.19     |  |  |  |  |  |  |  |  |        |  +-LWLockAttemptLock\n   1.070   0.08     |  |  |  |  |  |  |  |  |        +-LWLockRelease\n   1.040   0.08     |  |  |  |  |  |  |  |  |        +-ReservePrivateRefCountEntry\n   0.770   0.06     |  |  |  |  |  |  |  |  |        |  +-hash_search_with_hash_value\n   0.020   0.00     |  |  |  |  |  |  |  |  |        |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.150   0.01     |  |  |  |  |  |  |  |  |        |  +-hash_search\n   0.050   0.00     |  |  |  |  |  |  |  |  |        |    +-uint32_hash\n   0.650   0.05     |  |  |  |  |  |  |  |  |        +-BufTableLookup\n   0.640   0.05     |  |  |  |  |  |  |  |  |        |  +-hash_search_with_hash_value\n   0.110   0.01     |  |  |  |  |  |  |  |  |        |    +-<static>@0x188021 (<libc.so.6>)\n   0.120   0.01     |  |  |  |  |  |  |  |  |        +-hash_bytes\n   0.020   0.00     |  |  |  |  |  |  |  |  |        +-IOContextForStrategy\n   0.020   0.00     |  |  |  |  |  |  |  |  |        +-ResourceOwnerEnlarge\n   0.020   0.00     |  |  |  |  |  |  |  |  |        +-get_hash_value\n   0.020   0.00     |  |  |  |  |  |  |  |  |        +-pgstat_count_io_op\n  24.060   1.76     |  |  |  |  |  |  |  |  +-WorkerSearch.constprop.0\n  21.550   1.58     |  |  |  |  |  |  |  |  |  +-AnnIndexCall\n  21.150   1.55     |  |  |  |  |  |  |  |  |  |  +-AnnWorkerCall\n  12.170   0.89     |  |  |  |  |  |  |  |  |  |  |  +-ReceiveFrame\n  12.090   0.89     |  |  |  |  |  |  |  |  |  |  |  |  +-Wait\n   6.230   0.46     |  |  |  |  |  |  |  |  |  |  |  |  |  +-ReadAvailable\n   5.960   0.44     |  |  |  |  |  |  |  |  |  |  |  |  |  |  +-recv\n   0.020   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |  |  +-__errno_location\n   5.650   0.41     |  |  |  |  |  |  |  |  |  |  |  |  |  +-poll\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |  +-<static>@0xdc00 (<vector.so>)\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |  +-clock_gettime\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  |    +-<static>@0x7fffc5f796f0 ([vdso])\n",
+    "worker-functions.txt": "Print limit set to 60\nFunctions sorted by metric: Exclusive Total CPU Time\n\nExcl. Total CPU  Incl. Total CPU   Name\n\n    sec.      %      sec.      %\n1830.010 100.00  1830.010 100.00   <Total>\n 890.070  48.64  1144.820  62.56   SearchFiltered\n 288.140  15.75   522.010  28.52   SearchShards\n  72.580   3.97   184.970  10.11   <static>@0x10d9c3 (<libcupti.so.13.4>)\n  62.980   3.44    62.980   3.44   <static>@0x188021 (<libc.so.6>)\n  61.900   3.38    98.530   5.38   <static>@0x3a3aaf (<libcuda.so.580.126.09>)\n  61.370   3.35    61.370   3.35   sched_yield\n  60.830   3.32   114.460   6.25   <static>@0xab116 (<libcupti.so.13.4>)\n  43.510   2.38    43.510   2.38   HitCompare\n  30.840   1.69   135.810   7.42   <static>@0x26373e (<libcuda.so.580.126.09>)\n  29.690   1.62    30.730   1.68   read\n  24.380   1.33    49.540   2.71   <static>@0x684d76 (<libToolsInjection64.so>)\n  21.620   1.18    24.040   1.31   pthread_mutex_lock\n  19.680   1.08   104.460   5.71   <static>@0x49456 (<libc.so.6>)\n  18.420   1.01    21.040   1.15   pthread_mutex_unlock\n  17.020   0.93   132.610   7.25   <static>@0x1ccd36 (<libcuda.so.580.126.09>)\n  16.660   0.91    16.870   0.92   write\n  11.710   0.64    32.840   1.79   Lane\n   6.360   0.35   250.220  13.67   cuvsStreamSync\n   5.700   0.31     5.700   0.31   pread\n   4.840   0.26     4.840   0.26   <static>@0x283e0 (<libc.so.6>)\n   4.690   0.26     4.720   0.26   poll\n   4.660   0.25   101.110   5.53   <static>@0x4a3f35 (<libcuda.so.580.126.09>)\n   4.130   0.23     5.650   0.31   <static>@0xaaa3b (<libc.so.6>)\n   4.060   0.22    39.910   2.18   <static>@0x46a2ff (<libToolsInjection64.so>)\n   3.850   0.21   190.490  10.41   <static>@0x144e99 (<libcuvs_c.so>)\n   3.690   0.20    84.800   4.63   <static>@0x4a3f35 (<libcuda.so.580.126.09>)\n   3.640   0.20     3.640   0.20   ioctl\n   3.270   0.18     3.270   0.18   pthread_getspecific\n   3.180   0.17     5.900   0.32   malloc\n   2.620   0.14     2.620   0.14   <static>@0x98fb9 (<libc.so.6>)\n   2.440   0.13     2.440   0.13   <static>@0x98f31 (<libc.so.6>)\n   2.440   0.13     2.440   0.13   pthread_rwlock_rdlock\n   1.780   0.10     3.470   0.19   <static>@0x7e1e9 (<libcupti.so.13.4>)\n   1.730   0.09     1.730   0.09   munmap\n   1.430   0.08     6.910   0.38   SubmitBitmapJob\n   1.390   0.08     1.390   0.08   <static>@0xa8d44 (<libc.so.6>)\n   1.370   0.07    44.940   2.46   <static>@0x1e6872f (<libcuvs.so>)\n   1.320   0.07     1.320   0.07   <static>@0x98548 (<libc.so.6>)\n   1.270   0.07   163.460   8.93   <static>@0x3577ef (<libcuda.so.580.126.09>)\n   1.200   0.07     1.200   0.07   <static>@0xb2954 (<libcuvs_c.so>)\n   1.100   0.06     1.120   0.06   clock_nanosleep\n   0.910   0.05     0.980   0.05   Append\n   0.910   0.05     0.910   0.05   pthread_rwlock_unlock\n   0.870   0.05    53.030   2.90   <static>@0x24cf45 (<libcuda.so.580.126.09>)\n   0.860   0.05     6.730   0.37   <static>@0x628a2 (<librmm.so>)\n   0.780   0.04     0.950   0.05   <static>@0xa9c72 (<libcupti.so.13.4>)\n   0.740   0.04     0.740   0.04   <static>@0x7da45 (<libcupti.so.13.4>)\n   0.740   0.04     0.760   0.04   <static>@0x98bf5 (<libc.so.6>)\n   0.700   0.04     3.770   0.21   <static>@0x27dc80 (<libToolsInjection64.so>)\n   0.700   0.04     3.240   0.18   free\n   0.620   0.03     1.010   0.06   calloc\n   0.610   0.03     0.610   0.03   sem_post\n   0.550   0.03     0.550   0.03   __tls_get_addr\n   0.520   0.03     0.520   0.03   Int32Compare\n   0.510   0.03    29.110   1.59   <static>@0x166ea0 (<libcuda.so.580.126.09>)\n   0.510   0.03    48.890   2.67   Reader\n   0.480   0.03     0.480   0.03   <static>@0x7ffec51fd6f0 ([vdso])\n   0.480   0.03     0.480   0.03   FindValue\n   0.470   0.03     0.480   0.03   Take\n\n",
+    "worker-after-functions.txt": "Print limit set to 60\nFunctions sorted by metric: Exclusive Total CPU Time\n\nExcl. Total CPU  Incl. Total CPU   Name\n\n    sec.      %      sec.      %\n1458.500 100.00  1458.500 100.00   <Total>\n 603.310  41.37   932.860  63.96   SearchFiltered\n 243.800  16.72   433.660  29.73   SearchShards\n 113.020   7.75   113.020   7.75   sched_yield\n 104.310   7.15   147.400  10.11   <static>@0x3a3aaf (<libcuda.so.580.126.09>)\n  62.410   4.28    62.410   4.28   HitCompare\n  58.200   3.99    58.200   3.99   <static>@0x188021 (<libc.so.6>)\n  41.730   2.86   184.980  12.68   <static>@0x26373e (<libcuda.so.580.126.09>)\n  33.660   2.31    34.470   2.36   read\n  26.880   1.84   144.130   9.88   <static>@0x49456 (<libc.so.6>)\n  25.970   1.78   154.560  10.60   <static>@0x1ccd36 (<libcuda.so.580.126.09>)\n  17.170   1.18    17.360   1.19   write\n  13.870   0.95    16.480   1.13   pthread_mutex_lock\n  13.830   0.95    35.510   2.43   Lane\n  12.350   0.85   277.110  19.00   cuvsStreamSync\n  11.510   0.79    14.090   0.97   pthread_mutex_unlock\n   7.760   0.53     8.140   0.56   AnnIndexPositionsDistinct\n   6.010   0.41     6.010   0.41   <static>@0x283e0 (<libc.so.6>)\n   5.740   0.39     5.750   0.39   pread\n   5.110   0.35   135.800   9.31   <static>@0x4a3f35 (<libcuda.so.580.126.09>)\n   4.120   0.28   154.320  10.58   <static>@0x144e99 (<libcuvs_c.so>)\n   3.960   0.27     4.000   0.27   poll\n   3.730   0.26     4.350   0.30   <static>@0xaaa3b (<libc.so.6>)\n   3.090   0.21     3.090   0.21   pthread_rwlock_rdlock\n   2.610   0.18     2.610   0.18   <static>@0x98f31 (<libc.so.6>)\n   2.600   0.18     3.960   0.27   malloc\n   2.580   0.18     2.580   0.18   <static>@0x98fb9 (<libc.so.6>)\n   1.730   0.12     1.730   0.12   ioctl\n   1.600   0.11     6.140   0.42   SubmitBitmapJob\n   1.380   0.09    99.540   6.82   <static>@0x24cf45 (<libcuda.so.580.126.09>)\n   1.180   0.08     1.180   0.08   pthread_getspecific\n   1.100   0.08   177.600  12.18   <static>@0x3577ef (<libcuda.so.580.126.09>)\n   1.070   0.07     1.070   0.07   <static>@0x98548 (<libc.so.6>)\n   1.040   0.07     1.060   0.07   clock_nanosleep\n   0.970   0.07    30.730   2.11   <static>@0x1e6872f (<libcuvs.so>)\n   0.940   0.06     0.940   0.06   <static>@0xb2954 (<libcuvs_c.so>)\n   0.920   0.06     0.920   0.06   pthread_rwlock_unlock\n   0.630   0.04     0.630   0.04   Int32Compare\n   0.620   0.04     0.620   0.04   <static>@0xa8d44 (<libc.so.6>)\n   0.620   0.04    50.680   3.47   Reader\n   0.570   0.04     0.570   0.04   <static>@0x98bf5 (<libc.so.6>)\n   0.510   0.03     0.870   0.06   <static>@0x628a2 (<librmm.so>)\n   0.490   0.03     2.540   0.17   AnnIndexGet\n   0.490   0.03     0.490   0.03   FindValue\n   0.450   0.03     0.670   0.05   <static>@0x7372f0 (<libnvrtc.so.13>)\n   0.430   0.03    20.250   1.39   <static>@0x166ea0 (<libcuda.so.580.126.09>)\n   0.430   0.03     6.470   0.44   <static>@0x4a3f35 (<libcuda.so.580.126.09>)\n   0.420   0.03     0.420   0.03   Take\n   0.390   0.03     0.390   0.03   sem_post\n   0.360   0.02     1.400   0.10   AnnIndexPut\n   0.360   0.02     0.800   0.05   calloc\n   0.360   0.02     2.930   0.20   free\n   0.340   0.02   142.050   9.74   cuStreamQuery_ptsz\n   0.330   0.02     0.560   0.04   <static>@0x1fefc (<libgcc_s.so.1>)\n   0.310   0.02     0.310   0.02   pthread_once\n   0.290   0.02     0.900   0.06   AnnIndexBitmapGet\n   0.280   0.02     0.280   0.02   <static>@0x7a600 (<libcuvs_c.so>)\n   0.260   0.02     1.720   0.12   InvertAttribute\n   0.250   0.02    20.500   1.41   <static>@0x22a13 (<libcudart.so.13>)\n   0.240   0.02     0.780   0.05   <static>@0xebd935 (<libnvrtc.so.13>)\n\n",
+    "worker-after-calltree.txt": "Print limit set to 100\nFunctions Call Tree. Metric: Attributed Total CPU Time\n\nAttr. Total CPU   Name\n\n    sec.      %\n1458.500 100.00   +-<Total>\n 932.860  63.96     +-SearchFiltered\n 127.040   8.71     |  +-qsort_r\n 126.470   8.67     |  |  +-<static>@0x49456 (<libc.so.6>)\n 114.240   7.83     |  |  |  +-<static>@0x49456 (<libc.so.6>)\n 101.050   6.93     |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n  86.720   5.95     |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n  72.290   4.96     |  |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n  58.030   3.98     |  |  |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n  43.600   2.99     |  |  |  |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n  29.890   2.05     |  |  |  |  |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n  16.820   1.15     |  |  |  |  |  |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n   6.250   0.43     |  |  |  |  |  |  |  |  |  |  |  +-<static>@0x49456 (<libc.so.6>)\n   2.760   0.19     |  |  |  |  |  |  |  |  |  |  |  |  +-HitCompare\n   1.440   0.10     |  |  |  |  |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.010   0.00     |  |  |  |  |  |  |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   5.360   0.37     |  |  |  |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   2.920   0.20     |  |  |  |  |  |  |  |  |  |  |  +-HitCompare\n   0.090   0.01     |  |  |  |  |  |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   5.670   0.39     |  |  |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   5.020   0.34     |  |  |  |  |  |  |  |  |  |  +-HitCompare\n   0.160   0.01     |  |  |  |  |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   5.960   0.41     |  |  |  |  |  |  |  |  |  +-HitCompare\n   5.200   0.36     |  |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.080   0.01     |  |  |  |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   6.680   0.46     |  |  |  |  |  |  |  |  +-HitCompare\n   5.060   0.35     |  |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.010   0.00     |  |  |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   7.070   0.48     |  |  |  |  |  |  |  +-HitCompare\n   4.960   0.34     |  |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.010   0.00     |  |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   7.320   0.50     |  |  |  |  |  |  +-HitCompare\n   4.780   0.33     |  |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.010   0.00     |  |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   7.640   0.52     |  |  |  |  |  +-HitCompare\n   4.870   0.33     |  |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.010   0.00     |  |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   6.810   0.47     |  |  |  |  +-HitCompare\n   4.620   0.32     |  |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.020   0.00     |  |  |  |  +-<static>@0x283e0 (<libc.so.6>)\n   6.160   0.42     |  |  |  +-HitCompare\n   4.340   0.30     |  |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.350   0.02     |  |  +-<static>@0x188021 (<libc.so.6>)\n   0.070   0.00     |  |  +-malloc\n   0.030   0.00     |  |  |  +-<static>@0xaaa3b (<libc.so.6>)\n   0.060   0.00     |  |  +-free\n   0.050   0.00     |  |    +-<static>@0xaaa3b (<libc.so.6>)\n   0.010   0.00     |  |      +-<static>@0xaaa3b (<libc.so.6>)\n 123.630   8.48     |  +-cuvsStreamSync\n  69.300   4.75     |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n  68.920   4.73     |  |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n  64.200   4.40     |  |  |  |  +-cuStreamQuery_ptsz\n  64.070   4.39     |  |  |  |  |  +-<static>@0x3577ef (<libcuda.so.580.126.09>)\n  63.890   4.38     |  |  |  |  |    +-<static>@0x26373e (<libcuda.so.580.126.09>)\n  49.270   3.38     |  |  |  |  |      +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n  42.300   2.90     |  |  |  |  |      |  +-<static>@0x4a3f35 (<libcuda.so.580.126.09>)\n  42.160   2.89     |  |  |  |  |      |  |  +-<static>@0x24cf45 (<libcuda.so.580.126.09>)\n  41.730   2.86     |  |  |  |  |      |  |    +-<static>@0x1ccd36 (<libcuda.so.580.126.09>)\n  36.110   2.48     |  |  |  |  |      |  |      +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n   3.930   0.27     |  |  |  |  |      |  +-<static>@0x24cf45 (<libcuda.so.580.126.09>)\n   2.230   0.15     |  |  |  |  |      |  |  +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n   2.210   0.15     |  |  |  |  |      |  |  |  +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n   0.010   0.00     |  |  |  |  |      |  |  |    +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n   0.860   0.06     |  |  |  |  |      |  |  +-<static>@0x4a3f35 (<libcuda.so.580.126.09>)\n   0.060   0.00     |  |  |  |  |      |  |  |  +-pthread_mutex_lock\n   0.010   0.00     |  |  |  |  |      |  |  |    +-<static>@0x98f31 (<libc.so.6>)\n   0.550   0.04     |  |  |  |  |      |  |  +-<static>@0x24cf45 (<libcuda.so.580.126.09>)\n   0.550   0.04     |  |  |  |  |      |  |  |  +-<static>@0x1ccd36 (<libcuda.so.580.126.09>)\n   0.480   0.03     |  |  |  |  |      |  |  |    +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n   0.270   0.02     |  |  |  |  |      |  |  +-pthread_mutex_unlock\n   0.020   0.00     |  |  |  |  |      |  |    +-<static>@0x98fb9 (<libc.so.6>)\n   2.010   0.14     |  |  |  |  |      |  +-<static>@0x3a3aaf (<libcuda.so.580.126.09>)\n  10.170   0.70     |  |  |  |  |      +-<static>@0x26373e (<libcuda.so.580.126.09>)\n   0.630   0.04     |  |  |  |  |      |  +-<static>@0x26373e (<libcuda.so.580.126.09>)\n   1.370   0.09     |  |  |  |  |      +-pthread_mutex_lock\n   1.320   0.09     |  |  |  |  |      +-pthread_mutex_unlock\n   0.160   0.01     |  |  |  |  |      +-pthread_getspecific\n   4.270   0.29     |  |  |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n   3.700   0.25     |  |  |  |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n   3.220   0.22     |  |  |  |  |  |  +-<static>@0x1ccd36 (<libcuda.so.580.126.09>)\n   1.550   0.11     |  |  |  |  |  |  |  +-<static>@0x26373e (<libcuda.so.580.126.09>)\n   0.440   0.03     |  |  |  |  |  |  |  |  +-<static>@0x26373e (<libcuda.so.580.126.09>)\n   0.330   0.02     |  |  |  |  |  |  |  +-pthread_getspecific\n   0.100   0.01     |  |  |  |  |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n   0.010   0.00     |  |  |  |  |  |    +-pthread_once\n   0.050   0.00     |  |  |  |  |  +-pthread_once\n   0.060   0.00     |  |  |  |  +-<static>@0x3577ef (<libcuda.so.580.126.09>)\n   0.020   0.00     |  |  |  +-pthread_once\n  48.880   3.35     |  |  +-sched_yield\n   0.260   0.02     |  |  +-<static>@0xba53b (<libcuvs_c.so>)\n   0.140   0.01     |  |  |  +-<static>@0xb2954 (<libcuvs_c.so>)\n   0.060   0.00     |  |  |  |  +-<static>@0xb2954 (<libcuvs_c.so>)\n   0.120   0.01     |  |  |  +-<static>@0x7a600 (<libcuvs_c.so>)\n   0.010   0.00     |  |  +-<static>@0xb2954 (<libcuvs_c.so>)\n  22.240   1.52     |  +-SearchShards\n  12.640   0.87     |  |  +-cuvsStreamSync\n   6.480   0.44     |  |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n   6.420   0.44     |  |  |  |  +-<static>@0x144e99 (<libcuvs_c.so>)\n   6.040   0.41     |  |  |  |    +-cuStreamQuery_ptsz\n   6.020   0.41     |  |  |  |    |  +-<static>@0x3577ef (<libcuda.so.580.126.09>)\n"
+  },
+  "baseline_sql_runs": [
+    {
+      "label": "vm-pins",
+      "workload": "10pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 60.044529002858326,
+      "qps": 65053.209071,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 3898352,
+      "latency_samples": 195514,
+      "sampling_rate": 0.05,
+      "p50_ms": 3.826,
+      "p95_ms": 5.641,
+      "p99_ms": 6.655869999999995,
+      "cpu_seconds": {
+        "worker": 1949.69,
+        "client": 278.8,
+        "postgres": 3851.9600000000028
+      },
+      "average_cpu_cores": {
+        "worker": 32.47073517567584,
+        "client": 4.643220700202814,
+        "postgres": 64.15172312895712
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 22,
+        "active:none:none": 68431,
+        "active:Client:ClientRead": 962,
+        "idle:none:none": 1242
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 277,
+        "client:0": 46,
+        "postgres:0": 18399,
+        "postgres:do_poll.constprop.0": 51563,
+        "client:do_poll.constprop.0": 229,
+        "postgres:ep_poll": 469,
+        "postgres:sched_clock": 1,
+        "postgres:select_idle_core.isra.0": 1,
+        "postgres:find_busiest_group": 2,
+        "postgres:load_balance": 1,
+        "postgres:os_release_spinlock": 1,
+        "postgres:pick_next_task_fair": 1,
+        "postgres:unix_stream_read_actor": 2,
+        "postgres:select_idle_cpu": 1,
+        "postgres:pollwake": 2,
+        "postgres:page_counter_cancel": 1,
+        "postgres:syscall_exit_to_user_mode": 2,
+        "postgres:__x64_sys_epoll_wait": 1,
+        "postgres:x64_sys_call": 1,
+        "postgres:do_syscall_64": 2,
+        "postgres:sock_def_readable": 1,
+        "postgres:update_sg_lb_stats": 1,
+        "postgres:__mod_memcg_state": 1,
+        "client:pick_next_task": 1,
+        "postgres:ep_done_scan": 1,
+        "postgres:__x64_sys_poll": 1,
+        "postgres:default_wake_function": 1,
+        "postgres:select_idle_sibling": 1,
+        "postgres:futex_wait_queue": 48
+      },
+      "os_states": {
+        "worker:S": 277,
+        "client:R": 53,
+        "postgres:R": 18117,
+        "postgres:S": 52388,
+        "client:S": 223
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 81.01923076923077,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21702.0
+        },
+        "1": {
+          "utilization_mean": 80.78846153846153,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21706.0
+        },
+        "2": {
+          "utilization_mean": 81.26923076923077,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 80.6923076923077,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 80.25,
+          "utilization_max": 84.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 80.57692307692308,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 81.0,
+          "utilization_max": 85.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 80.25,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "vm-pins-narrow",
+      "workload": "0.1pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 30.02536792983301,
+      "qps": 33275.618531,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 996206,
+      "latency_samples": 50006,
+      "sampling_rate": 0.05,
+      "p50_ms": 7.764,
+      "p95_ms": 10.80775,
+      "p99_ms": 12.274949999999997,
+      "cpu_seconds": {
+        "worker": 974.81,
+        "client": 69.27,
+        "postgres": 880.1999999999998
+      },
+      "average_cpu_cores": {
+        "worker": 32.466213312624724,
+        "client": 2.307049164622352,
+        "postgres": 29.315211126037156
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 34117,
+        "active:Client:ClientRead": 258,
+        "idle:none:none": 342,
+        "idle:Client:ClientRead": 99
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 137,
+        "client:vm_mmap_pgoff": 1,
+        "postgres:do_poll.constprop.0": 30360,
+        "postgres:0": 4221,
+        "postgres:syscall_exit_to_user_mode": 1,
+        "client:do_poll.constprop.0": 123,
+        "postgres:ep_poll": 229,
+        "postgres:do_syscall_64": 1,
+        "client:0": 13,
+        "postgres:find_busiest_group": 1,
+        "postgres:hrtimer_wakeup": 1,
+        "postgres:mod_memcg_lruvec_state": 1,
+        "postgres:select_idle_sibling": 1
+      },
+      "os_states": {
+        "worker:S": 137,
+        "client:D": 1,
+        "postgres:S": 30628,
+        "postgres:R": 4188,
+        "client:S": 124,
+        "client:R": 12
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 34.07692307692308,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21702.0
+        },
+        "1": {
+          "utilization_mean": 34.73076923076923,
+          "utilization_max": 39.0,
+          "memory_mb_max": 21706.0
+        },
+        "2": {
+          "utilization_mean": 35.34615384615385,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 33.57692307692308,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 34.57692307692308,
+          "utilization_max": 39.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 35.92307692307692,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 35.57692307692308,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 34.46153846153846,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "vm-pins-narrow",
+      "workload": "1pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 30.08810750581324,
+      "qps": 29507.024332,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 883035,
+      "latency_samples": 44281,
+      "sampling_rate": 0.05,
+      "p50_ms": 8.756,
+      "p95_ms": 12.119,
+      "p99_ms": 13.792599999999991,
+      "cpu_seconds": {
+        "worker": 974.89,
+        "client": 62.18,
+        "postgres": 915.0500000000008
+      },
+      "average_cpu_cores": {
+        "worker": 32.40117377976146,
+        "client": 2.066597242381774,
+        "postgres": 30.412348128681952
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 34620,
+        "idle:none:none": 334,
+        "active:Client:ClientRead": 251,
+        "idle:Client:ClientRead": 123
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 140,
+        "client:0": 17,
+        "postgres:0": 4605,
+        "postgres:do_poll.constprop.0": 30485,
+        "postgres:ep_poll": 238,
+        "client:do_poll.constprop.0": 122
+      },
+      "os_states": {
+        "worker:S": 140,
+        "client:R": 15,
+        "postgres:R": 4585,
+        "postgres:S": 30743,
+        "client:S": 124
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 21.23076923076923,
+          "utilization_max": 23.0,
+          "memory_mb_max": 21702.0
+        },
+        "1": {
+          "utilization_mean": 21.653846153846153,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21706.0
+        },
+        "2": {
+          "utilization_mean": 22.23076923076923,
+          "utilization_max": 34.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 20.384615384615383,
+          "utilization_max": 23.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 21.0,
+          "utilization_max": 23.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 22.576923076923077,
+          "utilization_max": 39.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 21.5,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 21.423076923076923,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ],
+  "optimized_sql_runs": [
+    {
+      "label": "worker-opt",
+      "workload": "0.1pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 60.06316201901063,
+      "qps": 63706.981056,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 3819114,
+      "latency_samples": 191328,
+      "sampling_rate": 0.05,
+      "p50_ms": 4.0255,
+      "p95_ms": 5.41,
+      "p99_ms": 6.119,
+      "cpu_seconds": {
+        "worker": 1988.8,
+        "client": 251.37,
+        "postgres": 3157.8999999999996
+      },
+      "average_cpu_cores": {
+        "worker": 33.11180985394215,
+        "client": 4.185094349851889,
+        "postgres": 52.57631955840904
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 68977,
+        "active:Client:ClientRead": 857,
+        "idle:none:none": 1042,
+        "idle:Client:ClientRead": 36
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 278,
+        "client:do_poll.constprop.0": 222,
+        "postgres:0": 14883,
+        "postgres:do_poll.constprop.0": 55551,
+        "client:0": 56,
+        "postgres:ep_poll": 461,
+        "postgres:ttwu_queue_wakelist": 1,
+        "postgres:__schedule": 3,
+        "postgres:newidle_balance": 1,
+        "postgres:x64_sys_call": 1,
+        "postgres:find_busiest_group": 1,
+        "postgres:do_epoll_wait": 1,
+        "postgres:pollwake": 3,
+        "postgres:update_sg_lb_stats": 1,
+        "postgres:hrtimer_wakeup": 1,
+        "postgres:update_sd_lb_stats.constprop.0": 1,
+        "postgres:pick_next_task_fair": 1,
+        "postgres:__mod_memcg_state": 1,
+        "postgres:sock_def_readable": 1
+      },
+      "os_states": {
+        "worker:S": 278,
+        "client:S": 243,
+        "postgres:R": 14679,
+        "postgres:S": 56233,
+        "client:R": 35
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 60.05769230769231,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 59.09615384615385,
+          "utilization_max": 65.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 59.98076923076923,
+          "utilization_max": 66.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 58.94230769230769,
+          "utilization_max": 65.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 59.01923076923077,
+          "utilization_max": 65.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 58.88461538461539,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 57.98076923076923,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 57.96153846153846,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "worker-opt",
+      "workload": "1pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 60.05247355485335,
+      "qps": 49998.364005,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 2996550,
+      "latency_samples": 150416,
+      "sampling_rate": 0.05,
+      "p50_ms": 5.147,
+      "p95_ms": 7.012,
+      "p99_ms": 7.916,
+      "cpu_seconds": {
+        "worker": 1974.99,
+        "client": 197.58,
+        "postgres": 2684.9899999999984
+      },
+      "average_cpu_cores": {
+        "worker": 32.88773772484155,
+        "client": 3.2901225928608215,
+        "postgres": 44.71073114994115
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 69540,
+        "active:Client:ClientRead": 682,
+        "idle:none:none": 878,
+        "idle:Client:ClientRead": 68
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 279,
+        "client:do_poll.constprop.0": 238,
+        "postgres:0": 13084,
+        "postgres:do_poll.constprop.0": 57524,
+        "postgres:ep_poll": 363,
+        "postgres:pollwake": 1,
+        "postgres:__schedule": 2,
+        "client:0": 41,
+        "postgres:update_curr": 1,
+        "postgres:wake_affine": 1,
+        "postgres:select_idle_core.isra.0": 2,
+        "postgres:pick_next_task_fair": 2,
+        "postgres:update_sg_lb_stats": 2,
+        "postgres:rmqueue": 1,
+        "postgres:select_idle_cpu": 2,
+        "postgres:dequeue_task_fair": 1,
+        "postgres:arch_exit_to_user_mode_prepare.isra.0": 1,
+        "postgres:ep_done_scan": 1,
+        "postgres:x64_sys_call": 1,
+        "postgres:__x64_sys_poll": 1,
+        "postgres:__sys_recvfrom": 1,
+        "postgres:futex_wait_queue": 21
+      },
+      "os_states": {
+        "worker:S": 279,
+        "client:S": 249,
+        "postgres:R": 12880,
+        "postgres:S": 58132,
+        "client:R": 30
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 32.96153846153846,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 33.67307692307692,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 33.51923076923077,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 33.71153846153846,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 35.46153846153846,
+          "utilization_max": 62.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 34.15384615384615,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 33.61538461538461,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 33.30769230769231,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "worker-opt",
+      "workload": "10pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 60.06938512693159,
+      "qps": 64869.111107,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 3883452,
+      "latency_samples": 194976,
+      "sampling_rate": 0.05,
+      "p50_ms": 3.833,
+      "p95_ms": 5.692,
+      "p99_ms": 6.728,
+      "cpu_seconds": {
+        "postgres": 3751.6200000000003,
+        "worker": 1946.42,
+        "client": 263.96
+      },
+      "average_cpu_cores": {
+        "postgres": 62.45477612385271,
+        "worker": 32.402862055056055,
+        "client": 4.394251738089721
+      },
+      "disk_read_bytes": {
+        "postgres": 0,
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "postgres": 0,
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 29,
+        "active:none:none": 68801,
+        "active:Client:ClientRead": 962,
+        "idle:none:none": 1121
+      },
+      "os_wait_channels": {
+        "postgres:0": 17831,
+        "worker:do_poll.constprop.0": 278,
+        "client:vm_mmap_pgoff": 1,
+        "postgres:do_poll.constprop.0": 52674,
+        "client:do_poll.constprop.0": 219,
+        "postgres:ep_poll": 389,
+        "client:0": 58,
+        "postgres:rmqueue": 1,
+        "postgres:select_idle_sibling": 1,
+        "postgres:try_to_wake_up": 1,
+        "postgres:ep_done_scan": 1,
+        "postgres:update_sg_lb_stats": 2,
+        "postgres:wake_affine": 1,
+        "postgres:unix_stream_recvmsg": 1,
+        "postgres:dequeue_entity": 1,
+        "postgres:__mod_memcg_lruvec_state": 1,
+        "postgres:__schedule": 2,
+        "postgres:pollwake": 2,
+        "postgres:do_epoll_wait": 1,
+        "postgres:__scm_recv_common.isra.0": 1,
+        "postgres:do_syscall_64": 1,
+        "postgres:pick_next_task_fair": 1,
+        "postgres:update_sd_lb_stats.constprop.0": 1
+      },
+      "os_states": {
+        "postgres:R": 17414,
+        "worker:S": 278,
+        "client:D": 1,
+        "postgres:S": 53499,
+        "client:S": 235,
+        "client:R": 42
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 81.46153846153847,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 80.96153846153847,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 81.34615384615384,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 80.92307692307692,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 78.73076923076923,
+          "utilization_max": 84.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 79.51923076923077,
+          "utilization_max": 85.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 78.6923076923077,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 79.09615384615384,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "worker-opt-repeat",
+      "workload": "0.1pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 30.040246271062642,
+      "qps": 64982.189078,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 1945315,
+      "latency_samples": 97568,
+      "sampling_rate": 0.05,
+      "p50_ms": 3.953,
+      "p95_ms": 5.285,
+      "p99_ms": 5.937330000000002,
+      "cpu_seconds": {
+        "worker": 993.61,
+        "client": 130.03,
+        "postgres": 1628.6999999999973
+      },
+      "average_cpu_cores": {
+        "worker": 33.07596053089388,
+        "client": 4.328526431730892,
+        "postgres": 54.21726524156034
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 34290,
+        "idle:none:none": 557,
+        "active:Client:ClientRead": 458,
+        "idle:Client:ClientRead": 23
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 139,
+        "client:0": 32,
+        "postgres:do_poll.constprop.0": 26932,
+        "postgres:0": 8127,
+        "postgres:ep_poll": 254,
+        "client:do_poll.constprop.0": 105,
+        "postgres:refill_stock": 1,
+        "postgres:__schedule": 1,
+        "postgres:__scm_recv_common.isra.0": 1,
+        "client:pick_next_task": 1,
+        "postgres:update_sd_lb_stats.constprop.0": 1,
+        "postgres:select_idle_cpu": 1,
+        "postgres:pollwake": 1,
+        "postgres:default_wake_function": 1,
+        "postgres:update_sg_lb_stats": 1,
+        "postgres:do_syscall_64": 2,
+        "client:sched_clock": 1,
+        "postgres:__wake_up_common": 1,
+        "postgres:hrtimer_wakeup": 1,
+        "postgres:ttwu_queue_wakelist": 1,
+        "postgres:x64_sys_call": 1,
+        "postgres:__x64_sys_poll": 1
+      },
+      "os_states": {
+        "worker:S": 139,
+        "client:R": 24,
+        "postgres:S": 27374,
+        "postgres:R": 7954,
+        "client:S": 115
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 58.46153846153846,
+          "utilization_max": 65.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 58.76923076923077,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 59.42307692307692,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 59.19230769230769,
+          "utilization_max": 65.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 58.96153846153846,
+          "utilization_max": 66.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 58.65384615384615,
+          "utilization_max": 65.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 58.26923076923077,
+          "utilization_max": 64.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 58.69230769230769,
+          "utilization_max": 66.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "worker-opt-repeat",
+      "workload": "1pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 30.0403600060381,
+      "qps": 50479.633134,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 1510064,
+      "latency_samples": 75666,
+      "sampling_rate": 0.05,
+      "p50_ms": 5.1,
+      "p95_ms": 6.904,
+      "p99_ms": 7.806350000000006,
+      "cpu_seconds": {
+        "worker": 984.84,
+        "client": 99.54,
+        "postgres": 1439.5699999999981
+      },
+      "average_cpu_cores": {
+        "worker": 32.78389472702882,
+        "client": 3.313542180586135,
+        "postgres": 47.92119667376307
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 34565,
+        "active:Client:ClientRead": 287,
+        "idle:none:none": 454,
+        "idle:Client:ClientRead": 22
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 139,
+        "client:0": 26,
+        "postgres:do_poll.constprop.0": 28228,
+        "postgres:0": 6919,
+        "client:do_poll.constprop.0": 113,
+        "postgres:ep_poll": 175,
+        "postgres:__schedule": 1,
+        "postgres:select_idle_sibling": 1,
+        "postgres:pick_next_task": 1,
+        "postgres:entry_SYSCALL_64_after_hwframe": 1,
+        "postgres:do_sys_poll": 1,
+        "postgres:kmalloc_reserve": 1
+      },
+      "os_states": {
+        "worker:S": 139,
+        "client:R": 19,
+        "postgres:S": 28484,
+        "postgres:R": 6844,
+        "client:S": 120
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 35.57692307692308,
+          "utilization_max": 60.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 36.53846153846154,
+          "utilization_max": 60.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 33.34615384615385,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 34.30769230769231,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 33.61538461538461,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 35.92307692307692,
+          "utilization_max": 44.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 32.84615384615385,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 33.11538461538461,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ],
+  "optimized_direct_runs": [
+    {
+      "mode": "direct-worker",
+      "label": "direct-worker-opt",
+      "workload": "0.1pct",
+      "k": 500,
+      "sampling_rate": 0.05,
+      "latency_bin_ms": 0.01,
+      "clients": 256,
+      "seconds": 20,
+      "transactions": 1790613,
+      "qps": 89530.65,
+      "errors": 0,
+      "latency_samples": 89403,
+      "p50_ms": 2.86,
+      "p95_ms": 4.18,
+      "p99_ms": 4.82,
+      "cpu_seconds": {
+        "worker": 667.53,
+        "client": 34.86
+      },
+      "average_cpu_cores": {
+        "worker": 33.295732852916885,
+        "client": 1.7387821479973673
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {},
+      "os_wait_channels": {
+        "worker:0": 1,
+        "client:0": 1,
+        "worker:do_poll.constprop.0": 99,
+        "client:futex_wait_queue": 99
+      },
+      "os_states": {
+        "worker:R": 1,
+        "client:R": 1,
+        "worker:S": 99,
+        "client:S": 99
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 69.5,
+          "utilization_max": 78.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 70.16666666666667,
+          "utilization_max": 78.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 70.38888888888889,
+          "utilization_max": 78.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 69.55555555555556,
+          "utilization_max": 76.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 69.33333333333333,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 69.44444444444444,
+          "utilization_max": 78.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 69.33333333333333,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 69.55555555555556,
+          "utilization_max": 78.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "mode": "direct-worker",
+      "label": "direct-worker-opt",
+      "workload": "1pct",
+      "k": 500,
+      "sampling_rate": 0.05,
+      "latency_bin_ms": 0.01,
+      "clients": 256,
+      "seconds": 20,
+      "transactions": 1479560,
+      "qps": 73978.0,
+      "errors": 0,
+      "latency_samples": 73858,
+      "p50_ms": 3.45,
+      "p95_ms": 5.11,
+      "p99_ms": 5.9,
+      "cpu_seconds": {
+        "worker": 662.54,
+        "client": 29.72
+      },
+      "average_cpu_cores": {
+        "worker": 33.04516263190031,
+        "client": 1.4823289664323318
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {},
+      "os_wait_channels": {
+        "worker:0": 1,
+        "client:0": 1,
+        "worker:do_poll.constprop.0": 99,
+        "client:futex_wait_queue": 99
+      },
+      "os_states": {
+        "worker:R": 1,
+        "client:R": 1,
+        "worker:S": 99,
+        "client:S": 99
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 49.11764705882353,
+          "utilization_max": 72.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 48.411764705882355,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 48.411764705882355,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 48.529411764705884,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 47.588235294117645,
+          "utilization_max": 63.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 48.588235294117645,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 47.0,
+          "utilization_max": 73.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 48.529411764705884,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "mode": "direct-worker",
+      "label": "direct-worker-opt",
+      "workload": "10pct",
+      "k": 500,
+      "sampling_rate": 0.05,
+      "latency_bin_ms": 0.01,
+      "clients": 256,
+      "seconds": 20,
+      "transactions": 1899352,
+      "qps": 94967.6,
+      "errors": 0,
+      "latency_samples": 94848,
+      "p50_ms": 2.59,
+      "p95_ms": 4.1,
+      "p99_ms": 4.82,
+      "cpu_seconds": {
+        "worker": 633.77,
+        "client": 37.81
+      },
+      "average_cpu_cores": {
+        "worker": 31.595500724271428,
+        "client": 1.8849517685985495
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {},
+      "os_wait_channels": {
+        "worker:0": 1,
+        "client:0": 1,
+        "worker:do_poll.constprop.0": 99,
+        "client:futex_wait_queue": 99
+      },
+      "os_states": {
+        "worker:R": 1,
+        "client:R": 1,
+        "worker:S": 99,
+        "client:S": 99
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 86.41176470588235,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "1": {
+          "utilization_mean": 88.47058823529412,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "2": {
+          "utilization_mean": 88.47058823529412,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 88.88235294117646,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 87.52941176470588,
+          "utilization_max": 92.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 87.88235294117646,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 86.0,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 87.17647058823529,
+          "utilization_max": 92.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ],
+  "rejected_zero_copy_runs": [
+    {
+      "label": "zero-copy",
+      "workload": "10pct",
+      "clients": 256,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 60.04605282796547,
+      "qps": 64251.489263,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 3851064,
+      "latency_samples": 192091,
+      "sampling_rate": 0.05,
+      "p50_ms": 3.88,
+      "p95_ms": 5.644,
+      "p99_ms": 6.658100000000006,
+      "cpu_seconds": {
+        "worker": 1945.58,
+        "client": 265.46,
+        "postgres": 4193.099999999999
+      },
+      "average_cpu_cores": {
+        "worker": 32.401463682786456,
+        "client": 4.420940053471197,
+        "postgres": 69.83140110830286
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 68633,
+        "idle:none:none": 1116,
+        "active:Client:ClientRead": 880,
+        "idle:Client:ClientRead": 27
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 277,
+        "client:0": 48,
+        "postgres:0": 20157,
+        "postgres:do_poll.constprop.0": 50111,
+        "postgres:ep_poll": 370,
+        "client:do_poll.constprop.0": 229,
+        "postgres:__schedule": 3,
+        "postgres:__x64_sys_epoll_wait": 2,
+        "postgres:__memcg_slab_post_alloc_hook": 2,
+        "postgres:__mod_memcg_state": 1,
+        "postgres:hrtimer_wakeup": 2,
+        "postgres:sched_clock_cpu": 1,
+        "postgres:select_idle_cpu": 1,
+        "postgres:do_syscall_64": 1,
+        "postgres:__x64_sys_poll": 1,
+        "postgres:x64_sys_call": 1,
+        "postgres:__wake_up_sync_key": 1,
+        "postgres:update_sg_lb_stats": 1,
+        "postgres:kmem_cache_free": 1
+      },
+      "os_states": {
+        "worker:S": 277,
+        "client:R": 45,
+        "postgres:R": 19705,
+        "postgres:S": 50951,
+        "client:S": 232
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 81.23529411764706,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21696.0
+        },
+        "1": {
+          "utilization_mean": 81.19607843137256,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21702.0
+        },
+        "2": {
+          "utilization_mean": 81.33333333333333,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 81.33333333333333,
+          "utilization_max": 87.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 80.41176470588235,
+          "utilization_max": 85.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 80.05882352941177,
+          "utilization_max": 85.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 80.52941176470588,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 80.7843137254902,
+          "utilization_max": 86.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ],
+  "refreshed_direct_baseline": [
+    {
+      "mode": "direct-worker",
+      "label": "direct-current",
+      "workload": "10pct",
+      "k": 500,
+      "sampling_rate": 0.05,
+      "latency_bin_ms": 0.01,
+      "clients": 256,
+      "seconds": 20,
+      "transactions": 1898498,
+      "qps": 94924.9,
+      "errors": 0,
+      "latency_samples": 94808,
+      "p50_ms": 2.59,
+      "p95_ms": 4.1,
+      "p99_ms": 4.82,
+      "cpu_seconds": {
+        "worker": 634.46,
+        "client": 38.12
+      },
+      "average_cpu_cores": {
+        "worker": 31.633362024110216,
+        "client": 1.9006143182534458
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {},
+      "os_wait_channels": {
+        "worker:0": 1,
+        "client:0": 1,
+        "worker:do_poll.constprop.0": 99,
+        "client:futex_wait_queue": 99
+      },
+      "os_states": {
+        "worker:R": 1,
+        "client:R": 1,
+        "worker:S": 99,
+        "client:S": 99
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 85.0,
+          "utilization_max": 94.0,
+          "memory_mb_max": 21696.0
+        },
+        "1": {
+          "utilization_mean": 86.3529411764706,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21702.0
+        },
+        "2": {
+          "utilization_mean": 85.17647058823529,
+          "utilization_max": 94.0,
+          "memory_mb_max": 21596.0
+        },
+        "3": {
+          "utilization_mean": 84.76470588235294,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21596.0
+        },
+        "4": {
+          "utilization_mean": 85.58823529411765,
+          "utilization_max": 94.0,
+          "memory_mb_max": 21596.0
+        },
+        "5": {
+          "utilization_mean": 84.47058823529412,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "6": {
+          "utilization_mean": 85.05882352941177,
+          "utilization_max": 93.0,
+          "memory_mb_max": 21596.0
+        },
+        "7": {
+          "utilization_mean": 86.17647058823529,
+          "utilization_max": 94.0,
+          "memory_mb_max": 21596.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ],
+  "correctness": [
+    {
+      "workload": "0.1pct",
+      "query": 1,
+      "returned": 500,
+      "eligible": 10000,
+      "route": 2,
+      "recall_at_500": 1.0
+    },
+    {
+      "workload": "0.1pct",
+      "query": 17,
+      "returned": 500,
+      "eligible": 10000,
+      "route": 2,
+      "recall_at_500": 1.0
+    },
+    {
+      "workload": "0.1pct",
+      "query": 123,
+      "returned": 500,
+      "eligible": 10000,
+      "route": 2,
+      "recall_at_500": 1.0
+    },
+    {
+      "workload": "1pct",
+      "query": 1,
+      "returned": 500,
+      "eligible": 100002,
+      "route": 2,
+      "recall_at_500": 1.0
+    },
+    {
+      "workload": "1pct",
+      "query": 17,
+      "returned": 500,
+      "eligible": 100002,
+      "route": 2,
+      "recall_at_500": 1.0
+    },
+    {
+      "workload": "1pct",
+      "query": 123,
+      "returned": 500,
+      "eligible": 100002,
+      "route": 2,
+      "recall_at_500": 1.0
+    },
+    {
+      "workload": "10pct",
+      "query": 1,
+      "returned": 500,
+      "eligible": 1000020,
+      "route": 1,
+      "recall_at_500": 0.996
+    },
+    {
+      "workload": "10pct",
+      "query": 17,
+      "returned": 500,
+      "eligible": 1000020,
+      "route": 1,
+      "recall_at_500": 0.996
+    },
+    {
+      "workload": "10pct",
+      "query": 123,
+      "returned": 500,
+      "eligible": 1000020,
+      "route": 1,
+      "recall_at_500": 0.994
+    }
+  ],
+  "validation": {
+    "gpu_tests": 15,
+    "frozen_tests": 27,
+    "sql_tests": 16,
+    "native_unit_scenarios": 8,
+    "selection_test_reference_trials": 1000,
+    "sanitizers": [
+      "AddressSanitizer",
+      "UndefinedBehaviorSanitizer"
+    ]
+  },
+  "source_commit": "255a9cb",
+  "lane_tuning": {
+    "trial_sql_runs": [
+      {
+        "label": "worker-opt-lanes64",
+        "workload": "0.1pct",
+        "clients": 256,
+        "k": 500,
+        "plan_cache_mode": "force_generic_plan",
+        "setup_cost": 1000.0,
+        "mmap": "on",
+        "local_cache_mb": 16,
+        "client_threads": 32,
+        "table": "public.frozen_stress",
+        "query_table": "public.frozen_stress_queries",
+        "count_only": false,
+        "seconds": 30.05050218407996,
+        "qps": 96872.080551,
+        "returncode": 0,
+        "failed_transactions": 0,
+        "transactions": 2897897,
+        "latency_samples": 144369,
+        "sampling_rate": 0.05,
+        "p50_ms": 2.477,
+        "p95_ms": 3.485,
+        "p99_ms": 4.076320000000007,
+        "cpu_seconds": {
+          "worker": 1923.37,
+          "client": 250.84,
+          "postgres": 3334.9800000000046
+        },
+        "average_cpu_cores": {
+          "worker": 64.00458761780546,
+          "client": 8.347281468490369,
+          "postgres": 110.97917697251654
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "postgres_wait_samples": {
+          "active:none:none": 31602,
+          "active:Client:ClientRead": 1143,
+          "idle:none:none": 1373,
+          "idle:Client:ClientRead": 186
+        },
+        "os_wait_channels": {
+          "worker:do_poll.constprop.0": 136,
+          "client:do_mprotect_pkey": 1,
+          "postgres:do_poll.constprop.0": 18005,
+          "client:do_poll.constprop.0": 78,
+          "postgres:0": 15678,
+          "postgres:ep_poll": 607,
+          "client:0": 55,
+          "postgres:find_busiest_group": 2,
+          "postgres:pick_next_task": 1,
+          "postgres:do_syscall_64": 2,
+          "postgres:update_sd_lb_stats.constprop.0": 1,
+          "postgres:pick_next_task_fair": 1,
+          "postgres:pollwake": 1,
+          "postgres:dequeue_entity": 1,
+          "client:pollwake": 1,
+          "postgres:__update_idle_core": 1,
+          "postgres:sched_clock_noinstr": 1,
+          "postgres:do_epoll_wait": 1,
+          "postgres:do_sys_poll": 1,
+          "postgres:ep_autoremove_wake_function": 1
+        },
+        "os_states": {
+          "worker:S": 136,
+          "client:R": 48,
+          "postgres:S": 18961,
+          "client:S": 87,
+          "postgres:R": 15343
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 72.42307692307692,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "1": {
+            "utilization_mean": 71.88461538461539,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          },
+          "2": {
+            "utilization_mean": 71.57692307692308,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "3": {
+            "utilization_mean": 72.5,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "4": {
+            "utilization_mean": 71.84615384615384,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          },
+          "5": {
+            "utilization_mean": 72.15384615384616,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "6": {
+            "utilization_mean": 72.38461538461539,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          },
+          "7": {
+            "utilization_mean": 72.07692307692308,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          }
+        },
+        "monitor_errors": []
+      },
+      {
+        "label": "worker-opt-lanes64",
+        "workload": "1pct",
+        "clients": 256,
+        "k": 500,
+        "plan_cache_mode": "force_generic_plan",
+        "setup_cost": 1000.0,
+        "mmap": "on",
+        "local_cache_mb": 16,
+        "client_threads": 32,
+        "table": "public.frozen_stress",
+        "query_table": "public.frozen_stress_queries",
+        "count_only": false,
+        "seconds": 30.044120423030108,
+        "qps": 79126.499344,
+        "returncode": 0,
+        "failed_transactions": 0,
+        "transactions": 2370235,
+        "latency_samples": 118620,
+        "sampling_rate": 0.05,
+        "p50_ms": 3.107,
+        "p95_ms": 4.467,
+        "p99_ms": 5.343619999999995,
+        "cpu_seconds": {
+          "worker": 1945.23,
+          "client": 193.46,
+          "postgres": 2871.5499999999997
+        },
+        "average_cpu_cores": {
+          "worker": 64.74577962711459,
+          "client": 6.439196663973714,
+          "postgres": 95.57776894672654
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "postgres_wait_samples": {
+          "active:none:none": 32927,
+          "idle:none:none": 1000,
+          "idle:Client:ClientRead": 83,
+          "active:Client:ClientRead": 806
+        },
+        "os_wait_channels": {
+          "worker:do_poll.constprop.0": 137,
+          "client:0": 35,
+          "postgres:do_poll.constprop.0": 20741,
+          "postgres:0": 13750,
+          "postgres:ep_poll": 309,
+          "client:do_poll.constprop.0": 102,
+          "postgres:do_sys_poll": 2,
+          "postgres:syscall_exit_to_user_mode": 1,
+          "postgres:sched_clock_noinstr": 1,
+          "postgres:update_sd_lb_stats.constprop.0": 2,
+          "postgres:update_blocked_averages": 1,
+          "postgres:do_epoll_wait": 1,
+          "postgres:pollwake": 1,
+          "postgres:select_idle_cpu": 1,
+          "postgres:x64_sys_call": 1,
+          "postgres:pick_next_task_fair": 1,
+          "postgres:__schedule": 1,
+          "postgres:find_busiest_group": 1,
+          "postgres:sched_clock": 1,
+          "postgres:update_sg_lb_stats": 1
+        },
+        "os_states": {
+          "worker:S": 137,
+          "client:R": 25,
+          "postgres:S": 21460,
+          "postgres:R": 13356,
+          "client:S": 112
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 49.46153846153846,
+            "utilization_max": 52.0,
+            "memory_mb_max": 21630.0
+          },
+          "1": {
+            "utilization_mean": 48.07692307692308,
+            "utilization_max": 52.0,
+            "memory_mb_max": 21630.0
+          },
+          "2": {
+            "utilization_mean": 48.5,
+            "utilization_max": 52.0,
+            "memory_mb_max": 21630.0
+          },
+          "3": {
+            "utilization_mean": 50.80769230769231,
+            "utilization_max": 69.0,
+            "memory_mb_max": 21630.0
+          },
+          "4": {
+            "utilization_mean": 46.84615384615385,
+            "utilization_max": 51.0,
+            "memory_mb_max": 21630.0
+          },
+          "5": {
+            "utilization_mean": 48.38461538461539,
+            "utilization_max": 52.0,
+            "memory_mb_max": 21630.0
+          },
+          "6": {
+            "utilization_mean": 48.57692307692308,
+            "utilization_max": 54.0,
+            "memory_mb_max": 21630.0
+          },
+          "7": {
+            "utilization_mean": 48.19230769230769,
+            "utilization_max": 53.0,
+            "memory_mb_max": 21630.0
+          }
+        },
+        "monitor_errors": []
+      },
+      {
+        "label": "worker-opt-lanes64",
+        "workload": "10pct",
+        "clients": 256,
+        "k": 500,
+        "plan_cache_mode": "force_generic_plan",
+        "setup_cost": 1000.0,
+        "mmap": "on",
+        "local_cache_mb": 16,
+        "client_threads": 32,
+        "table": "public.frozen_stress",
+        "query_table": "public.frozen_stress_queries",
+        "count_only": false,
+        "seconds": 30.071688869036734,
+        "qps": 69520.325113,
+        "returncode": 0,
+        "failed_transactions": 0,
+        "transactions": 2073849,
+        "latency_samples": 103904,
+        "sampling_rate": 0.05,
+        "p50_ms": 3.562,
+        "p95_ms": 5.066,
+        "p99_ms": 6.1099700000000015,
+        "cpu_seconds": {
+          "postgres": 2363.9100000000026,
+          "worker": 1674.85,
+          "client": 161.49
+        },
+        "average_cpu_cores": {
+          "postgres": 78.60915329015653,
+          "worker": 55.69524236879514,
+          "client": 5.370167292675003
+        },
+        "disk_read_bytes": {
+          "postgres": 0,
+          "worker": 0,
+          "client": 0
+        },
+        "disk_write_bytes": {
+          "postgres": 0,
+          "worker": 0,
+          "client": 0
+        },
+        "postgres_wait_samples": {
+          "idle:Client:ClientRead": 49,
+          "active:none:none": 31443,
+          "active:LWLock:LockManager": 6,
+          "idle:none:none": 705,
+          "active:Client:ClientRead": 566
+        },
+        "os_wait_channels": {
+          "postgres:0": 10769,
+          "worker:do_poll.constprop.0": 128,
+          "client:vm_mmap_pgoff": 1,
+          "postgres:__mmap_region": 3,
+          "postgres:ep_poll": 227,
+          "postgres:vma_prepare": 3,
+          "postgres:do_poll.constprop.0": 21512,
+          "postgres:unix_wait_for_peer": 19,
+          "worker:0": 1,
+          "client:do_poll.constprop.0": 105,
+          "client:0": 22,
+          "postgres:__mod_memcg_state": 1,
+          "postgres:do_epoll_wait": 1,
+          "postgres:do_syscall_64": 2,
+          "postgres:unix_stream_sendmsg": 1,
+          "postgres:skb_queue_tail": 1,
+          "postgres:pollwake": 1,
+          "postgres:sched_clock_cpu": 1,
+          "postgres:sock_def_readable": 1,
+          "postgres:update_sd_lb_stats.constprop.0": 1,
+          "postgres:sched_clock": 1,
+          "postgres:x64_sys_call": 2,
+          "postgres:__x64_sys_epoll_wait": 1,
+          "postgres:futex_wait_queue": 54
+        },
+        "os_states": {
+          "postgres:R": 10453,
+          "worker:S": 128,
+          "client:D": 1,
+          "postgres:D": 6,
+          "postgres:S": 22142,
+          "worker:R": 1,
+          "client:S": 107,
+          "client:R": 20
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 95.76923076923077,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "1": {
+            "utilization_mean": 95.76923076923077,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "2": {
+            "utilization_mean": 95.76923076923077,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "3": {
+            "utilization_mean": 95.6923076923077,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "4": {
+            "utilization_mean": 95.65384615384616,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "5": {
+            "utilization_mean": 95.88461538461539,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "6": {
+            "utilization_mean": 95.84615384615384,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "7": {
+            "utilization_mean": 95.53846153846153,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          }
+        },
+        "monitor_errors": []
+      }
+    ],
+    "sustained_sql_runs": [
+      {
+        "label": "worker-opt-lanes64-sustained",
+        "workload": "0.1pct",
+        "clients": 256,
+        "k": 500,
+        "plan_cache_mode": "force_generic_plan",
+        "setup_cost": 1000.0,
+        "mmap": "on",
+        "local_cache_mb": 16,
+        "client_threads": 32,
+        "table": "public.frozen_stress",
+        "query_table": "public.frozen_stress_queries",
+        "count_only": false,
+        "seconds": 60.08956279116683,
+        "qps": 97130.709387,
+        "returncode": 0,
+        "failed_transactions": 0,
+        "transactions": 5828234,
+        "latency_samples": 291144,
+        "sampling_rate": 0.05,
+        "p50_ms": 2.492,
+        "p95_ms": 3.515,
+        "p99_ms": 4.121,
+        "cpu_seconds": {
+          "worker": 3873.56,
+          "client": 506.27,
+          "postgres": 6713.109999999997
+        },
+        "average_cpu_cores": {
+          "worker": 64.46310840140467,
+          "client": 8.425256841349855,
+          "postgres": 111.71840313317814
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "postgres_wait_samples": {
+          "active:none:none": 62755,
+          "idle:none:none": 2642,
+          "active:Client:ClientRead": 2257,
+          "idle:Client:ClientRead": 442,
+          "active:LWLock:ProcArray": 1
+        },
+        "os_wait_channels": {
+          "worker:do_poll.constprop.0": 268,
+          "client:lock_mm_and_find_vma": 1,
+          "postgres:do_poll.constprop.0": 35624,
+          "client:do_poll.constprop.0": 158,
+          "postgres:0": 31227,
+          "postgres:ep_poll": 1199,
+          "postgres:sock_def_readable": 1,
+          "postgres:skb_queue_tail": 1,
+          "postgres:__mod_memcg_state": 3,
+          "postgres:__memcg_kmem_charge_page": 1,
+          "client:0": 107,
+          "postgres:sched_clock_cpu": 4,
+          "postgres:newidle_balance": 1,
+          "postgres:dequeue_entity": 1,
+          "postgres:__smp_call_single_queue": 1,
+          "postgres:sched_clock": 2,
+          "postgres:__x64_sys_epoll_wait": 1,
+          "postgres:alloc_skb_with_frags": 1,
+          "postgres:__schedule": 3,
+          "postgres:pollwake": 1,
+          "postgres:do_epoll_wait": 1,
+          "postgres:ep_done_scan": 1,
+          "postgres:dequeue_task": 1,
+          "postgres:do_sys_poll": 2,
+          "postgres:__sys_recvfrom": 2,
+          "postgres:update_sd_lb_stats.constprop.0": 2,
+          "postgres:select_idle_core.isra.0": 1,
+          "postgres:unix_stream_read_generic": 1,
+          "postgres:__memcg_slab_post_alloc_hook": 1,
+          "postgres:find_busiest_group": 2,
+          "postgres:load_balance": 2,
+          "postgres:detach_tasks": 1,
+          "postgres:ep_autoremove_wake_function": 1,
+          "postgres:unix_stream_recvmsg": 1,
+          "client:__schedule": 1,
+          "postgres:__sys_sendto": 1,
+          "postgres:rseq_ip_fixup": 1,
+          "postgres:select_idle_cpu": 1,
+          "postgres:do_syscall_64": 2,
+          "postgres:rmqueue": 1,
+          "postgres:futex_wait_queue": 1,
+          "client:futex_wait_queue": 1
+        },
+        "os_states": {
+          "worker:S": 268,
+          "client:R": 93,
+          "postgres:S": 37681,
+          "client:S": 175,
+          "postgres:R": 30416
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 73.58823529411765,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          },
+          "1": {
+            "utilization_mean": 73.27450980392157,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "2": {
+            "utilization_mean": 73.70588235294117,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "3": {
+            "utilization_mean": 73.6078431372549,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          },
+          "4": {
+            "utilization_mean": 73.19607843137256,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "5": {
+            "utilization_mean": 73.58823529411765,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "6": {
+            "utilization_mean": 73.54901960784314,
+            "utilization_max": 78.0,
+            "memory_mb_max": 21630.0
+          },
+          "7": {
+            "utilization_mean": 73.56862745098039,
+            "utilization_max": 77.0,
+            "memory_mb_max": 21630.0
+          }
+        },
+        "monitor_errors": []
+      },
+      {
+        "label": "worker-opt-lanes64-sustained",
+        "workload": "1pct",
+        "clients": 256,
+        "k": 500,
+        "plan_cache_mode": "force_generic_plan",
+        "setup_cost": 1000.0,
+        "mmap": "on",
+        "local_cache_mb": 16,
+        "client_threads": 32,
+        "table": "public.frozen_stress",
+        "query_table": "public.frozen_stress_queries",
+        "count_only": false,
+        "seconds": 60.16252237185836,
+        "qps": 80058.565203,
+        "returncode": 0,
+        "failed_transactions": 0,
+        "transactions": 4806696,
+        "latency_samples": 241164,
+        "sampling_rate": 0.05,
+        "p50_ms": 3.068,
+        "p95_ms": 4.393,
+        "p99_ms": 5.217,
+        "cpu_seconds": {
+          "worker": 3926.1,
+          "client": 394.27,
+          "postgres": 5749.6699999999955
+        },
+        "average_cpu_cores": {
+          "worker": 65.25823461545014,
+          "client": 6.553415389784652,
+          "postgres": 95.56896508530473
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "postgres_wait_samples": {
+          "active:none:none": 66023,
+          "active:Client:ClientRead": 1600,
+          "idle:none:none": 1857,
+          "idle:Client:ClientRead": 152,
+          "active:LWLock:ProcArray": 1
+        },
+        "os_wait_channels": {
+          "worker:do_poll.constprop.0": 274,
+          "client:0": 89,
+          "postgres:0": 27115,
+          "postgres:do_poll.constprop.0": 41884,
+          "postgres:ep_poll": 589,
+          "client:do_poll.constprop.0": 180,
+          "postgres:do_sys_poll": 2,
+          "postgres:ttwu_queue_wakelist": 1,
+          "postgres:update_sg_lb_stats": 1,
+          "postgres:load_balance": 1,
+          "client:pollwake": 1,
+          "postgres:__mod_memcg_state": 2,
+          "postgres:find_busiest_group": 3,
+          "postgres:__schedule": 3,
+          "postgres:pick_next_task_fair": 5,
+          "client:sched_clock": 1,
+          "postgres:exc_page_fault": 1,
+          "postgres:__x64_sys_poll": 2,
+          "postgres:sched_clock_noinstr": 1,
+          "client:sock_poll": 1,
+          "postgres:pollwake": 2,
+          "postgres:x64_sys_call": 2,
+          "postgres:ep_done_scan": 1,
+          "postgres:put_prev_entity": 1,
+          "postgres:update_curr": 1,
+          "postgres:raw_spin_rq_lock_nested": 1,
+          "postgres:rmqueue": 1,
+          "postgres:autoremove_wake_function": 1,
+          "postgres:update_cfs_group": 1,
+          "postgres:sched_clock_cpu": 1,
+          "postgres:do_syscall_64": 1,
+          "postgres:update_load_avg": 1,
+          "postgres:dequeue_task_fair": 1,
+          "postgres:__wake_up_common": 1,
+          "postgres:__smp_call_single_queue": 2,
+          "postgres:sched_clock": 1,
+          "postgres:newidle_balance": 1,
+          "postgres:update_sd_lb_stats.constprop.0": 1,
+          "client:pick_next_task_fair": 1,
+          "postgres:unix_stream_sendmsg": 1,
+          "postgres:futex_wait_queue": 1,
+          "client:futex_wait_queue": 1
+        },
+        "os_states": {
+          "worker:S": 274,
+          "client:D": 1,
+          "postgres:S": 43323,
+          "postgres:R": 26310,
+          "client:R": 66,
+          "client:S": 207
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 50.80392156862745,
+            "utilization_max": 54.0,
+            "memory_mb_max": 21630.0
+          },
+          "1": {
+            "utilization_mean": 49.72549019607843,
+            "utilization_max": 53.0,
+            "memory_mb_max": 21630.0
+          },
+          "2": {
+            "utilization_mean": 50.15686274509804,
+            "utilization_max": 53.0,
+            "memory_mb_max": 21630.0
+          },
+          "3": {
+            "utilization_mean": 48.94117647058823,
+            "utilization_max": 52.0,
+            "memory_mb_max": 21630.0
+          },
+          "4": {
+            "utilization_mean": 49.78431372549019,
+            "utilization_max": 54.0,
+            "memory_mb_max": 21630.0
+          },
+          "5": {
+            "utilization_mean": 49.15686274509804,
+            "utilization_max": 53.0,
+            "memory_mb_max": 21630.0
+          },
+          "6": {
+            "utilization_mean": 50.529411764705884,
+            "utilization_max": 54.0,
+            "memory_mb_max": 21630.0
+          },
+          "7": {
+            "utilization_mean": 48.27450980392157,
+            "utilization_max": 52.0,
+            "memory_mb_max": 21630.0
+          }
+        },
+        "monitor_errors": []
+      },
+      {
+        "label": "worker-opt-lanes64-sustained",
+        "workload": "10pct",
+        "clients": 256,
+        "k": 500,
+        "plan_cache_mode": "force_generic_plan",
+        "setup_cost": 1000.0,
+        "mmap": "on",
+        "local_cache_mb": 16,
+        "client_threads": 32,
+        "table": "public.frozen_stress",
+        "query_table": "public.frozen_stress_queries",
+        "count_only": false,
+        "seconds": 60.068088905885816,
+        "qps": 70044.600943,
+        "returncode": 0,
+        "failed_transactions": 0,
+        "transactions": 4197813,
+        "latency_samples": 210032,
+        "sampling_rate": 0.05,
+        "p50_ms": 3.554,
+        "p95_ms": 4.991,
+        "p99_ms": 5.837,
+        "cpu_seconds": {
+          "worker": 3370.15,
+          "client": 330.15,
+          "postgres": 4706.44
+        },
+        "average_cpu_cores": {
+          "worker": 56.105497301242984,
+          "client": 5.496262758039069,
+          "postgres": 78.35175191563046
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0,
+          "postgres": 0
+        },
+        "postgres_wait_samples": {
+          "active:none:none": 66991,
+          "idle:Client:ClientRead": 46,
+          "active:Client:ClientRead": 1257,
+          "idle:none:none": 1594
+        },
+        "os_wait_channels": {
+          "worker:do_poll.constprop.0": 274,
+          "client:do_poll.constprop.0": 199,
+          "postgres:do_poll.constprop.0": 46962,
+          "postgres:0": 22427,
+          "postgres:ep_poll": 455,
+          "client:0": 74,
+          "postgres:do_epoll_wait": 2,
+          "postgres:__sys_sendto": 1,
+          "postgres:do_sys_poll": 2,
+          "postgres:update_sg_lb_stats": 3,
+          "postgres:dequeue_task": 2,
+          "postgres:pick_next_task": 7,
+          "postgres:ep_autoremove_wake_function": 2,
+          "postgres:default_wake_function": 2,
+          "postgres:pollwake": 2,
+          "postgres:x64_sys_call": 2,
+          "postgres:entry_SYSCALL_64_after_hwframe": 1,
+          "postgres:syscall_exit_to_user_mode": 1,
+          "postgres:load_balance": 3,
+          "postgres:ep_done_scan": 1,
+          "postgres:update_sd_lb_stats.constprop.0": 3,
+          "postgres:select_idle_sibling": 2,
+          "postgres:arch_exit_to_user_mode_prepare.isra.0": 1,
+          "postgres:__x64_sys_epoll_wait": 1,
+          "postgres:do_syscall_64": 1,
+          "postgres:pick_next_task_fair": 1,
+          "postgres:hrtimer_wakeup": 1,
+          "postgres:__x64_sys_poll": 1,
+          "postgres:psi_task_switch": 1,
+          "postgres:skb_queue_tail": 1,
+          "client:pick_next_task": 1
+        },
+        "os_states": {
+          "worker:S": 274,
+          "client:S": 218,
+          "postgres:S": 48129,
+          "postgres:R": 21759,
+          "client:R": 56
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 97.74509803921569,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "1": {
+            "utilization_mean": 97.72549019607843,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "2": {
+            "utilization_mean": 97.86274509803921,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "3": {
+            "utilization_mean": 97.88235294117646,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "4": {
+            "utilization_mean": 97.86274509803921,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "5": {
+            "utilization_mean": 97.82352941176471,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "6": {
+            "utilization_mean": 97.94117647058823,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "7": {
+            "utilization_mean": 97.92156862745098,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          }
+        },
+        "monitor_errors": []
+      }
+    ],
+    "direct_runs": [
+      {
+        "mode": "direct-worker",
+        "label": "direct-opt-lanes64",
+        "workload": "0.1pct",
+        "k": 500,
+        "sampling_rate": 0.05,
+        "latency_bin_ms": 0.01,
+        "clients": 256,
+        "seconds": 20,
+        "transactions": 3093380,
+        "qps": 154669.0,
+        "errors": 0,
+        "latency_samples": 154550,
+        "p50_ms": 1.58,
+        "p95_ms": 2.55,
+        "p99_ms": 3.09,
+        "cpu_seconds": {
+          "worker": 1325.82,
+          "client": 56.74
+        },
+        "average_cpu_cores": {
+          "worker": 66.11089087760185,
+          "client": 2.829292021839412
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0
+        },
+        "postgres_wait_samples": {},
+        "os_wait_channels": {
+          "worker:0": 1,
+          "client:0": 1,
+          "worker:do_poll.constprop.0": 99,
+          "client:futex_wait_queue": 99
+        },
+        "os_states": {
+          "worker:R": 1,
+          "client:R": 1,
+          "worker:S": 99,
+          "client:S": 99
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 84.5,
+            "utilization_max": 92.0,
+            "memory_mb_max": 21662.0
+          },
+          "1": {
+            "utilization_mean": 84.72222222222223,
+            "utilization_max": 91.0,
+            "memory_mb_max": 21662.0
+          },
+          "2": {
+            "utilization_mean": 84.83333333333333,
+            "utilization_max": 92.0,
+            "memory_mb_max": 21662.0
+          },
+          "3": {
+            "utilization_mean": 85.66666666666667,
+            "utilization_max": 93.0,
+            "memory_mb_max": 21662.0
+          },
+          "4": {
+            "utilization_mean": 86.72222222222223,
+            "utilization_max": 94.0,
+            "memory_mb_max": 21662.0
+          },
+          "5": {
+            "utilization_mean": 86.16666666666667,
+            "utilization_max": 93.0,
+            "memory_mb_max": 21662.0
+          },
+          "6": {
+            "utilization_mean": 84.66666666666667,
+            "utilization_max": 91.0,
+            "memory_mb_max": 21662.0
+          },
+          "7": {
+            "utilization_mean": 85.16666666666667,
+            "utilization_max": 92.0,
+            "memory_mb_max": 21662.0
+          }
+        },
+        "monitor_errors": []
+      },
+      {
+        "mode": "direct-worker",
+        "label": "direct-opt-lanes64",
+        "workload": "1pct",
+        "k": 500,
+        "sampling_rate": 0.05,
+        "latency_bin_ms": 0.01,
+        "clients": 256,
+        "seconds": 20,
+        "transactions": 2609549,
+        "qps": 130477.45,
+        "errors": 0,
+        "latency_samples": 130363,
+        "p50_ms": 1.87,
+        "p95_ms": 3.07,
+        "p99_ms": 3.71,
+        "cpu_seconds": {
+          "worker": 1313.84,
+          "client": 50.45
+        },
+        "average_cpu_cores": {
+          "worker": 65.52468126242103,
+          "client": 2.5160751458999124
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0
+        },
+        "postgres_wait_samples": {},
+        "os_wait_channels": {
+          "worker:0": 1,
+          "client:0": 1,
+          "worker:do_poll.constprop.0": 99,
+          "client:futex_wait_queue": 99
+        },
+        "os_states": {
+          "worker:R": 1,
+          "client:R": 1,
+          "worker:S": 99,
+          "client:S": 99
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 64.27777777777777,
+            "utilization_max": 72.0,
+            "memory_mb_max": 21662.0
+          },
+          "1": {
+            "utilization_mean": 66.77777777777777,
+            "utilization_max": 91.0,
+            "memory_mb_max": 21662.0
+          },
+          "2": {
+            "utilization_mean": 71.5,
+            "utilization_max": 92.0,
+            "memory_mb_max": 21662.0
+          },
+          "3": {
+            "utilization_mean": 69.88888888888889,
+            "utilization_max": 90.0,
+            "memory_mb_max": 21662.0
+          },
+          "4": {
+            "utilization_mean": 67.44444444444444,
+            "utilization_max": 91.0,
+            "memory_mb_max": 21662.0
+          },
+          "5": {
+            "utilization_mean": 67.55555555555556,
+            "utilization_max": 91.0,
+            "memory_mb_max": 21662.0
+          },
+          "6": {
+            "utilization_mean": 66.66666666666667,
+            "utilization_max": 92.0,
+            "memory_mb_max": 21662.0
+          },
+          "7": {
+            "utilization_mean": 66.72222222222223,
+            "utilization_max": 88.0,
+            "memory_mb_max": 21662.0
+          }
+        },
+        "monitor_errors": []
+      },
+      {
+        "mode": "direct-worker",
+        "label": "direct-opt-lanes64",
+        "workload": "10pct",
+        "k": 500,
+        "sampling_rate": 0.05,
+        "latency_bin_ms": 0.01,
+        "clients": 256,
+        "seconds": 20,
+        "transactions": 1890269,
+        "qps": 94513.45,
+        "errors": 0,
+        "latency_samples": 94397,
+        "p50_ms": 2.66,
+        "p95_ms": 3.71,
+        "p99_ms": 4.22,
+        "cpu_seconds": {
+          "worker": 1024.84,
+          "client": 37.84
+        },
+        "average_cpu_cores": {
+          "worker": 51.12295174382374,
+          "client": 1.8876044006735593
+        },
+        "disk_read_bytes": {
+          "worker": 0,
+          "client": 0
+        },
+        "disk_write_bytes": {
+          "worker": 0,
+          "client": 0
+        },
+        "postgres_wait_samples": {},
+        "os_wait_channels": {
+          "worker:0": 1,
+          "client:vm_mmap_pgoff": 1,
+          "worker:do_poll.constprop.0": 99,
+          "client:futex_wait_queue": 99
+        },
+        "os_states": {
+          "worker:R": 1,
+          "client:D": 1,
+          "worker:S": 99,
+          "client:S": 99
+        },
+        "gpu_samples": {
+          "0": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "1": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "2": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "3": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "4": {
+            "utilization_mean": 94.05882352941177,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "5": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "6": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          },
+          "7": {
+            "utilization_mean": 94.11764705882354,
+            "utilization_max": 100.0,
+            "memory_mb_max": 21662.0
+          }
+        },
+        "monitor_errors": []
+      }
+    ],
+    "correctness": [
+      {
+        "workload": "0.1pct",
+        "query": 1,
+        "returned": 500,
+        "eligible": 10000,
+        "route": 2,
+        "recall_at_500": 1.0
+      },
+      {
+        "workload": "0.1pct",
+        "query": 17,
+        "returned": 500,
+        "eligible": 10000,
+        "route": 2,
+        "recall_at_500": 1.0
+      },
+      {
+        "workload": "0.1pct",
+        "query": 123,
+        "returned": 500,
+        "eligible": 10000,
+        "route": 2,
+        "recall_at_500": 1.0
+      },
+      {
+        "workload": "1pct",
+        "query": 1,
+        "returned": 500,
+        "eligible": 100002,
+        "route": 2,
+        "recall_at_500": 1.0
+      },
+      {
+        "workload": "1pct",
+        "query": 17,
+        "returned": 500,
+        "eligible": 100002,
+        "route": 2,
+        "recall_at_500": 1.0
+      },
+      {
+        "workload": "1pct",
+        "query": 123,
+        "returned": 500,
+        "eligible": 100002,
+        "route": 2,
+        "recall_at_500": 1.0
+      },
+      {
+        "workload": "10pct",
+        "query": 1,
+        "returned": 500,
+        "eligible": 1000020,
+        "route": 1,
+        "recall_at_500": 0.994
+      },
+      {
+        "workload": "10pct",
+        "query": 17,
+        "returned": 500,
+        "eligible": 1000020,
+        "route": 1,
+        "recall_at_500": 0.992
+      },
+      {
+        "workload": "10pct",
+        "query": 123,
+        "returned": 500,
+        "eligible": 1000020,
+        "route": 1,
+        "recall_at_500": 0.996
+      }
+    ],
+    "retained_worker_lanes": 64,
+    "note": "Same candidate/ordinal code, batch=32, routing/search parameters and dataset. Higher rate uses more CPU."
+  }
+}

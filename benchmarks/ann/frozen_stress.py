@@ -143,11 +143,14 @@ def main():
     parser.add_argument('--local-cache-mb', type=int, default=16)
     parser.add_argument('--worker-pid', type=int)
     parser.add_argument('--label', default='baseline')
+    parser.add_argument('--plan-cache-mode', choices=['auto', 'force_generic_plan', 'force_custom_plan'],
+                        default='force_generic_plan')
+    parser.add_argument('--setup-cost', type=float, default=1000.0)
     parser.add_argument('--profile-library', help='optional session preload library for isolated debugger runs')
     parser.add_argument('--count-only', action='store_true', help='diagnostic: aggregate the 500 rows on the server')
     args = parser.parse_args()
-    if not 1 <= args.k <= 10000 or args.seconds < 1:
-        parser.error('k must be 1..10000 and seconds must be positive')
+    if not 1 <= args.k <= 10000 or args.seconds < 1 or not np.isfinite(args.setup_cost) or args.setup_cost < 0:
+        parser.error('k must be 1..10000, seconds must be positive and setup cost must be finite and nonnegative')
     args.output.mkdir(parents=True, exist_ok=True)
     results = []
     with psycopg.connect(args.dsn) as db:
@@ -172,7 +175,8 @@ def main():
                 env = dict(os.environ, PGAPPNAME=application,
                            PGOPTIONS=(f'-c ann.worker_socket={args.socket} -c ann.enable_frozen_search=on '
                                       f'-c ann.frozen_mmap={args.mmap} -c ann.frozen_filter_local_cache_mb={args.local_cache_mb} '
-                                      '-c jit=off -c statement_timeout=30000 -c plan_cache_mode=force_generic_plan'))
+                                      f'-c ann.frozen_setup_cost={args.setup_cost} -c jit=off '
+                                      f'-c statement_timeout=30000 -c plan_cache_mode={args.plan_cache_mode}'))
                 if args.profile_library:
                     env['PGOPTIONS'] += f' -c session_preload_libraries={args.profile_library}'
                 command = ['pgbench', args.dsn, '-n', '-M', 'prepared', '-c', str(clients),
@@ -207,6 +211,7 @@ def main():
                             except ValueError:
                                 pass
                 row = dict(label=args.label, workload=workload, clients=clients, k=args.k,
+                           plan_cache_mode=args.plan_cache_mode, setup_cost=args.setup_cost,
                            mmap=args.mmap, local_cache_mb=args.local_cache_mb,
                            client_threads=min(clients,args.threads), table=args.table, query_table=args.queries,
                            count_only=args.count_only, seconds=elapsed,

@@ -1,5 +1,8 @@
 # Frozen GPU ANN at k = 500
 
+For the subsequent CPU/GPU profiles and worker improvements, see the
+[profiling follow-up](ann-k500-profile.md).
+
 Measured on 2026-11-04, on one host with eight NVIDIA B200 GPUs, 224 logical
 CPUs (two Xeon Platinum 8570 sockets) and 2 TiB RAM. PostgreSQL 17.6, extension
 0.9.3, cuVS 26.10, GCC 13.3, NVIDIA driver 580.126.09. These are synthetic,
@@ -279,7 +282,88 @@ as `--profile-library`. It enables same-user debugger attachment only in those
 sessions; it changes no host-wide perf/ptrace settings. Exclude debugger runs
 from performance comparisons.
 
-The run also passed 15 GPU tests, the CPU/PostgreSQL integration suites and
+## Planner-costing follow-up
+
+After replacing the frozen path's fixed cost with normal startup and per-row
+costs, the same 10M-row dataset and adaptive worker were tested again at
+`ann.frozen_setup_cost = 1000`, k=500 and 256 clients. Each mode/filter ran for
+60 seconds, fetching the query vector and returning all 500 keys. Prepared
+EXPLAINs confirmed `AnnFrozenSearch` for all three filters with both generic
+plans and parameter-specific custom plans. Separate EXPLAIN ANALYZE checks
+confirmed 500 rows, one worker call, zero local evaluations and zero heap
+fetches for each filter at the default setup cost.
+
+| Selectivity | Generic plan QPS | Custom plan QPS | Generic p99 ms | Custom p99 ms |
+| ---: | ---: | ---: | ---: | ---: |
+| 0.1% | 33,253 | 33,021 | 12.03 | 12.10 |
+| 1% | 29,684 | 29,649 | 13.40 | 13.44 |
+| 10% | 50,850 | 49,854 | 7.89 | 8.14 |
+
+All 13,549,355 transactions succeeded; monitoring reported no errors and zero
+sampled physical read bytes. Generic-plan rates were within approximately 1%
+of the earlier sustained measurements. Custom planning showed no throughput
+benefit here and was about 2% slower for the broad filter. These are single,
+sequential runs per mode/filter, so small differences are not evidence of a
+repeatable improvement or regression. The costing change lets selective local
+plans compete; it does not speed up a workload that retains the same GPU path.
+
+The broad-filter generic run consumed about 127 PostgreSQL CPU cores versus
+31 worker cores on average. Together with the earlier 95,221 direct-worker
+QPS control and sampled buffer/visibility-map stacks, this points to substantial
+PostgreSQL overhead for broad filters. Narrow filters remain closer to their
+earlier direct-worker limits of 39,817 and 36,214 QPS. The direct controls were
+not repeated in this follow-up; they exclude SQL planning, vector lookup and
+tuple processing, and are not a pure measurement of planner overhead.
+
+Reproduce the two modes separately with the same loaded worker:
+
+```sh
+python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_PID" \
+  --output results --label costed-generic --clients 256 --seconds 60 --k 500 \
+  --setup-cost 1000 --plan-cache-mode force_generic_plan
+python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_PID" \
+  --output results --label costed-custom --clients 256 --seconds 60 --k 500 \
+  --setup-cost 1000 --plan-cache-mode force_custom_plan
+```
+
+Full metrics and prepared plans are in the
+[planner-costing result artifact](../benchmarks/ann/results/frozen-k500-planner-costing.json).
+The GPU node also passed all 27 frozen tests (including GPU k=500 rollback and
+deletion) and all 16 SQL regression tests after a clean rebuild.
+
+## Reusing visibility-map pins
+
+The broad-filter profiles led to a concrete read-side change: retain up to 32
+visibility-map buffer pins per frozen scan instead of just one. Distance-ordered
+hits move between heap blocks and previously forced frequent VM buffer lookups
+and pin/unpin operations. A bounded direct-mapped array now reuses the pins;
+every tuple still checks its current visibility bit, mutable TIDs still use
+shared buffer locks, and non-all-visible pages still use snapshot-aware heap
+fetches. All pins are released at scan end.
+
+At the same default setup cost, 256 clients and k=500, 60-second 10% runs gave:
+
+| Run | QPS | p99 ms | PostgreSQL CPU cores | Worker CPU cores |
+| --- | ---: | ---: | ---: | ---: |
+| 32 pins, first run | 65,053 | 6.66 | 64.2 | 32.5 |
+| One-pin control | 50,888 | 7.94 | 126.9 | 30.6 |
+| 32 pins, repeat | 65,053 | 6.69 | 64.3 | 32.5 |
+
+The control compiled the same implementation with its cache size set to one,
+then restored the 32-pin build before repeating. Pin reuse increased throughput
+by 27.8%, reduced PostgreSQL CPU use by about half, and cut p99 by about 16%.
+Thirty-second narrow-filter checks reached 33,276 QPS at 0.1% and 29,507 QPS
+at 1%, close to the earlier results. All 12,727,069 transactions across these
+five runs succeeded, with no monitor errors and zero sampled physical reads.
+The worker and GPU routing settings were unchanged.
+
+The implementation passed all 27 frozen tests including GPU k=500 deletion
+and rollback, all 16 SQL regressions, macOS/Linux builds and pgindent. Full
+metrics are in the [VM-pin result artifact](../benchmarks/ann/results/frozen-k500-vm-pins.json).
+This improves one measured source of PostgreSQL overhead; it does not establish
+that TID access, tuple execution or result transport are no longer bottlenecks.
+
+The earlier run also passed 15 GPU tests, the CPU/PostgreSQL integration suites and
 all 16 SQL regression cases. The GPU frozen test now includes rollback and
 committed deletion checks at k=500. Selected measured results and correctness
 samples are in [the result artifact](../benchmarks/ann/results/frozen-k500-2026-11-04.json).
