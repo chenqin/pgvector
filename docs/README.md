@@ -1,5 +1,6 @@
 # Design documents
 
+- [Frozen GPU ANN at k=500](ann-k500-stress.md): RAM-backed 10M × 128 B200 stress tests, filtered CAGRA versus GPU exact routing, concurrency and mmap controls, PostgreSQL/worker profiling, and reproducible benchmark tools.
 - [cuVS bulk build and filtered ANN implementation plan](cuvs-filtered-ann-plan.md): proposed GPU-backed indexing and search for full-text and text metadata predicates, including architecture, execution diagrams, repository code conventions, build/upgrade integration, delivery steps, and validation gates.
 - [Native CPU staging index](ann-native-index.md): implemented C access method, SQL usage, storage/locking diagrams, source conventions, and lifecycle tests.
 - [Native filtered exact search](ann-filtered-search.md): opt-in C CustomScan, supported query shapes, predicate-first execution, EXPLAIN, and tests.
