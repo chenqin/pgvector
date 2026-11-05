@@ -200,3 +200,79 @@ nsys start --session=frozen-gpu --sample=none --cpuctxsw=none --output=gpu-captu
 nsys stop --session=frozen-gpu
 nsys stats --report cuda_gpu_kern_sum,cuda_api_sum,cuda_gpu_mem_time_sum gpu-capture.nsys-rep
 ```
+
+## Prefetch follow-up, 2026-11-05
+
+Two read-side changes were retained after testing on the same 10M-row,
+eight-B200 dataset with 64 lanes, batch up to 32, k=500 and 256 SQL clients:
+
+* `ann.frozen_prefetch_distance = 4` hints immutable mapped vectors, keys and
+  attributes four result rows ahead. `0` disables it; the allowed range is
+  0–64. The scan still materializes rows in distance order and reads mutable
+  TIDs and current visibility bits normally. With mmap disabled the hint is
+  a no-op. Startup lookahead is bounded by the actual result count.
+* Worker `--rerank-prefetch 8` hints host FP32 vectors eight candidates ahead
+  during CAGRA and cached-ordinal gather reranking. `0` disables it; the range
+  is 0–64. Candidate bounds are checked before issuing hints. The distance
+  calculation, candidate count, repair checks and GPU selection are unchanged.
+
+Four alternating 60-second broad-filter runs isolated the SQL hint with worker
+prefetch disabled. Disabled controls reached 70,179 and 70,045 QPS; lookahead
+four reached 71,516 and 71,613 QPS, approximately a 2.1% gain on average. The
+initial 15-second sweep also checked lookaheads 1, 8 and 16, with similar broad
+rates; four was retained as the smaller consistently successful lookahead.
+
+The main comparison ran each filter for 60 seconds with both hints disabled,
+then with SQL lookahead four and worker lookahead eight:
+
+| Filter | Disabled QPS | Enabled QPS | Gain | Disabled p99 ms | Enabled p99 ms | Enabled native-worker QPS |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.1% | 96,267 | 101,686 | 5.6% | 4.18 | 4.43 | 170,133 |
+| 1% | 78,234 | 97,611 | 24.8% | 5.37 | 4.37 | 170,692 |
+| 10% | 69,985 | 74,482 | 6.4% | 5.83 | 5.13 | 96,426 |
+
+The 0.1% tail latency increased by 0.24 ms despite higher throughput and lower
+median latency; these changes do not improve every latency percentile. Both
+controls are exposed so latency-sensitive workloads can disable either hint.
+The main comparison completed 31,063,512 searches without failure. Across all
+22 SQL tuning and comparison runs, 61,707,118 transactions succeeded, with no
+monitor errors and zero sampled physical read bytes. Native controls ran for
+20 seconds per filter and reported no errors. The main comparison is one pass
+per setting/filter, so the observed differences are not a production guarantee.
+
+All nine recall samples returned 500 unique hits. Recall@500 was 1.0 on the six
+narrow samples and 0.994–0.998 on the broad samples. Tests passed: 15 GPU cases,
+28 frozen cases on Linux, 27 frozen cases plus one GPU skip on macOS, 16 SQL
+regressions and eight native unit scenarios. The new boundary case exercises
+lookahead 0/1/4/64, empty and short results, and a fresh mmap-disabled backend.
+Both platforms were clean-built; pgindent and diff checks passed.
+
+The installed cuVS C++ selection API was also probed with 10,000 input scores
+and k=756 (500 plus the existing 256 quantization slack). Auto and both
+11-bit radix variants took about 59.3 µs in that standalone microtest; 8-bit
+radix took 163.1 µs. The installed warp variants rejected k=756; WarpAuto
+reported a maximum k of 256. Supported variants passed unique-position and
+selection-threshold checks. No selector change was retained, and no C++ shim
+or new dependency was added to the production worker. This microtest used
+synthetic scores and does not establish performance on other distributions.
+Custom generalized-k selection and GPU-batched reranking remain future work.
+
+To reproduce the main comparison, start/load/precompute the worker twice with
+the same adaptive settings above, using `--rerank-prefetch 0` for the control
+and `--rerank-prefetch 8` for the enabled run:
+
+```sh
+# Control worker: --rerank-prefetch 0
+python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_PID" \
+  --output results --label prefetch-control60 --clients 256 --seconds 60 \
+  --k 500 --prefetch-distance 0
+# Enabled worker: --rerank-prefetch 8
+python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_PID" \
+  --output results --label prefetch-enabled60 --clients 256 --seconds 60 \
+  --k 500 --prefetch-distance 4
+```
+
+The retained defaults are SQL lookahead four and worker lookahead eight. Raw
+logs and selector probe sources remain in `~/pgvector-test.tKp5o0/prefetch-test/`
+on the node. Full measurements, source hashes and accuracy checks are in the
+[prefetch result artifact](../benchmarks/ann/results/frozen-k500-prefetch.json).
