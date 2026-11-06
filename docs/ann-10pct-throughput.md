@@ -179,9 +179,10 @@ the graph: 171.6k, 490.5k and 766.3k for b1, b16 and b32, lowest recall 0.29–0
 
 At k=100 the crossover moves down, as the cost argument predicts (graph work grows
 with k / (1 − r)): single-vector SQL ties at 1M rows and the graph wins at 2M;
-batches tie at 2M (b16). The gather's 2M b32 point is bimodal: two reruns from fresh
-workers gave 295.1k (the worker at 7 cores, GPUs 62% busy: a stall, not a limit) and
-490.7k, above the graph's 460.3k; b16 repeated at 449.0k. Below 1M rows the gather is 1.2× to 190× faster with every query at
+batches tie at 2M (b16). The gather's 2M b32 point varies between runs: five reruns from
+fresh workers gave 295.1k once (the worker at 7 cores, GPUs 62% busy: a stall, not a
+limit) and 489.2k–490.7k four times, above the graph's 460.3k; b16 repeated at
+449.0k. Below 1M rows the gather is 1.2× to 190× faster with every query at
 0.99 or better.
 
 ### Cost-profile routing against the limits
