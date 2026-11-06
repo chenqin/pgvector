@@ -195,8 +195,26 @@ settings otherwise, k=500, with and without `--cost-profile`:
 
 Recall was the same (lowest query 0.992 or better). The profile matches the
 limits up to 1M rows; at 2M it trades 29% of single-query throughput for 20% more
-batched throughput. An FP32 recalibration was not run: the worker applies profiles
-only to FP16 + NVFP4 indexes, and the difference above appears only near 2M rows.
+batched throughput.
+
+**FP32 calibration.** `calibrate_cost.py` ran against the FP32 CAGRA + NVFP4 index
+(GPU 3, 95% recall target, frontier 4096, 256 extra graph candidates; 63 cells,
+[profile](../benchmarks/ann/results/frozen-10pct-throughput/fp32-cost-profile/)). At
+k=500 its scan beats the graph up to 1M matching rows at every batch size (0.43 ms
+against 0.79 ms for one search at 1M) and loses from 5M (1.13 ms against 0.75 ms).
+The worker now applies a profile to an FP32 index (FP16 indexes still need
+`--fp16-exact on`). On that index, same settings, with and without it:
+
+| Matching rows | Limits b1 | Profile b1 | Limits b32 | Profile b32 |
+| ---: | ---: | ---: | ---: | ---: |
+| 100k | 161.7k | 161.5k | 871.7k | 873.0k |
+| 1M | 171.7k | 168.9k | 682.8k | 685.5k |
+| 2M | 130.3k | 93.3k | 206.9k | 205.5k |
+
+Recall is identical (lowest query 0.992 or better). Up to 1M rows the profile
+chooses the NVFP4 scan, as the limits do; at 2M it sends single searches to the
+graph (isolated latency favours it, saturated throughput does not) and loses 28%.
+For saturated throughput the 4M gather limit is the better rule here.
 
 ### Distinct predicates
 

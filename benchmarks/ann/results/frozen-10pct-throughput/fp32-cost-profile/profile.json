@@ -1,0 +1,645 @@
+{
+  "version": 5,
+  "graph_slack": 256,
+  "graph_itopk": 4096,
+  "rows": 10000000,
+  "dimensions": 128,
+  "generation": "4718468a94ab9c21",
+  "min_recall": 0.95,
+  "setup_us": 0.0,
+  "tuple_us": 0.0,
+  "overhead_samples": [],
+  "note": "Warm, one-GPU one-lane isolated service latency in microseconds per request; local controls one SQL request.",
+  "cells": [
+    {
+      "matching": 1429,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 333.651,
+      "scan_gpu": 193.406,
+      "graph_host": 3586.23,
+      "graph_gpu": 3581.8945000000003,
+      "local_us": 1038.5240000000001
+    },
+    {
+      "matching": 1429,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 1145.1860000000001,
+      "scan_gpu": 160.2215,
+      "graph_host": 40753.7765,
+      "graph_gpu": 40661.4695,
+      "local_us": 1038.5240000000001
+    },
+    {
+      "matching": 1429,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 2446.204,
+      "scan_gpu": 324.3295,
+      "graph_host": 80310.703,
+      "graph_gpu": 80313.08249999999,
+      "local_us": 1038.5240000000001
+    },
+    {
+      "matching": 1429,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 307.25800000000004,
+      "scan_gpu": 238.887,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 1089.3515000000002
+    },
+    {
+      "matching": 1429,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 3161.6324999999997,
+      "scan_gpu": 654.194,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 1089.3515000000002
+    },
+    {
+      "matching": 1429,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 6519.532,
+      "scan_gpu": 966.2795,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 1089.3515000000002
+    },
+    {
+      "matching": 1429,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 589.553,
+      "scan_gpu": 373.23900000000003,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 1352.7925
+    },
+    {
+      "matching": 1429,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 5750.9315,
+      "scan_gpu": 923.6735,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 1352.7925
+    },
+    {
+      "matching": 1429,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 10975.2965,
+      "scan_gpu": 1077.8395,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 1352.7925
+    },
+    {
+      "matching": 10000,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 468.064,
+      "scan_gpu": 360.916,
+      "graph_host": 3417.477,
+      "graph_gpu": 3426.565,
+      "local_us": 6388.284
+    },
+    {
+      "matching": 10000,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 1493.789,
+      "scan_gpu": 226.226,
+      "graph_host": 40615.868,
+      "graph_gpu": 40615.949,
+      "local_us": 6388.284
+    },
+    {
+      "matching": 10000,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 2815.739,
+      "scan_gpu": 302.389,
+      "graph_host": 80331.876,
+      "graph_gpu": 80351.846,
+      "local_us": 6388.284
+    },
+    {
+      "matching": 10000,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 333.274,
+      "scan_gpu": 264.222,
+      "graph_host": 6096.719,
+      "graph_gpu": 6097.737,
+      "local_us": 6574.231
+    },
+    {
+      "matching": 10000,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 3739.027,
+      "scan_gpu": 455.402,
+      "graph_host": 80995.105,
+      "graph_gpu": 80947.157,
+      "local_us": 6574.231
+    },
+    {
+      "matching": 10000,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 6847.468,
+      "scan_gpu": 929.037,
+      "graph_host": 160658.644,
+      "graph_gpu": 160683.727,
+      "local_us": 6574.231
+    },
+    {
+      "matching": 10000,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 677.338,
+      "scan_gpu": 411.386,
+      "graph_host": 7688.961,
+      "graph_gpu": 7710.646,
+      "local_us": 6729.298
+    },
+    {
+      "matching": 10000,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 5923.041,
+      "scan_gpu": 787.761,
+      "graph_host": 102746.845,
+      "graph_gpu": 102735.146,
+      "local_us": 6729.298
+    },
+    {
+      "matching": 10000,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 11249.687,
+      "scan_gpu": 1351.474,
+      "graph_host": 204004.051,
+      "graph_gpu": 204042.892,
+      "local_us": 6729.298
+    },
+    {
+      "matching": 100001,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 539.493,
+      "scan_gpu": 267.123,
+      "graph_host": 1042.058,
+      "graph_gpu": 1053.039,
+      "local_us": 25417.374
+    },
+    {
+      "matching": 100001,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 1555.786,
+      "scan_gpu": 256.296,
+      "graph_host": 7382.167,
+      "graph_gpu": 7409.943,
+      "local_us": 25417.374
+    },
+    {
+      "matching": 100001,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 3143.371,
+      "scan_gpu": 388.209,
+      "graph_host": 14052.62,
+      "graph_gpu": 14062.83,
+      "local_us": 25417.374
+    },
+    {
+      "matching": 100001,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 235.85,
+      "scan_gpu": 232.544,
+      "graph_host": 1520.548,
+      "graph_gpu": 1568.375,
+      "local_us": 23245.207
+    },
+    {
+      "matching": 100001,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 3932.215,
+      "scan_gpu": 478.773,
+      "graph_host": 12167.52,
+      "graph_gpu": 12285.559,
+      "local_us": 23245.207
+    },
+    {
+      "matching": 100001,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 7346.393,
+      "scan_gpu": 980.125,
+      "graph_host": 23644.289,
+      "graph_gpu": 23681.673,
+      "local_us": 23245.207
+    },
+    {
+      "matching": 100001,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 647.214,
+      "scan_gpu": 399.683,
+      "graph_host": 1507.423,
+      "graph_gpu": 1641.324,
+      "local_us": 23795.268
+    },
+    {
+      "matching": 100001,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 6308.992,
+      "scan_gpu": 946.994,
+      "graph_host": 14091.042,
+      "graph_gpu": 14126.801,
+      "local_us": 23795.268
+    },
+    {
+      "matching": 100001,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 11970.866,
+      "scan_gpu": 1503.205,
+      "graph_host": 26970.757,
+      "graph_gpu": 26991.106,
+      "local_us": 23795.268
+    },
+    {
+      "matching": 500009,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 222.327,
+      "scan_gpu": 174.382,
+      "graph_host": 874.716,
+      "graph_gpu": 888.412,
+      "local_us": 117099.187
+    },
+    {
+      "matching": 500009,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 1933.143,
+      "scan_gpu": 541.561,
+      "graph_host": 3109.959,
+      "graph_gpu": 3100.183,
+      "local_us": 117099.187
+    },
+    {
+      "matching": 500009,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 3798.98,
+      "scan_gpu": 1000.045,
+      "graph_host": 5800.879,
+      "graph_gpu": 5807.34,
+      "local_us": 117099.187
+    },
+    {
+      "matching": 500009,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 353.817,
+      "scan_gpu": 272.999,
+      "graph_host": 659.667,
+      "graph_gpu": 784.66,
+      "local_us": 98692.081
+    },
+    {
+      "matching": 500009,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 4260.068,
+      "scan_gpu": 801.266,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 98692.081
+    },
+    {
+      "matching": 500009,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 8146.643,
+      "scan_gpu": 1692.86,
+      "graph_host": 7656.653,
+      "graph_gpu": 7697.159,
+      "local_us": 98692.081
+    },
+    {
+      "matching": 500009,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 705.4,
+      "scan_gpu": 464.534,
+      "graph_host": 791.096,
+      "graph_gpu": -1,
+      "local_us": 98873.431
+    },
+    {
+      "matching": 500009,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 6799.322,
+      "scan_gpu": 1359.885,
+      "graph_host": 4871.319,
+      "graph_gpu": 5094.256,
+      "local_us": 98873.431
+    },
+    {
+      "matching": 500009,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 13131.257,
+      "scan_gpu": 2064.366,
+      "graph_host": 8996.648,
+      "graph_gpu": 9020.015,
+      "local_us": 98873.431
+    },
+    {
+      "matching": 1000019,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 300.667,
+      "scan_gpu": 396.805,
+      "graph_host": 713.956,
+      "graph_gpu": 874.844,
+      "local_us": 229692.734
+    },
+    {
+      "matching": 1000019,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 2240.481,
+      "scan_gpu": 921.146,
+      "graph_host": 2404.036,
+      "graph_gpu": 2373.564,
+      "local_us": 229692.734
+    },
+    {
+      "matching": 1000019,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 4269.469,
+      "scan_gpu": 2084.759,
+      "graph_host": 4102.559,
+      "graph_gpu": 4109.48,
+      "local_us": 229692.734
+    },
+    {
+      "matching": 1000019,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 435.421,
+      "scan_gpu": 424.893,
+      "graph_host": 736.119,
+      "graph_gpu": 789.096,
+      "local_us": 232048.466
+    },
+    {
+      "matching": 1000019,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 4770.126,
+      "scan_gpu": 1306.285,
+      "graph_host": 3206.943,
+      "graph_gpu": 3227.303,
+      "local_us": 232048.466
+    },
+    {
+      "matching": 1000019,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 9084.391,
+      "scan_gpu": 2691.089,
+      "graph_host": 5500.005,
+      "graph_gpu": 5554.884,
+      "local_us": 232048.466
+    },
+    {
+      "matching": 1000019,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 808.355,
+      "scan_gpu": 531.606,
+      "graph_host": 921.138,
+      "graph_gpu": 766.122,
+      "local_us": 229001.844
+    },
+    {
+      "matching": 1000019,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 7168.975,
+      "scan_gpu": 1708.806,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 229001.844
+    },
+    {
+      "matching": 1000019,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 13893.596,
+      "scan_gpu": 3102.766,
+      "graph_host": 6418.996,
+      "graph_gpu": 6429.977,
+      "local_us": 229001.844
+    },
+    {
+      "matching": 5000099,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 1258.031,
+      "scan_gpu": 1168.37,
+      "graph_host": 651.444,
+      "graph_gpu": 516.065,
+      "local_us": 1794857.99
+    },
+    {
+      "matching": 5000099,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 8037.895,
+      "scan_gpu": 6789.615,
+      "graph_host": 812.742,
+      "graph_gpu": 828.849,
+      "local_us": 1794857.99
+    },
+    {
+      "matching": 5000099,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 15506.434,
+      "scan_gpu": 13050.245,
+      "graph_host": 1179.624,
+      "graph_gpu": 1259.761,
+      "local_us": 1794857.99
+    },
+    {
+      "matching": 5000099,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 994.211,
+      "scan_gpu": 1128.078,
+      "graph_host": 712.704,
+      "graph_gpu": 745.373,
+      "local_us": 1782300.745
+    },
+    {
+      "matching": 5000099,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 10357.787,
+      "scan_gpu": 7783.512,
+      "graph_host": 1467.982,
+      "graph_gpu": 1621.599,
+      "local_us": 1782300.745
+    },
+    {
+      "matching": 5000099,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 19964.129,
+      "scan_gpu": 14462.812,
+      "graph_host": 2281.471,
+      "graph_gpu": 2298.711,
+      "local_us": 1782300.745
+    },
+    {
+      "matching": 5000099,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 1487.984,
+      "scan_gpu": 1108.266,
+      "graph_host": 652.451,
+      "graph_gpu": 493.195,
+      "local_us": 1775251.393
+    },
+    {
+      "matching": 5000099,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 12972.037,
+      "scan_gpu": 8014.368,
+      "graph_host": 1910.054,
+      "graph_gpu": 1896.708,
+      "local_us": 1775251.393
+    },
+    {
+      "matching": 5000099,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 24924.771,
+      "scan_gpu": 14937.706,
+      "graph_host": 2666.528,
+      "graph_gpu": 2686.173,
+      "local_us": 1775251.393
+    },
+    {
+      "matching": 10000000,
+      "k": 50,
+      "batch": 1,
+      "scan_host": 1850.99,
+      "scan_gpu": 1774.731,
+      "graph_host": 765.805,
+      "graph_gpu": 594.715,
+      "local_us": 2121310.393
+    },
+    {
+      "matching": 10000000,
+      "k": 50,
+      "batch": 16,
+      "scan_host": 25410.738,
+      "scan_gpu": 24262.927,
+      "graph_host": 710.794,
+      "graph_gpu": 809.832,
+      "local_us": 2121310.393
+    },
+    {
+      "matching": 10000000,
+      "k": 50,
+      "batch": 32,
+      "scan_host": 50303.361,
+      "scan_gpu": 48456.051,
+      "graph_host": 939.066,
+      "graph_gpu": 1146.217,
+      "local_us": 2121310.393
+    },
+    {
+      "matching": 10000000,
+      "k": 500,
+      "batch": 1,
+      "scan_host": 1786.432,
+      "scan_gpu": 1931.42,
+      "graph_host": 585.626,
+      "graph_gpu": 718.372,
+      "local_us": 2120546.968
+    },
+    {
+      "matching": 10000000,
+      "k": 500,
+      "batch": 16,
+      "scan_host": 27907.376,
+      "scan_gpu": 26145.196,
+      "graph_host": 1654.044,
+      "graph_gpu": 1539.686,
+      "local_us": 2120546.968
+    },
+    {
+      "matching": 10000000,
+      "k": 500,
+      "batch": 32,
+      "scan_host": 55488.952,
+      "scan_gpu": 52147.606,
+      "graph_host": 2273.372,
+      "graph_gpu": 2215.003,
+      "local_us": 2120546.968
+    },
+    {
+      "matching": 10000000,
+      "k": 1000,
+      "batch": 1,
+      "scan_host": 2225.798,
+      "scan_gpu": 1954.765,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 2122245.216
+    },
+    {
+      "matching": 10000000,
+      "k": 1000,
+      "batch": 16,
+      "scan_host": 30467.012,
+      "scan_gpu": 26588.966,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 2122245.216
+    },
+    {
+      "matching": 10000000,
+      "k": 1000,
+      "batch": 32,
+      "scan_host": 60782.135,
+      "scan_gpu": 52897.699,
+      "graph_host": -1,
+      "graph_gpu": -1,
+      "local_us": 2122245.216
+    }
+  ]
+}

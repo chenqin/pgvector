@@ -4546,11 +4546,13 @@ CalibratedFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJ
 	int			mode;
 
 	/*
-	 * The profile's FP16 routes were calibrated (and recall-qualified) with
-	 * FP32 rescoring, so they apply only with --fp16-exact.
+	 * A profile is calibrated on its index (the generation matches it):
+	 * FP16 graphs were measured with FP32 rescoring, so their profiles apply
+	 * only with --fp16-exact; FP32 graphs use their native distances either
+	 * way.
 	 */
-	if (AnnIndexCostProfile == NULL || file->quant != ANN_QUANT_NVFP4 || file->nshards != 1 || !state->fp16 ||
-		!AnnIndexConfig.fp16_exact ||
+	if (AnnIndexCostProfile == NULL || file->quant != ANN_QUANT_NVFP4 || file->nshards != 1 ||
+		(state->fp16 && !AnnIndexConfig.fp16_exact) ||
 		AnnIndexConfig.filtered_algo != 2 || AnnIndexConfig.quant_slack != 256 || AnnIndexConfig.itopk != 512 ||
 		AnnIndexConfig.filtered_itopk != 1024 || AnnIndexConfig.filtered_width != 4 ||
 		AnnIndexConfig.filtered_iterations != 0 || AnnIndexConfig.persistent || AnnIndexConfig.filtered_slack != 0 ||
