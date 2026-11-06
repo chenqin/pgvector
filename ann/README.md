@@ -187,3 +187,14 @@ Routing statistics include `matrix_queries`, `matrix_peak_score_bytes`,
 can verify which path actually ran and how much resident memory was added.
 The benchmark comparison is documented in
 [the k=500 profile](../docs/ann-k500-profile.md).
+
+`--cost-profile PATH` enables the optional [measured cost model](../docs/ann-cost-model.md).
+It chooses among NVFP4/CAGRA and CPU/GPU reranking using actual filter
+cardinality and batch shape. Profiles are explicit deployment configuration;
+the default remains the configured threshold policy when no profile is loaded.
+
+`--filtered-slack N` (default 0) overfetches extra bitset-filtered CAGRA
+candidates before FP32 reranking, with total overfetched output bounded at
+1024 candidates. Calibrated batches use the profile's measured frontier and
+overfetch budget. Kernel modules publish their ready state atomically;
+concurrent cold callers wait for initialization instead of falling back.

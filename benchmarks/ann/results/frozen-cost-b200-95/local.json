@@ -1,0 +1,695 @@
+[
+  {
+    "case": 0,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 0",
+    "k": 50,
+    "us": 110.27,
+    "samples_us": [
+      144.79,
+      110.27,
+      104.279
+    ],
+    "estimated_rows": 50,
+    "cost": 434.66,
+    "returned": 0,
+    "sql_us": 579.802,
+    "sql_samples_us": [
+      16806.817,
+      579.802,
+      500.303,
+      613.416
+    ]
+  },
+  {
+    "case": 0,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 0",
+    "k": 500,
+    "us": 336.616,
+    "samples_us": [
+      337.229,
+      336.616,
+      159.798
+    ],
+    "estimated_rows": 106,
+    "cost": 434.84,
+    "returned": 0,
+    "sql_us": 254.8,
+    "sql_samples_us": [
+      161.877,
+      258.513,
+      152.594,
+      254.8
+    ]
+  },
+  {
+    "case": 0,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 0",
+    "k": 1000,
+    "us": 95.895,
+    "samples_us": [
+      109.549,
+      95.895,
+      93.947
+    ],
+    "estimated_rows": 106,
+    "cost": 434.84,
+    "returned": 0,
+    "sql_us": 267.463,
+    "sql_samples_us": [
+      295.947,
+      311.115,
+      136.878,
+      267.463
+    ]
+  },
+  {
+    "case": 1,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 4",
+    "k": 50,
+    "us": 1064.645,
+    "samples_us": [
+      1011.53,
+      1064.645,
+      1070.48
+    ],
+    "estimated_rows": 50,
+    "cost": 2053.1,
+    "returned": 50,
+    "sql_us": 557.934,
+    "sql_samples_us": [
+      2208.859,
+      603.724,
+      557.934,
+      543.962
+    ]
+  },
+  {
+    "case": 1,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 4",
+    "k": 500,
+    "us": 1132.122,
+    "samples_us": [
+      1234.104,
+      1132.122,
+      1082.893
+    ],
+    "estimated_rows": 500,
+    "cost": 2060.3,
+    "returned": 500,
+    "sql_us": 991.16,
+    "sql_samples_us": [
+      11321.491,
+      1052.857,
+      991.16,
+      961.29
+    ]
+  },
+  {
+    "case": 1,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 4",
+    "k": 1000,
+    "us": 1354.94,
+    "samples_us": [
+      1528.065,
+      1354.94,
+      1285.153
+    ],
+    "estimated_rows": 514,
+    "cost": 2060.33,
+    "returned": 1000,
+    "sql_us": 1346.93,
+    "sql_samples_us": [
+      8952.33,
+      2203.371,
+      1346.93,
+      1306.733
+    ]
+  },
+  {
+    "case": 2,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 9",
+    "k": 50,
+    "us": 1043.274,
+    "samples_us": [
+      1076.445,
+      1043.274,
+      1032.547
+    ],
+    "estimated_rows": 50,
+    "cost": 3946.59,
+    "returned": 50,
+    "sql_us": 359.62,
+    "sql_samples_us": [
+      555.103,
+      329.097,
+      388.243,
+      359.62
+    ]
+  },
+  {
+    "case": 2,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 9",
+    "k": 500,
+    "us": 1094.302,
+    "samples_us": [
+      1119.972,
+      1094.302,
+      1069.872
+    ],
+    "estimated_rows": 500,
+    "cost": 3964.25,
+    "returned": 500,
+    "sql_us": 640.504,
+    "sql_samples_us": [
+      662.724,
+      640.504,
+      764.642,
+      597.613
+    ]
+  },
+  {
+    "case": 2,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 9",
+    "k": 1000,
+    "us": 1296.982,
+    "samples_us": [
+      1316.32,
+      1296.982,
+      1254.527
+    ],
+    "estimated_rows": 997,
+    "cost": 3965.49,
+    "returned": 1000,
+    "sql_us": 769.696,
+    "sql_samples_us": [
+      1078.612,
+      880.799,
+      769.696,
+      769.333
+    ]
+  },
+  {
+    "case": 3,
+    "predicate": "tenant = 7",
+    "k": 50,
+    "us": 6244.166,
+    "samples_us": [
+      7523.381,
+      6244.166,
+      6187.819
+    ],
+    "estimated_rows": 50,
+    "cost": 36638.05,
+    "returned": 50,
+    "sql_us": 848.843,
+    "sql_samples_us": [
+      1307.077,
+      848.843,
+      817.669,
+      1068.467
+    ]
+  },
+  {
+    "case": 3,
+    "predicate": "tenant = 7",
+    "k": 500,
+    "us": 7257.529,
+    "samples_us": [
+      12219.882,
+      7257.529,
+      6478.59
+    ],
+    "estimated_rows": 500,
+    "cost": 36804.45,
+    "returned": 500,
+    "sql_us": 1426.435,
+    "sql_samples_us": [
+      4463.853,
+      1426.435,
+      1461.607,
+      1425.655
+    ]
+  },
+  {
+    "case": 3,
+    "predicate": "tenant = 7",
+    "k": 1000,
+    "us": 7293.051,
+    "samples_us": [
+      8340.175,
+      7293.051,
+      6905.613
+    ],
+    "estimated_rows": 1000,
+    "cost": 36855.46,
+    "returned": 1000,
+    "sql_us": 1121.936,
+    "sql_samples_us": [
+      4268.737,
+      1121.936,
+      1138.838,
+      1113.885
+    ]
+  },
+  {
+    "case": 4,
+    "predicate": "category BETWEEN 0 AND 0",
+    "k": 50,
+    "us": 23217.064,
+    "samples_us": [
+      27365.652,
+      23217.064,
+      22937.163
+    ],
+    "estimated_rows": 50,
+    "cost": 292889.99,
+    "returned": 50,
+    "sql_us": 460.503,
+    "sql_samples_us": [
+      1086.124,
+      704.042,
+      460.503,
+      418.95
+    ]
+  },
+  {
+    "case": 4,
+    "predicate": "category BETWEEN 0 AND 0",
+    "k": 500,
+    "us": 23396.278,
+    "samples_us": [
+      23342.86,
+      23396.278,
+      23413.849
+    ],
+    "estimated_rows": 500,
+    "cost": 294662.77,
+    "returned": 500,
+    "sql_us": 797.552,
+    "sql_samples_us": [
+      3998.776,
+      797.552,
+      771.482,
+      1413.598
+    ]
+  },
+  {
+    "case": 4,
+    "predicate": "category BETWEEN 0 AND 0",
+    "k": 1000,
+    "us": 25895.272,
+    "samples_us": [
+      39750.457,
+      25895.272,
+      23828.428
+    ],
+    "estimated_rows": 1000,
+    "cost": 295197.34,
+    "returned": 1000,
+    "sql_us": 1499.891,
+    "sql_samples_us": [
+      4577.703,
+      1499.891,
+      1478.786,
+      1559.462
+    ]
+  },
+  {
+    "case": 5,
+    "predicate": "category BETWEEN 0 AND 4",
+    "k": 50,
+    "us": 127022.575,
+    "samples_us": [
+      140860.775,
+      127022.575,
+      122065.191
+    ],
+    "estimated_rows": 50,
+    "cost": 721514.92,
+    "returned": 50,
+    "sql_us": 1596.279,
+    "sql_samples_us": [
+      1996.299,
+      1678.204,
+      1596.279,
+      1402.491
+    ]
+  },
+  {
+    "case": 5,
+    "predicate": "category BETWEEN 0 AND 4",
+    "k": 500,
+    "us": 119928.566,
+    "samples_us": [
+      127689.146,
+      119928.566,
+      110902.958
+    ],
+    "estimated_rows": 500,
+    "cost": 730102.99,
+    "returned": 500,
+    "sql_us": 1872.194,
+    "sql_samples_us": [
+      4312.491,
+      2221.149,
+      1867.591,
+      1872.194
+    ]
+  },
+  {
+    "case": 5,
+    "predicate": "category BETWEEN 0 AND 4",
+    "k": 1000,
+    "us": 110708.573,
+    "samples_us": [
+      111954.152,
+      110708.573,
+      109006.002
+    ],
+    "estimated_rows": 1000,
+    "cost": 732689.17,
+    "returned": 1000,
+    "sql_us": 1955.67,
+    "sql_samples_us": [
+      3707.272,
+      1903.826,
+      1983.95,
+      1955.67
+    ]
+  },
+  {
+    "case": 6,
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 50,
+    "us": 264546.306,
+    "samples_us": [
+      274089.613,
+      264546.306,
+      261913.805
+    ],
+    "estimated_rows": 50,
+    "cost": 815966.17,
+    "returned": 50,
+    "sql_us": 1402.37,
+    "sql_samples_us": [
+      1549.474,
+      1666.859,
+      1361.212,
+      1402.37
+    ]
+  },
+  {
+    "case": 6,
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 500,
+    "us": 250681.783,
+    "samples_us": [
+      250681.783,
+      235004.332,
+      271578.886
+    ],
+    "estimated_rows": 500,
+    "cost": 832615.24,
+    "returned": 500,
+    "sql_us": 1992.477,
+    "sql_samples_us": [
+      3604.213,
+      2121.11,
+      1992.477,
+      1963.979
+    ]
+  },
+  {
+    "case": 6,
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 1000,
+    "us": 259967.014,
+    "samples_us": [
+      244414.955,
+      263150.102,
+      259967.014
+    ],
+    "estimated_rows": 1000,
+    "cost": 837628.02,
+    "returned": 1000,
+    "sql_us": 2414.067,
+    "sql_samples_us": [
+      3922.226,
+      2414.067,
+      2190.18,
+      2432.569
+    ]
+  },
+  {
+    "case": 7,
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 50,
+    "us": 1935564.384,
+    "samples_us": [
+      1913182.678,
+      1935564.384,
+      2003546.105
+    ],
+    "estimated_rows": 50,
+    "cost": 1043913.64,
+    "returned": 50,
+    "sql_us": 1759.126,
+    "sql_samples_us": [
+      1890.762,
+      1867.678,
+      1680.602,
+      1759.126
+    ]
+  },
+  {
+    "case": 7,
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 500,
+    "us": 1901460.146,
+    "samples_us": [
+      1987691.195,
+      1901460.146,
+      1887623.692
+    ],
+    "estimated_rows": 500,
+    "cost": 1127431.31,
+    "returned": 500,
+    "sql_us": 1667.859,
+    "sql_samples_us": [
+      4206.845,
+      2032.589,
+      1654.533,
+      1667.859
+    ]
+  },
+  {
+    "case": 7,
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 1000,
+    "us": 1922909.203,
+    "samples_us": [
+      2005042.002,
+      1922909.203,
+      1917753.509
+    ],
+    "estimated_rows": 1000,
+    "cost": 1152573.55,
+    "returned": 1000,
+    "sql_us": 1868.311,
+    "sql_samples_us": [
+      4529.895,
+      2233.572,
+      1827.723,
+      1868.311
+    ]
+  },
+  {
+    "case": 8,
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 50,
+    "us": 2286946.157,
+    "samples_us": [
+      2286946.157,
+      2261196.852,
+      2305144.443
+    ],
+    "estimated_rows": 50,
+    "cost": 1221493.19,
+    "returned": 50,
+    "sql_us": 1752.137,
+    "sql_samples_us": [
+      2091.251,
+      1928.376,
+      1471.287,
+      1752.137
+    ]
+  },
+  {
+    "case": 8,
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 500,
+    "us": 2331972.28,
+    "samples_us": [
+      2361537.85,
+      2297545.382,
+      2331972.28
+    ],
+    "estimated_rows": 500,
+    "cost": 1387586.22,
+    "returned": 500,
+    "sql_us": 2047.175,
+    "sql_samples_us": [
+      3285.704,
+      2153.376,
+      2046.09,
+      2047.175
+    ]
+  },
+  {
+    "case": 8,
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 1000,
+    "us": 2306475.077,
+    "samples_us": [
+      2306475.077,
+      2288644.552,
+      2354083.258
+    ],
+    "estimated_rows": 1000,
+    "cost": 1437586.11,
+    "returned": 1000,
+    "sql_us": 2133.666,
+    "sql_samples_us": [
+      3494.179,
+      2173.968,
+      2133.666,
+      2060.086
+    ]
+  },
+  {
+    "case": 9,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 1",
+    "k": 250,
+    "us": 1163.93,
+    "samples_us": [
+      1314.29,
+      1163.93,
+      1148.659
+    ],
+    "estimated_rows": 212,
+    "cost": 857.14,
+    "returned": 250,
+    "sql_us": 463.692,
+    "sql_samples_us": [
+      1149.038,
+      520.916,
+      463.692,
+      354.089
+    ]
+  },
+  {
+    "case": 9,
+    "predicate": "tenant = 7 AND category BETWEEN 0 AND 1",
+    "k": 750,
+    "us": 1373.215,
+    "samples_us": [
+      1373.215,
+      1409.107,
+      1220.068
+    ],
+    "estimated_rows": 212,
+    "cost": 857.14,
+    "returned": 750,
+    "sql_us": 724.203,
+    "sql_samples_us": [
+      1397.197,
+      766.196,
+      724.203,
+      699.832
+    ]
+  },
+  {
+    "case": 10,
+    "predicate": "category BETWEEN 0 AND 1",
+    "k": 250,
+    "us": 39540.482,
+    "samples_us": [
+      44615.273,
+      39540.482,
+      38825.292
+    ],
+    "estimated_rows": 250,
+    "cost": 473897.45,
+    "returned": 250,
+    "sql_us": 1227.726,
+    "sql_samples_us": [
+      2638.702,
+      1227.726,
+      1114.21,
+      1434.531
+    ]
+  },
+  {
+    "case": 10,
+    "predicate": "category BETWEEN 0 AND 1",
+    "k": 750,
+    "us": 42172.682,
+    "samples_us": [
+      63769.479,
+      41421.546,
+      42172.682
+    ],
+    "estimated_rows": 750,
+    "cost": 475583.99,
+    "returned": 750,
+    "sql_us": 1201.598,
+    "sql_samples_us": [
+      3648.09,
+      1144.742,
+      1201.598,
+      1450.518
+    ]
+  },
+  {
+    "case": 11,
+    "predicate": "category BETWEEN 0 AND 19",
+    "k": 250,
+    "us": 569489.391,
+    "samples_us": [
+      569489.391,
+      598060.574,
+      566237.572
+    ],
+    "estimated_rows": 250,
+    "cost": 867917.65,
+    "returned": 250,
+    "sql_us": 1616.805,
+    "sql_samples_us": [
+      2756.205,
+      1852.645,
+      1616.805,
+      1178.939
+    ]
+  },
+  {
+    "case": 11,
+    "predicate": "category BETWEEN 0 AND 19",
+    "k": 750,
+    "us": 570601.629,
+    "samples_us": [
+      515879.411,
+      618456.59,
+      570601.629
+    ],
+    "estimated_rows": 750,
+    "cost": 883942.43,
+    "returned": 750,
+    "sql_us": 1746.113,
+    "sql_samples_us": [
+      4346.94,
+      1746.113,
+      1591.061,
+      1889.833
+    ]
+  }
+]

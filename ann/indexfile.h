@@ -1,6 +1,8 @@
 #ifndef ANN_INDEXFILE_H
 #define ANN_INDEXFILE_H
 
+#include "cost.h"
+
 #include "backend.h"
 
 #include <pthread.h>
@@ -223,9 +225,12 @@ typedef struct AnnIndexOptions
 	int			gpu_rerank;		/* optional FP32 device copy, else host
 								 * reranking */
 	uint64_t	matrix_max_bytes;	/* per-lane score-matrix bound */
+	uint32_t	filtered_slack; /* extra bitset CAGRA candidates for FP32
+								 * reranking */
 } AnnIndexOptions;
 
 extern AnnIndexOptions AnnIndexConfig;
+extern AnnCostProfile *AnnIndexCostProfile;
 
 /* Optional backend routing snapshot, JSON written within capacity. */
 extern size_t (*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity);

@@ -1760,6 +1760,22 @@ nomem:
  * the bitmap as BuildBitmap returns it (without the count). The bitmap is
  * cached under the id until replaced or the worker exits.
  */
+static uint64_t
+PredicateGatherLimit(const AnnIndexFile *file)
+{
+	uint64_t	limit = AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
+		AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit;
+
+	if (AnnCostMatches(AnnIndexCostProfile, file->rows, file->dimensions, file->generationValue))
+	{
+		uint64_t	measured = AnnCostGatherLimit(AnnIndexCostProfile);
+
+		if (measured > limit)
+			limit = measured;
+	}
+	return limit;
+}
+
 static AnnStatus
 PutBitmap(const unsigned char *payload, uint32_t size)
 {
@@ -1793,8 +1809,7 @@ PutBitmap(const unsigned char *payload, uint32_t size)
 
 	/* Keep rows for every filter a scan may take; see SubmitCached. */
 	status = AnnIndexBitmapPut(file, id, ANN_BITMAP_PUSHED, bitmap, words, file->device == NULL ? UINT64_MAX :
-							   AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
-							   AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit, NULL);
+							   PredicateGatherLimit(file), NULL);
 	AnnIndexPut(file);
 	free(bitmap);
 	return status;
@@ -2055,8 +2070,7 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	/* Keep rows for every filter a scan may take; see SubmitCached. */
 	/* The entry comes back referenced: an eviction meanwhile can't lose it. */
 	status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words, nwords, file->device == NULL ? UINT64_MAX :
-								  AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
-								  AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit, result);
+								  PredicateGatherLimit(file), result);
 	free(words);
 	(void) __atomic_fetch_add(&service->predicate_evaluations, 1, __ATOMIC_RELAXED);
 	(void) __atomic_fetch_add(&service->predicate_eval_us, MicrosecondsSince(&start), __ATOMIC_RELAXED);

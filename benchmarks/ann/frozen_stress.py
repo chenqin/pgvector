@@ -185,6 +185,7 @@ def main():
     parser.add_argument('--materialize-batch', type=int, default=0, metavar='ROWS',
                         help='mapped TID visibility window for covering scans, 0 disables, maximum 1024')
     parser.add_argument('--profile-library', help='optional session preload library for isolated debugger runs')
+    parser.add_argument('--cost-profile', help='optional calibrated planner profile on the PostgreSQL host')
     parser.add_argument('--count-only', action='store_true', help='diagnostic: aggregate the 500 rows on the server')
     args = parser.parse_args()
     if not 0 <= args.materialize_batch <= 1024:
@@ -236,6 +237,9 @@ def main():
                 if args.prefetch_distance is not None:
                     env['PGOPTIONS'] += f' -c ann.frozen_prefetch_distance={args.prefetch_distance}'
                 env['PGOPTIONS'] += f' -c ann.frozen_materialize_batch={args.materialize_batch}'
+                if args.cost_profile:
+                    escaped = ''.join(('\\' + c) if c.isspace() or c == '\\' else c for c in args.cost_profile)
+                    env['PGOPTIONS'] += f' -c ann.frozen_cost_profile={escaped}'
                 command = ['pgbench', args.dsn, '-n', '-M', 'prepared', '-c', str(clients),
                            '-j', str(min(clients, args.threads)), '-T', str(args.seconds), '-r',
                            '-f', str(script), '-l', '--sampling-rate=0.05', '--log-prefix', str(Path(directory) / 'latency')]
@@ -271,7 +275,7 @@ def main():
                 row = dict(label=args.label, workload=workload, clients=clients, k=args.k,
                            plan_cache_mode=args.plan_cache_mode, setup_cost=args.setup_cost,
                            prefetch_distance=args.prefetch_distance,
-                           materialize_batch=args.materialize_batch,
+                           materialize_batch=args.materialize_batch, cost_profile=args.cost_profile,
                            batch_queries=args.batch_queries, index_name=args.index_name,
                            routing_stats_before=routing_before,
                            routing_stats_after=routing_stats(args.socket, args.index_name),

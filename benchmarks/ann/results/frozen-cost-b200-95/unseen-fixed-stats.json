@@ -1,0 +1,32 @@
+{
+  "policy": "home",
+  "slack": 1,
+  "copies": 1,
+  "matrix_queries": 3294,
+  "matrix_peak_score_bytes": 25600384,
+  "gpu_rerank_candidates": 5784264,
+  "cost_queries": [
+    0,
+    0,
+    0,
+    0
+  ],
+  "replicas": [
+    {
+      "copy": 0,
+      "device": 0,
+      "device_mask": 1,
+      "rerank_bytes": 5120000000,
+      "rerank_ready": true,
+      "active": 0,
+      "device_active": 0,
+      "started": 1191,
+      "finished": 1191,
+      "queries": 9882,
+      "migrations": 0,
+      "failures": 0,
+      "reserved_ns": 791022035,
+      "device_batch_ns": 1181038
+    }
+  ]
+}

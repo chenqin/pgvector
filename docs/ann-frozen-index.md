@@ -421,3 +421,7 @@ by the vectors per transaction. Batch latency is measured for the whole
 transaction. Covering scans default to 64-row mapped TID visibility windows;
 set `ann.frozen_materialize_batch = 0` for an unbatched control. The earlier
 page-sorting prototypes were removed after regressing throughput.
+
+The optional [measured cost model](ann-cost-model.md) extends planner costing
+and worker dispatch with calibration profiles for filter size, k, batch size
+and CPU/GPU reranking. Its calibration target is 95% recall@k.

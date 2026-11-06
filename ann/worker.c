@@ -383,6 +383,31 @@ main(int argc, char **argv)
 			}
 			AnnIndexConfig.matrix_gather = strcmp(value, "on") == 0;
 		}
+		else if (strcmp(argv[i], "--filtered-slack") == 0)
+		{
+			char	   *end;
+			unsigned long slack = strtoul(value, &end, 10);
+
+			if (value[0] == '\0' || value[0] == '-' || *end || slack > 10000)
+			{
+				fprintf(stderr, "--filtered-slack takes 0..10000 candidates\n");
+				return 2;
+			}
+			AnnIndexConfig.filtered_slack = (uint32_t) slack;
+		}
+		else if (strcmp(argv[i], "--cost-profile") == 0)
+		{
+			char		error[160];
+			AnnCostProfile *profile = AnnCostLoad(value, error, sizeof(error));
+
+			if (profile == NULL)
+			{
+				fprintf(stderr, "--cost-profile: %s\n", error);
+				return 2;
+			}
+			free(AnnIndexCostProfile);
+			AnnIndexCostProfile = profile;
+		}
 		else if (strcmp(argv[i], "--gpu-rerank") == 0)
 		{
 			if (strcmp(value, "on") && strcmp(value, "off"))
@@ -618,7 +643,7 @@ usage:
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
-			"  [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N] [--quantized-scan on|off] [--quant-slack N] [--rerank-prefetch N] [--predicate-cache N]\n"
+			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N] [--quantized-scan on|off] [--quant-slack N] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else

@@ -722,6 +722,48 @@ class FrozenTests(unittest.TestCase):
         finally:
             server.close()
 
+    def test_calibrated_planner(self):
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            self.db.execute('CREATE INDEX docs_tenant_cost ON docs(tenant)')
+            self.db.execute('ANALYZE docs')
+            name = 'cost_' + uuid.uuid4().hex[:8]
+            self.load(server, name)
+            generation = self.value("SELECT generation FROM ann_frozen_info('docs_ann')")
+            path = os.path.join(self.directory.name, 'cost.tsv')
+            statement = "SELECT id FROM docs WHERE tenant=1 ORDER BY emb <-> '[1,2,3,4]' LIMIT 20"
+            expected = self.db.execute(statement).fetchall()
+
+            def plan():
+                return '\n'.join(r[0] for r in self.db.execute('EXPLAIN ' + statement))
+
+            def profile(worker_us, gen=generation):
+                with open(path, 'w') as output:
+                    output.write(f'ANN_COST_PROFILE 2 {ROWS} 4 {gen} 8 0 0\n')
+                    for matching in (1, ROWS):
+                        for k in (1, 1000):
+                            for batch in (1, 32):
+                                output.write(f'{matching} {k} {batch} {worker_us} {worker_us} '
+                                             f'{worker_us} {worker_us} 1000\n')
+                self.db.execute("SET ann.frozen_cost_profile = ''")
+                self.db.execute("SELECT set_config('ann.frozen_cost_profile',%s,false)", (path,))
+
+            profile(1)
+            self.assertIn('Estimated GPU Path:', plan())
+            self.assertEqual(self.db.execute(statement).fetchall(), expected)
+            profile(1000000)
+            self.assertNotIn('AnnFrozenSearch', plan())
+            self.assertEqual(self.db.execute(statement).fetchall(), expected)
+            profile(1, '0000000000000001')
+            self.assertNotIn('Estimated GPU Path:', plan())
+            with open(path, 'w') as output:
+                output.write('invalid profile')
+            self.assertIn('invalid', self.error("SELECT set_config('ann.frozen_cost_profile',%s,false)", (path,)))
+        finally:
+            self.db.execute("SET ann.frozen_cost_profile = ''")
+            server.close()
+
     def test_tombstones(self):
         """ann_frozen_delete: deleted keys leave the frozen route, on the pages and on the worker, and reach
         exports loaded later; the table itself is untouched."""

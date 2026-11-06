@@ -605,12 +605,18 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t matrix_queries;
 	atomic_uint_fast64_t matrix_peak_score_bytes;
 	atomic_uint_fast64_t gpu_rerank_candidates;
+	atomic_uint_fast64_t cost_queries[4];
 } AnnCuvsIndex;
 
 /* Keep the full lane ordinal: wrapping before modulo copies biases 3/6/7 GPUs. */
 static _Thread_local int64_t laneHome = -1;
 static atomic_uint nextHome;
 static _Thread_local uint32_t laneCopy;
+
+/* -1 uses deployment defaults; 0/1 is a batch-local calibrated decision. */
+static _Thread_local int laneRerank = -1;
+static _Thread_local uint32_t laneProfileItopk;
+static _Thread_local uint32_t laneProfileSlack;
 static _Alignas(64)
 AnnReplicaRouter replicaRouter;
 
@@ -699,11 +705,15 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"gpu_rerank_candidates\":%llu,\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"gpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
-					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed));
+					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cost_queries[0], memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cost_queries[1], memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cost_queries[2], memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cost_queries[3], memory_order_relaxed));
 	if (written < 0 || (size_t) written >= capacity)
 		return 0;
 	used = (size_t) written;
@@ -1192,8 +1202,9 @@ UploadBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 	 * exact limit. Smaller filters run exact on the CPU; a route that finds
 	 * no device copy copies the filter per query.
 	 */
-	int			needBitsets = bitmap->ordinals == NULL ||
-		bitmap->count > AnnIndexConfig.bitset_gather_limit;
+	int			needBitsets = bitmap->words != NULL &&
+		(AnnCostMatches(AnnIndexCostProfile, file->rows, file->dimensions, file->generationValue) ||
+		 bitmap->ordinals == NULL || bitmap->count > AnnIndexConfig.bitset_gather_limit);
 	int			needRows = bitmap->ordinals != NULL && bitmap->count > AnnIndexConfig.exact_limit;
 
 	if (needBitsets)
@@ -1331,6 +1342,8 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->matrix_queries, 0);
 	atomic_init(&state->matrix_peak_score_bytes, 0);
 	atomic_init(&state->gpu_rerank_candidates, 0);
+	for (int mode = 0; mode < 4; mode++)
+		atomic_init(&state->cost_queries[mode], 0);
 	for (uint32_t c = 0; c < copies; c++)
 	{
 		atomic_init(&state->routing[c].active, 0);
@@ -1566,7 +1579,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	int			uploaded[ANN_CUVS_MAX_DEVICES] = {0};
 	int			exactUploaded[ANN_CUVS_MAX_DEVICES] = {0};
 	int			exactGpu[ANN_INDEX_MAX_SHARDS] = {0};
-	float	   *exactHost = AnnIndexConfig.gpu_rerank && state->fp16 ? malloc((size_t) m * dims * sizeof(float)) : NULL;
+	float	   *exactHost = AnnIndexConfig.gpu_rerank && laneRerank != 0 && state->fp16 ? malloc((size_t) m * dims * sizeof(float)) : NULL;
 	size_t		slot[ANN_INDEX_MAX_SHARDS];
 	size_t		bitsetSlot[ANN_INDEX_MAX_SHARDS];
 	size_t		perDevice[ANN_CUVS_MAX_DEVICES] = {0};
@@ -1627,7 +1640,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			ok = 0;
 			break;
 		}
-		lane->params->itopk_size = itopk;
+		lane->params->itopk_size = itopk > laneProfileItopk ? itopk : laneProfileItopk;
 		lane->params->persistent = AnnIndexConfig.persistent != 0;
 
 		/* Lane parameters are shared: set every filtered knob each time. */
@@ -1675,7 +1688,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			ok = 0;
 			break;
 		}
-		if (shard->rerank && (!state->fp16 || exactHost))
+		if (shard->rerank && laneRerank != 0 && (!state->fp16 || exactHost))
 		{
 			const float *exactQueries = lane->queries;
 			int			ready = 1;
@@ -1815,7 +1828,8 @@ static const char RerankSource[] =
 
 typedef struct GatherModule
 {
-	int			state;			/* 0 untried, 1 ready, -1 unavailable */
+	atomic_int	state;			/* 0 untried/compiling, 1 ready, -1
+								 * unavailable */
 	CUcontext	context;
 	CUmodule	module;
 	CUfunction	lookup;
@@ -1841,12 +1855,11 @@ GatherKernels(int device)
 				minor = 0;
 	CUdevice	handle;
 
-	if (module->state != 0)
-		return module->state > 0 ? module : NULL;
+	if (atomic_load_explicit(&module->state, memory_order_acquire) != 0)
+		return atomic_load_explicit(&module->state, memory_order_acquire) > 0 ? module : NULL;
 	(void) pthread_mutex_lock(&gatherMutex);
-	if (module->state != 0)
+	if (atomic_load_explicit(&module->state, memory_order_relaxed) != 0)
 		goto unlock;
-	module->state = -1;
 	if (cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&handle, device) != CUDA_SUCCESS ||
 		cuDevicePrimaryCtxRetain(&module->context, handle) != CUDA_SUCCESS ||
 		cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
@@ -1867,15 +1880,16 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->rerank64, module->module, "rerank_i64") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->rerank32, module->module, "rerank_u32") != CUDA_SUCCESS)
 		goto fail;
-	module->state = 1;
+	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
 fail:
+	atomic_store_explicit(&module->state, -1, memory_order_release);
 	fprintf(stderr, "cuVS: gather scan unavailable on device %d; filtered queries use CAGRA\n", device);
 unlock:
 	free(source);
 	free(image);
 	(void) pthread_mutex_unlock(&gatherMutex);
-	return module->state > 0 ? module : NULL;
+	return atomic_load_explicit(&module->state, memory_order_acquire) > 0 ? module : NULL;
 }
 
 /* Size this lane's gather buffers on its current device. */
@@ -2276,6 +2290,19 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
  * the rest run CAGRA with a bitset, with a larger internal top-k when the
  * filter is selective. All per-shard lists are tree-merged.
  */
+/* Overfetch before FP32 reranking: rescoring cannot recover omitted neighbors. */
+static uint32_t
+FilteredCandidates(uint32_t k)
+{
+	uint32_t	slack = AnnIndexConfig.filtered_slack > laneProfileSlack ?
+		AnnIndexConfig.filtered_slack : laneProfileSlack;
+
+	/* cuVS' filtered result selector supports at most 1024 output columns. */
+	if (k >= 1024)
+		return k;
+	return k + (slack < 1024 - k ? slack : 1024 - k);
+}
+
 static void
 SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 {
@@ -2303,23 +2330,24 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		((job->ordinals == NULL && job->filter == NULL) || job->nfilter > AnnIndexConfig.bitset_gather_limit))
 	{
 		uint32_t	graphCounts[ANN_INDEX_MAX_SHARDS] = {0};
-		AnnIndexHit *graphLists = malloc(sizeof(AnnIndexHit) * (size_t) k * state->nshards);
+		uint32_t	selected = FilteredCandidates(k);
+		AnnIndexHit *graphLists = malloc(sizeof(AnnIndexHit) * (size_t) selected * state->nshards);
 
 		for (uint32_t s = 0; s < state->nshards; s++)
 		{
 			useShard[s] = 1;
 			bitsets[s] = job->bitsets[s];
 		}
-		itopk = RoundTopK(k) > AnnIndexConfig.itopk ? RoundTopK(k) : AnnIndexConfig.itopk;
+		itopk = RoundTopK(selected) > AnnIndexConfig.itopk ? RoundTopK(selected) : AnnIndexConfig.itopk;
 		if ((double) job->nfilter / (double) file->rows < 0.25 && AnnIndexConfig.filtered_itopk > itopk)
 			itopk = AnnIndexConfig.filtered_itopk;
 		if (graphLists == NULL ||
-			!SearchShards(file, state, jobs, 1, k, itopk, bitsets, job->deviceBitsets, useShard, graphLists,
+			!SearchShards(file, state, jobs, 1, selected, itopk, bitsets, job->deviceBitsets, useShard, graphLists,
 						  graphCounts))
 			job->status = ANN_BACKEND_ERROR;
 		else
 		{
-			MergeJob(job, graphLists, graphCounts, state->nshards, k);
+			MergeJob(job, graphLists, graphCounts, state->nshards, selected);
 			job->route = ANN_ROUTE_FILTERED;
 		}
 		free(graphLists);
@@ -2501,6 +2529,7 @@ SearchFilteredGroupGraph(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndex
 	for (uint32_t j = 0; j < m; j++)
 		if (jobs[j]->k > k)
 			k = jobs[j]->k;
+	k = FilteredCandidates(k);
 	for (uint32_t s = 0; s < state->nshards; s++)
 	{
 		useShard[s] = 1;
@@ -2919,7 +2948,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				ok = 0;
 				break;
 			}
-			if (shard->rerank)
+			if (shard->rerank && laneRerank != 0)
 			{
 				if (!RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
 								  candidates, q, lane->queries, lane->matrixCandidates, stream, 1) ||
@@ -3042,10 +3071,58 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
  * the gather scan one by one and broad ones with prebuilt bitsets run one
  * batched filtered CAGRA search.
  */
+/* Profile hints use actual eligibility and batch shape, with no queue/RPC lock. */
+static int
+CalibratedFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
+{
+	double		us[ANN_COST_MODES];
+	uint32_t	k = 0;
+	int			gpu = AnnIndexConfig.gpu_rerank;
+	int			scan = AnnIndexConfig.matrix_gather && state->grouped && jobs[0]->ordinals != NULL;
+	int			graph = jobs[0]->bitsets != NULL;
+	int			mode;
+
+	if (AnnIndexCostProfile == NULL || file->quant != ANN_QUANT_NVFP4 || file->nshards != 1 || !state->fp16 ||
+		AnnIndexConfig.filtered_algo != 2 || AnnIndexConfig.quant_slack != 256 || AnnIndexConfig.itopk != 512 ||
+		AnnIndexConfig.filtered_itopk != 1024 || AnnIndexConfig.filtered_width != 4 ||
+		AnnIndexConfig.filtered_iterations != 0 || AnnIndexConfig.persistent || AnnIndexConfig.filtered_slack != 0 ||
+		AnnIndexConfig.matrix_max_bytes != (UINT64_C(64) << 20))
+		return 0;
+	for (uint32_t j = 0; j < m; j++)
+		if (jobs[j]->k > k)
+			k = jobs[j]->k;
+	for (uint32_t s = 0; s < state->nshards; s++)
+		gpu = gpu && state->shards[(size_t) laneCopy * state->nshards + s].rerank != NULL;
+	if (!AnnCostEstimate(AnnIndexCostProfile, file->rows, file->dimensions, file->generationValue,
+						 jobs[0]->nfilter, k, m, us) || (mode = AnnCostBest(us, scan, graph, gpu)) < 0)
+		return 0;
+	laneRerank = mode & 1;
+	if (mode < ANN_COST_GRAPH_HOST)
+	{
+		int			ok = SearchGatherMatrix(file, state, jobs, m);
+
+		laneRerank = -1;
+		if (ok)
+			(void) atomic_fetch_add_explicit(&state->cost_queries[mode], m, memory_order_relaxed);
+		return ok;
+	}
+	laneProfileItopk = AnnIndexCostProfile->graph_itopk;
+	laneProfileSlack = AnnIndexCostProfile->graph_slack;
+	SearchFilteredGroupGraph(file, state, jobs, m);
+	laneProfileItopk = 0;
+	laneProfileSlack = 0;
+	laneRerank = -1;
+	(void) atomic_fetch_add_explicit(&state->cost_queries[mode], m, memory_order_relaxed);
+	return 1;
+}
+
 static void
 SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
 {
 	uint32_t	n = jobs[0]->nfilter;
+
+	if (CalibratedFilteredGroup(file, state, jobs, m))
+		return;
 
 	if (n > AnnIndexConfig.exact_limit && n <= AnnIndexConfig.group_gather_limit)
 	{

@@ -18,6 +18,7 @@
 #pragma GCC diagnostic pop
 #include <cuda_runtime_api.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -542,7 +543,8 @@ NULL};
 
 typedef struct BlackwellModule
 {
-	int			state;			/* 0 untried, 1 ready, -1 unavailable */
+	atomic_int	state;			/* 0 untried/compiling, 1 ready, -1
+								 * unavailable */
 	CUcontext	context;
 	CUmodule	module;
 	CUfunction	nvfp4;
@@ -646,12 +648,11 @@ AnnBlackwellReady(int device)
 	if (device < 0 || device >= ANN_BLACKWELL_MAX_DEVICES)
 		return 0;
 	module = &modules[device];
-	if (module->state != 0)
-		return module->state > 0;
+	if (atomic_load_explicit(&module->state, memory_order_acquire) != 0)
+		return atomic_load_explicit(&module->state, memory_order_acquire) > 0;
 	(void) pthread_mutex_lock(&moduleMutex);
-	if (module->state != 0)
+	if (atomic_load_explicit(&module->state, memory_order_relaxed) != 0)
 		goto unlock;
-	module->state = -1;
 	if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess || major != 10)
 	{
 		fprintf(stderr, "Blackwell module: device %d has compute capability %d.x, not 10.x; "
@@ -678,7 +679,7 @@ AnnBlackwellReady(int device)
 		fprintf(stderr, "Blackwell module: unavailable on device %d (NVRTC or sm_100a load failed)\n", device);
 		goto unlock;
 	}
-	module->state = 1;
+	atomic_store_explicit(&module->state, 1, memory_order_release);
 	{
 		/* Register arrays indexed by an unrolled loop must not spill. */
 		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_fp8", "score_mma_nvfp4_64"};
@@ -697,10 +698,12 @@ AnnBlackwellReady(int device)
 		}
 	}
 unlock:
+	if (atomic_load_explicit(&module->state, memory_order_relaxed) == 0)
+		atomic_store_explicit(&module->state, -1, memory_order_release);
 	free(source);
 	free(image);
 	(void) pthread_mutex_unlock(&moduleMutex);
-	return module->state > 0;
+	return atomic_load_explicit(&module->state, memory_order_acquire) > 0;
 }
 
 void
@@ -773,7 +776,7 @@ AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32_t *ro
 
 	if (n == 0)
 		return 1;
-	if (shard->quant == ANN_QUANT_NONE || shard->quant >= ANN_BLACKWELL_HALF || module->state <= 0 ||
+	if (shard->quant == ANN_QUANT_NONE || shard->quant >= ANN_BLACKWELL_HALF || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
 		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
 		return 0;
 	if (shard->quant == ANN_QUANT_NVFP4)
@@ -893,7 +896,7 @@ AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32
 	&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dims, &out};
 
 	if (n == 0 || nq == 0 || nq > (unsigned) AnnBlackwellGroupLimit(dims) ||
-		shard->quant == ANN_QUANT_NONE || module->state <= 0 ||
+		shard->quant == ANN_QUANT_NONE || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
 		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
 		return 0;
 	if (grid > (unsigned) module->sms * 4)
@@ -921,7 +924,7 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 	SearchSlot *sc;
 	CUfunction	function;
 
-	if (shard->quant == ANN_QUANT_NONE || module->state <= 0 || n == 0 || nq == 0 ||
+	if (shard->quant == ANN_QUANT_NONE || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 || n == 0 || nq == 0 ||
 		nq > (unsigned) AnnBlackwellGroupLimit(dims) || slot >= ANN_INDEX_MAX_SHARDS)
 		return 0;
 

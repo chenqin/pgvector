@@ -1,0 +1,213 @@
+{
+  "cases": [
+    {
+      "matching": 1429,
+      "k": 250,
+      "batch": 4,
+      "mode": 1,
+      "predicted_us": [
+        856.825926,
+        301.917422,
+        -1.0,
+        -1.0,
+        1095.03305
+      ],
+      "actual_us": 290.206,
+      "best_actual_us": 290.206,
+      "regret": 0.0,
+      "recall": 1.0
+    },
+    {
+      "matching": 1429,
+      "k": 250,
+      "batch": 8,
+      "mode": 1,
+      "predicted_us": [
+        1459.64822,
+        340.18435,
+        -1.0,
+        -1.0,
+        1095.03305
+      ],
+      "actual_us": 227.115,
+      "best_actual_us": 227.115,
+      "regret": 0.0,
+      "recall": 1.0
+    },
+    {
+      "matching": 1429,
+      "k": 750,
+      "batch": 4,
+      "mode": 1,
+      "predicted_us": [
+        1370.79798,
+        418.630912,
+        -1.0,
+        -1.0,
+        1233.12602
+      ],
+      "actual_us": 243.724,
+      "best_actual_us": 243.724,
+      "regret": 0.0,
+      "recall": 1.0
+    },
+    {
+      "matching": 1429,
+      "k": 750,
+      "batch": 8,
+      "mode": 1,
+      "predicted_us": [
+        2489.72275,
+        492.844801,
+        -1.0,
+        -1.0,
+        1233.12602
+      ],
+      "actual_us": 456.149,
+      "best_actual_us": 456.149,
+      "regret": 0.0,
+      "recall": 1.0
+    },
+    {
+      "matching": 200003,
+      "k": 250,
+      "batch": 4,
+      "mode": 1,
+      "predicted_us": [
+        959.958082,
+        423.584999,
+        -1.0,
+        -1.0,
+        47587.7003
+      ],
+      "actual_us": 208.586,
+      "best_actual_us": 208.586,
+      "regret": 0.0,
+      "recall": 1.0
+    },
+    {
+      "matching": 200003,
+      "k": 250,
+      "batch": 8,
+      "mode": 1,
+      "predicted_us": [
+        1712.85718,
+        527.212932,
+        -1.0,
+        -1.0,
+        47587.7003
+      ],
+      "actual_us": 367.827,
+      "best_actual_us": 367.827,
+      "regret": 0.0,
+      "recall": 1.0
+    },
+    {
+      "matching": 200003,
+      "k": 750,
+      "batch": 4,
+      "mode": 1,
+      "predicted_us": [
+        1500.9852,
+        559.02523,
+        -1.0,
+        -1.0,
+        47946.4932
+      ],
+      "actual_us": 350.506,
+      "best_actual_us": 350.506,
+      "regret": 0.0,
+      "recall": 0.9996666666666667
+    },
+    {
+      "matching": 200003,
+      "k": 750,
+      "batch": 8,
+      "mode": 1,
+      "predicted_us": [
+        2766.80354,
+        722.719383,
+        -1.0,
+        -1.0,
+        47946.4932
+      ],
+      "actual_us": 574.1,
+      "best_actual_us": 574.1,
+      "regret": 0.0,
+      "recall": 0.9996666666666667
+    },
+    {
+      "matching": 2000039,
+      "k": 250,
+      "batch": 4,
+      "mode": 3,
+      "predicted_us": [
+        1868.46287,
+        1347.83274,
+        1542.28842,
+        1330.61937,
+        606890.87
+      ],
+      "actual_us": 1195.652,
+      "best_actual_us": 961.384,
+      "regret": 0.24367786441213912,
+      "recall": 1.0
+    },
+    {
+      "matching": 2000039,
+      "k": 250,
+      "batch": 8,
+      "mode": 3,
+      "predicted_us": [
+        3238.61845,
+        1970.81568,
+        2188.76308,
+        1783.19572,
+        606890.87
+      ],
+      "actual_us": 1971.263,
+      "best_actual_us": 1327.922,
+      "regret": 0.4844719795289181,
+      "recall": 1.0
+    },
+    {
+      "matching": 2000039,
+      "k": 750,
+      "batch": 4,
+      "mode": 1,
+      "predicted_us": [
+        2549.64677,
+        1465.71581,
+        -1.0,
+        -1.0,
+        608962.599
+      ],
+      "actual_us": 932.328,
+      "best_actual_us": 932.328,
+      "regret": 0.0,
+      "recall": 0.999
+    },
+    {
+      "matching": 2000039,
+      "k": 750,
+      "batch": 8,
+      "mode": 1,
+      "predicted_us": [
+        4469.32513,
+        2170.7342,
+        -1.0,
+        -1.0,
+        608962.599
+      ],
+      "actual_us": 1835.55,
+      "best_actual_us": 1835.55,
+      "regret": 0.0,
+      "recall": 0.9993333333333333
+    }
+  ],
+  "coverage": 12,
+  "total": 12,
+  "median_regret": 0.0,
+  "max_regret": 0.4844719795289181,
+  "median_relative_time_error": 0.22237632913135397
+}

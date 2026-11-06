@@ -8,6 +8,7 @@
 #include "access/visibilitymap.h"
 #include "ann.h"
 #include "ann/filter.h"
+#include "ann/cost.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -52,6 +53,8 @@
 
 bool		ann_enable_frozen_search = true;
 static double ann_frozen_setup_cost = 1000.0;
+static char *ann_frozen_cost_profile = NULL;
+static const AnnCostProfile *frozenCostProfile = NULL;
 static int	ann_frozen_prefetch_distance = 4;
 static int	ann_frozen_materialize_batch = 64;
 static set_rel_pathlist_hook_type previous_pathlist_hook = NULL;
@@ -112,6 +115,7 @@ typedef struct FrozenScanState
 	uint64		materializedRows;
 	uint64		mappedTidRows;
 	int			workerRoute;
+	List	   *costEstimate;
 } FrozenScanState;
 
 static char *WorkerName(Oid relid, uint64 generation, bool refresh);
@@ -198,6 +202,66 @@ DistanceOperand(PlannerInfo *root, RelOptInfo *rel, PathKey *pathkey, IndexOptIn
 	return NULL;
 }
 
+/* A trusted deployment profile is loaded at SET time, never by a planner RPC. */
+static bool
+CheckCostProfile(char **newval, void **extra, GucSource source)
+{
+	char		error[160];
+	AnnCostProfile *profile;
+
+	if ((*newval)[0] == '\0')
+		return true;
+	profile = AnnCostLoad(*newval, error, sizeof(error));
+	if (profile == NULL)
+	{
+		GUC_check_errdetail("%s", error);
+		return false;
+	}
+#if PG_VERSION_NUM >= 170000
+	*extra = guc_malloc(ERROR, sizeof(*profile));
+	memcpy(*extra, profile, sizeof(*profile));
+	free(profile);
+#else
+	*extra = profile;
+#endif
+	return true;
+}
+
+static void
+AssignCostProfile(const char *newval, void *extra)
+{
+	frozenCostProfile = extra;
+}
+
+/* Include the sort/limit that upper planning has not added to base paths yet. */
+static Cost
+LocalLimitCost(PlannerInfo *root, RelOptInfo *rel, int k)
+{
+	Cost		best = DBL_MAX;
+	ListCell   *lc;
+	double		fraction = Min(1.0, k / Max(rel->rows, 1.0));
+
+	foreach(lc, rel->pathlist)
+	{
+		Path	   *candidate = lfirst(lc);
+		Path		sorted;
+		Cost		cost;
+
+		if (candidate->param_info)
+			continue;
+		if (!pathkeys_contained_in(root->query_pathkeys, candidate->pathkeys))
+		{
+			cost_sort(&sorted, root, root->query_pathkeys, candidate->total_cost,
+					  rel->rows, rel->reltarget->width, 0, work_mem, k);
+			candidate = &sorted;
+		}
+		cost = candidate->startup_cost + fraction * (candidate->total_cost - candidate->startup_cost);
+		if (cost > 0 && cost < best)
+			best = cost;
+	}
+	return best;
+}
+
 static void
 AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
@@ -214,6 +278,12 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	CustomPath *path;
 	int			member;
 	QualCost	recheck;
+	AnnFrozenMetaData *meta;
+	int			dimensions;
+	List	   *estimate = NIL;
+	double		latencies[ANN_COST_MODES];
+	Cost		localCost;
+	int			mode;
 
 	if (previous_pathlist_hook)
 		previous_pathlist_hook(root, rel, rti, rte);
@@ -234,6 +304,8 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	quals = extract_actual_clauses(rel->baserestrictinfo, false);
 	indexRel = index_open(index->indexoid, NoLock);
 	AnnPredicateColumnsInit(indexRel, &columns);
+	meta = AnnFrozenGetMeta(indexRel, false);
+	dimensions = TupleDescAttr(RelationGetDescr(indexRel), 0)->atttypmod;
 	supported = AnnPredicateSupported(quals, rel->relid, &columns);
 
 	/* Columns the query reads: covered if all are the index's. */
@@ -246,7 +318,7 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 		bool		in = false;
 
 		/* Half or no vector pages: the vector itself comes from the heap. */
-		for (int i = AnnFrozenVectorMode(indexRel, AnnFrozenGetMeta(indexRel, false)) ==
+		for (int i = AnnFrozenVectorMode(indexRel, meta) ==
 			 ANN_FROZEN_VECTORS_FLOAT ? 0 : 1; i < RelationGetDescr(indexRel)->natts; i++)
 			in |= indexRel->rd_index->indkey.values[i] == attno;
 		covering &= in;
@@ -276,10 +348,38 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	path->path.total_cost = path->path.startup_cost +
 		rel->rows * (cpu_tuple_cost + recheck.per_tuple +
 					 (covering ? cpu_index_tuple_cost : random_page_cost));
+
+	/*
+	 * Warm measurements put worker time into this query's local cost units.
+	 * Keep standard row costs, and refuse profiles outside their measured
+	 * generation/dimensions/domain or for uncovered, joined/unknown-LIMIT
+	 * SQL.
+	 */
+	if (frozenCostProfile && covering && root->limit_tuples > 0 &&
+		bms_num_members(root->all_baserels) == 1 &&
+		(AnnRemoteConfigured() || (ann_worker_socket && ann_worker_socket[0])) &&
+		AnnCostEstimate(frozenCostProfile, meta->rows, dimensions, meta->generation,
+						rel->rows, k, 1, latencies) && latencies[ANN_COST_LOCAL] > 0 &&
+		(mode = AnnCostBest(latencies, 1, 1, 1)) >= 0 &&
+		(localCost = LocalLimitCost(root, rel, k)) < DBL_MAX &&
+		WorkerName(rte->relid, meta->generation, false) != NULL)
+	{
+		double		predicted = latencies[mode] + frozenCostProfile->setup_us +
+			Min((double) k, rel->rows) * frozenCostProfile->tuple_us;
+
+		path->path.startup_cost = recheck.startup + localCost * predicted / latencies[ANN_COST_LOCAL];
+		path->path.total_cost = path->path.startup_cost +
+			rel->rows * (cpu_tuple_cost + recheck.per_tuple + cpu_index_tuple_cost);
+		estimate = list_make5(makeString(pstrdup(AnnCostName(mode))),
+							  makeFloat(psprintf("%.17g", predicted)),
+							  makeFloat(psprintf("%.17g", latencies[ANN_COST_LOCAL])),
+							  makeFloat(psprintf("%.17g", rel->rows)),
+							  makeFloat(psprintf("%.17g", frozenCostProfile->min_recall)));
+	}
 	path->path.pathkeys = list_make1(pathkey);
 	path->methods = &FrozenPathMethods;
-	path->custom_private = list_make3(list_make1_oid(index->indexoid), list_make2_int(covering, k),
-									  copyObject(operand));
+	path->custom_private = list_make4(list_make1_oid(index->indexoid), list_make2_int(covering, k),
+									  copyObject(operand), estimate);
 	add_path(rel, &path->path);
 }
 
@@ -294,7 +394,8 @@ PlanFrozenPath(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist
 	scan->scan.plan.qual = quals;
 	scan->scan.scanrelid = rel->relid;
 	scan->methods = &FrozenScanMethods;
-	scan->custom_private = list_make2(linitial(path->custom_private), lsecond(path->custom_private));
+	scan->custom_private = list_make3(linitial(path->custom_private), lsecond(path->custom_private),
+									  lfourth(path->custom_private));
 	scan->custom_exprs = lcons(lthird(path->custom_private), list_copy(quals));
 	return &scan->scan.plan;
 }
@@ -311,6 +412,7 @@ CreateFrozenScanState(CustomScan *scan)
 	state->indexOid = linitial_oid(linitial(scan->custom_private));
 	state->covering = linitial_int(lsecond(scan->custom_private)) != 0;
 	state->initialK = lsecond_int(lsecond(scan->custom_private));
+	state->costEstimate = lthird(scan->custom_private);
 	return (Node *) state;
 }
 
@@ -1027,6 +1129,15 @@ ExplainFrozenScan(CustomScanState *node, List *ancestors, ExplainState *es)
 	FrozenScanState *state = (FrozenScanState *) node;
 
 	ExplainPropertyText("Frozen Index", RelationGetRelationName(state->index), es);
+	if (state->costEstimate && es->costs)
+	{
+		ExplainPropertyText("Estimated GPU Path", strVal(linitial(state->costEstimate)), es);
+		ExplainPropertyFloat("Estimated Search Time", "ms", floatVal(lsecond(state->costEstimate)) / 1000, 3, es);
+		ExplainPropertyFloat("Estimated Local Time", "ms", floatVal(lthird(state->costEstimate)) / 1000, 3, es);
+		ExplainPropertyFloat("Estimated Matching Rows", NULL, floatVal(lfourth(state->costEstimate)), 0, es);
+		ExplainPropertyFloat("Calibration Recall Target", "%", floatVal(list_nth(state->costEstimate, 4)) * 100, 1, es);
+	}
+
 	ExplainPropertyText("Search Route", state->workerName && !state->workerFailed ?
 						psprintf("frozen index predicates on GPU worker \"%s\"", state->workerName) :
 						es->analyze || state->workerName ? "frozen index predicates from index pages" :
@@ -1046,6 +1157,11 @@ ExplainFrozenScan(CustomScanState *node, List *ancestors, ExplainState *es)
 void
 AnnFrozenScanInit(void)
 {
+	DefineCustomStringVariable("ann.frozen_cost_profile",
+							   "Measured worker and local SQL latencies for frozen planning.",
+							   "Empty uses legacy costing; profiles are generation- and dimension-specific.",
+							   &ann_frozen_cost_profile, "", PGC_SUSET, 0,
+							   CheckCostProfile, AssignCostProfile, NULL);
 	DefineCustomIntVariable("ann.frozen_materialize_batch",
 							"Validate covering result visibility in batches (0 disables).",
 							NULL, &ann_frozen_materialize_batch, 64, 0, 1024, PGC_USERSET,

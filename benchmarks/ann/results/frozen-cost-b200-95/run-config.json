@@ -1,0 +1,8 @@
+{
+  "graph_itopk": 4096,
+  "graph_slack": 256,
+  "min_recall": 0.95,
+  "gpu": "7",
+  "repeats": 7,
+  "index_dir": "/dev/shm/pgvector-k500-q5apcmte/index"
+}

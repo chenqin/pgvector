@@ -55,7 +55,7 @@ class CuvsIndexTests(unittest.TestCase):
         for quant in ['nvfp4', 'fp8']:
             path = os.path.join(cls.directory.name, quant)
             subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{cls.table}', '--key', 'id',
-                            '--vector', 'emb', '--out', path, '--shards', '4', '--quantize', quant],
+                            '--vector', 'emb', '--out', path, '--shards', '4', '--quantize', quant, '--attribute', 'tenant'],
                            check=True, capture_output=True)
             cls.loaded[quant] = cls.psql(f"SELECT ann_index_load('{cls.table}_{quant}', '{path}')")
 
@@ -228,7 +228,7 @@ class CuvsIndexTests(unittest.TestCase):
             finally:
                 server.close()
 
-    def test_graph_gpu_rerank_k500(self):
+    def _graph_gpu_rerank(self, slack):
         import json
         import struct
         from test_predicate_cache import search_batch_frame, values_program
@@ -239,7 +239,7 @@ class CuvsIndexTests(unittest.TestCase):
         nearest = set(sorted(expected, key=lambda key: (expected[key], key))[:500])
         server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gather-limit', '0',
                         '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', 'on',
-                        '--filtered-itopk', '1024', executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                        '--filtered-itopk', '1024', '--filtered-slack', str(slack), executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
         name = self.table + '_gpu_rerank'
         try:
             self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float16')", server)
@@ -264,8 +264,40 @@ class CuvsIndexTests(unittest.TestCase):
                 self.assertEqual(status, 0)
                 stats = json.loads(data)
                 self.assertEqual(stats['matrix_queries'], 0)
-                self.assertGreater(stats['gpu_rerank_candidates'], 0)
+                self.assertEqual(stats['gpu_rerank_candidates'], 8 * 4 * (500 + slack))
                 self.assertTrue(all(r['rerank_ready'] for r in stats['replicas']))
+        finally:
+            server.close()
+
+    def test_graph_gpu_rerank_k500(self):
+        self._graph_gpu_rerank(0)
+
+    def test_graph_gpu_rerank_overfetch(self):
+        self._graph_gpu_rerank(256)
+
+    def test_concurrent_blackwell_module_load(self):
+        import json
+        import struct
+        from test_predicate_cache import search_batch_frame, values_program
+        # Four shards load concurrently on one device: all must wait for the
+        # same cold module, rather than mistaking in-progress for unavailable.
+        server = Server('--backend','cuvs','--lanes','4','--exact-limit','0',
+                        '--matrix-gather','on','--gpu-rerank','on','--group-gather-limit','4000000',
+                        executable=os.path.join(ROOT,'ann','ann-worker-cuvs'),
+                        env={'CUDA_VISIBLE_DEVICES':'0'})
+        name = self.table + '_cold_module'
+        try:
+            self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/nvfp4')", server)
+            query = json.loads(self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1'))
+            with server.connect() as connection:
+                connection.sendall(search_batch_frame(1,name,[query]*8,500,values_program('tenant',[7])))
+                _,_,status,data = receive(connection)
+                self.assertEqual(status,0)
+                self.assertEqual(struct.unpack_from('<I',data)[0],8)
+                connection.sendall(frame(31,2,name.encode()))
+                _,_,status,data = receive(connection)
+                self.assertEqual(status,0)
+                self.assertEqual(json.loads(data)['matrix_queries'],8)
         finally:
             server.close()
 

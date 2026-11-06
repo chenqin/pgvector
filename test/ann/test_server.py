@@ -117,7 +117,9 @@ class ServerTests(unittest.TestCase):
         for option, value in (('--replica-routing', 'other'), ('--replica-load-slack', '-1'),
                               ('--replica-load-slack', '65'), ('--replica-load-slack', 'many'),
                               ('--matrix-gather', 'other'), ('--gpu-rerank', 'other'),
-                              ('--matrix-max-mb', '0'), ('--matrix-max-mb', '1025')):
+                              ('--matrix-max-mb', '0'), ('--matrix-max-mb', '1025'),
+                              ('--filtered-slack', '-1'), ('--filtered-slack', '10001'),
+                              ('--cost-profile', '/nonexistent/ann-profile')):
             result = subprocess.run([WORKER, option, value], input=b'', capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 2)
             self.assertIn(option.encode(), result.stderr)

@@ -1,0 +1,44 @@
+{
+  "platform": "8 NVIDIA B200 GPUs, 224 logical CPUs, 2 TiB RAM, PostgreSQL 17.6, cuVS 26.10, CUDA 13",
+  "dataset": "10M rows x 128 FP32 dimensions, NVFP4 scan, FP16 CAGRA, one shard, tmpfs",
+  "baseline_commit": "f9a71f68055a57bbc649f6bb1017935ead4d43e8",
+  "calibration": {
+    "points": 372,
+    "grid_cells": 63,
+    "recall_target": 0.95,
+    "qualification": "Mean recall across all query vectors in each request; not a per-query guarantee",
+    "warmups": 2,
+    "repeats": 7,
+    "gpus": 1,
+    "lanes": 1
+  },
+  "stress": {
+    "seconds_per_point": 15,
+    "k": 500,
+    "replicas": 8,
+    "lanes": 64,
+    "max_batch": 32,
+    "sql_clients": 256,
+    "sql_batch_clients": 64,
+    "sql_batch_vectors": 16,
+    "materialize_batch": 64
+  },
+  "notes": [
+    "Training vectors 1..32; interpolation and route-validation vectors 65..96. CAGRA search budget was tuned using validation vectors, so these are not an untouched final quality holdout.",
+    "FP64 exact references use original exported FP32 vectors and are checked against local SQL for each first vector.",
+    "Main stress requests return 500 keys per vector, with all query errors counted. All measured cost routes in this stress test were NVFP4 scan + GPU reranking.",
+    "Single 15-second points have no confidence intervals. Saturated QPS is essentially unchanged; p99 regressed at 10% filtering. Keep this latency profile opt-in.",
+    "Absolute node paths are retained for reproducibility; no authentication secrets are included. Recalibrate for another generation, graph, SDK or hardware.",
+    "Final independent vectors 129..160 were checked after CAGRA budget tuning; all 90 calibrated requests passed 95% mean recall and cardinality.",
+    "Integration includes the newer origin/master upstream pgvector merge; benchmark baseline was f9a71f6. Upstream changes do not touch the frozen or GPU routes."
+  ],
+  "independent_validation": {
+    "cases": 90,
+    "query_start": 129,
+    "query_end": 160,
+    "min_request_mean_recall": 0.992375,
+    "min_individual_query_recall": 0.9626666666666667,
+    "all_cardinality": true
+  },
+  "integration_base": "497a9d2"
+}

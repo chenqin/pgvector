@@ -1,0 +1,1892 @@
+[
+  {
+    "mode": "fixed",
+    "predicate": "tenant=7 AND category=0",
+    "k": 50,
+    "execution_ms": 0.004,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 434.27,
+        "Total Cost": 434.39,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 0,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 434.27,
+            "Total Cost": 434.53,
+            "Plan Rows": 106,
+            "Plan Width": 16,
+            "Actual Rows": 0,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "quicksort",
+            "Sort Space Used": 25,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "frozen_cost_tenant_category",
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 0.43,
+                "Total Cost": 430.75,
+                "Plan Rows": 106,
+                "Plan Width": 16,
+                "Actual Rows": 0,
+                "Actual Loops": 1,
+                "Index Cond": "((tenant = 7) AND (category = 0))",
+                "Rows Removed by Index Recheck": 0
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.012,
+      "Triggers": [],
+      "Execution Time": 0.004
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "tenant=7 AND category=0",
+    "k": 500,
+    "execution_ms": 0.003,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 434.31,
+        "Total Cost": 434.58,
+        "Plan Rows": 106,
+        "Plan Width": 16,
+        "Actual Rows": 0,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 434.31,
+            "Total Cost": 434.58,
+            "Plan Rows": 106,
+            "Plan Width": 16,
+            "Actual Rows": 0,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "quicksort",
+            "Sort Space Used": 25,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "frozen_cost_tenant_category",
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 0.43,
+                "Total Cost": 430.75,
+                "Plan Rows": 106,
+                "Plan Width": 16,
+                "Actual Rows": 0,
+                "Actual Loops": 1,
+                "Index Cond": "((tenant = 7) AND (category = 0))",
+                "Rows Removed by Index Recheck": 0
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.012,
+      "Triggers": [],
+      "Execution Time": 0.003
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "tenant=7 AND category BETWEEN 0 AND 1",
+    "k": 50,
+    "execution_ms": 0.741,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 855.46,
+        "Total Cost": 855.59,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 855.46,
+            "Total Cost": 855.99,
+            "Plan Rows": 212,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "top-N heapsort",
+            "Sort Space Used": 28,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Bitmap Heap Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 7.14,
+                "Total Cost": 848.42,
+                "Plan Rows": 212,
+                "Plan Width": 16,
+                "Actual Rows": 1429,
+                "Actual Loops": 1,
+                "Recheck Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))",
+                "Rows Removed by Index Recheck": 0,
+                "Exact Heap Blocks": 1429,
+                "Lossy Heap Blocks": 0,
+                "Plans": [
+                  {
+                    "Node Type": "Bitmap Index Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Index Name": "frozen_cost_tenant_category",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 7.08,
+                    "Plan Rows": 212,
+                    "Plan Width": 0,
+                    "Actual Rows": 1429,
+                    "Actual Loops": 1,
+                    "Index Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.035,
+      "Triggers": [],
+      "Execution Time": 0.749
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "tenant=7 AND category BETWEEN 0 AND 1",
+    "k": 500,
+    "execution_ms": 0.825,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 856.61,
+        "Total Cost": 857.14,
+        "Plan Rows": 212,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 856.61,
+            "Total Cost": 857.14,
+            "Plan Rows": 212,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "top-N heapsort",
+            "Sort Space Used": 58,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Bitmap Heap Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 7.14,
+                "Total Cost": 848.42,
+                "Plan Rows": 212,
+                "Plan Width": 16,
+                "Actual Rows": 1429,
+                "Actual Loops": 1,
+                "Recheck Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))",
+                "Rows Removed by Index Recheck": 0,
+                "Exact Heap Blocks": 1429,
+                "Lossy Heap Blocks": 0,
+                "Plans": [
+                  {
+                    "Node Type": "Bitmap Index Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Index Name": "frozen_cost_tenant_category",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 7.08,
+                    "Plan Rows": 212,
+                    "Plan Width": 0,
+                    "Actual Rows": 1429,
+                    "Actual Loops": 1,
+                    "Index Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.03,
+      "Triggers": [],
+      "Execution Time": 0.817
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 1",
+    "k": 50,
+    "execution_ms": 0.481,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 1531.65,
+        "Total Cost": 1533.28,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 1531.65,
+            "Total Cost": 8443.14,
+            "Plan Rows": 212661,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 1531.65,
+                "Total Cost": 5784.87,
+                "Plan Rows": 212661,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 1))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 200003,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.022,
+      "Triggers": [],
+      "Execution Time": 0.299
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 1",
+    "k": 500,
+    "execution_ms": 0.635,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 1531.65,
+        "Total Cost": 1547.9,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 1531.65,
+            "Total Cost": 8443.14,
+            "Plan Rows": 212661,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 1531.65,
+                "Total Cost": 5784.87,
+                "Plan Rows": 212661,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 1))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 200003,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.018,
+      "Triggers": [],
+      "Execution Time": 0.661
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 50,
+    "execution_ms": 0.884,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 3505.76,
+        "Total Cost": 3507.39,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 3505.76,
+            "Total Cost": 36080.71,
+            "Plan Rows": 1002306,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 3505.76,
+                "Total Cost": 23551.89,
+                "Plan Rows": 1002306,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 9))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 1000019,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.017,
+      "Triggers": [],
+      "Execution Time": 0.561
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 500,
+    "execution_ms": 0.934,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 3505.76,
+        "Total Cost": 3522.01,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 3505.76,
+            "Total Cost": 36080.71,
+            "Plan Rows": 1002306,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 3505.76,
+                "Total Cost": 23551.89,
+                "Plan Rows": 1002306,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 9))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 1000019,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.016,
+      "Triggers": [],
+      "Execution Time": 0.745
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 19",
+    "k": 50,
+    "execution_ms": 0.897,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 6054.86,
+        "Total Cost": 6056.49,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 6054.86,
+            "Total Cost": 71768.08,
+            "Plan Rows": 2021945,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 6054.86,
+                "Total Cost": 46493.76,
+                "Plan Rows": 2021945,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 19))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 2000039,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.024,
+      "Triggers": [],
+      "Execution Time": 0.582
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 19",
+    "k": 500,
+    "execution_ms": 0.708,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 6054.86,
+        "Total Cost": 6071.11,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 6054.86,
+            "Total Cost": 71768.08,
+            "Plan Rows": 2021945,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 6054.86,
+                "Total Cost": 46493.76,
+                "Plan Rows": 2021945,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 19))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 2000039,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.016,
+      "Triggers": [],
+      "Execution Time": 0.559
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 50,
+    "execution_ms": 1.09,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 13570.49,
+        "Total Cost": 13572.12,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 13570.49,
+            "Total Cost": 176986.89,
+            "Plan Rows": 5028197,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 13570.49,
+                "Total Cost": 114134.43,
+                "Plan Rows": 5028197,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 49))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 5000099,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.022,
+      "Triggers": [],
+      "Execution Time": 0.768
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 500,
+    "execution_ms": 0.997,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 13570.49,
+        "Total Cost": 13586.74,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 13570.49,
+            "Total Cost": 176986.89,
+            "Plan Rows": 5028197,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 13570.49,
+                "Total Cost": 114134.43,
+                "Plan Rows": 5028197,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 49))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 5000099,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.041,
+      "Triggers": [],
+      "Execution Time": 0.97
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 50,
+    "execution_ms": 0.841,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 25999.32,
+        "Total Cost": 26000.95,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 25999.32,
+            "Total Cost": 350990.52,
+            "Plan Rows": 9999729,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 25999.32,
+                "Total Cost": 225993.9,
+                "Plan Rows": 9999729,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 99))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 10000000,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.023,
+      "Triggers": [],
+      "Execution Time": 0.409
+    }
+  },
+  {
+    "mode": "fixed",
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 500,
+    "execution_ms": 0.624,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 25999.32,
+        "Total Cost": 26015.57,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 25999.32,
+            "Total Cost": 350990.52,
+            "Plan Rows": 9999729,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 25999.32,
+                "Total Cost": 225993.9,
+                "Plan Rows": 9999729,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 99))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 10000000,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.016,
+      "Triggers": [],
+      "Execution Time": 0.516
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "tenant=7 AND category=0",
+    "k": 50,
+    "execution_ms": 0.004,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 434.27,
+        "Total Cost": 434.39,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 0,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 434.27,
+            "Total Cost": 434.53,
+            "Plan Rows": 106,
+            "Plan Width": 16,
+            "Actual Rows": 0,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "quicksort",
+            "Sort Space Used": 25,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "frozen_cost_tenant_category",
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 0.43,
+                "Total Cost": 430.75,
+                "Plan Rows": 106,
+                "Plan Width": 16,
+                "Actual Rows": 0,
+                "Actual Loops": 1,
+                "Index Cond": "((tenant = 7) AND (category = 0))",
+                "Rows Removed by Index Recheck": 0
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.013,
+      "Triggers": [],
+      "Execution Time": 0.003
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "tenant=7 AND category=0",
+    "k": 500,
+    "execution_ms": 0.003,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 434.31,
+        "Total Cost": 434.58,
+        "Plan Rows": 106,
+        "Plan Width": 16,
+        "Actual Rows": 0,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 434.31,
+            "Total Cost": 434.58,
+            "Plan Rows": 106,
+            "Plan Width": 16,
+            "Actual Rows": 0,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "quicksort",
+            "Sort Space Used": 25,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Index Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Scan Direction": "Forward",
+                "Index Name": "frozen_cost_tenant_category",
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 0.43,
+                "Total Cost": 430.75,
+                "Plan Rows": 106,
+                "Plan Width": 16,
+                "Actual Rows": 0,
+                "Actual Loops": 1,
+                "Index Cond": "((tenant = 7) AND (category = 0))",
+                "Rows Removed by Index Recheck": 0
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.012,
+      "Triggers": [],
+      "Execution Time": 0.003
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "tenant=7 AND category BETWEEN 0 AND 1",
+    "k": 50,
+    "execution_ms": 0.739,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 855.46,
+        "Total Cost": 855.59,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 855.46,
+            "Total Cost": 855.99,
+            "Plan Rows": 212,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "top-N heapsort",
+            "Sort Space Used": 28,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Bitmap Heap Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 7.14,
+                "Total Cost": 848.42,
+                "Plan Rows": 212,
+                "Plan Width": 16,
+                "Actual Rows": 1429,
+                "Actual Loops": 1,
+                "Recheck Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))",
+                "Rows Removed by Index Recheck": 0,
+                "Exact Heap Blocks": 1429,
+                "Lossy Heap Blocks": 0,
+                "Plans": [
+                  {
+                    "Node Type": "Bitmap Index Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Index Name": "frozen_cost_tenant_category",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 7.08,
+                    "Plan Rows": 212,
+                    "Plan Width": 0,
+                    "Actual Rows": 1429,
+                    "Actual Loops": 1,
+                    "Index Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.031,
+      "Triggers": [],
+      "Execution Time": 0.727
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "tenant=7 AND category BETWEEN 0 AND 1",
+    "k": 500,
+    "execution_ms": 0.824,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 856.61,
+        "Total Cost": 857.14,
+        "Plan Rows": 212,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Sort",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 856.61,
+            "Total Cost": 857.14,
+            "Plan Rows": 212,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Sort Key": [
+              "((emb <-> '[-1.18177,2.21106,-1.1616,-0.619329,2.57406,-0.459207,0.550887,1.21284,-1.29014,1.30448,2.71664,1.6903,1.30464,0.678974,0.667007,-1.38322,-3.01608,1.43315,-0.643059,-0.318629,2.99942,1.47863,-0.211038,1.1649,2.96755,-0.592196,-2.53263,-0.2009,-3.6184,-1.4723,-1.12008,-2.23166,-0.869712,1.5007,0.972485,-0.621369,-0.588402,-1.92305,0.483794,2.74224,0.636042,0.410046,-0.115549,0.967612,-1.74048,0.493662,0.387937,1.17696,1.2662,0.24647,1.10384,2.59754,-0.333787,0.518754,-0.340767,2.17982,-0.289897,0.275672,1.50298,-2.1882,0.455469,1.26731,1.09343,-1.02913,1.05136,-2.85317,-0.66396,3.33501,0.433614,-1.51916,1.4385,1.73805,-0.640901,-0.628466,0.961145,-1.2757,-0.152105,1.01285,0.152245,-1.7383,-0.00865197,0.401098,0.328796,-1.43176,1.32705,-0.254701,-0.2088,1.52276,-1.55943,-2.36108,-1.22609,-1.61738,-2.02104,-0.779501,-0.101125,-0.189872,0.204149,0.0219272,2.57761,0.916473,-0.648024,1.88697,0.466828,-0.848427,-0.423821,-3.18837,-2.69046,1.83952,-1.50354,-0.150094,1.55309,-1.57689,-1.49073,-0.143903,-2.80055,2.55696,0.67996,-1.42657,1.81907,1.44643,2.97628,0.713795,-2.66493,0.881514,-1.33034,-3.03128,1.19057,-1.49781]'::vector))"
+            ],
+            "Sort Method": "top-N heapsort",
+            "Sort Space Used": 58,
+            "Sort Space Type": "Memory",
+            "Plans": [
+              {
+                "Node Type": "Bitmap Heap Scan",
+                "Parent Relationship": "Outer",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 7.14,
+                "Total Cost": 848.42,
+                "Plan Rows": 212,
+                "Plan Width": 16,
+                "Actual Rows": 1429,
+                "Actual Loops": 1,
+                "Recheck Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))",
+                "Rows Removed by Index Recheck": 0,
+                "Exact Heap Blocks": 1429,
+                "Lossy Heap Blocks": 0,
+                "Plans": [
+                  {
+                    "Node Type": "Bitmap Index Scan",
+                    "Parent Relationship": "Outer",
+                    "Parallel Aware": false,
+                    "Async Capable": false,
+                    "Index Name": "frozen_cost_tenant_category",
+                    "Startup Cost": 0.0,
+                    "Total Cost": 7.08,
+                    "Plan Rows": 212,
+                    "Plan Width": 0,
+                    "Actual Rows": 1429,
+                    "Actual Loops": 1,
+                    "Index Cond": "((tenant = 7) AND (category >= 0) AND (category <= 1))"
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.029,
+      "Triggers": [],
+      "Execution Time": 0.817
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 1",
+    "k": 50,
+    "execution_ms": 0.438,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 5899.51,
+        "Total Cost": 5901.13,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 5899.51,
+            "Total Cost": 12810.99,
+            "Plan Rows": 212661,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 5899.51,
+                "Total Cost": 10152.73,
+                "Plan Rows": 212661,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 1))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "NVFP4 scan, GPU rerank",
+                "Estimated Search Time": 0.645,
+                "Estimated Local Time": 51.502,
+                "Estimated Matching Rows": 212661,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 200003,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.026,
+      "Triggers": [],
+      "Execution Time": 0.287
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 1",
+    "k": 500,
+    "execution_ms": 0.65,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 7637.47,
+        "Total Cost": 7653.72,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 7637.47,
+            "Total Cost": 14548.95,
+            "Plan Rows": 212661,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 7637.47,
+                "Total Cost": 11890.69,
+                "Plan Rows": 212661,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 1))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "NVFP4 scan, GPU rerank",
+                "Estimated Search Time": 0.81,
+                "Estimated Local Time": 50.338,
+                "Estimated Matching Rows": 212661,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 200003,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.051,
+      "Triggers": [],
+      "Execution Time": 0.65
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 50,
+    "execution_ms": 0.645,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 2368.29,
+        "Total Cost": 2369.92,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 2368.29,
+            "Total Cost": 34943.24,
+            "Plan Rows": 1002306,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 2368.29,
+                "Total Cost": 22414.41,
+                "Plan Rows": 1002306,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 9))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "NVFP4 scan, CPU rerank",
+                "Estimated Search Time": 0.772,
+                "Estimated Local Time": 265.295,
+                "Estimated Matching Rows": 1002306,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 1000019,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.027,
+      "Triggers": [],
+      "Execution Time": 0.316
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 9",
+    "k": 500,
+    "execution_ms": 0.737,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 3199.16,
+        "Total Cost": 3215.41,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 3199.16,
+            "Total Cost": 35774.11,
+            "Plan Rows": 1002306,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 3199.16,
+                "Total Cost": 23245.28,
+                "Plan Rows": 1002306,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 9))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "NVFP4 scan, GPU rerank",
+                "Estimated Search Time": 0.969,
+                "Estimated Local Time": 251.404,
+                "Estimated Matching Rows": 1002306,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 1000019,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.018,
+      "Triggers": [],
+      "Execution Time": 0.617
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 19",
+    "k": 50,
+    "execution_ms": 0.699,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 1284.54,
+        "Total Cost": 1286.16,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 1284.54,
+            "Total Cost": 66997.75,
+            "Plan Rows": 2021945,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 1284.54,
+                "Total Cost": 41723.44,
+                "Plan Rows": 2021945,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 19))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "NVFP4 scan, CPU rerank",
+                "Estimated Search Time": 0.967,
+                "Estimated Local Time": 631.812,
+                "Estimated Matching Rows": 2021945,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 2000039,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.02,
+      "Triggers": [],
+      "Execution Time": 0.659
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 19",
+    "k": 500,
+    "execution_ms": 0.78,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 1665.74,
+        "Total Cost": 1681.99,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 1665.74,
+            "Total Cost": 67378.95,
+            "Plan Rows": 2021945,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 1665.74,
+                "Total Cost": 42104.64,
+                "Plan Rows": 2021945,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 19))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "NVFP4 scan, GPU rerank",
+                "Estimated Search Time": 1.161,
+                "Estimated Local Time": 608.217,
+                "Estimated Matching Rows": 2021945,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 2000039,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.051,
+      "Triggers": [],
+      "Execution Time": 0.664
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 50,
+    "execution_ms": 1.013,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 516.47,
+        "Total Cost": 518.09,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 516.47,
+            "Total Cost": 163932.87,
+            "Plan Rows": 5028197,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 516.47,
+                "Total Cost": 101080.41,
+                "Plan Rows": 5028197,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 49))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "CAGRA, CPU rerank",
+                "Estimated Search Time": 0.971,
+                "Estimated Local Time": 1938.177,
+                "Estimated Matching Rows": 5028197,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 5000099,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.026,
+      "Triggers": [],
+      "Execution Time": 0.687
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 49",
+    "k": 500,
+    "execution_ms": 1.348,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 752.65,
+        "Total Cost": 768.9,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 752.65,
+            "Total Cost": 164169.05,
+            "Plan Rows": 5028197,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 752.65,
+                "Total Cost": 101316.59,
+                "Plan Rows": 5028197,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 49))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "CAGRA, CPU rerank",
+                "Estimated Search Time": 1.286,
+                "Estimated Local Time": 1904.6,
+                "Estimated Matching Rows": 5028197,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 5000099,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.051,
+      "Triggers": [],
+      "Execution Time": 1.544
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 50,
+    "execution_ms": 0.899,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 444.3,
+        "Total Cost": 445.92,
+        "Plan Rows": 50,
+        "Plan Width": 16,
+        "Actual Rows": 50,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 444.3,
+            "Total Cost": 325435.49,
+            "Plan Rows": 9999729,
+            "Plan Width": 16,
+            "Actual Rows": 50,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 444.3,
+                "Total Cost": 200438.88,
+                "Plan Rows": 9999729,
+                "Plan Width": 528,
+                "Actual Rows": 50,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 99))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "CAGRA, GPU rerank",
+                "Estimated Search Time": 0.849,
+                "Estimated Local Time": 2286.931,
+                "Estimated Matching Rows": 9999729,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 10000000,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 50,
+                "Mapped TID Rows": 50
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.026,
+      "Triggers": [],
+      "Execution Time": 0.604
+    }
+  },
+  {
+    "mode": "calibrated",
+    "predicate": "category BETWEEN 0 AND 99",
+    "k": 500,
+    "execution_ms": 0.933,
+    "plan": {
+      "Plan": {
+        "Node Type": "Limit",
+        "Parallel Aware": false,
+        "Async Capable": false,
+        "Startup Cost": 728.5,
+        "Total Cost": 744.75,
+        "Plan Rows": 500,
+        "Plan Width": 16,
+        "Actual Rows": 500,
+        "Actual Loops": 1,
+        "Plans": [
+          {
+            "Node Type": "Result",
+            "Parent Relationship": "Outer",
+            "Parallel Aware": false,
+            "Async Capable": false,
+            "Startup Cost": 728.5,
+            "Total Cost": 325719.7,
+            "Plan Rows": 9999729,
+            "Plan Width": 16,
+            "Actual Rows": 500,
+            "Actual Loops": 1,
+            "Plans": [
+              {
+                "Node Type": "Custom Scan",
+                "Parent Relationship": "Outer",
+                "Custom Plan Provider": "AnnFrozenSearch",
+                "Parallel Aware": false,
+                "Async Capable": false,
+                "Relation Name": "frozen_stress",
+                "Alias": "frozen_stress",
+                "Startup Cost": 728.5,
+                "Total Cost": 200723.08,
+                "Plan Rows": 9999729,
+                "Plan Width": 528,
+                "Actual Rows": 500,
+                "Actual Loops": 1,
+                "Filter": "((category >= 0) AND (category <= 99))",
+                "Rows Removed by Filter": 0,
+                "Frozen Index": "frozen_stress_ann",
+                "Estimated GPU Path": "CAGRA, GPU rerank",
+                "Estimated Search Time": 1.247,
+                "Estimated Local Time": 2331.954,
+                "Estimated Matching Rows": 9999729,
+                "Calibration Recall Target": 95.0,
+                "Search Route": "frozen index predicates on GPU worker \"frozen_stress\"",
+                "Columns": "index pages when all-visible",
+                "Filter Rows": 10000000,
+                "Heap Fetches": 0,
+                "Worker Calls": 1,
+                "Local Evaluations": 0,
+                "Materialized Rows": 500,
+                "Mapped TID Rows": 500
+              }
+            ]
+          }
+        ]
+      },
+      "Planning Time": 0.046,
+      "Triggers": [],
+      "Execution Time": 0.933
+    }
+  }
+]
