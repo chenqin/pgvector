@@ -11,16 +11,26 @@
 
 /*
  * Frozen indexes never move a row's ordinal. A deleted row (possible only if
- * someone dropped the guard trigger) keeps its ordinal with an invalid TID,
- * which scans skip, so VACUUM can safely reuse its heap slot.
+ * someone disabled or dropped the guard trigger) keeps its ordinal with an
+ * invalid TID, which scans skip, so VACUUM can safely reuse its heap slot.
+ * The first invalidated TID also clears ANN_FROZEN_PRISTINE in the metapage,
+ * so ann.frozen_immutable never applies to the table again. VACUUM calls this
+ * only with dead rows to remove, which a table it applies to never has.
  */
 IndexBulkDeleteResult *
 AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 					IndexBulkDeleteCallback callback, void *callback_state)
 {
 	Relation	index = info->index;
-	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
+	AnnFrozenMetaData *meta;
 
+	if (AnnFrozenIndexImmutable(index))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot remove rows from frozen ann index \"%s\" while ann.frozen_immutable applies to its table",
+						RelationGetRelationName(index)),
+				 errhint("The table changed after its frozen index was built: VACUUM it with ann.frozen_immutable off.")));
+	meta = AnnFrozenGetMeta(index, false);
 	if (!stats)
 		stats = palloc0_object(IndexBulkDeleteResult);
 	stats->num_index_tuples = 0;

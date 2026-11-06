@@ -19,6 +19,7 @@
  * contiguous ordinal ranges, so key to shard mapping is a binary search.
  */
 #define ANN_INDEX_MAX_SHARDS 64
+#define ANN_INDEX_NO_GRAPH "-"	/* shard file of an index served by quantized scans only */
 #define ANN_INDEX_NAME_MAX 63
 #define ANN_INDEX_MAX_ATTRIBUTES 8
 #define ANN_INDEX_MAX_VALUES 64
@@ -60,7 +61,13 @@ typedef struct AnnIndexPosting
 	uint32_t  **bitsets;		/* nshards bitsets, or NULL */
 } AnnIndexPosting;
 
-/* An int32 column stored per row in key order, inverted at load. */
+/*
+ * An int32 column stored per row in key order, inverted at load. A
+ * multi-valued column (manifest "multivalued") stores each row's elements
+ * instead, rows in key order, with rows + 1 u32 offsets into them; a row
+ * appears once under each of its distinct elements, so the key and ordinal
+ * arrays hold npostings entries, and column stays NULL.
+ */
 typedef struct AnnIndexAttribute
 {
 	char		name[64];
@@ -78,6 +85,15 @@ typedef struct AnnIndexAttribute
 	uint32_t	nstrings;
 	uint32_t   *starts;			/* nstrings + 1 offsets into strings */
 	char	   *strings;
+	/* multi-valued attributes */
+	int			multi;
+	char		offsetsFile[256];
+	const uint32_t *rowOffsets; /* rows + 1, mapped */
+	size_t		offsetsBytes;
+	const int32_t *elements;	/* in the column file's mapping */
+	uint64_t	nelements;
+	uint64_t	npostings;		/* entries of keys and ordinals: rows unless
+								 * multi-valued */
 	/* AnnIndexRemap: the codes rewritten into a collection's dictionary */
 	int32_t    *remap;			/* the map, by part code; NULL until remapped */
 	int32_t    *ownedColumn;	/* the remapped column (column points here) */
@@ -158,6 +174,7 @@ struct AnnIndexFile
 	size_t		quantScalesBytes;
 	size_t		rowScalesBytes;
 	int			quantActive;	/* set by a backend scanning the copy */
+	int			scanOnly;		/* no graphs: every search scans the quantized copy's rows */
 	pthread_mutex_t bitmapMutex;
 	AnnIndexBitmap *bitmaps[ANN_INDEX_BITMAP_BUCKETS];
 	uint64_t	nbitmaps;
@@ -174,6 +191,7 @@ struct AnnIndexFile
 	uint64_t	ndeleted;		/* bits set (atomic reads) */
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
+	uint16_t   *halfVectors;	/* FP16 copy for --rescore fp16, else NULL */
 	size_t		keysBytes;		/* mapped or reserved bytes, for munmap */
 	size_t		vectorsBytes;
 	void	   *device;			/* backend-owned device state */
@@ -216,6 +234,15 @@ typedef struct AnnIndexOptions
 	int			lock_memory;	/* mlock them */
 	int			plain_allocator;	/* --device-allocator plain: cuVS
 									 * allocates with cudaMalloc, no pool */
+	int			scan_off;		/* --scan-routes off: no exact scans in
+								 * place of graph searches (0: on) */
+	uint32_t	scan_max_k;		/* most candidates a scan selects; 0 for
+								 * 2048 */
+	int			rescore;		/* --rescore: how large-k scans re-score their
+								 * candidates (ANN_RESCORE_*) */
+	uint32_t	slack_ratio;	/* --slack-ratio: a quantized scan's extra
+								 * candidates as a percentage of k, at least
+								 * quant_slack (default 100) */
 	uint32_t	rerank_prefetch;	/* candidate lookahead for host vector
 									 * reads */
 	int			replica_routing;	/* 0 home, 1 latency-weighted batch load */
@@ -229,6 +256,17 @@ typedef struct AnnIndexOptions
 								 * reranking */
 } AnnIndexOptions;
 
+/*
+ * Re-scoring of a quantized scan's candidates at k > 24: from the FP32 rows in
+ * host memory (the default), not at all (the scan's distances), from an FP16
+ * copy in host memory (half the RAM), or on the GPU from an FP8 copy made at
+ * load. The last two leave the FP32 rows unlocked.
+ */
+#define ANN_RESCORE_FP32 0
+#define ANN_RESCORE_OFF 1
+#define ANN_RESCORE_FP16 2
+#define ANN_RESCORE_FP8_GPU 3
+
 extern AnnIndexOptions AnnIndexConfig;
 extern AnnCostProfile *AnnIndexCostProfile;
 
@@ -236,6 +274,8 @@ extern AnnCostProfile *AnnIndexCostProfile;
 extern size_t (*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity);
 
 const char *AnnIndexQuantName(int quant);
+uint16_t	AnnIndexHalf(float value);
+float		AnnIndexHalfFloat(uint16_t half);
 
 AnnStatus	AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result);
 void		AnnIndexFileClose(AnnIndexFile *file);
@@ -307,7 +347,7 @@ void		AnnIndexPut(AnnIndexFile *file);
  * Rows matching attribute IN (values): sorted keys and ordinals, and the
  * prebuilt per-shard bitsets when exactly one value has them. A single value
  * returns slices of the index (*owned = 0); several are merged into new
- * arrays the caller frees (*owned = 1).
+ * arrays the caller frees (*owned = 1), each row once.
  */
 AnnStatus	AnnIndexMatch(const AnnIndexFile *file, const char *attribute, const int32_t *values,
 						  uint32_t nvalues, const int64_t **keys, const uint64_t **ordinals,

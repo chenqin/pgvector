@@ -98,7 +98,7 @@ flowchart LR
 | `--predicate-cache N` | An optional cap on the number of cached predicate results per index (default 0, no cap). |
 | `--prewarm on\|off`, `--lock-memory on\|off` | Read loaded index files into memory at load (default on), and `mlock` what searches and filters read (default off; needs `RLIMIT_MEMLOCK`). |
 | `--group-gather-limit ROWS` | Largest filter a group of same-filter searches scans together on a quantized index's tensor cores (default 4,000,000; exact, and 1.5× batched CAGRA's throughput at 10% filters); broader groups run one batched filtered CAGRA search. Cached bitmaps up to the larger of this and `--bitset-gather-limit` keep their rows. |
-| `--quantized-scan on\|off`, `--quant-slack N` | On compute capability 10.x GPUs, gather scans of indexes built with `--quantize` run the [Blackwell module](ann-blackwell.md)'s fused NVFP4/FP8 search (default on); slack applies when k is too large for it. |
+| `--quantized-scan on\|off`, `--quant-slack N` | On compute capability 10.x or 12.x GPUs, gather scans of indexes built with `--quantize` run the [Blackwell module](ann-blackwell.md)'s fused NVFP4/FP8 search (default on); slack applies when k is too large for it. |
 | `--device-bitmaps on\|off` | Keep cached filter bitmaps' per-shard bitsets in GPU memory (default on), instead of copying them per filtered search. |
 | `--max-batch N`, `--delay-us N` | Queries per CAGRA submission, and an optional wait to fill a batch. |
 | `--lanes N` | Concurrent submissions across all GPUs. |

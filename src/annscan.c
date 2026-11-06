@@ -27,6 +27,7 @@ typedef struct AnnScanOpaqueData
 	AnnArrayReader keys;
 	AnnArrayReader vectors;
 	AnnArrayReader *columns;
+	AnnArrayReader *starts;		/* integer[] columns' row starts */
 	Vector	   *vector;
 	MemoryContext tupleCtx;
 } AnnScanOpaqueData;
@@ -223,6 +224,11 @@ ReturnColumns(IndexScanDesc scan, uint64 ordinal)
 	{
 		int32		value;
 
+		if (AnnFrozenMultiType(TupleDescAttr(desc, 2 + c)->atttypid))
+		{
+			values[2 + c] = AnnFrozenArrayDatum(&so->columns[c], &so->starts[c], ordinal, &isnull[2 + c]);
+			continue;
+		}
 		AnnArrayRead(&so->columns[c], ordinal, &value);
 		isnull[2 + c] = value == ANN_FROZEN_NULL;
 		if (AnnFrozenTextType(TupleDescAttr(desc, 2 + c)->atttypid))
@@ -267,8 +273,13 @@ annbeginscan(Relation index, int nkeys, int norderbys)
 		AnnArrayReaderInit(&so->keys, index, &so->meta->keys, NULL);
 		AnnArrayReaderInit(&so->vectors, index, &so->meta->vectors, NULL);
 		so->columns = palloc(sizeof(AnnArrayReader) * Max(so->meta->ncolumns, 1));
+		so->starts = palloc0(sizeof(AnnArrayReader) * Max(so->meta->ncolumns, 1));
 		for (uint32 c = 0; c < so->meta->ncolumns; c++)
+		{
 			AnnArrayReaderInit(&so->columns[c], index, &so->meta->columns[c].values, NULL);
+			if (AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
+				AnnArrayReaderInit(&so->starts[c], index, &AnnFrozenGetExtra(so->meta)[c].starts, NULL);
+		}
 		so->vector = palloc(so->meta->vectors.width);
 		so->tupleCtx = AllocSetContextCreate(CurrentMemoryContext, "Ann scan tuple context",
 											 ALLOCSET_DEFAULT_SIZES);
@@ -352,7 +363,11 @@ annendscan(IndexScanDesc scan)
 		AnnArrayReaderEnd(&so->keys);
 		AnnArrayReaderEnd(&so->vectors);
 		for (uint32 c = 0; c < so->meta->ncolumns; c++)
+		{
 			AnnArrayReaderEnd(&so->columns[c]);
+			if (AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(scan->indexRelation), 2 + c)->atttypid))
+				AnnArrayReaderEnd(&so->starts[c]);
+		}
 		MemoryContextDelete(so->tupleCtx);
 	}
 	ExecDropSingleTupleTableSlot(so->input);

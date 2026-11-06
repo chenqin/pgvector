@@ -115,7 +115,7 @@ class CuvsIndexTests(unittest.TestCase):
             self.assertEqual(outside, '0', function)
 
     def test_blackwell_quantized_gather(self):
-        # On compute capability 10.x GPUs the gather scan scores the NVFP4 or
+        # On compute capability 10.x and 12.x GPUs the gather scan scores the NVFP4 or
         # FP8 copy and re-scores candidates in FP32: rows stay within the
         # filter, distances stay exact, and recall holds.
         import ctypes
@@ -126,7 +126,7 @@ class CuvsIndexTests(unittest.TestCase):
             with self.server.connect() as connection:
                 connection.sendall(frame(15, 1, index.encode()))
                 info = receive(connection)[3]
-            expected = b'quant_scan on' if major.value == 10 else b'quant_scan off'
+            expected = b'quant_scan on' if major.value in (10, 12) else b'quant_scan off'
             self.assertIn(f'quant {quant} '.encode() + expected, info)
             stats = self.psql(f"""
                 SELECT round(avg(cardinality(ARRAY(SELECT unnest(a) INTERSECT SELECT unnest(b)))) / 10, 3),

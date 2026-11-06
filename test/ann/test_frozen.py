@@ -83,8 +83,8 @@ class FrozenTests(unittest.TestCase):
         return '\n'.join(row[0] for row in self.db.execute(
             'EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) ' + statement, params))
 
-    def ordered(self, columns, predicate, query, limit, index):
-        statement = (f'SELECT {columns}, emb <-> %s::vector AS d FROM docs WHERE {predicate} '
+    def ordered(self, columns, predicate, query, limit, index, table='docs'):
+        statement = (f'SELECT {columns}, emb <-> %s::vector AS d FROM {table} WHERE {predicate} '
                      f'ORDER BY emb <-> %s::vector, id LIMIT {limit}')
         # The access method's own scans; the frozen route is tested separately.
         self.db.execute('SET ann.enable_frozen_search = off')
@@ -118,7 +118,7 @@ class FrozenTests(unittest.TestCase):
         self.db.execute('RESET session_replication_role')
 
         self.db.execute('VACUUM (FREEZE) docs')
-        self.assertIn('date, text or varchar', self.error(f'{ann} INCLUDE (id, emb) WITH (frozen = true)'))
+        self.assertIn('text, varchar or integer[]', self.error(f'{ann} INCLUDE (id, emb) WITH (frozen = true)'))
         self.assertIn('smallint, integer or bigint', self.error(f'{ann} INCLUDE (body) WITH (frozen = true)'))
         self.assertIn('partial', self.error(f'{ann} INCLUDE (id) WITH (frozen = true) WHERE tenant = 1'))
         self.assertIn('appears more than once', self.error(f'{ann} INCLUDE (tenant) WITH (frozen = true)'))
@@ -243,6 +243,22 @@ class FrozenTests(unittest.TestCase):
         for predicate in self.FILTERS[:8]:
             self.assert_filter('docs_ann', predicate)
         self.db.execute('RESET ann.frozen_mmap')
+        # Mapped TID pages and no visibility checks for a table that no longer changes.
+        expected = [self.route(predicate, '[1,2,3,4]', 10, route=False)[0] for predicate in self.FILTERS[:6]]
+        self.db.execute('SET ann.frozen_immutable = on')
+        try:
+            self.assertEqual(self.value("SELECT ann_frozen_prewarm('docs_ann')"),
+                             self.value("SELECT pg_relation_size('docs_ann')") - 8192)
+            for predicate, rows in zip(self.FILTERS[:6], expected):
+                self.assertEqual(self.route(predicate, '[1,2,3,4]', 10)[0], rows)
+            # Rows skip their TIDs unless the query reads them.
+            statement = "SELECT id, ctid FROM docs WHERE tenant = 9 ORDER BY emb <-> '[1,2,3,4]' LIMIT 5"
+            routed = self.db.execute(statement).fetchall()
+            self.assertEqual(routed, self.db.execute(
+                f"SELECT id, ctid FROM docs WHERE id = ANY(%s) ORDER BY emb <-> '[1,2,3,4]'",
+                ([row[0] for row in routed],)).fetchall())
+        finally:
+            self.db.execute('RESET ann.frozen_immutable')
         for predicate in ['body = $$x$$', 'tenant = random()::int', 'tenant + 1 = 3']:
             self.assertIn('not a predicate over the INCLUDE attributes',
                           self.error('SELECT * FROM ann_frozen_filter(%s, %s)', ('docs_ann', predicate)))
@@ -276,7 +292,7 @@ class FrozenTests(unittest.TestCase):
         rows = self.db.execute("SELECT id, body FROM docs WHERE tenant = 4 ORDER BY emb <-> '[1,2,3,4]' "
                                'LIMIT 5').fetchall()
         self.assertEqual([row[1] for row in rows], [f'row {row[0] // 5}' for row in rows])
-        # A parameterized LIMIT starts from 100 rows and refills.
+        # A parameterized LIMIT in a generic plan sizes the first request.
         results = []
         for setting in ['on', 'off']:
             self.db.execute(f'SET ann.enable_frozen_search = {setting}')
@@ -291,6 +307,135 @@ class FrozenTests(unittest.TestCase):
         # Unsupported predicates keep ordinary plans.
         plan = self.plan("SELECT id FROM docs WHERE body = 'row 7' ORDER BY emb <-> '[1,2,3,4]' LIMIT 3")
         self.assertNotIn('AnnFrozenSearch', plan)
+
+    def test_immutable_enforcement(self):
+        """ann.frozen_immutable refuses deletes, and applies only while the guard fires always on an unchanged table."""
+        self.create()
+        statement = "SELECT id, tenant FROM docs WHERE tenant = 4 ORDER BY emb <-> '[1,2,3,4]' LIMIT 25"
+
+        def columns():
+            plan = self.plan(statement)
+            self.assertIn('AnnFrozenSearch', plan)
+            return [line.strip() for line in plan.splitlines() if 'Columns:' in line or 'Qual Recheck:' in line]
+
+        def matches_sql():
+            actual, plan = self.route('tenant = 4', '[1,2,3,4]', 25)
+            self.assertEqual(actual, self.route('tenant = 4', '[1,2,3,4]', 25, route=False)[0])
+            self.assertIn('AnnFrozenSearch', plan)
+            return plan
+
+        self.db.execute('SET ann.frozen_immutable = on')
+        try:
+            self.assertIn('ann.frozen_immutable is on', self.error('SELECT ann_frozen_delete(%s, %s)',
+                                                                   ('docs', [5])))
+            self.assertEqual(self.value("SELECT count(*) FROM ann_frozen_tombstone WHERE source = 'docs'::regclass"),
+                             0)
+            # VACUUM has no dead rows to remove from a guarded table.
+            self.db.execute('VACUUM docs')
+            self.db.execute('VACUUM (FREEZE) docs')
+
+            immutable = ['Columns: index pages', 'Qual Recheck: false']
+            mutable = ['Columns: index pages when all-visible', 'Qual Recheck: true']
+            self.assertEqual(columns(), immutable)
+            # A disabled guard: TIDs through shared buffers, the visibility map checked, quals rechecked.
+            self.db.execute('ALTER TABLE docs DISABLE TRIGGER ann_frozen_guard')
+            self.assertEqual(columns(), mutable)
+            # Enabled as origin: sessions in replica mode and replication workers could still write.
+            self.db.execute('ALTER TABLE docs ENABLE TRIGGER ann_frozen_guard')
+            self.assertEqual(columns(), mutable)
+            self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_guard')
+            self.assertEqual(columns(), immutable)
+
+            # Rows deleted under a disabled guard leave pages not all-visible: they come from the heap,
+            # even once the guard fires again.
+            self.db.execute('ALTER TABLE docs DISABLE TRIGGER ann_frozen_guard')
+            self.db.execute('DELETE FROM docs WHERE tenant = 4 AND id % 10 = 0')
+            self.assertNotIn('Heap Fetches: 0', matches_sql())
+            self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_guard')
+            self.assertEqual(columns(), mutable)
+            self.assertNotIn('Heap Fetches: 0', matches_sql())
+            # VACUUM removes them whatever the setting, and the index stays modified once pages are
+            # all-visible again.
+            self.vacuum('docs')
+            self.assertTrue(self.value("SELECT relallvisible = relpages FROM pg_class WHERE oid = 'docs'::regclass"))
+            self.assertEqual(columns(), mutable)
+            matches_sql()
+            self.db.execute('ALTER TABLE docs DISABLE TRIGGER ann_frozen_guard')
+            self.db.execute('ALTER TABLE docs ENABLE ALWAYS TRIGGER ann_frozen_guard')
+            self.assertEqual(columns(), mutable)
+            matches_sql()
+        finally:
+            self.db.execute('RESET ann.frozen_immutable')
+        matches_sql()
+
+    def test_immutable_without_recheck(self):
+        """Rows from the pages of an immutable table skip the qual recheck and still equal SQL."""
+        self.create()
+        rng = random.Random(11)
+        queries = [str([rng.uniform(-50, 50), rng.uniform(-40, 40), rng.uniform(-30, 30), rng.uniform(0, 5)])
+                   for _ in self.FILTERS]
+        expected = [self.route(predicate, query, 25, route=False)[0]
+                    for predicate, query in zip(self.FILTERS, queries)]
+        self.db.execute('SET ann.frozen_immutable = on')
+        try:
+            for recheck in ['off', 'on']:
+                self.db.execute(f'SET ann.frozen_recheck = {recheck}')
+                for predicate, query, rows in zip(self.FILTERS, queries, expected):
+                    actual, plan = self.route(predicate, query, 25)
+                    self.assertEqual(actual, rows, (predicate, recheck))
+                    if predicate not in ('true', 'false'):
+                        self.assertIn('AnnFrozenSearch', plan, predicate)
+                        self.assertIn('Heap Fetches: 0', plan, predicate)
+                        self.assertIn('Qual Recheck: ' + ('true' if recheck == 'on' else 'false'), plan, predicate)
+            self.db.execute('RESET ann.frozen_recheck')
+            # Rows from the heap keep the recheck.
+            statement = "SELECT id, body FROM docs WHERE tenant = 4 ORDER BY emb <-> '[1,2,3,4]' LIMIT 5"
+            self.assertIn('Qual Recheck: true', self.plan(statement))
+            rows = self.db.execute(statement).fetchall()
+            self.assertEqual([row[1] for row in rows], [f'row {row[0] // 5}' for row in rows])
+            # Columns only the quals read aren't needed for the rows.
+            statement = "SELECT id FROM docs WHERE category = 3 ORDER BY emb <-> '[1,2,3,4]' LIMIT 40"
+            routed = [row[0] for row in self.db.execute(statement)]
+            self.db.execute('SET ann.enable_frozen_search = off')
+            self.assertEqual(routed, [row[0] for row in self.db.execute(statement)])
+            self.db.execute('RESET ann.enable_frozen_search')
+        finally:
+            self.db.execute('RESET ann.frozen_recheck')
+            self.db.execute('RESET ann.frozen_immutable')
+
+    def test_generic_plan_limit(self):
+        """A generic plan's LIMIT $n (and OFFSET) asks the worker for that many rows in one call."""
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            name = 'generic_' + uuid.uuid4().hex[:8]
+            self.load(server, name)
+            self.db.execute('SET plan_cache_mode = force_generic_plan')
+            self.db.execute('PREPARE nearest(int, vector, int, int) AS SELECT id FROM docs WHERE tenant <> $1 '
+                            'ORDER BY emb <-> $2 LIMIT $3 OFFSET $4')
+            try:
+                for limit, offset in [(700, 0), (30, 20), (5, 0)]:
+                    execute = f"EXECUTE nearest(3, '[5,5,5,1]', {limit}, {offset})"
+                    plan = self.plan(execute)
+                    self.assertIn(f'GPU worker "{name}"', plan)
+                    self.assertIn('Worker Calls: 1', plan, plan)
+                    self.assertIn('Worker Reply Short: false', plan, plan)
+                    generic = [row[0] for row in self.db.execute(execute)]
+                    literal = [row[0] for row in self.db.execute(
+                        "SELECT id FROM docs WHERE tenant <> 3 ORDER BY emb <-> '[5,5,5,1]' "
+                        f'LIMIT {limit} OFFSET {offset}')]
+                    self.assertEqual(len(generic), limit)
+                    self.assertEqual(generic, literal, (limit, offset))
+                # LIMIT NULL is no limit: the scan starts from 100 rows and refills.
+                rows = self.db.execute("EXECUTE nearest(3, '[5,5,5,1]', NULL, 0)").fetchall()
+                self.assertEqual(len(rows), self.value('SELECT count(*) FROM docs WHERE tenant <> 3'))
+            finally:
+                self.db.execute('DEALLOCATE nearest')
+                self.db.execute('RESET plan_cache_mode')
+        finally:
+            server.close()
 
     def test_partition_base_and_delta(self):
         self.create(table='base', index=False)
@@ -1185,6 +1330,255 @@ class FrozenTests(unittest.TestCase):
         finally:
             server.close()
 
+    TAG_FILTERS = ["tags && '{1,5}'", "NOT (tags && '{1}')", "tags && '{}'", "NOT (tags && '{}')",
+                   "tags && '{NULL,1}'", "NOT (tags && '{NULL,7}')", "'{2,40}' && tags", "tags && '{99}'",
+                   "tags && ARRAY[3, 3, -2147483648]", 'tags IS NULL', 'tags IS NOT NULL',
+                   "tenant = 3 OR tags && '{7}'", "NOT (tenant = 3 AND tags && '{7}')",
+                   "tags && '{4,8}' AND tags && '{12,16,20}'", 'tags && NULL']
+
+    def create_tags(self, table='tagged', first=1, last=2000, index=True, options=''):
+        """Rows with keys 5 * first .. 5 * last; tenant 0..12; tags NULL, '{}', '{3,3}', '{5,1}' or 1..9
+        values of 0..40 with repeats."""
+        self.db.execute(f'CREATE TABLE {table} (id bigint, tenant int, tags int[], emb vector(4))')
+        self.db.execute(f"""INSERT INTO {table} SELECT i * 5, i % 13,
+                                CASE i % 10 WHEN 0 THEN NULL WHEN 1 THEN '{{}}'::int[] WHEN 2 THEN '{{3,3}}'
+                                    WHEN 3 THEN '{{5,1}}' ELSE ARRAY(SELECT abs(hashint4(i * 7 + j)) % 41
+                                                                     FROM generate_series(1, 1 + i % 9) j) END,
+                                ARRAY[sin(i) * 50, cos(i * 1.3) * 40, sin(i * 0.7) * 30, i % 5]::vector
+                            FROM generate_series({last}, {first}, -1) i""")
+        self.assertTrue(self.value(f"SELECT ann_freeze('{table}')"))
+        self.vacuum(table)
+        if index:
+            self.db.execute(f'CREATE INDEX {table}_ann ON {table} USING ann (emb vector_l2_ops) '
+                            f'INCLUDE (id, tenant, tags) WITH (frozen = true{options})')
+
+    def tag_route(self, predicate, query, limit, route=True, table='tagged'):
+        statement = (f'SELECT id, tenant, tags, emb <-> %s::vector AS d FROM {table} WHERE {predicate} '
+                     f'ORDER BY emb <-> %s::vector, id LIMIT {limit}')
+        self.db.execute('SET ann.enable_frozen_search = ' + ('on' if route else 'off'))
+        self.db.execute('SET enable_indexscan = ' + ('on' if route else 'off'))
+        self.db.execute('SET enable_indexonlyscan = ' + ('on' if route else 'off'))
+        try:
+            rows = self.db.execute(statement, (query, query)).fetchall()
+            plan = self.plan(statement, (query, query))
+        finally:
+            for setting in ['ann.enable_frozen_search', 'enable_indexscan', 'enable_indexonlyscan']:
+                self.db.execute(f'RESET {setting}')
+        return rows, plan
+
+    def metapage_version(self, index):
+        """The version in the metapage header (after the page header and the magic number)."""
+        data = self.value('SELECT pg_read_binary_file(pg_relation_filepath(%s), 28, 4)', (index,))
+        return int.from_bytes(bytes(data), 'little')
+
+    def test_multi_valued_attributes(self):
+        """integer[] INCLUDE columns: && translated to one OVERLAP leaf, rows equal SQL on the pages and the route."""
+        self.create_tags()
+        self.db.execute('CREATE INDEX tagged_bits ON tagged USING ann (emb vector_l2_ops) '
+                        'INCLUDE (id, tenant, tags) WITH (frozen = true, bitset_min = 0)')
+        for predicate in self.TAG_FILTERS:
+            for index in ['tagged_ann', 'tagged_bits']:
+                eligible, bitmap = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                                   (index, predicate)).fetchone()
+                expected = [row[0] for row in self.db.execute(f'SELECT id FROM tagged WHERE {predicate} ORDER BY id')]
+                self.assertEqual(self.bitmap_rows(bytes(bitmap)), expected, (index, predicate))
+                self.assertEqual(eligible, len(expected), (index, predicate))
+        self.db.execute('DROP INDEX tagged_bits')
+        rng = random.Random(13)
+        for predicate in self.TAG_FILTERS:
+            query = str([rng.uniform(-50, 50), rng.uniform(-40, 40), rng.uniform(-30, 30), rng.uniform(0, 5)])
+            actual, plan = self.tag_route(predicate, query, 30)
+            expected, _ = self.tag_route(predicate, query, 30, route=False)
+            self.assertEqual(actual, expected, predicate)
+            if predicate != 'tags && NULL':
+                self.assertIn('AnnFrozenSearch', plan, predicate)
+                self.assertIn('Heap Fetches: 0', plan, predicate)
+        # Rows built from the pages hold the heap's arrays: NULL and '{}', order and repeats.
+        returned = dict((row[0], row[2]) for row in self.tag_route('true', '[1,2,3,4]', 2000)[0])
+        self.assertEqual(returned, dict(self.db.execute('SELECT id, tags FROM tagged').fetchall()))
+        self.assertIsNone(returned[50])
+        self.assertEqual((returned[55], returned[60], returned[65]), ([], [3, 3], [5, 1]))
+        # Without a recheck on an immutable table, the program alone selects the rows.
+        self.db.execute('SET ann.frozen_immutable = on')
+        try:
+            for predicate in self.TAG_FILTERS[:6]:
+                actual, plan = self.tag_route(predicate, '[3,1,4,1]', 25)
+                self.assertIn('Qual Recheck: false', plan, predicate)
+                self.assertEqual(actual, self.tag_route(predicate, '[3,1,4,1]', 25, route=False)[0], predicate)
+        finally:
+            self.db.execute('RESET ann.frozen_immutable')
+        # A parameter, in a generic plan.
+        self.db.execute('SET plan_cache_mode = force_generic_plan')
+        try:
+            results = []
+            for setting in ['on', 'off']:
+                self.db.execute(f'SET ann.enable_frozen_search = {setting}')
+                self.db.execute('PREPARE tagged_near(int[], vector) AS SELECT id, tags FROM tagged '
+                                'WHERE tags && $1 ORDER BY emb <-> $2, id LIMIT 40')
+                execute = "EXECUTE tagged_near('{7,NULL,9,7}', '[5,5,5,1]')"
+                plan = self.plan(execute)
+                self.assertEqual('AnnFrozenSearch' in plan, setting == 'on', plan)
+                results.append(self.db.execute(execute).fetchall())
+                self.db.execute('DEALLOCATE tagged_near')
+            self.assertEqual(results[0], results[1])
+            self.assertEqual(len(results[0]), 40)
+        finally:
+            self.db.execute('RESET plan_cache_mode')
+            self.db.execute('RESET ann.enable_frozen_search')
+        # More values than a leaf holds, or other array operators: ordinary plans, SQL's rows.
+        huge = "tags && '{" + ','.join(str(i) for i in range(1000, 71000)) + ",7}'"
+        for predicate in [huge, "tags @> '{1}'", '1 = ANY(tags)', "tags = '{5,1}'", "tags <@ '{1,5}'",
+                          'tags[1] = 3', 'cardinality(tags) > 3']:
+            actual, plan = self.tag_route(predicate, '[1,2,3,4]', 20)
+            self.assertNotIn('AnnFrozenSearch', plan, predicate[:40])
+            self.assertEqual(actual, self.tag_route(predicate, '[1,2,3,4]', 20, route=False)[0], predicate[:40])
+            if predicate != huge:
+                self.assertIn('not a predicate over the INCLUDE attributes',
+                              self.error('SELECT * FROM ann_frozen_filter(%s, %s)', ('tagged_ann', predicate)))
+        # The access method's ordered scans return the arrays as index-only scans.
+        actual, plan = self.ordered('id, tags', 'true', '[11,-7,3,2]', 300, True, table='tagged')
+        self.assertIn('Index Only Scan using tagged_ann', plan)
+        self.assertEqual(actual, self.ordered('id, tags', 'true', '[11,-7,3,2]', 300, False, table='tagged')[0])
+        # Keys of rows holding any of the values, each once.
+        for values in [[1, 5, 3], [40], [3], [], [None, 7, 7], [-2147483648]]:
+            actual = [row[0] for row in self.db.execute('SELECT ann_frozen_keys(%s, %s, %s::int[])',
+                                                        ('tagged_ann', 'tags', values))]
+            expected = [row[0] for row in self.db.execute(
+                'SELECT id FROM tagged WHERE tags && %s::int[] ORDER BY id', (values,))]
+            self.assertEqual(actual, expected, values)
+
+    def test_multi_valued_layout(self):
+        """Version 5 only with an integer[] attribute; build refusals; generations; row starts."""
+        self.create()
+        self.create_tags()
+        self.assertEqual(self.metapage_version('docs_ann'), 4)
+        self.assertEqual(self.metapage_version('tagged_ann'), 5)
+        structures = [row[0] for row in self.db.execute("SELECT structure FROM ann_frozen_sizes('docs_ann')")]
+        self.assertEqual(structures, ['tids', 'keys', 'vectors (float)'] + [
+            f'{column} {kind}' for column in ['tenant', 'category']
+            for kind in ['values', 'distinct values', 'offsets', 'postings', 'bitsets']])
+        structures = [row[0] for row in self.db.execute("SELECT structure FROM ann_frozen_sizes('tagged_ann')")]
+        self.assertEqual(structures[-6:], ['tags values', 'tags row starts', 'tags distinct values', 'tags offsets',
+                                           'tags postings', 'tags bitsets'])
+        info = self.db.execute("SELECT rows, attributes, distinct_values FROM ann_frozen_info('tagged_ann')")
+        distinct = self.value('SELECT count(DISTINCT e) + 1 FROM tagged, unnest(tags) e')  # and NULL
+        self.assertEqual(info.fetchone(), (2000, ['tenant', 'tags'], [13, distinct]))
+        # Arrays the index can't return as stored, or holding the value that stands for NULL.
+        for table, value, message in [('nullelement', "'{1,NULL}'", 'cannot hold NULL elements'),
+                                      ('square', "'{{1,2},{3,4}}'", 'one-dimensional'),
+                                      ('shifted', "'[0:1]={1,2}'", 'one-dimensional'),
+                                      ('reserved', "'{7,-2147483648}'", 'out of range')]:
+            self.db.execute(f'CREATE TABLE {table} (LIKE tagged)')
+            self.db.execute(f"INSERT INTO {table} VALUES (1, 1, '{{}}', '[1,2,3,4]'), (2, 1, {value}, '[1,2,3,4]')")
+            self.db.execute(f"SELECT ann_freeze('{table}')")
+            self.vacuum(table)
+            self.assertIn(message, self.error(f'CREATE INDEX ON {table} USING ann (emb vector_l2_ops) '
+                                              'INCLUDE (id, tags) WITH (frozen = true)'), table)
+        # The same rows in another order hash the same; one changed element changes the generation.
+        generation = self.value("SELECT generation FROM ann_frozen_info('tagged_ann')")
+        build = 'CREATE INDEX copy_ann ON copy USING ann (emb vector_l2_ops) INCLUDE (id, tenant, tags) WITH (frozen = true)'
+        self.db.execute('CREATE TABLE copy AS SELECT * FROM tagged ORDER BY random()')
+        self.db.execute("SELECT ann_freeze('copy')")
+        self.vacuum('copy')
+        self.db.execute(build)
+        self.assertEqual(self.value("SELECT generation FROM ann_frozen_info('copy_ann')"), generation)
+        for change in ["tags = '{3}' WHERE id = 10", "tags = '{}' WHERE id = 50", "tags = '{1,5}' WHERE id = 15"]:
+            self.db.execute('DROP INDEX copy_ann')
+            self.db.execute('DROP TRIGGER ann_frozen_guard ON copy')
+            self.db.execute(f'UPDATE copy SET {change}')
+            self.db.execute("SELECT ann_freeze('copy')")
+            self.vacuum('copy')
+            self.db.execute(build)
+            changed = self.value("SELECT generation FROM ann_frozen_info('copy_ann')")
+            self.assertNotEqual(changed, generation, change)
+            generation = changed
+
+    def read_ints(self, path, code):
+        import array
+
+        values = array.array(code)
+        with open(path, 'rb') as source:
+            values.frombytes(source.read())
+        return values.tolist()
+
+    def assert_multi_files(self, directory, table):
+        """attr-tags.i32 and attr-tags.offsets hold the table's arrays in key order."""
+        rows = self.db.execute(f'SELECT tags FROM {table} ORDER BY id').fetchall()
+        elements = self.read_ints(os.path.join(directory, 'attr-tags.i32'), 'i')
+        offsets = self.read_ints(os.path.join(directory, 'attr-tags.offsets'), 'I')
+        self.assertEqual(len(offsets), len(rows) + 1)
+        self.assertEqual((offsets[0], offsets[-1]), (0, len(elements)))
+        self.assertEqual([elements[offsets[i]:offsets[i + 1]] for i in range(len(rows))],
+                         [row[0] if row[0] is not None else [-2 ** 31] for row in rows])
+
+    def test_multi_valued_export(self):
+        """ann_index_export writes elements and row offsets; the builder links them, or rebases them across members."""
+        self.create_tags()
+        export = os.path.join(self.directory.name, 'export')
+        self.assertEqual(self.value('SELECT ann_index_export(%s, %s)', ('tagged_ann', export)), 2000)
+        with open(os.path.join(export, 'manifest')) as manifest:
+            lines = manifest.read().splitlines()
+        position = lines.index('attribute tags attr-tags.i32')
+        self.assertEqual(lines[position + 1], 'multivalued tags attr-tags.offsets')
+        self.assertIn('attribute tenant attr-tenant.i32', lines)
+        self.assert_multi_files(export, 'tagged')
+        built = os.path.join(self.directory.name, 'built')
+        subprocess.run([sys.executable, BUILD, '--from-export', export, '--out', built, '--no-cagra'],
+                       check=True, capture_output=True)
+        with open(os.path.join(built, 'manifest')) as manifest:
+            lines = manifest.read().splitlines()
+        position = lines.index('attribute tags attr-tags.i32')
+        self.assertEqual(lines[position + 1], 'multivalued tags attr-tags.offsets')
+        for name in ['attr-tags.i32', 'attr-tags.offsets']:
+            self.assertTrue(filecmp.cmp(os.path.join(export, name), os.path.join(built, name), shallow=False))
+        # Two key ranges combined: the elements concatenated, the offsets rebased.
+        self.create_tags(table='low', first=1, last=900)
+        self.create_tags(table='high', first=901, last=2000)
+        members = []
+        for table in ['high', 'low']:
+            members += ['--from-export', os.path.join(self.directory.name, table)]
+            self.db.execute('SELECT ann_index_export(%s, %s)', (f'{table}_ann', members[-1]))
+        combined = os.path.join(self.directory.name, 'combined')
+        subprocess.run([sys.executable, BUILD, *members, '--out', combined, '--no-cagra'],
+                       check=True, capture_output=True)
+        with open(os.path.join(combined, 'manifest')) as manifest:
+            lines = manifest.read().splitlines()
+        position = lines.index('attribute tags attr-tags.i32')
+        self.assertEqual(lines[position + 1], 'multivalued tags attr-tags.offsets')
+        self.assert_multi_files(combined, 'tagged')
+        # The table path refuses arrays.
+        result = subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'{self.schema}.tagged',
+                                 '--key', 'id', '--vector', 'emb', '--out', os.path.join(self.directory.name, 'sql'),
+                                 '--no-cagra', '--attribute', 'tags'], capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('is an array', result.stderr)
+
+    def test_multi_valued_worker_route(self):
+        """The worker's OVERLAP evaluation from its postings equals the pages', and the route equals SQL."""
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+                       stdout=subprocess.DEVNULL)
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create_tags()
+            name = 'tagged_' + uuid.uuid4().hex[:8]
+            self.load(server, name, table='tagged')
+            for predicate in self.TAG_FILTERS:
+                worker = self.db.execute('SELECT eligible, bitmap FROM ann_index_filter(%s, %s)',
+                                         (name, predicate)).fetchone()
+                pages = self.db.execute('SELECT eligible, bitmap FROM ann_frozen_filter(%s, %s)',
+                                        ('tagged_ann', predicate)).fetchone()
+                self.assertEqual((worker[0], bytes(worker[1])), (pages[0], bytes(pages[1])), predicate)
+            rng = random.Random(17)
+            for predicate in self.TAG_FILTERS[:-1]:
+                query = str([rng.uniform(-50, 50), rng.uniform(-40, 40), rng.uniform(-30, 30), 2])
+                actual, plan = self.tag_route(predicate, query, 20)
+                expected, _ = self.tag_route(predicate, query, 20, route=False)
+                self.assertEqual([row[:3] for row in actual], [row[:3] for row in expected], predicate)
+                self.assertIn(f'GPU worker "{name}"', plan, predicate)
+                self.assertNotIn('Worker Calls: 0', plan, predicate)
+        finally:
+            server.close()
+
 
 
 @unittest.skipUnless(os.environ.get('ANN_CUVS_TEST') and DSN, 'set ANN_CUVS_TEST=1 and ANN_PG_DSN on a cuVS host')
@@ -1256,6 +1650,134 @@ class FrozenCuvsTests(unittest.TestCase):
         finally:
             db.execute('ROLLBACK')
             db.execute('DELETE FROM ann_frozen_tombstone WHERE source=to_regclass(%s)', (table,))
+            db.execute(f'DROP TABLE IF EXISTS {table}')
+            db.close()
+            server.close()
+            directory.cleanup()
+
+
+    def test_large_k_scan_route(self):
+        """k beyond CAGRA's 1,024 limit, and k = 500 on a quantized index, run as exact tensor-core scans."""
+        self.check_scan_route([], ((500, ''), (1500, ''), (1500, 'WHERE tenant < 30')))
+
+    def test_scan_only_index(self):
+        """An index without CAGRA graphs serves every k, filtered or not, from the quantized scan."""
+        # Limits far under the filters' sizes, as at 11.6M rows, where a predicate's bitmap would otherwise keep
+        # bitsets only: on an index without graphs every filter is scanned from its rows.
+        self.check_scan_route(['--scan-only'], ((10, ''), (500, ''), (1500, ''), (500, 'WHERE tenant < 3'),
+                                                (1500, 'WHERE tenant < 30')),
+                              worker_args=('--group-gather-limit', '1000', '--bitset-gather-limit', '1000'))
+
+    def test_rescore_modes(self):
+        """Large-k candidates re-scored from FP16 rows, on the GPU from FP8 rows, or not at all."""
+        # Floors for random 32-dimension rows at half of k as slack: FP8's 3 mantissa bits reorder close
+        # candidates, unscored NVFP4 more so. The experiments measure recall on real segments.
+        for mode, floor in (('fp16', 0.97), ('fp8-gpu', 0.9), ('off', 0.7)):
+            with self.subTest(mode=mode):
+                self.check_scan_route(['--scan-only'], ((500, ''), (1500, 'WHERE tenant < 30')),
+                                      worker_args=('--rescore', mode, '--slack-ratio', '50'), floor=floor)
+
+    def check_concurrent_large_k(self, db, table, server, floor=0.99):
+        """Concurrent k = 500 searches over one filter share grouped tensor-core passes and stay exact."""
+        import psycopg
+
+        statement = f'SELECT id FROM {table} WHERE tenant < 30 ORDER BY emb <-> %s::vector LIMIT 500'
+        queries = [row[0] for row in db.execute(f'SELECT emb::text FROM {table} WHERE id % 1201 = 0 LIMIT 24')]
+        db.execute('SET ann.enable_frozen_search = off')
+        db.execute('SET enable_indexscan = off')
+        exact = [{row[0] for row in db.execute(statement, (query,))} for query in queries]
+        db.execute('SET ann.enable_frozen_search = on')
+        db.execute('RESET enable_indexscan')
+        barrier = threading.Barrier(len(queries))
+        found = [None] * len(queries)
+        errors = []
+
+        def search(i):
+            try:
+                with psycopg.connect(DSN, autocommit=True) as connection:
+                    connection.execute("SELECT set_config('ann.worker_socket', %s, false)", (server.path,))
+                    connection.execute('SET ann.gpu_min_eligible = 0')
+                    connection.execute(statement, (queries[i],)).fetchall()
+                    barrier.wait()
+                    results = []
+                    for _ in range(4):
+                        results.append({row[0] for row in connection.execute(statement, (queries[i],))})
+                    found[i] = results
+            except BaseException as error:
+                errors.append(error)
+                barrier.abort()
+
+        threads = [threading.Thread(target=search, args=(i,)) for i in range(len(queries))]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        for i, results in enumerate(found):
+            for result in results:
+                self.assertGreaterEqual(len(result & exact[i]) / 500, floor, f'query {i}')
+        server.process.terminate()
+        server.process.wait(5)
+        log = server.process.stderr.read().decode(errors='replace')
+        self.assertIn('grouped large-k scan', log, log[-3000:])
+        self.assertIn('bounded candidates', log, log[-3000:])
+        self.assertNotIn('failed', log, log[-3000:])
+        self.assertNotIn('job by job', log, log[-3000:])
+
+    def check_scan_route(self, build_args, cases, worker_args=(), floor=0.99):
+        import psycopg
+        from psycopg import sql
+
+        directory = tempfile.TemporaryDirectory()
+        os.chmod(directory.name, 0o777)
+        server = Server('--backend', 'cuvs', '--lanes', '4', *worker_args,
+                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'), env={'ANN_SCAN_DEBUG': '1'})
+        db = psycopg.connect(DSN, autocommit=True)
+        table = 'ann_frozen_scan_' + uuid.uuid4().hex[:8]
+        rows = 30000
+        try:
+            db.execute('SET synchronous_commit = on')
+            db.execute(f'CREATE TABLE {table} (id bigint, tenant int, emb vector(32))')
+            db.execute('SELECT setseed(0.7)')
+            db.execute(f"""INSERT INTO {table} SELECT i * 3, i % 40,
+                               (SELECT array_agg(random()::real) FROM generate_series(1, 32) WHERE i > 0)::vector
+                           FROM generate_series(1, {rows}) i""")
+            db.execute(f"SELECT ann_freeze('{table}')")
+            db.execute(f'VACUUM (FREEZE) {table}')
+            db.execute(f'CREATE INDEX {table}_ann ON {table} USING ann (emb vector_l2_ops) '
+                       'INCLUDE (id, tenant) WITH (frozen = true)')
+            export = os.path.join(directory.name, 'export')
+            db.execute('SELECT ann_index_export(%s, %s)', (f'{table}_ann', export))
+            path = os.path.join(directory.name, 'index')
+            subprocess.run([sys.executable, BUILD, '--from-export', export, '--out', path, '--shards', '2',
+                            '--quantize', 'nvfp4'] + build_args, check=True, capture_output=True)
+            db.execute('SET ann.worker_socket = %s' % sql.Literal(server.path).as_string(db))
+            db.execute('SET ann.gpu_min_eligible = 0')
+            self.assertEqual(db.execute('SELECT ann_index_load(%s, %s)', (table, path)).fetchone()[0], rows)
+            for k, filtered in cases:
+                query = db.execute(f'SELECT emb::text FROM {table} WHERE id = 300').fetchone()[0]
+                statement = f"SELECT id FROM {table} {filtered} ORDER BY emb <-> %s::vector LIMIT {k}"
+                plan = '\n'.join(row[0] for row in db.execute('EXPLAIN (ANALYZE, COSTS OFF) ' + statement,
+                                                              (query,)).fetchall())
+                self.assertIn('Worker Route: exact scan', plan, plan)
+                self.assertIn('Local Evaluations: 0', plan, plan)
+                found = [row[0] for row in db.execute(statement, (query,)).fetchall()]
+                db.execute('SET ann.enable_frozen_search = off')
+                db.execute('SET enable_indexscan = off')
+                exact = [row[0] for row in db.execute(statement, (query,)).fetchall()]
+                db.execute('SET ann.enable_frozen_search = on')
+                db.execute('RESET enable_indexscan')
+                self.assertEqual(len(found), k)
+                overlap = len(set(found) & set(exact)) / k
+                self.assertGreaterEqual(overlap, floor, f'k={k} {filtered}: overlap {overlap}')
+            if '--scan-only' in build_args:
+                self.check_concurrent_large_k(db, table, server, floor)
+        except BaseException:
+            server.process.terminate()
+            server.process.wait(5)
+            print('WORKER LOG:\n' + server.process.stderr.read().decode(errors='replace')[-3000:])
+            raise
+        finally:
             db.execute(f'DROP TABLE IF EXISTS {table}')
             db.close()
             server.close()

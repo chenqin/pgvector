@@ -2045,7 +2045,8 @@ PushTombstones(FunctionCallInfo fcinfo, const char *name, const char *source)
  * every loaded export of the table, and the frozen route leaves them out.
  * Other scans of the table still see them; rebuild the table without them
  * (then clear their tombstones) to remove them for good. Returns how many
- * were newly recorded.
+ * were newly recorded. Refused under ann.frozen_immutable, whose scans read
+ * the tombstones only once per generation.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_delete);
 Datum
@@ -2065,6 +2066,11 @@ ann_frozen_delete(PG_FUNCTION_ARGS)
 	ListCell   *cell;
 
 	RequireSuperuser("delete from");
+	if (ann_frozen_immutable)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("cannot delete from \"%s\" while ann.frozen_immutable is on", get_rel_name(table)),
+				 errhint("Rebuild the table without the rows, or delete with ann.frozen_immutable off.")));
 	if (!AnnFrozenTableFrozen(table))
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),

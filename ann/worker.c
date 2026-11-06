@@ -433,8 +433,30 @@ main(int argc, char **argv)
 			AnnIndexConfig.group_gather_limit = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--quantized-scan") == 0)
 			AnnIndexConfig.quantized_scan = strcmp(value, "off") != 0;
+		else if (strcmp(argv[i], "--scan-routes") == 0)
+			AnnIndexConfig.scan_off = strcmp(value, "off") == 0;
+		else if (strcmp(argv[i], "--scan-max-k") == 0)
+			AnnIndexConfig.scan_max_k = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--quant-slack") == 0)
 			AnnIndexConfig.quant_slack = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--slack-ratio") == 0)
+			AnnIndexConfig.slack_ratio = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--rescore") == 0)
+		{
+			if (strcmp(value, "fp32") == 0)
+				AnnIndexConfig.rescore = ANN_RESCORE_FP32;
+			else if (strcmp(value, "off") == 0)
+				AnnIndexConfig.rescore = ANN_RESCORE_OFF;
+			else if (strcmp(value, "fp16") == 0)
+				AnnIndexConfig.rescore = ANN_RESCORE_FP16;
+			else if (strcmp(value, "fp8-gpu") == 0)
+				AnnIndexConfig.rescore = ANN_RESCORE_FP8_GPU;
+			else
+			{
+				fprintf(stderr, "ann-worker: --rescore takes fp32, off, fp16 or fp8-gpu\n");
+				return 2;
+			}
+		}
 		else if (strcmp(argv[i], "--rerank-prefetch") == 0)
 		{
 			char	   *end;
@@ -643,7 +665,9 @@ usage:
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
-			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N] [--quantized-scan on|off] [--quant-slack N] [--rerank-prefetch N] [--predicate-cache N]\n"
+			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
+			"  [--quantized-scan on|off] [--quant-slack N] [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT]\n"
+			"  [--rerank-prefetch N] [--predicate-cache N] [--scan-routes on|off] [--scan-max-k N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else

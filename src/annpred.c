@@ -4,6 +4,7 @@
 #include "ann.h"
 #include "ann/filter.h"
 #include "catalog/pg_am_d.h"
+#include "catalog/pg_operator_d.h"
 #include "catalog/pg_opfamily_d.h"
 #include "commands/defrem.h"
 #include "catalog/pg_type_d.h"
@@ -24,8 +25,9 @@
  * Predicates over a frozen index's INCLUDE attributes become ann/filter.h
  * programs: =, <>, <, <=, >, >=, BETWEEN, IN, NOT IN, IS [NOT] NULL, AND,
  * OR and NOT, with integer operands that are constants, parameters or
- * stable expressions. NOT is pushed down to the leaves, where a negated
- * comparison keeps SQL's meaning: rows whose attribute is NULL never match.
+ * stable expressions, and && of an integer[] attribute with an integer[]
+ * operand. NOT is pushed down to the leaves, where a negated comparison
+ * keeps SQL's meaning: rows whose attribute is NULL never match.
  */
 #define STRATEGY_NE 6
 
@@ -63,6 +65,12 @@ AnnPredicateColumnsInit(Relation index, AnnPredicateColumns *columns)
 			local.attnos[c] = index->rd_index->indkey.values[2 + c];
 			local.types[c] = TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid;
 			local.collations[c] = AnnFrozenColumnCollation(index, 2 + c);
+			/* integer[] takes && only: no comparison strategies */
+			if (AnnFrozenMultiType(local.types[c]))
+			{
+				local.families[c] = InvalidOid;
+				continue;
+			}
 			/* varchar compares with text's operators */
 			opclass = GetDefaultOpClass(AnnFrozenTextType(local.types[c]) ? TEXTOID : local.types[c],
 										BTREE_AM_OID);
@@ -518,6 +526,81 @@ PutTextComparison(Context *cxt, int column, int strategy, text *value)
 
 static bool Translate(Context *cxt, Node *node, bool negate);
 
+/*
+ * column && array, either way round, for an integer[] attribute: one
+ * OVERLAP leaf of the array's distinct elements. NULL elements never
+ * overlap, nor does the value standing for NULL, which arrays never hold.
+ */
+static bool
+TranslateOverlap(Context *cxt, OpExpr *op, bool negate)
+{
+	int			column;
+	Node	   *operand;
+	Datum		value;
+	bool		isnull;
+	ArrayType  *array;
+	Datum	   *elements;
+	bool	   *nulls;
+	int			n;
+	int32	   *values;
+	int			nvalues = 0;
+
+	if ((column = ColumnOf(cxt, linitial(op->args))) >= 0)
+		operand = lsecond(op->args);
+	else if ((column = ColumnOf(cxt, lsecond(op->args))) >= 0)
+		operand = linitial(op->args);
+	else
+		return false;
+	if (!AnnFrozenMultiType(cxt->columns->types[column]) || exprType(operand) != INT4ARRAYOID ||
+		contain_var_clause(operand) || contain_volatile_functions(operand) || contain_subplans(operand))
+		return false;
+	if (cxt->program == NULL)
+		return true;
+	value = Evaluate(cxt, operand, &isnull);
+	if (isnull)
+	{
+		PutByte(cxt->program, ANN_FILTER_NONE);
+		return true;
+	}
+	array = DatumGetArrayTypeP(value);
+	deconstruct_array(array, INT4OID, sizeof(int32), true, TYPALIGN_INT, &elements, &nulls, &n);
+	values = palloc(sizeof(int32) * Max(n, 1));
+	for (int i = 0; i < n; i++)
+		if (!nulls[i] && DatumGetInt32(elements[i]) != ANN_FROZEN_NULL)
+			values[nvalues++] = DatumGetInt32(elements[i]);
+	if (nvalues > 1)
+	{
+		int			unique = 1;
+
+		qsort(values, nvalues, sizeof(int32), Int32Order);
+		for (int i = 1; i < nvalues; i++)
+			if (values[i] != values[unique - 1])
+				values[unique++] = values[i];
+		nvalues = unique;
+	}
+	if (nvalues > ANN_FILTER_MAX_VALUES)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("ann predicates take at most %d values per && array", ANN_FILTER_MAX_VALUES)));
+	if (nvalues == 0)
+	{
+		/* nothing overlaps; NOT of that holds for every array but NULL */
+		if (negate)
+			PutLeaf(cxt, ANN_FILTER_NULL, column, true);
+		else
+			PutByte(cxt->program, ANN_FILTER_NONE);
+	}
+	else
+	{
+		PutLeaf(cxt, ANN_FILTER_OVERLAP, column, negate);
+		Put32(cxt->program, (uint32) nvalues);
+		for (int i = 0; i < nvalues; i++)
+			Put32(cxt->program, (uint32) values[i]);
+	}
+	pfree(values);
+	return true;
+}
+
 static bool
 TranslateOp(Context *cxt, OpExpr *op, bool negate)
 {
@@ -531,6 +614,8 @@ TranslateOp(Context *cxt, OpExpr *op, bool negate)
 
 	if (list_length(op->args) != 2)
 		return false;
+	if (op->opno == OID_ARRAY_OVERLAP_OP)
+		return TranslateOverlap(cxt, op, negate);
 	left = linitial(op->args);
 	right = lsecond(op->args);
 	if ((column = ColumnOf(cxt, left)) >= 0)
@@ -694,7 +779,30 @@ Translate(Context *cxt, Node *node, bool negate)
 	 */
 	cxt->steps += 3;
 	if (IsA(node, OpExpr))
-		return TranslateOp(cxt, (OpExpr *) node, negate);
+	{
+		OpExpr	   *op = (OpExpr *) node;
+
+		/* constant && arrays count against the program's size, like lists */
+		if (op->opno == OID_ARRAY_OVERLAP_OP && list_length(op->args) == 2)
+		{
+			for (int side = 0; side < 2; side++)
+			{
+				Node	   *operand = list_nth(op->args, side);
+
+				if (IsA(operand, Const) && !((Const *) operand)->constisnull &&
+					((Const *) operand)->consttype == INT4ARRAYOID)
+				{
+					ArrayType  *array = DatumGetArrayTypeP(((Const *) operand)->constvalue);
+					int			n = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
+
+					if (n > ANN_FILTER_MAX_VALUES)
+						return false;
+					cxt->bytes += (size_t) n * 4 + 80;
+				}
+			}
+		}
+		return TranslateOp(cxt, op, negate);
+	}
 	if (IsA(node, ScalarArrayOpExpr))
 	{
 		Node	   *operand = list_length(((ScalarArrayOpExpr *) node)->args) == 2 ?

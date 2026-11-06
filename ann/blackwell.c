@@ -5,8 +5,9 @@
  * one 8-byte (NVFP4) or 16-byte (FP8) load and, for NVFP4, one block-scale
  * decode, so a warp scores four rows. That reads 4 or 8 bits per dimension
  * where the cuVS backend's gather kernel reads 16 or 32. Decoding uses Blackwell's conversion instructions, which
- * need the architecture-specific target sm_100a; the module is compiled
- * once per device with NVRTC and only on compute capability 10.x.
+ * need an architecture-specific target (sm_100a, sm_120a); the module is
+ * compiled once per device with NVRTC and only on compute capability 10.x
+ * or 12.x.
  */
 #include "blackwell.h"
 #include "nvrtc.h"
@@ -18,6 +19,7 @@
 #pragma GCC diagnostic pop
 #include <cuda_runtime_api.h>
 #include <pthread.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,6 +30,11 @@
 #define ANN_BLACKWELL_GROUP 8	/* threads per scored row, as GROUP below */
 
 /* Pieces stay under ISO C's string literal limit; joined before compiling. */
+/* Dynamic shared memory every grouped kernel may use on every device with a
+ * loaded module: the device's opt-in limit less the kernel's static shared
+ * memory, at most 160 KB. */
+static size_t sharedMax = ANN_BLACKWELL_SHARED_MAX;
+
 static const char *const BlackwellSource[] = {
 	"__device__ __forceinline__ float half_bits(unsigned short h)\n"
 	"{ float f; asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h)); return f; }\n"
@@ -289,7 +296,7 @@ static const char *const BlackwellSource[] = {
 	"__device__ void score_mma(const unsigned char *data, const unsigned char *scales,\n"
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
 	"    const float *queries, int nq, int dims, float *out, const float *bounds, unsigned *candR,\n"
-	"    unsigned *counts)\n"
+	"    unsigned *counts, unsigned cap)\n"
 	"{\n"
 	"  extern __shared__ unsigned short qh[];\n"
 	"  __shared__ float qn[NT * 8];\n"
@@ -441,7 +448,7 @@ static const char *const BlackwellSource[] = {
 	"        if (nn < nq && i < n && vr && dist <= th[nn])\n"
 	"        {\n"
 	"          unsigned at = atomicAdd(counts + nn, 1u);\n"
-	"          out[(unsigned long long) nn * n + at] = dist; candR[(unsigned long long) nn * n + at] = i;\n"
+	"          if (at < cap) { out[(unsigned long long) nn * cap + at] = dist; candR[(unsigned long long) nn * cap + at] = i; }\n"
 	"        }\n"
 	"      }\n"
 	"      else if (nn < nq && i < n) out[(unsigned long long) nn * n + i] = vr ? dist : inf;\n"
@@ -451,13 +458,13 @@ static const char *const BlackwellSource[] = {
 	"#define MMA(NAME, QUANT, NT) extern \"C\" __global__ void NAME(const unsigned char *data, \\\n"
 	"    const unsigned char *scales, const float *rowScales, unsigned rowBytes, unsigned blocks, \\\n"
 	"    const unsigned *rows, unsigned n, const float *queries, int nq, int dims, float *out) \\\n"
-	"{ score_mma<QUANT, NT, 0>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, out, 0, 0, 0); }\n"
+	"{ score_mma<QUANT, NT, 0>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, out, 0, 0, 0, 0); }\n"
 	"#define FUSE(NAME, QUANT, NT) extern \"C\" __global__ void NAME(const unsigned char *data, \\\n"
 	"    const unsigned char *scales, const float *rowScales, unsigned rowBytes, unsigned blocks, \\\n"
 	"    const unsigned *rows, unsigned n, const float *queries, int nq, int dims, const float *bounds, \\\n"
-	"    float *candD, unsigned *candR, unsigned *counts) \\\n"
+	"    float *candD, unsigned *candR, unsigned *counts, unsigned cap) \\\n"
 	"{ score_mma<QUANT, NT, 1>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, candD, bounds, \\\n"
-	"    candR, counts); }\n"
+	"    candR, counts, cap); }\n"
 	"MMA(score_mma_nvfp4, 1, 2) MMA(score_mma_nvfp4_32, 1, 4) MMA(score_mma_nvfp4_64, 1, 8)\n"
 	"MMA(score_mma_fp8, 2, 2) MMA(score_mma_fp8_32, 2, 4) MMA(score_mma_fp8_64, 2, 8)\n"
 	"MMA(score_mma_half, 3, 2) MMA(score_mma_half_32, 3, 4) MMA(score_mma_half_64, 3, 8)\n"
@@ -582,6 +589,18 @@ typedef struct SearchSlot
 	unsigned   *outR;
 	float	   *hostD;
 	unsigned   *hostR;
+	/* Large-k candidates (AnnBlackwellCandidates): sampled rows, their scores, bounded lists. */
+	unsigned   *largeSample;
+	size_t		largeSampleCapacity;
+	float	   *largeSampleScores;
+	size_t		largeScoreCapacity;
+	float	   *candD;
+	unsigned   *candR;
+	size_t		candCapacity;
+	float	   *hostCandD;		/* pinned */
+	unsigned   *hostCandR;		/* pinned */
+	size_t		hostCandCapacity;
+	unsigned   *hostCounts;		/* pinned, ANN_BLACKWELL_GROUP_MAX */
 } SearchSlot;
 
 static _Thread_local SearchSlot *slots[ANN_BLACKWELL_MAX_DEVICES][ANN_INDEX_MAX_SHARDS];
@@ -611,7 +630,7 @@ JoinSource(void)
  * memory, past the 48 KB a launch gets without opting in.
  */
 static int
-LoadScoreFunctions(BlackwellModule *module)
+LoadScoreFunctions(BlackwellModule *module, size_t optin)
 {
 	static const char *const formats[] = {"nvfp4", "fp8", "half", "float"};
 	static const char *const widths[] = {"", "_32", "_64"};
@@ -620,17 +639,29 @@ LoadScoreFunctions(BlackwellModule *module)
 		for (int w = 0; w < 3; w++)
 		{
 			char		name[64];
+			CUfunction *functions[] = {&module->mma[f][w], &module->fuse[f][w]};
 
-			snprintf(name, sizeof(name), "score_mma_%s%s", formats[f], widths[w]);
-			if (cuModuleGetFunction(&module->mma[f][w], module->module, name) != CUDA_SUCCESS ||
-				(w > 0 && cuFuncSetAttribute(module->mma[f][w], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-											 ANN_BLACKWELL_SHARED_MAX) != CUDA_SUCCESS))
-				return 0;
-			snprintf(name, sizeof(name), "fuse_mma_%s%s", formats[f], widths[w]);
-			if (cuModuleGetFunction(&module->fuse[f][w], module->module, name) != CUDA_SUCCESS ||
-				(w > 0 && cuFuncSetAttribute(module->fuse[f][w], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-											 ANN_BLACKWELL_SHARED_MAX) != CUDA_SUCCESS))
-				return 0;
+			for (int kind = 0; kind < 2; kind++)
+			{
+				int			fixed = 0;
+				size_t		dynamic = ANN_BLACKWELL_SHARED_MAX;
+
+				snprintf(name, sizeof(name), "%s_%s%s", kind ? "fuse_mma" : "score_mma", formats[f], widths[w]);
+				if (cuModuleGetFunction(functions[kind], module->module, name) != CUDA_SUCCESS)
+					return 0;
+				if (w == 0)
+					continue;
+				/* Static and dynamic shared memory share the device's opt-in limit. */
+				if (cuFuncGetAttribute(&fixed, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, *functions[kind]) != CUDA_SUCCESS)
+					return 0;
+				if (optin > 0 && optin - (size_t) fixed < dynamic)
+					dynamic = optin - (size_t) fixed;
+				if (cuFuncSetAttribute(*functions[kind], CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+									   (int) dynamic) != CUDA_SUCCESS)
+					return 0;
+				if (dynamic < sharedMax)
+					sharedMax = dynamic;
+			}
 		}
 	return 1;
 }
@@ -640,7 +671,12 @@ AnnBlackwellReady(int device)
 {
 	BlackwellModule *module;
 	CUdevice	handle;
-	int			major = 0;
+	int			major = 0,
+				minor = 0,
+				optin = 0;
+	char		arch[16];
+	const char *failed = NULL;
+	CUresult	result = CUDA_SUCCESS;
 	char	   *image = NULL;
 	char	   *source = NULL;
 	size_t		size = 0;
@@ -653,30 +689,43 @@ AnnBlackwellReady(int device)
 	(void) pthread_mutex_lock(&moduleMutex);
 	if (atomic_load_explicit(&module->state, memory_order_relaxed) != 0)
 		goto unlock;
-	if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess || major != 10)
+	if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
+		(major != 10 && major != 12))
 	{
-		fprintf(stderr, "Blackwell module: device %d has compute capability %d.x, not 10.x; "
+		fprintf(stderr, "Blackwell module: device %d has compute capability %d.x, not 10.x or 12.x; "
 				"quantized scans are off there\n", device, major);
 		goto unlock;
 	}
+	snprintf(arch, sizeof(arch), "sm_%d%da", major, minor);
+	if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
+		optin = 0;
 	if (cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&handle, device) != CUDA_SUCCESS ||
 		cuDevicePrimaryCtxRetain(&module->context, handle) != CUDA_SUCCESS ||
-		cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
-		(source = JoinSource()) == NULL ||
-		(image = AnnNvrtcCompile(source, "Blackwell module", "sm_100a", &size)) == NULL ||
-		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->nvfp4, module->module, "score_nvfp4") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->fp8, module->module, "score_fp8") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->searchNvfp4, module->module, "search_nvfp4") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->searchFp8, module->module, "search_fp8") != CUDA_SUCCESS ||
-		!LoadScoreFunctions(module) ||
-		cuModuleGetFunction(&module->select32, module->module, "select32") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->select32c, module->module, "select32c") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->strideRows, module->module, "stride_rows") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->merge32, module->module, "merge32") != CUDA_SUCCESS ||
-		cudaDeviceGetAttribute(&module->sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
+		failed = "context";
+	else if ((source = JoinSource()) == NULL ||
+			 (image = AnnNvrtcCompile(source, "Blackwell module", arch, &size)) == NULL)
+		failed = "NVRTC compile";
+	else if ((result = cuModuleLoadData(&module->module, image)) != CUDA_SUCCESS)
+		failed = "module load";
+	else if (cuModuleGetFunction(&module->nvfp4, module->module, "score_nvfp4") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->fp8, module->module, "score_fp8") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->searchNvfp4, module->module, "search_nvfp4") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->searchFp8, module->module, "search_fp8") != CUDA_SUCCESS)
+		failed = "scan kernels";
+	else if (!LoadScoreFunctions(module, (size_t) optin))
+		failed = "grouped kernels";
+	else if (cuModuleGetFunction(&module->select32, module->module, "select32") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->select32c, module->module, "select32c") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->strideRows, module->module, "stride_rows") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->merge32, module->module, "merge32") != CUDA_SUCCESS ||
+			 cudaDeviceGetAttribute(&module->sms, cudaDevAttrMultiProcessorCount, device) != cudaSuccess)
+		failed = "selection kernels";
+	if (failed)
 	{
-		fprintf(stderr, "Blackwell module: unavailable on device %d (NVRTC or sm_100a load failed)\n", device);
+		fprintf(stderr, "Blackwell module: unavailable on device %d (%s failed for %s, CUDA error %d, "
+				"%zu bytes of shared memory)\n", device, failed, arch, (int) result, sharedMax);
 		goto unlock;
 	}
 	atomic_store_explicit(&module->state, 1, memory_order_release);
@@ -728,6 +777,97 @@ AnnBlackwellView(const void *dataset, int64_t stride, int half, uint32_t dims, i
 	out->data = (uint8_t *) (uintptr_t) dataset;
 	out->rowBytes = (uint32_t) (stride * (half ? 2 : 4));
 	out->blocks = (dims + 15) / 16;
+	return 1;
+}
+
+/* E4M3 (OCP FN: no infinities, 448 the largest) nearest to a value. */
+static uint8_t
+E4m3(float value)
+{
+	uint8_t		sign = value < 0 ? 0x80 : 0;
+	float		magnitude = fabsf(value);
+	int			exponent;
+	float		fraction;
+
+	if (!(magnitude > 0))
+		return sign;
+	if (magnitude >= 448.0f)
+		return sign | 0x7e;
+	fraction = frexpf(magnitude, &exponent);	/* magnitude = fraction * 2^exponent, fraction in [0.5, 1) */
+	if (exponent + 6 >= 1)
+	{
+		int			biased = exponent + 6;
+		int			mantissa = (int) nearbyintf((2.0f * fraction - 1.0f) * 8.0f);
+
+		if (mantissa == 8)
+		{
+			mantissa = 0;
+			biased++;
+		}
+		if (biased > 15 || (biased == 15 && mantissa == 7))
+			return sign | 0x7e;
+		return sign | (uint8_t) (biased << 3 | mantissa);
+	}
+	{
+		/* Subnormals are multiples of 2^-9; eight of them make the smallest normal. */
+		int			units = (int) nearbyintf(magnitude * 512.0f);
+
+		return sign | (uint8_t) (units >= 8 ? 0x08 : units);
+	}
+}
+
+int
+AnnBlackwellUploadFp8(const float *vectors, uint64_t rows, uint32_t dims, int device, AnnBlackwellShard *out)
+{
+	uint32_t	rowBytes = (dims + 15) / 16 * 16;
+	const uint64_t chunk = 65536;
+	uint8_t    *codes = NULL;
+	float	   *scales = NULL;
+	int			ok;
+
+	memset(out, 0, sizeof(*out));
+	if (rows == 0 || !AnnBlackwellReady(device) || cudaSetDevice(device) != cudaSuccess)
+		return 0;
+	codes = malloc(chunk * rowBytes);
+	scales = malloc(chunk * sizeof(float));
+	ok = codes != NULL && scales != NULL &&
+		cudaMalloc((void **) &out->data, rows * rowBytes) == cudaSuccess &&
+		cudaMalloc((void **) &out->rowScales, rows * sizeof(float)) == cudaSuccess;
+	for (uint64_t first = 0; ok && first < rows; first += chunk)
+	{
+		uint64_t	count = rows - first < chunk ? rows - first : chunk;
+
+		/* As build_cuvs_index.py --quantize fp8 writes them: a row scale of max |x| / 448. */
+		for (uint64_t r = 0; r < count; r++)
+		{
+			const float *x = vectors + (first + r) * dims;
+			float		amax = 0;
+			float		scale;
+
+			for (uint32_t d = 0; d < dims; d++)
+				amax = fabsf(x[d]) > amax ? fabsf(x[d]) : amax;
+			scale = amax > 0 ? amax / 448.0f : 1.0f;
+			scales[r] = scale;
+			for (uint32_t d = 0; d < rowBytes; d++)
+				codes[r * rowBytes + d] = d < dims ? E4m3(x[d] / scale) : 0;
+		}
+		ok = cudaMemcpy(out->data + first * rowBytes, codes, count * rowBytes, cudaMemcpyHostToDevice) == cudaSuccess &&
+			cudaMemcpy(out->rowScales + first, scales, count * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
+	}
+	free(codes);
+	free(scales);
+	if (!ok)
+	{
+		fprintf(stderr, "Blackwell module: cannot make the FP8 re-scoring copy on device %d\n", device);
+		out->owned = 1;			/* free what was allocated */
+		AnnBlackwellFree(out);
+		return 0;
+	}
+	out->quant = ANN_QUANT_FP8;
+	out->owned = 1;
+	out->rowBytes = rowBytes;
+	out->blocks = rowBytes / 16;
+	out->bytes = rows * (rowBytes + sizeof(float));
 	return 1;
 }
 
@@ -818,6 +958,13 @@ GetSlot(int device, unsigned slot, unsigned maxBlocks)
 		(void) cudaFree(sc->outR);
 		(void) cudaFreeHost(sc->hostD);
 		(void) cudaFreeHost(sc->hostR);
+		(void) cudaFree(sc->largeSample);
+		(void) cudaFree(sc->largeSampleScores);
+		(void) cudaFree(sc->candD);
+		(void) cudaFree(sc->candR);
+		(void) cudaFreeHost(sc->hostCandD);
+		(void) cudaFreeHost(sc->hostCandR);
+		(void) cudaFreeHost(sc->hostCounts);
 		memset(sc, 0, sizeof(*sc));
 	}
 	else if ((sc = slots[device][slot] = calloc(1, sizeof(*sc))) == NULL)
@@ -875,7 +1022,7 @@ AnnBlackwellGroupLimit(int dims)
 			cap = ANN_BLACKWELL_GROUP_MAX;
 	}
 	for (int queries = ANN_BLACKWELL_GROUP_MAX; queries > 16; queries /= 2)
-		if (queries <= cap && queries * qstride * 2 <= ANN_BLACKWELL_SHARED_MAX)
+		if (queries <= cap && queries * qstride * 2 <= sharedMax)
 			return queries;
 	return 16 * qstride * 2 <= 45 * 1024 ? 16 : 1;
 }
@@ -1023,7 +1170,7 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 			void	   *sampleMerge[] = {&sc->partD, &sc->partR, &one, &sc->outD, &sc->outR};
 			void	   *fuseArgs[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
 				&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dimensions, &sc->outD, &candD,
-			&candR, &sc->counts};
+			&candR, &sc->counts, &n};
 			void	   *selectArgs[] = {&candD, &candR, &sc->counts, &n, &sc->partD, &sc->partR};
 			void	   *mergeArgs[] = {&sc->partD, &sc->partR, &candidateSlices, &sc->outD, &sc->outR};
 
@@ -1063,6 +1210,178 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 						   cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess &&
 		cudaMemcpyAsync(sc->hostR, sc->outR, (size_t) nq * ANN_BLACKWELL_TOP * sizeof(unsigned),
 						cudaMemcpyDeviceToHost, (cudaStream_t) stream) == cudaSuccess;
+}
+
+/* Device memory of count units grown to at least that; 0 when it cannot be. */
+static int
+GrowScratch(void **pointer, size_t *capacity, size_t count, size_t unit)
+{
+	if (count <= *capacity)
+		return 1;
+	(void) cudaFree(*pointer);
+	*pointer = NULL;
+	*capacity = 0;
+	if (cudaMalloc(pointer, count * unit) != cudaSuccess)
+	{
+		*pointer = NULL;
+		return 0;
+	}
+	*capacity = count;
+	return 1;
+}
+
+static int
+GrowPinnedScratch(void **pointer, size_t *capacity, size_t count, size_t unit)
+{
+	if (count <= *capacity)
+		return 1;
+	(void) cudaFreeHost(*pointer);
+	*pointer = NULL;
+	*capacity = 0;
+	if (cudaMallocHost(pointer, count * unit) != cudaSuccess)
+	{
+		*pointer = NULL;
+		return 0;
+	}
+	*capacity = count;
+	return 1;
+}
+
+unsigned
+AnnBlackwellCandidateCap(unsigned n, unsigned wanted)
+{
+	uint64_t	sample;
+
+	if (wanted == 0)
+		return 0;
+	sample = ((uint64_t) 32 * n + 4 * (uint64_t) wanted - 1) / (4 * (uint64_t) wanted);
+	if (sample < ANN_BLACKWELL_TOP || sample * 4 > n)
+		return 0;
+	return (uint64_t) wanted * 16 < n ? wanted * 16 : n;
+}
+
+unsigned
+AnnBlackwellCandidates(const AnnBlackwellShard *shard, int device, unsigned slot, const uint32_t *rows, unsigned n,
+					   const float *queries, unsigned nq, int dims, unsigned wanted, void *stream)
+{
+	BlackwellModule *module = &modules[device];
+	unsigned	cap = AnnBlackwellCandidateCap(n, wanted);
+	unsigned	sample = cap ? (unsigned) (((uint64_t) 32 * n + 4 * (uint64_t) wanted - 1) / (4 * (uint64_t) wanted)) : 0;
+	unsigned	maxBlocks = (unsigned) module->sms * 4;
+	unsigned	rowBytes = shard->rowBytes,
+				blocks = shard->blocks;
+	int			dimensions = dims,
+				count = (int) nq;
+	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
+	unsigned	shared = (unsigned) ((16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t));
+	unsigned	sampleGrid,
+				grid,
+				slices,
+				perSlice,
+				cutoff = (unsigned) module->sms / 4 > 1 ? (unsigned) module->sms / 4 : 1;
+	SearchSlot *sc;
+
+	if (cap == 0 || shard->quant == ANN_QUANT_NONE ||
+		atomic_load_explicit(&module->state, memory_order_acquire) <= 0 || nq == 0 ||
+		nq > (unsigned) AnnBlackwellGroupLimit(dims) || slot >= ANN_INDEX_MAX_SHARDS ||
+		(sc = GetSlot(device, slot, maxBlocks)) == NULL || cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+		!GrowScratch((void **) &sc->largeSample, &sc->largeSampleCapacity, sample, sizeof(unsigned)) ||
+		!GrowScratch((void **) &sc->largeSampleScores, &sc->largeScoreCapacity, (size_t) nq * sample, sizeof(float)) ||
+		!GrowScratch((void **) &sc->candD, &sc->candCapacity, (size_t) nq * cap, sizeof(float)))
+		return 0;
+	if (sc->candR == NULL || sc->candCapacity > sc->hostCandCapacity)
+	{
+		/* candR follows candD's capacity; the host copies too. */
+		(void) cudaFree(sc->candR);
+		sc->candR = NULL;
+		if (cudaMalloc((void **) &sc->candR, sc->candCapacity * sizeof(unsigned)) != cudaSuccess ||
+			!GrowPinnedScratch((void **) &sc->hostCandD, &sc->hostCandCapacity, sc->candCapacity, sizeof(float)))
+			return 0;
+		(void) cudaFreeHost(sc->hostCandR);
+		if (cudaMallocHost((void **) &sc->hostCandR, sc->hostCandCapacity * sizeof(unsigned)) != cudaSuccess)
+		{
+			sc->hostCandR = NULL;
+			sc->hostCandCapacity = 0;
+			return 0;
+		}
+	}
+	if (sc->hostCounts == NULL &&
+		cudaMallocHost((void **) &sc->hostCounts, ANN_BLACKWELL_GROUP_MAX * sizeof(unsigned)) != cudaSuccess)
+	{
+		sc->hostCounts = NULL;
+		return 0;
+	}
+	if (shard->quant == ANN_QUANT_FP8)
+		blocks = rowBytes / 16;
+	else if (shard->quant >= ANN_BLACKWELL_HALF)
+		blocks = ((unsigned) dims + 15) / 16;
+	sampleGrid = (sample + 127) / 128 < maxBlocks ? (sample + 127) / 128 : maxBlocks;
+	grid = (n + 127) / 128 < maxBlocks ? (n + 127) / 128 : maxBlocks;
+	slices = (sample + 8191) / 8192 < cutoff ? (sample + 8191) / 8192 : cutoff;
+	if (slices < 1)
+		slices = 1;
+	perSlice = (sample + slices - 1) / slices;
+	{
+		void	   *strideArgs[] = {(void *) &rows, &n, &sample, &sc->largeSample};
+		void	   *sampleArgs[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+			&rowBytes, &blocks, &sc->largeSample, &sample, (void *) &queries, &count, &dimensions,
+		&sc->largeSampleScores};
+		void	   *selectArgs[] = {&sc->largeSampleScores, &sample, &perSlice, &sc->partD, &sc->partR};
+		void	   *mergeArgs[] = {&sc->partD, &sc->partR, &slices, &sc->outD, &sc->outR};
+		void	   *fuseArgs[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+			&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dimensions, &sc->outD, &sc->candD,
+		&sc->candR, &sc->counts, &cap};
+
+		/*
+		 * The 32nd best of the sampled rows bounds each query's candidates,
+		 * about 32 n / sample = 4 * wanted of them: the scan keeps only rows
+		 * at or under it, up to cap per query, and counts them all.
+		 */
+		if (cuLaunchKernel(module->strideRows, (sample + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   strideArgs, NULL) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->mma[shard->quant - 1][width], sampleGrid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, shared,
+						   (CUstream) stream, sampleArgs, NULL) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->select32, slices, nq, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0, (CUstream) stream,
+						   selectArgs, NULL) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->merge32, nq, 1, 1, 32, 1, 1, 0, (CUstream) stream, mergeArgs, NULL) != CUDA_SUCCESS ||
+			cudaMemsetAsync(sc->counts, 0, nq * sizeof(unsigned), (cudaStream_t) stream) != cudaSuccess ||
+			cuLaunchKernel(module->fuse[shard->quant - 1][width], grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, shared,
+						   (CUstream) stream, fuseArgs, NULL) != CUDA_SUCCESS ||
+			cudaMemcpyAsync(sc->hostCounts, sc->counts, nq * sizeof(unsigned), cudaMemcpyDeviceToHost,
+							(cudaStream_t) stream) != cudaSuccess)
+			return 0;
+	}
+	return cap;
+}
+
+const unsigned *
+AnnBlackwellCandidateCounts(int device, unsigned slot)
+{
+	return slots[device][slot]->hostCounts;
+}
+
+int
+AnnBlackwellCopyCandidates(int device, unsigned slot, unsigned nq, unsigned cap, const unsigned *take, void *stream)
+{
+	SearchSlot *sc = slots[device][slot];
+
+	for (unsigned q = 0; q < nq; q++)
+		if (take[q] &&
+			(cudaMemcpyAsync(sc->hostCandD + (size_t) q * cap, sc->candD + (size_t) q * cap, take[q] * sizeof(float),
+							 cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess ||
+			 cudaMemcpyAsync(sc->hostCandR + (size_t) q * cap, sc->candR + (size_t) q * cap, take[q] * sizeof(unsigned),
+							 cudaMemcpyDeviceToHost, (cudaStream_t) stream) != cudaSuccess))
+			return 0;
+	return 1;
+}
+
+void
+AnnBlackwellCandidateRows(int device, unsigned slot, unsigned q, unsigned cap, float **distances, unsigned **rows)
+{
+	SearchSlot *sc = slots[device][slot];
+
+	*distances = sc->hostCandD + (size_t) q * cap;
+	*rows = sc->hostCandR + (size_t) q * cap;
 }
 
 void

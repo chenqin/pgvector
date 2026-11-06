@@ -9,6 +9,7 @@
 #include "rdma.h"
 
 #include <errno.h>
+#include <execinfo.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -193,6 +194,8 @@ typedef struct Service
 } Service;
 
 static volatile sig_atomic_t stopRequested;
+static volatile sig_atomic_t stopSignal;	/* the signal that stopped the worker, and its sender */
+static volatile sig_atomic_t stopSender;
 
 void
 AnnServeDefaultOptions(AnnServeOptions *options)
@@ -216,10 +219,29 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 }
 
 static void
-OnSignal(int signal)
+OnSignal(int signal, siginfo_t *info, void *context)
 {
-	(void) signal;
+	(void) context;
+	stopSignal = signal;
+	stopSender = info ? (sig_atomic_t) info->si_pid : 0;
 	stopRequested = 1;
+}
+
+/*
+ * A crash prints the stack before the default action, so a worker that dies
+ * under load leaves where it died in its log: frames read as
+ * binary(+offset), which addr2line -f -e binary offset resolves.
+ */
+static void
+OnCrash(int number)
+{
+	static const char message[] = "ann-worker: crashed; stack:\n";
+	void	   *frames[64];
+	int			count = backtrace(frames, 64);
+
+	if (write(STDERR_FILENO, message, sizeof(message) - 1) > 0)
+		backtrace_symbols_fd(frames, count, STDERR_FILENO);
+	(void) raise(number);
 }
 
 static uint64_t
@@ -2067,10 +2089,14 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 			ANN_INVALID;
 	}
 
-	/* Keep rows for every filter a scan may take; see SubmitCached. */
+	/*
+	 * Keep rows for every filter a scan may take; see SubmitCached. An index
+	 * without graphs scans every filter, however broad.
+	 */
 	/* The entry comes back referenced: an eviction meanwhile can't lose it. */
-	status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words, nwords, file->device == NULL ? UINT64_MAX :
-								  PredicateGatherLimit(file), result);
+	status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words, nwords,
+								  file->device == NULL || file->scanOnly ? UINT64_MAX : PredicateGatherLimit(file),
+								  result);
 	free(words);
 	(void) __atomic_fetch_add(&service->predicate_evaluations, 1, __ATOMIC_RELAXED);
 	(void) __atomic_fetch_add(&service->predicate_eval_us, MicrosecondsSince(&start), __ATOMIC_RELAXED);
@@ -2135,7 +2161,8 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 	 */
 	if (programLength == 1 && payload[offset] == ANN_FILTER_ALL &&
 		(uint64_t) k + __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) <=
-		(service->backend->max_k < 10000 ? service->backend->max_k : 10000))
+		(service->backend->max_k < 10000 ? service->backend->max_k : 10000) &&
+		!(service->backend->scan_preferred && service->backend->scan_preferred(file, k)))
 	{
 		uint64_t	deleted = __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE);
 
@@ -3150,10 +3177,20 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	(void) pthread_mutex_init(&service.mutex, NULL);
 	(void) pthread_mutex_init(&service.peersMutex, NULL);
 	(void) pthread_cond_init(&service.condition, NULL);
-	action.sa_handler = OnSignal;
+	action.sa_sigaction = OnSignal;
+	action.sa_flags = SA_SIGINFO;
 	(void) sigaction(SIGINT, &action, NULL);
 	(void) sigaction(SIGTERM, &action, NULL);
 	(void) signal(SIGPIPE, SIG_IGN);
+	{
+		struct sigaction crash = {0};
+		const int	fatal[] = {SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT};
+
+		crash.sa_handler = OnCrash;
+		crash.sa_flags = SA_RESETHAND;
+		for (size_t i = 0; i < sizeof(fatal) / sizeof(fatal[0]); i++)
+			(void) sigaction(fatal[i], &crash, NULL);
+	}
 
 	address.sun_family = AF_UNIX;
 	strcpy(address.sun_path, path);
@@ -3299,6 +3336,7 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	if (network >= 0)
 		(void) close(network);
 	(void) unlink(path);
+	fprintf(stderr, "ann-worker: stopping on signal %d from process %d\n", (int) stopSignal, (int) stopSender);
 	(void) pthread_mutex_lock(&service.mutex);
 	service.stopping = 1;
 	(void) pthread_cond_broadcast(&service.condition);

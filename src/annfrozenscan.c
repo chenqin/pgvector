@@ -52,6 +52,7 @@
 #define ANN_FROZEN_VM_BUFFERS 32
 
 bool		ann_enable_frozen_search = true;
+static bool ann_frozen_recheck = false;
 static double ann_frozen_setup_cost = 1000.0;
 static char *ann_frozen_cost_profile = NULL;
 static const AnnCostProfile *frozenCostProfile = NULL;
@@ -64,8 +65,15 @@ typedef struct FrozenScanState
 	CustomScanState css;
 	Oid			indexOid;
 	bool		covering;		/* every used column is in the index */
+	bool		immutable;		/* AnnFrozenImmutable: no TID or visibility changes */
+	List	   *usedAttnos;		/* heap columns the plan reads (0: the whole row) */
+	List	   *outputAttnos;	/* those of the target list alone */
+	bool	   *needed;			/* per index column: read from the pages */
+	bool		needTids;		/* rows need their TIDs (heap fetches, ctid, mutable tables) */
 	int			vectorMode;		/* ANN_FROZEN_VECTORS_* */
 	int			initialK;
+	ExprState  *limitCount;		/* a LIMIT and OFFSET the planner couldn't */
+	ExprState  *limitOffset;	/* estimate (generic plans), or NULL */
 	Relation	index;
 	AnnFrozenMetaData *meta;
 	AnnPredicateColumns columns;
@@ -82,6 +90,7 @@ typedef struct FrozenScanState
 	AnnArrayReader keys;
 	AnnArrayReader vectors;
 	AnnArrayReader *values;
+	AnnArrayReader *starts;		/* integer[] columns' row starts */
 	Vector	   *vector;			/* the returned row's vector */
 	MemoryContext resultCtx;
 	MemoryContext batchCtx;
@@ -262,6 +271,40 @@ LocalLimitCost(PlannerInfo *root, RelOptInfo *rel, int k)
 	return best;
 }
 
+/* A parameter, under implicit casts (LIMIT $1 of an int parameter). */
+static bool
+LimitParam(Node *node)
+{
+	node = strip_implicit_coercions(node);
+	return IsA(node, Param) && ((Param *) node)->paramkind == PARAM_EXTERN;
+}
+
+/*
+ * A LIMIT the planner could not turn into root->limit_tuples, as LIMIT $1 in
+ * a generic plan: the scan evaluates it, and the OFFSET, to size its first
+ * request. Only where root->limit_tuples would apply: no grouping,
+ * aggregates, DISTINCT, window functions or set-returning functions between
+ * the scan and the LIMIT. Leaves both NULL otherwise.
+ */
+static void
+ParamLimit(PlannerInfo *root, Node **count, Node **offset)
+{
+	Query	   *parse = root->parse;
+	Node	   *limit = parse->limitCount;
+	Node	   *skip = parse->limitOffset;
+
+	if (limit == NULL || parse->groupClause || parse->groupingSets || parse->distinctClause ||
+		parse->hasAggs || parse->hasWindowFuncs || parse->hasTargetSRFs || root->hasHavingQual)
+		return;
+	if (!(IsA(limit, Const) || LimitParam(limit)) || !(skip == NULL || IsA(skip, Const) || LimitParam(skip)))
+		return;
+	/* constants alone are in root->limit_tuples already, or mean no limit */
+	if (IsA(limit, Const) && (skip == NULL || IsA(skip, Const)))
+		return;
+	*count = copyObject(limit);
+	*offset = copyObject(skip);
+}
+
 static void
 AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *rte)
 {
@@ -275,6 +318,8 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	Bitmapset  *used = NULL;
 	bool		covering = true;
 	int			k;
+	Node	   *limitCount = NULL;
+	Node	   *limitOffset = NULL;
 	CustomPath *path;
 	int			member;
 	QualCost	recheck;
@@ -328,6 +373,8 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 		return;
 
 	k = root->limit_tuples > 0 ? (int) Min(root->limit_tuples, ANN_FROZEN_WORKER_MAX_K) : ANN_FROZEN_DEFAULT_K;
+	if (root->limit_tuples <= 0)
+		ParamLimit(root, &limitCount, &limitOffset);
 	path = makeNode(CustomPath);
 	path->path.pathtype = T_CustomScan;
 	path->path.parent = rel;
@@ -378,8 +425,10 @@ AnnSetRelPathlist(PlannerInfo *root, RelOptInfo *rel, Index rti, RangeTblEntry *
 	}
 	path->path.pathkeys = list_make1(pathkey);
 	path->methods = &FrozenPathMethods;
-	path->custom_private = list_make4(list_make1_oid(index->indexoid), list_make2_int(covering, k),
-									  copyObject(operand), estimate);
+	/* index, (covering, k), operand, LIMIT and OFFSET (or NULLs), cost estimate */
+	path->custom_private = lappend(list_make5(list_make1_oid(index->indexoid), list_make2_int(covering, k),
+											  copyObject(operand), limitCount, limitOffset),
+								   estimate);
 	add_path(rel, &path->path);
 }
 
@@ -389,14 +438,33 @@ PlanFrozenPath(PlannerInfo *root, RelOptInfo *rel, CustomPath *path, List *tlist
 {
 	CustomScan *scan = makeNode(CustomScan);
 	List	   *quals = extract_actual_clauses(clauses, false);
+	Bitmapset  *used = NULL;
+	List	   *attnos = NIL;
+	List	   *outputAttnos = NIL;
+	int			member = -1;
+
+	/*
+	 * Rows from the index pages carry only the columns the plan reads: the
+	 * target list's, and the quals' unless the scan drops their recheck.
+	 */
+	pull_varattnos((Node *) tlist, rel->relid, &used);
+	while ((member = bms_next_member(used, member)) >= 0)
+		outputAttnos = lappend_int(outputAttnos, member + FirstLowInvalidHeapAttributeNumber);
+	pull_varattnos((Node *) quals, rel->relid, &used);
+	member = -1;
+	while ((member = bms_next_member(used, member)) >= 0)
+		attnos = lappend_int(attnos, member + FirstLowInvalidHeapAttributeNumber);
 
 	scan->scan.plan.targetlist = tlist;
 	scan->scan.plan.qual = quals;
 	scan->scan.scanrelid = rel->relid;
 	scan->methods = &FrozenScanMethods;
-	scan->custom_private = list_make3(linitial(path->custom_private), lsecond(path->custom_private),
-									  lfourth(path->custom_private));
-	scan->custom_exprs = lcons(lthird(path->custom_private), list_copy(quals));
+	scan->custom_private = list_make5(linitial(path->custom_private), lsecond(path->custom_private), attnos,
+									  outputAttnos, list_nth(path->custom_private, 5));
+	/* the distance operand, the LIMIT and OFFSET (or NULLs), then the quals */
+	scan->custom_exprs = list_concat(list_make3(lthird(path->custom_private), lfourth(path->custom_private),
+												list_nth(path->custom_private, 4)),
+									 quals);
 	return &scan->scan.plan;
 }
 
@@ -412,7 +480,9 @@ CreateFrozenScanState(CustomScan *scan)
 	state->indexOid = linitial_oid(linitial(scan->custom_private));
 	state->covering = linitial_int(lsecond(scan->custom_private)) != 0;
 	state->initialK = lsecond_int(lsecond(scan->custom_private));
-	state->costEstimate = lthird(scan->custom_private);
+	state->usedAttnos = lthird(scan->custom_private);
+	state->outputAttnos = lfourth(scan->custom_private);
+	state->costEstimate = list_nth(scan->custom_private, 4);
 	return (Node *) state;
 }
 
@@ -427,7 +497,9 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 		elog(ERROR, "\"%s\" is not a frozen ann index", RelationGetRelationName(state->index));
 	AnnPredicateColumnsInit(state->index, &state->columns);
 	state->queryState = ExecInitExpr(linitial(scan->custom_exprs), &node->ss.ps);
-	state->quals = list_copy_tail(scan->custom_exprs, 1);
+	state->limitCount = ExecInitExpr(lsecond(scan->custom_exprs), &node->ss.ps);
+	state->limitOffset = ExecInitExpr(lthird(scan->custom_exprs), &node->ss.ps);
+	state->quals = list_copy_tail(scan->custom_exprs, 3);
 	state->distance = index_getprocinfo(state->index, 1, ANN_DISTANCE_PROC);
 	for (int i = 0; i < ANN_FROZEN_VM_BUFFERS; i++)
 		state->vmbufs[i] = InvalidBuffer;
@@ -435,13 +507,48 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 											 ALLOCSET_DEFAULT_SIZES);
 	state->batchCtx = AllocSetContextCreate(estate->es_query_cxt, "Ann frozen materialization batch",
 											ALLOCSET_DEFAULT_SIZES);
-	AnnArrayReaderInit(&state->tids, state->index, &state->meta->tids, NULL);
-	AnnArrayReaderInit(&state->keys, state->index, &state->meta->keys, NULL);
-	AnnArrayReaderInit(&state->vectors, state->index, &state->meta->vectors, NULL);
+	state->immutable = AnnFrozenImmutable(node->ss.ss_currentRelation, state->index);
+
+	/*
+	 * Every qual is in the program (else there's no path), and the program
+	 * selects exactly SQL's rows: rows from the pages of an immutable table
+	 * need no recheck, nor the columns only the quals read.
+	 */
+	if (state->immutable && state->covering && !ann_frozen_recheck)
+	{
+		node->ss.ps.qual = NULL;
+		state->usedAttnos = state->outputAttnos;
+	}
+	AnnArrayReaderInitExtended(&state->tids, state->index, &state->meta->tids, NULL, state->immutable);
+	AnnArrayReaderInitExtended(&state->keys, state->index, &state->meta->keys, NULL, state->immutable);
+	AnnArrayReaderInitExtended(&state->vectors, state->index, &state->meta->vectors, NULL, state->immutable);
 	state->values = palloc(sizeof(AnnArrayReader) * Max(state->meta->ncolumns, 1));
+	state->starts = palloc0(sizeof(AnnArrayReader) * Max(state->meta->ncolumns, 1));
 	for (uint32 c = 0; c < state->meta->ncolumns; c++)
-		AnnArrayReaderInit(&state->values[c], state->index, &state->meta->columns[c].values, NULL);
+	{
+		AnnArrayReaderInitExtended(&state->values[c], state->index, &state->meta->columns[c].values, NULL,
+								   state->immutable);
+		if (AnnFrozenMultiType(state->columns.types[c]))
+			AnnArrayReaderInitExtended(&state->starts[c], state->index, &AnnFrozenGetExtra(state->meta)[c].starts,
+									   NULL, state->immutable);
+	}
 	state->vector = palloc(state->meta->vectors.width);
+	state->needed = palloc0(sizeof(bool) * RelationGetDescr(state->index)->natts);
+	/* An immutable table's TIDs never change or die: read them only when the rows need them. */
+	state->needTids = !state->immutable || !state->covering;
+	foreach_int(attno, state->usedAttnos)
+	{
+		if (attno == InvalidAttrNumber)
+		{
+			memset(state->needed, true, sizeof(bool) * RelationGetDescr(state->index)->natts);
+			state->needTids = true;
+		}
+		else if (attno < 0)
+			state->needTids = true;
+		else
+			for (int i = 0; i < RelationGetDescr(state->index)->natts; i++)
+				state->needed[i] |= state->index->rd_index->indkey.values[i] == attno;
+	}
 	state->vectorMode = AnnFrozenVectorMode(state->index, state->meta);
 	state->workerRoute = -1;
 	if (eflags & EXEC_FLAG_EXPLAIN_ONLY)
@@ -471,13 +578,14 @@ static HTAB *workerNames = NULL;
 /*
  * Tombstones (ann_frozen_tombstone) of each frozen index's table, as this
  * generation's ordinals, cached per backend: read again after a second, or
- * at once after ann_frozen_delete in this backend.
+ * at once after ann_frozen_delete in this backend. An immutable table's are
+ * read once per generation (ann_frozen_delete is refused meanwhile).
  */
 typedef struct TombstoneEntry
 {
 	Oid			indexOid;
 	uint64		generation;
-	uint64		epoch;
+	uint64		epoch;			/* 0 until loaded */
 	TimestampTz checked;
 	uint64	   *ordinals;
 	int			count;
@@ -485,6 +593,7 @@ typedef struct TombstoneEntry
 
 static HTAB *tombstoneCache = NULL;
 static uint64 tombstoneEpoch = 1;
+static Oid	tombstoneSchema = InvalidOid;	/* the extension's, once found */
 
 void
 AnnFrozenTombstonesChanged(void)
@@ -493,6 +602,22 @@ AnnFrozenTombstonesChanged(void)
 }
 
 static int	OrdinalCompare(const void *a, const void *b);
+
+/* Whether the extension's schema, found once, has the tombstone table. */
+static bool
+TombstoneTableExists(void)
+{
+	Oid			extension;
+
+	if (OidIsValid(tombstoneSchema) && OidIsValid(get_relname_relid("ann_frozen_tombstone", tombstoneSchema)))
+		return true;
+	extension = get_extension_oid("vector", true);
+	tombstoneSchema = OidIsValid(extension) ? get_extension_schema(extension) : InvalidOid;
+	if (OidIsValid(tombstoneSchema) && OidIsValid(get_relname_relid("ann_frozen_tombstone", tombstoneSchema)))
+		return true;
+	tombstoneSchema = InvalidOid;
+	return false;
+}
 
 /* A cache refresh must not reclaim another active scan's tombstones. */
 static void
@@ -515,9 +640,6 @@ LoadTombstones(FrozenScanState *state)
 	Oid			indexOid = RelationGetRelid(state->index);
 	TombstoneEntry *entry;
 	bool		found;
-	TimestampTz now = GetCurrentTimestamp();
-	Oid			extension = get_extension_oid("vector", true);
-	Oid			schema = OidIsValid(extension) ? get_extension_schema(extension) : InvalidOid;
 	Oid			types[1] = {OIDOID};
 	Datum		values[1] = {ObjectIdGetDatum(state->index->rd_index->indrelid)};
 	uint64	   *ordinals;
@@ -542,17 +664,29 @@ LoadTombstones(FrozenScanState *state)
 		entry->checked = 0;
 	}
 	if (found && entry->generation == state->meta->generation && entry->epoch == tombstoneEpoch &&
-		!TimestampDifferenceExceeds(entry->checked, now, 1000))
+		(state->immutable || !TimestampDifferenceExceeds(entry->checked, GetCurrentTimestamp(), 1000)))
 	{
 		CopyTombstones(state, entry);
 		return;
 	}
-	if (!OidIsValid(schema) || !OidIsValid(get_relname_relid("ann_frozen_tombstone", schema)))
+	state->tombstones = NULL;
+	state->ntombstones = 0;
+	if (!TombstoneTableExists())
+	{
+		/* no tombstone table: nothing deleted, cached like a read */
+		if (entry->ordinals)
+			pfree(entry->ordinals);
+		entry->ordinals = NULL;
+		entry->count = 0;
+		entry->generation = state->meta->generation;
+		entry->epoch = tombstoneEpoch;
+		entry->checked = GetCurrentTimestamp();
 		return;
+	}
 	if (SPI_connect() != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed");
 	if (SPI_execute_with_args(psprintf("SELECT key FROM %s.ann_frozen_tombstone WHERE source = $1",
-									   quote_identifier(get_namespace_name(schema))),
+									   quote_identifier(get_namespace_name(tombstoneSchema))),
 							  1, types, values, NULL, true, 0) != SPI_OK_SELECT)
 		elog(ERROR, "could not read the ann tombstones");
 	ordinals = MemoryContextAlloc(TopMemoryContext, sizeof(uint64) * Max(SPI_processed, 1));
@@ -593,7 +727,7 @@ LoadTombstones(FrozenScanState *state)
 	entry->count = count;
 	entry->generation = state->meta->generation;
 	entry->epoch = tombstoneEpoch;
-	entry->checked = now;
+	entry->checked = GetCurrentTimestamp();
 	CopyTombstones(state, entry);
 }
 
@@ -694,7 +828,7 @@ LocalSearch(FrozenScanState *state)
 		AnnFrozenVectorReaderEnd(&vr);
 		nwords = 0;				/* done: skip the page loop */
 	}
-	AnnArrayReaderInit(&reader, state->index, &meta->vectors, strategy);
+	AnnArrayReaderInitExtended(&reader, state->index, &meta->vectors, strategy, state->immutable);
 	for (size_t w = 0; w < nwords; w++)
 	{
 		for (uint32 bits = words[w]; bits; bits &= bits - 1)
@@ -735,6 +869,9 @@ LocalSearch(FrozenScanState *state)
 	state->nresults = n;
 	state->exhausted = true;
 }
+
+/* The worker's route code for an exact scan of the eligible rows (ann/backend.h: ANN_ROUTE_EXACT). */
+#define ANN_FROZEN_ROUTE_EXACT 2
 
 /* Operation 22: the top k in ordinals, or false to fall back to the CPU. */
 static bool
@@ -800,11 +937,19 @@ WorkerSearch(FrozenScanState *state, uint64 k)
 	/*
 	 * Done once every eligible row came back. An approximate route can return
 	 * fewer than k while more rows qualify: the rest then come from the
-	 * pages, exactly, skipping what was returned.
+	 * pages, exactly, skipping what was returned. With
+	 * ann.frozen_complete_short off, the rows an approximate route found are
+	 * the answer: finishing a few missing rows costs a scan of every eligible
+	 * row on the CPU, hundreds of milliseconds at a million rows.
 	 */
 	state->exhausted = count >= state->eligible;
 	if (!state->exhausted && count < k)
-		state->workerShort = true;
+	{
+		if (!ann_frozen_complete_short && state->workerRoute != ANN_FROZEN_ROUTE_EXACT)
+			state->exhausted = true;
+		else
+			state->workerShort = true;
+	}
 	return true;
 }
 
@@ -815,6 +960,30 @@ OrdinalCompare(const void *a, const void *b)
 	uint64		y = *(const uint64 *) b;
 
 	return (x > y) - (x < y);
+}
+
+/* The first request: LIMIT + OFFSET, evaluated when the plan carries them. */
+static uint64
+FirstK(FrozenScanState *state, ExprContext *econtext)
+{
+	Datum		value;
+	bool		isnull;
+	int64		count;
+	int64		offset = 0;
+
+	if (state->limitCount == NULL)
+		return (uint64) state->initialK;
+	value = ExecEvalExprSwitchContext(state->limitCount, econtext, &isnull);
+	if (isnull)
+		return (uint64) state->initialK;	/* LIMIT NULL: no limit */
+	count = Min(Max(DatumGetInt64(value), 1), ANN_FROZEN_WORKER_MAX_K);
+	if (state->limitOffset)
+	{
+		value = ExecEvalExprSwitchContext(state->limitOffset, econtext, &isnull);
+		if (!isnull)
+			offset = Min(Max(DatumGetInt64(value), 0), ANN_FROZEN_WORKER_MAX_K);
+	}
+	return (uint64) Min(count + offset, ANN_FROZEN_WORKER_MAX_K);
 }
 
 /* (Re)fill results: first k, then four times as many as asked before. */
@@ -842,7 +1011,7 @@ Fill(FrozenScanState *state)
 		if (!state->queryIsNull)
 			state->query = PointerGetDatum(PG_DETOAST_DATUM_COPY(state->query));
 	}
-	k = state->requested == 0 ? (uint64) state->initialK : state->requested * 4;
+	k = state->requested == 0 ? FirstK(state, econtext) : state->requested * 4;
 	state->requested = k;
 
 	/* Remember what was returned, so a refill skips it. */
@@ -877,13 +1046,14 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 {
 	Relation	index = state->index;
 	TupleDesc	desc = slot->tts_tupleDescriptor;
-	int64		key;
+	int64		key = 0;
 
 	ExecClearTuple(slot);
 	memset(slot->tts_isnull, true, sizeof(bool) * desc->natts);
-	if (state->vectorMode == ANN_FROZEN_VECTORS_FLOAT)
+	if (state->vectorMode == ANN_FROZEN_VECTORS_FLOAT && state->needed[0])
 		AnnArrayRead(&state->vectors, ordinal, state->vector);
-	AnnArrayRead(&state->keys, ordinal, &key);
+	if (state->needed[1])
+		AnnArrayRead(&state->keys, ordinal, &key);
 	for (int i = 0; i < RelationGetDescr(index)->natts; i++)
 	{
 		AttrNumber	attno = index->rd_index->indkey.values[i];
@@ -891,6 +1061,9 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 		Datum		value;
 		bool		isnull = false;
 
+		/* each random read of the pages is a cache miss: skip the columns nothing reads */
+		if (!state->needed[i])
+			continue;
 		if (i == 0)
 		{
 			/* not read by the query unless the pages hold whole vectors */
@@ -901,6 +1074,13 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 		else if (i == 1)
 			value = type == INT2OID ? Int16GetDatum((int16) key) :
 				type == INT4OID ? Int32GetDatum((int32) key) : Int64GetDatum(key);
+		else if (AnnFrozenMultiType(type))
+		{
+			MemoryContext oldCtx = MemoryContextSwitchTo(state->css.ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
+
+			value = AnnFrozenArrayDatum(&state->values[i - 2], &state->starts[i - 2], ordinal, &isnull);
+			MemoryContextSwitchTo(oldCtx);
+		}
 		else
 		{
 			int32		v;
@@ -934,11 +1114,14 @@ PrefetchResult(FrozenScanState *state, uint64 position)
 
 	if (ordinal >= state->meta->rows)
 		return;
-	if (state->vectorMode == ANN_FROZEN_VECTORS_FLOAT)
+	/* only the columns StoreFromPages reads */
+	if (state->vectorMode == ANN_FROZEN_VECTORS_FLOAT && state->needed[0])
 		AnnArrayPrefetch(&state->vectors, ordinal);
-	AnnArrayPrefetch(&state->keys, ordinal);
+	if (state->needed[1])
+		AnnArrayPrefetch(&state->keys, ordinal);
 	for (uint32 c = 0; c < state->meta->ncolumns; c++)
-		AnnArrayPrefetch(&state->values[c], ordinal);
+		if (state->needed[c + 2])
+			AnnArrayPrefetch(&state->values[c], ordinal);
 }
 
 /*
@@ -1013,7 +1196,8 @@ FrozenNext(ScanState *node)
 			if (state->nresults - state->next > distance)
 				PrefetchResult(state, state->next + distance);
 		}
-		if (state->covering && ann_frozen_materialize_batch > 0 && !state->batchUnavailable)
+		if (state->covering && !state->immutable && ann_frozen_materialize_batch > 0 &&
+			!state->batchUnavailable)
 		{
 			uint64		position;
 
@@ -1035,13 +1219,28 @@ FrozenNext(ScanState *node)
 		if (state->ntombstones &&
 			bsearch(&ordinal, state->tombstones, state->ntombstones, sizeof(uint64), OrdinalCompare))
 			continue;			/* deleted (ann_frozen_delete) */
-		if (state->covering)
-			AnnFrozenReadTid(&state->tids, node->ss_currentRelation, ordinal, &tid, &visible,
-							 state->vmbufs, ANN_FROZEN_VM_BUFFERS);
+		if (state->covering && state->immutable)
+		{
+			/* the table is unchanged since the build: every TID is visible */
+			ItemPointerSetInvalid(&tid);
+			if (state->needTids)
+			{
+				AnnArrayRead(&state->tids, ordinal, &tid);
+				if (!ItemPointerIsValid(&tid))
+					continue;
+			}
+			visible = true;
+		}
 		else
-			AnnArrayRead(&state->tids, ordinal, &tid);
-		if (!ItemPointerIsValid(&tid))
-			continue;
+		{
+			if (state->covering)
+				AnnFrozenReadTid(&state->tids, node->ss_currentRelation, ordinal, &tid, &visible,
+								 state->vmbufs, ANN_FROZEN_VM_BUFFERS);
+			else
+				AnnArrayRead(&state->tids, ordinal, &tid);
+			if (!ItemPointerIsValid(&tid))
+				continue;
+		}
 		if (visible)
 		{
 			StoreFromPages(state, slot, ordinal);
@@ -1110,7 +1309,11 @@ EndFrozenScan(CustomScanState *node)
 	AnnArrayReaderEnd(&state->keys);
 	AnnArrayReaderEnd(&state->vectors);
 	for (uint32 c = 0; c < state->meta->ncolumns; c++)
+	{
 		AnnArrayReaderEnd(&state->values[c]);
+		if (AnnFrozenMultiType(state->columns.types[c]))
+			AnnArrayReaderEnd(&state->starts[c]);
+	}
 	if (state->fetch)
 		table_index_fetch_end(state->fetch);
 	if (state->heapSlot)
@@ -1142,12 +1345,22 @@ ExplainFrozenScan(CustomScanState *node, List *ancestors, ExplainState *es)
 						psprintf("frozen index predicates on GPU worker \"%s\"", state->workerName) :
 						es->analyze || state->workerName ? "frozen index predicates from index pages" :
 						"frozen index predicates", es);
-	ExplainPropertyText("Columns", state->covering ? "index pages when all-visible" : "heap", es);
+	ExplainPropertyText("Columns", !state->covering ? "heap" :
+						state->immutable ? "index pages" : "index pages when all-visible", es);
+	if (node->ss.ps.plan->qual != NIL)
+		ExplainPropertyBool("Qual Recheck", node->ss.ps.qual != NULL, es);
 	if (es->analyze)
 	{
 		ExplainPropertyInteger("Filter Rows", NULL, state->eligible, es);
 		ExplainPropertyInteger("Heap Fetches", NULL, state->heapFetches, es);
 		ExplainPropertyInteger("Worker Calls", NULL, state->workerCalls, es);
+		if (state->workerCalls > 0 && !state->workerFailed)
+		{
+			static const char *const routes[] = {"graph", "filtered graph", "exact scan"};
+
+			ExplainPropertyText("Worker Route", (unsigned) state->workerRoute < 3 ? routes[state->workerRoute] : "other", es);
+			ExplainPropertyBool("Worker Reply Short", state->workerShort, es);
+		}
 		ExplainPropertyInteger("Local Evaluations", NULL, state->localRuns, es);
 		ExplainPropertyInteger("Materialized Rows", NULL, state->materializedRows, es);
 		ExplainPropertyInteger("Mapped TID Rows", NULL, state->mappedTidRows, es);
@@ -1173,6 +1386,9 @@ AnnFrozenScanInit(void)
 	DefineCustomBoolVariable("ann.enable_frozen_search",
 							 "Answer ordered searches of tables with frozen ann indexes from the index and the GPU worker.",
 							 NULL, &ann_enable_frozen_search, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("ann.frozen_complete_short",
+							 "Finish a frozen search from the index pages when an approximate worker route returns fewer rows than asked.",
+							 NULL, &ann_frozen_complete_short, true, PGC_USERSET, 0, NULL, NULL, NULL);
 	DefineCustomRealVariable("ann.frozen_setup_cost",
 							 "Sets the planner's estimate of the cost of one frozen search call.",
 							 "The GPU worker round trip or the evaluation from the pages, before the first row.",
@@ -1180,6 +1396,15 @@ AnnFrozenScanInit(void)
 	DefineCustomBoolVariable("ann.frozen_mmap",
 							 "Read frozen ann index pages through read-only mappings of the index files.",
 							 NULL, &ann_frozen_mmap, true, PGC_USERSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("ann.frozen_immutable",
+							 "Treat frozen tables as never changing: map TID pages and skip visibility checks.",
+							 "Applies to tables whose ann_frozen_guard trigger is enabled always and that haven't "
+							 "changed since the build; ann_frozen_delete fails while it is on.",
+							 &ann_frozen_immutable, false, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("ann.frozen_recheck",
+							 "Recheck the WHERE clause on rows a frozen search of an immutable table builds from the index pages.",
+							 "Other rows are always rechecked.",
+							 &ann_frozen_recheck, false, PGC_USERSET, 0, NULL, NULL, NULL);
 	RegisterCustomScanMethods(&FrozenScanMethods);
 	previous_pathlist_hook = set_rel_pathlist_hook;
 	set_rel_pathlist_hook = AnnSetRelPathlist;

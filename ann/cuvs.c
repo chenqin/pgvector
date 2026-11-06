@@ -25,6 +25,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef struct AnnCuvsState
 {
@@ -575,6 +576,7 @@ typedef struct AnnCuvsShard
 	size_t		rerankBytes;	/* owned bytes, zero when reusing FP32 CAGRA
 								 * rows */
 	AnnBlackwellShard quant;	/* quantized rows for Blackwell scans */
+	AnnBlackwellShard rescore;	/* FP8 rows for --rescore fp8-gpu */
 } AnnCuvsShard;
 
 /*
@@ -600,6 +602,8 @@ typedef struct AnnCuvsIndex
 	int			fp16;
 	int			quantized;		/* every shard copy has its quantized rows */
 	int			grouped;		/* every shard copy can be scored in groups */
+	int			scanOnly;		/* no CAGRA graphs: every search scans the quantized rows */
+	int			rescoreGpu;		/* every shard copy has its FP8 re-scoring rows */
 	AnnCuvsShard *shards;
 	AnnCuvsRoute routing[ANN_CUVS_MAX_DEVICES];
 	atomic_uint_fast64_t matrix_queries;
@@ -783,6 +787,16 @@ typedef struct AnnCuvsDevice
 	size_t		queryBytes;
 	size_t		resultCount;
 	size_t		bitsetWords;
+	float	   *groupScores;	/* grouped large-k scan: [queries][rows] distances */
+	size_t		groupCapacity;
+	float	   *hostBest;		/* pinned: selected distances (--rescore off) */
+	uint32_t   *rescoreRows;	/* --rescore fp8-gpu: candidates' shard rows */
+	float	   *rescoreOut;		/* and their distances */
+	uint32_t   *hostRescoreRows;	/* pinned */
+	float	   *hostRescoreOut; /* pinned */
+	size_t		rescoreCapacity;
+	cudaEvent_t timing[4];		/* ANN_KERNEL_TIMING: candidate scan and copy marks */
+	int			timingReady;
 	float	   *matrixScores,
 			   *matrixCandidates,
 			   *matrixValues;
@@ -803,46 +817,6 @@ typedef struct AnnCuvsDevice
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
 
-static uint16_t
-FloatToHalf(float value)
-{
-	uint32_t	bits;
-	uint32_t	sign;
-	int32_t		exponent;
-	uint32_t	mantissa;
-
-	memcpy(&bits, &value, sizeof(bits));
-	sign = (bits >> 16) & 0x8000;
-	exponent = (int32_t) ((bits >> 23) & 0xff) - 127 + 15;
-	mantissa = bits & 0x7fffff;
-	if (exponent >= 31)
-		return (uint16_t) (sign | 0x7c00);
-	if (exponent <= 0)
-	{
-		if (exponent < -10)
-			return (uint16_t) sign;
-		mantissa |= 0x800000;
-		{
-			uint32_t	shift = (uint32_t) (14 - exponent);
-			uint32_t	half = mantissa >> shift;
-			uint32_t	rest = mantissa & ((1U << shift) - 1);
-			uint32_t	middle = 1U << (shift - 1);
-
-			if (rest > middle || (rest == middle && (half & 1)))
-				half++;
-
-			return (uint16_t) (sign | half);
-		}
-	}
-	{
-		uint32_t	half = sign | ((uint32_t) exponent << 10) | (mantissa >> 13);
-		uint32_t	rest = mantissa & 0x1fff;
-
-		if (rest > 0x1000 || (rest == 0x1000 && (half & 1)))
-			half++;
-		return (uint16_t) half;
-	}
-}
 
 static int
 GrowDevice(void **pointer, size_t *capacity, size_t needed, size_t unit, size_t floor, cudaStream_t stream)
@@ -964,6 +938,13 @@ LoadShard(void *argument)
 
 	args->status = ANN_BACKEND_ERROR;
 	shard->device = args->device;
+	if (args->state->scanOnly)
+	{
+		/* No graph: the shard's keys and quantized rows are all the GPU holds. */
+		if (cudaSetDevice(shard->device) != cudaSuccess)
+			return NULL;
+		goto keys;
+	}
 	snprintf(path, sizeof(path), "%s/%s", args->file->directory, args->file->shards[args->shard].file);
 	if (cudaSetDevice(shard->device) != cudaSuccess ||
 		cuvsResourcesCreate(&shard->resources) != CUVS_SUCCESS ||
@@ -1009,6 +990,7 @@ LoadShard(void *argument)
 		if (view.deleter)
 			view.deleter(&view);
 	}
+keys:
 	if (cudaMalloc((void **) &shard->keys, (size_t) args->file->shards[args->shard].rows * sizeof(int64_t)) != cudaSuccess ||
 		cudaMemcpy(shard->keys, args->file->keys + args->file->shards[args->shard].first,
 				   (size_t) args->file->shards[args->shard].rows * sizeof(int64_t), cudaMemcpyHostToDevice) != cudaSuccess)
@@ -1016,6 +998,8 @@ LoadShard(void *argument)
 		if (shard->keys)
 			(void) cudaFree(shard->keys);
 		shard->keys = NULL;
+		if (args->state->scanOnly)
+			return NULL;
 	}
 
 	/*
@@ -1023,13 +1007,21 @@ LoadShard(void *argument)
 	 * or 8 bits per dimension rather than 16 or 32.
 	 */
 	if (args->file->quant != ANN_QUANT_NONE && AnnIndexConfig.quantized_scan)
-		(void) AnnBlackwellUpload(args->file, args->shard, shard->device, &shard->quant);
+	{
+		if (!AnnBlackwellUpload(args->file, args->shard, shard->device, &shard->quant) && args->state->scanOnly)
+			return NULL;
+	}
 	else if (AnnIndexConfig.quantized_scan && shard->rows)
 	{
 		/* Grouped searches can read the FP16 or FP32 dataset in place. */
 		(void) AnnBlackwellView(shard->rows, shard->stride, strcmp(args->file->dtype, "float16") == 0,
 								args->file->dimensions, shard->device, &shard->quant);
 	}
+	if (AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && AnnIndexConfig.quantized_scan)
+		(void) AnnBlackwellUploadFp8(args->file->vectors +
+									 (size_t) args->file->shards[args->shard].first * args->file->dimensions,
+									 args->file->shards[args->shard].rows, args->file->dimensions, shard->device,
+									 &shard->rescore);
 	if (AnnIndexConfig.gpu_rerank)
 	{
 		if (strcmp(args->file->dtype, "float32") == 0 && shard->rows)
@@ -1076,6 +1068,8 @@ DestroyIndexState(AnnCuvsIndex *state)
 		(void) cudaSetDevice(shard->device);
 		if (shard->quant.quant != ANN_QUANT_NONE)
 			AnnBlackwellFree(&shard->quant);
+		if (shard->rescore.quant != ANN_QUANT_NONE)
+			AnnBlackwellFree(&shard->rescore);
 		if (shard->keys)
 			(void) cudaFree(shard->keys);
 		if (shard->rerankBytes)
@@ -1138,11 +1132,16 @@ UploadStream(int device)
 	if (uploadStreams[device] == NULL)
 	{
 		cudaMemPool_t pool;
-		uint64_t	keep = UINT64_MAX;
+
+		/*
+		 * Keep freed bitmap memory in the pool instead of unmapping it, up to the cached rows' budget
+		 * and 2 GB more. Lane buffers come from the same pool and regrow as filters widen (232k, then
+		 * 1.4M, then 11.6M rows): kept without a bound, every generation stayed reserved, 27.6 of 32 GB.
+		 */
+		uint64_t	keep = AnnIndexConfig.predicate_device_bytes + (UINT64_C(2) << 30);
 
 		if (cudaStreamCreateWithFlags(&uploadStreams[device], cudaStreamNonBlocking) != cudaSuccess)
 			uploadStreams[device] = NULL;
-		/* Keep freed bitmap memory in the pool instead of unmapping it. */
 		else if (cudaDeviceGetDefaultMemPool(&pool, device) == cudaSuccess)
 			(void) cudaMemPoolSetAttribute(pool, cudaMemPoolAttrReleaseThreshold, &keep);
 	}
@@ -1366,6 +1365,23 @@ LoadIndex(const char *name, const char *directory)
 	}
 
 	state->fp16 = strcmp(file->dtype, "float16") == 0;
+	state->scanOnly = strcmp(file->shards[0].file, ANN_INDEX_NO_GRAPH) == 0;
+	for (uint32_t s = 1; s < file->nshards; s++)
+		if ((strcmp(file->shards[s].file, ANN_INDEX_NO_GRAPH) == 0) != state->scanOnly)
+			status = ANN_INVALID;
+	if (state->scanOnly && (file->quant == ANN_QUANT_NONE || !AnnIndexConfig.quantized_scan))
+		status = ANN_INVALID;
+	if (status != ANN_OK)
+	{
+		fprintf(stderr, "cuVS: index %s mixes shards without graphs with CAGRA shards, or has no graphs "
+				"and no quantized copy for the Blackwell module to scan\n", name);
+		free(state->shards);
+		free(state);
+		free(args);
+		free(threads);
+		AnnIndexFileClose(file);
+		return status;
+	}
 	cuvsSetLogLevel(CUVS_LOG_LEVEL_OFF);
 
 	/*
@@ -1437,9 +1453,23 @@ LoadIndex(const char *name, const char *directory)
 			bytes += state->shards[s].quant.bytes;
 		}
 		file->quantActive = state->quantized;
+		file->scanOnly = state->scanOnly;
 		fprintf(stderr, "Blackwell module: %s gather scan for index %s %s (%.1f MB of quantized rows on the GPUs)\n",
 				AnnIndexQuantName(file->quant), name, state->quantized ? "on" : "off: not every GPU is ready",
 				(double) bytes / 1048576.0);
+	}
+	if (status == ANN_OK && AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && AnnIndexConfig.quantized_scan)
+	{
+		size_t		bytes = 0;
+
+		state->rescoreGpu = 1;
+		for (uint32_t s = 0; s < total; s++)
+		{
+			state->rescoreGpu &= state->shards[s].rescore.quant != ANN_QUANT_NONE;
+			bytes += state->shards[s].rescore.bytes;
+		}
+		fprintf(stderr, "Blackwell module: FP8 re-scoring rows for index %s %s (%.1f MB on the GPUs)\n", name,
+				state->rescoreGpu ? "on" : "off: not every GPU has them", (double) bytes / 1048576.0);
 	}
 	if (status == ANN_OK && state->copies > AnnIndexConfig.index_copies)
 		AnnIndexConfig.index_copies = state->copies;
@@ -1556,7 +1586,7 @@ UploadQueries(AnnCuvsDevice *lane, const AnnIndexJob *const *jobs, uint32_t m, u
 		for (uint32_t d = 0; d < dims; d++)
 		{
 			if (half)
-				((uint16_t *) host)[(size_t) j * dims + d] = FloatToHalf(jobs[j]->query[d]);
+				((uint16_t *) host)[(size_t) j * dims + d] = AnnIndexHalf(jobs[j]->query[d]);
 			else
 				((float *) host)[(size_t) j * dims + d] = jobs[j]->query[d];
 		}
@@ -1772,6 +1802,13 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	return ok;
 }
 
+/* cuVS CAGRA's top-k selection takes at most this many candidates. */
+#define ANN_CAGRA_MAX_ITOPK 1024
+
+static int SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *const *jobs,
+						uint32_t m, uint32_t k, uint32_t itopk, uint32_t **bitsets, void *const *deviceBitsets,
+						const int *useShard, AnnIndexHit *lists, uint32_t *counts);
+
 /* Merge per-shard lists for query j into its job's results. */
 static void
 MergeJob(AnnIndexJob *job, AnnIndexHit *lists, uint32_t *counts, uint32_t nshards, uint32_t k)
@@ -1782,6 +1819,53 @@ MergeJob(AnnIndexJob *job, AnnIndexHit *lists, uint32_t *counts, uint32_t nshard
 		heads[s] = lists + (size_t) s * k;
 	job->nresults = AnnIndexTreeMerge(heads, counts, nshards, job->k, job->results);
 	job->status = ANN_OK;
+}
+
+/*
+ * A graph search can return fewer than k hits although more rows qualify: its
+ * candidate list holds invalid entries, or the walk never reached the rows
+ * the filter allows. Replying short makes PostgreSQL finish the search itself,
+ * scanning every eligible row on the CPU (hundreds of milliseconds at a million
+ * rows). Search again first, with twice the candidate list (cuVS allows
+ * ANN_CAGRA_MAX_ITOPK), and keep the longer answer.
+ */
+static void
+WidenShortJob(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job, uint32_t itopk,
+			  uint32_t **bitsets, void *const *deviceBitsets, uint64_t eligible)
+{
+	uint32_t	k = job->k;
+	uint32_t	wider = itopk * 2 > ANN_CAGRA_MAX_ITOPK ? ANN_CAGRA_MAX_ITOPK : itopk * 2;
+	const AnnIndexJob *jobs[1] = {job};
+	int			useShard[ANN_INDEX_MAX_SHARDS];
+	uint32_t	counts[ANN_INDEX_MAX_SHARDS] = {0};
+	AnnIndexHit *lists;
+	AnnIndexHit *previous;
+	uint32_t	before = job->nresults;
+
+	if (job->status != ANN_OK || before >= k || before >= eligible || wider <= itopk)
+		return;
+	lists = malloc(sizeof(AnnIndexHit) * (size_t) k * state->nshards);
+	previous = malloc(sizeof(AnnIndexHit) * (size_t) (before ? before : 1));
+	if (lists == NULL || previous == NULL)
+	{
+		free(lists);
+		free(previous);
+		return;
+	}
+	memcpy(previous, job->results, sizeof(AnnIndexHit) * before);
+	for (uint32_t s = 0; s < state->nshards; s++)
+		useShard[s] = 1;
+	if (SearchShards(file, state, jobs, 1, k, wider, bitsets, deviceBitsets, useShard, lists, counts))
+	{
+		MergeJob(job, lists, counts, state->nshards, k);
+		if (job->nresults < before)
+		{
+			memcpy(job->results, previous, sizeof(AnnIndexHit) * before);
+			job->nresults = before;
+		}
+	}
+	free(lists);
+	free(previous);
 }
 
 /*
@@ -1845,6 +1929,25 @@ static const char RerankSource[] =
 
 #define ANN_GATHER_BLOCK 256
 #define ANN_GATHER_SLACK 32		/* extra FP16 candidates re-scored in FP32 */
+
+/*
+ * Candidates beyond k that a scan of a quantized or FP16 copy selects and
+ * re-scores in FP32. Quantization error reorders rows near the cutoff, so the
+ * margin grows with k: --quant-slack at least, and --slack-ratio percent of k
+ * past that (at k = 500 a 256 margin lost 1 to 1.4% of recall; k extra
+ * candidates, the default 100%, did not).
+ */
+static uint32_t
+GatherSlack(const AnnCuvsIndex *state, uint32_t k)
+{
+	if (state->quantized)
+	{
+		uint32_t	slack = (uint32_t) ((uint64_t) k * AnnIndexConfig.slack_ratio / 100);
+
+		return AnnIndexConfig.quant_slack > slack ? AnnIndexConfig.quant_slack : slack;
+	}
+	return state->fp16 ? ANN_GATHER_SLACK : 0;
+}
 #define ANN_EXACT_FALLBACK 20000	/* CPU exact limit when gather cannot run */
 
 typedef struct GatherModule
@@ -1914,6 +2017,18 @@ unlock:
 }
 
 /* Size this lane's gather buffers on its current device. */
+/* A lane buffer that could not grow: say so (a search then fails and PostgreSQL scans itself). */
+static int
+LaneBufferFailure(const char *what, size_t count)
+{
+	static atomic_uint reported;
+
+	if (atomic_fetch_add(&reported, 1) < 20)
+		fprintf(stderr, "cuVS gather scan: cannot allocate %s for %zu entries: %s\n", what, count,
+				cudaGetErrorString(cudaGetLastError()));
+	return 0;
+}
+
 static int
 GatherBuffers(AnnCuvsDevice *lane, size_t rows, size_t top)
 {
@@ -1921,39 +2036,50 @@ GatherBuffers(AnnCuvsDevice *lane, size_t rows, size_t top)
 
 	if (cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS)
 		return 0;
+
+	/*
+	 * GrowDevice and GrowPinned allocate twice the need (at least the floor).
+	 * A failure part way leaves capacity 0, so no buffer freed on the way is
+	 * trusted by a later, smaller search.
+	 */
 	if (rows > lane->gatherCount)
 	{
-		size_t		count = rows * 2 > ANN_LANE_ROW_FLOOR ? rows * 2 : ANN_LANE_ROW_FLOOR;
+		size_t		old = lane->gatherCount;
 		size_t		have;
 
-		have = lane->gatherCount;
-		if (!GrowDevice((void **) &lane->gatherKeys, &have, count, sizeof(int64_t), 0, stream))
-			return 0;
-		have = lane->gatherCount;
-		if (!GrowDevice((void **) &lane->gatherRows, &have, count, sizeof(uint32_t), 0, stream))
-			return 0;
-		have = lane->gatherCount;
-		if (!GrowDevice((void **) &lane->gatherScores, &have, count, sizeof(float), 0, stream))
-			return 0;
-		have = lane->gatherCount;
-		if (!GrowPinned((void **) &lane->hostKeys, &have, count, sizeof(int64_t), 0))
-			return 0;
+		lane->gatherCount = 0;
+		have = old;
+		if (!GrowDevice((void **) &lane->gatherKeys, &have, rows, sizeof(int64_t), ANN_LANE_ROW_FLOOR, stream))
+			return LaneBufferFailure("gather keys", rows);
+		have = old;
+		if (!GrowDevice((void **) &lane->gatherRows, &have, rows, sizeof(uint32_t), ANN_LANE_ROW_FLOOR, stream))
+			return LaneBufferFailure("gather rows", rows);
+		have = old;
+		if (!GrowDevice((void **) &lane->gatherScores, &have, rows, sizeof(float), ANN_LANE_ROW_FLOOR, stream))
+			return LaneBufferFailure("gather scores", rows);
+		have = old;
+		if (!GrowPinned((void **) &lane->hostKeys, &have, rows, sizeof(int64_t), ANN_LANE_ROW_FLOOR))
+			return LaneBufferFailure("pinned gather keys", rows);
 		lane->gatherCount = have;
 	}
 	if (top > lane->gatherTop)
 	{
-		size_t		count = top * 2 > ANN_LANE_RESULT_FLOOR ? top * 2 : ANN_LANE_RESULT_FLOOR;
+		size_t		old = lane->gatherTop;
 		size_t		have;
 
-		have = lane->gatherTop;
-		if (!GrowDevice((void **) &lane->gatherBest, &have, count, sizeof(float), 0, stream))
-			return 0;
-		have = lane->gatherTop;
-		if (!GrowDevice((void **) &lane->gatherIndex, &have, count, sizeof(int64_t), 0, stream))
-			return 0;
-		have = lane->gatherTop;
-		if (!GrowPinned((void **) &lane->hostIndex, &have, count, sizeof(int64_t), 0))
-			return 0;
+		lane->gatherTop = 0;
+		have = old;
+		if (!GrowDevice((void **) &lane->gatherBest, &have, top, sizeof(float), ANN_LANE_RESULT_FLOOR, stream))
+			return LaneBufferFailure("selected distances", top);
+		have = old;
+		if (!GrowDevice((void **) &lane->gatherIndex, &have, top, sizeof(int64_t), ANN_LANE_RESULT_FLOOR, stream))
+			return LaneBufferFailure("selected positions", top);
+		have = old;
+		if (!GrowPinned((void **) &lane->hostIndex, &have, top, sizeof(int64_t), ANN_LANE_RESULT_FLOOR))
+			return LaneBufferFailure("pinned selected positions", top);
+		have = old;
+		if (!GrowPinned((void **) &lane->hostBest, &have, top, sizeof(float), ANN_LANE_RESULT_FLOOR))
+			return LaneBufferFailure("pinned selected distances", top);
 		lane->gatherTop = have;
 	}
 	return 1;
@@ -1978,6 +2104,48 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 
 static atomic_ullong gatherRepairs;
 
+/* Lane buffers for re-scoring count candidates on the GPU (--rescore fp8-gpu). */
+static int
+RescoreBuffers(AnnCuvsDevice *lane, size_t count, cudaStream_t stream)
+{
+	size_t		old = lane->rescoreCapacity;
+	size_t		have;
+
+	if (count <= old)
+		return 1;
+	lane->rescoreCapacity = 0;
+	have = old;
+	if (!GrowDevice((void **) &lane->rescoreRows, &have, count, sizeof(uint32_t), ANN_LANE_RESULT_FLOOR, stream))
+		return LaneBufferFailure("re-scored rows", count);
+	have = old;
+	if (!GrowDevice((void **) &lane->rescoreOut, &have, count, sizeof(float), ANN_LANE_RESULT_FLOOR, stream))
+		return LaneBufferFailure("re-scored distances", count);
+	have = old;
+	if (!GrowPinned((void **) &lane->hostRescoreRows, &have, count, sizeof(uint32_t), ANN_LANE_RESULT_FLOOR))
+		return LaneBufferFailure("pinned re-scored rows", count);
+	have = old;
+	if (!GrowPinned((void **) &lane->hostRescoreOut, &have, count, sizeof(float), ANN_LANE_RESULT_FLOOR))
+		return LaneBufferFailure("pinned re-scored distances", count);
+	lane->rescoreCapacity = have;
+	return 1;
+}
+
+/* L2 distance from the FP16 copy (--rescore fp16). */
+static float
+HalfDistance(const AnnIndexFile *file, uint64_t row, const float *query)
+{
+	const uint16_t *vector = file->halfVectors + row * file->dimensions;
+	double		sum = 0;
+
+	for (uint32_t d = 0; d < file->dimensions; d++)
+	{
+		double		delta = (double) AnnIndexHalfFloat(vector[d]) - query[d];
+
+		sum += delta * delta;
+	}
+	return (float) sqrt(sum);
+}
+
 /*
  * Exact top k of one filtered query by gather scan. Keys are sorted and
  * unique; each shard's slice goes to its device, where a lookup kernel finds
@@ -1996,7 +2164,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	 * Quantized and FP16 scores rank approximately: take extra candidates and
 	 * let the FP32 re-score below decide.
 	 */
-	uint32_t	slack = state->quantized ? AnnIndexConfig.quant_slack : state->fp16 ? ANN_GATHER_SLACK : 0;
+	uint32_t	slack = GatherSlack(state, k);
 
 	/*
 	 * On Blackwell the module's fused kernel scores and selects in one
@@ -2055,7 +2223,8 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		topSlot[s] = perDeviceTop[device];
 		perDeviceKeys[device] += eligible[s];
 		perDeviceTop[device] += wanted[s];
-		if (eligible[s] && (shards[s].rows == NULL || shards[s].keys == NULL || GatherKernels(device) == NULL))
+		if (eligible[s] && ((shards[s].rows == NULL && !state->quantized) || shards[s].keys == NULL ||
+						   GatherKernels(device) == NULL))
 			return 0;
 	}
 	lists = malloc(sizeof(AnnIndexHit) * (size_t) (k + slack) * state->nshards);
@@ -2092,6 +2261,8 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			!GatherBuffers(lane, perDeviceKeys[shard->device], perDeviceTop[shard->device]) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
 		{
+			if (lane == NULL)
+				LaneBufferFailure("lane", 1);
 			ok = 0;
 			break;
 		}
@@ -2197,7 +2368,10 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 		if (laneDevices[d].resources && perDeviceKeys[d] &&
 			(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+		{
+			fprintf(stderr, "cuVS gather scan: device %d failed: %s\n", d, cudaGetErrorString(cudaGetLastError()));
 			ok = 0;
+		}
 
 	/*
 	 * Map the selected keys back to rows on the host: k binary searches. Keys
@@ -2324,6 +2498,49 @@ FilteredCandidates(uint32_t k)
 	return k + (slack < 1024 - k ? slack : 1024 - k);
 }
 
+/* The default for the most candidates an exact scan selects (--scan-max-k). */
+#define ANN_SCAN_MAX_K 4096
+
+/*
+ * Whether a search for k results over `rows` eligible rows runs as an exact
+ * scan of those rows rather than a graph search. The scan reads the NVFP4 or
+ * FP8 copy on the tensor cores and re-scores its candidates in FP32, so its
+ * answer is exact where CAGRA's is approximate (recall@500 of 0.87 on a
+ * million rows), and it has no limit near k = 1,024, where CAGRA's top-k
+ * selection stops. It is the default on an index with a quantized copy on
+ * every GPU; without one it still answers what only a scan can (k beyond
+ * CAGRA's limit). Beyond --gather-limit rows the graph is cheaper, and
+ * beyond --scan-max-k candidates the selection stops.
+ */
+static int
+ScanPreferred(const AnnCuvsIndex *state, uint32_t k, uint64_t rows)
+{
+	uint32_t	limit = AnnIndexConfig.scan_max_k ? AnnIndexConfig.scan_max_k : ANN_SCAN_MAX_K;
+	uint32_t	slack = GatherSlack(state, k);
+
+	if (state->scanOnly)
+		return (uint64_t) k + slack <= limit;
+	if (AnnIndexConfig.scan_off || rows > AnnIndexConfig.gather_limit || (uint64_t) k + slack > limit)
+		return 0;
+	if (RoundTopK(k) > ANN_CAGRA_MAX_ITOPK)
+		return 1;
+	return state->quantized != 0;
+}
+
+static int
+ScanPreferredIndex(const AnnIndexFile *file, uint32_t k)
+{
+	const AnnCuvsIndex *state = file->device;
+
+	int			scan = state != NULL && ScanPreferred(state, k, file->rows);
+
+	if (getenv("ANN_SCAN_DEBUG") && state != NULL)
+		fprintf(stderr, "scan route: k=%u rows=%llu quantized=%d fp16=%d off=%d max_k=%u gather_limit=%u -> %d\n", k,
+				(unsigned long long) file->rows, state->quantized, state->fp16, AnnIndexConfig.scan_off,
+				AnnIndexConfig.scan_max_k, AnnIndexConfig.gather_limit, scan);
+	return scan;
+}
+
 static void
 SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 {
@@ -2342,12 +2559,30 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	double		selectivity;
 	uint32_t	itopk;
 	uint64_t	exactLimit = AnnIndexConfig.exact_limit;
+	int			scan;
 
 	/*
 	 * A broad filter with prebuilt bitsets runs filtered CAGRA on every
 	 * shard, with no per-row work here, whether or not its rows are known.
 	 */
-	if (job->bitsets != NULL &&
+	scan = job->filter != NULL && ScanPreferred(state, k, job->nfilter);
+	if (state->scanOnly)
+	{
+		if (job->filter == NULL && job->ordinals == NULL)
+		{
+			/* Bitsets alone: predicates on these indexes keep their rows (server.c). */
+			job->status = ANN_INVALID;
+			return;
+		}
+		/* Without graphs, what the scan cannot take is scored on the CPU. */
+		if (!(scan && job->nfilter > AnnIndexConfig.exact_limit && SearchGather(file, state, job)))
+		{
+			exactLimit = UINT64_MAX;
+			goto exact;
+		}
+		return;
+	}
+	if (job->bitsets != NULL && !scan &&
 		((job->ordinals == NULL && job->filter == NULL) || job->nfilter > AnnIndexConfig.bitset_gather_limit))
 	{
 		uint32_t	graphCounts[ANN_INDEX_MAX_SHARDS] = {0};
@@ -2369,6 +2604,7 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		else
 		{
 			MergeJob(job, graphLists, graphCounts, state->nshards, selected);
+			WidenShortJob(file, state, job, itopk, bitsets, job->deviceBitsets, job->nfilter);
 			job->route = ANN_ROUTE_FILTERED;
 		}
 		free(graphLists);
@@ -2382,7 +2618,7 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	 * the bitset must be built per query.
 	 */
 	if (job->nfilter > AnnIndexConfig.exact_limit &&
-		job->nfilter <= (job->bitsets ? AnnIndexConfig.bitset_gather_limit : AnnIndexConfig.gather_limit))
+		job->nfilter <= (job->bitsets && !scan ? AnnIndexConfig.bitset_gather_limit : AnnIndexConfig.gather_limit))
 	{
 		if (SearchGather(file, state, job))
 			return;
@@ -2394,6 +2630,7 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		if (exactLimit < ANN_EXACT_FALLBACK)
 			exactLimit = ANN_EXACT_FALLBACK;
 	}
+exact:
 	/* Attribute filters arrive with their ordinals, and maybe bitsets. */
 	if (job->ordinals == NULL)
 		ordinals = malloc(sizeof(uint64_t) * (job->nfilter ? job->nfilter : 1));
@@ -2496,6 +2733,13 @@ SearchUnfiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jo
 	uint32_t   *counts;
 	uint32_t	itopk;
 
+	if (state->scanOnly)
+	{
+		/* Unfiltered frozen searches come as all-rows filters; others have no graph to search. */
+		for (uint32_t j = 0; j < m; j++)
+			jobs[j]->status = ANN_INVALID;
+		return;
+	}
 	for (uint32_t j = 0; j < m; j++)
 		if (jobs[j]->k > k)
 			k = jobs[j]->k;
@@ -2515,6 +2759,7 @@ SearchUnfiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jo
 		{
 			MergeJob(jobs[j], lists + (size_t) j * state->nshards * k, counts + (size_t) j * state->nshards,
 					 state->nshards, k);
+			WidenShortJob(file, state, jobs[j], itopk, NULL, NULL, file->rows);
 			jobs[j]->route = ANN_ROUTE_ANN;
 		}
 	free(lists);
@@ -2573,6 +2818,7 @@ SearchFilteredGroupGraph(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndex
 		{
 			MergeJob(jobs[j], lists + (size_t) j * state->nshards * k, counts + (size_t) j * state->nshards,
 					 state->nshards, k);
+			WidenShortJob(file, state, jobs[j], itopk, bitsets, jobs[0]->deviceBitsets, jobs[0]->nfilter);
 			jobs[j]->route = ANN_ROUTE_FILTERED;
 		}
 	free(lists);
@@ -3085,6 +3331,642 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 }
 
 /*
+ * Reorder (distance, row) pairs so the m smallest distances come first, in
+ * any order (Hoare quickselect).
+ */
+static void
+SmallestFirst(float *d, uint32_t *r, uint32_t n, uint32_t m)
+{
+	int64_t		lo = 0,
+				hi = (int64_t) n - 1;
+
+	if (m == 0 || m >= n)
+		return;
+	while (lo < hi)
+	{
+		float		a = d[lo],
+					b = d[lo + (hi - lo) / 2],
+					c = d[hi];
+		float		pivot = a < b ? (b < c ? b : (a < c ? c : a)) : (a < c ? a : (b < c ? c : b));
+		int64_t		i = lo - 1,
+					j = hi + 1;
+
+		for (;;)
+		{
+			float		swapD;
+			uint32_t	swapR;
+
+			do
+				i++;
+			while (d[i] < pivot);
+			do
+				j--;
+			while (d[j] > pivot);
+			if (i >= j)
+				break;
+			swapD = d[i], d[i] = d[j], d[j] = swapD;
+			swapR = r[i], r[i] = r[j], r[j] = swapR;
+		}
+		/* [lo, j] <= pivot <= [j + 1, hi] */
+		if ((int64_t) m - 1 <= j)
+			hi = j;
+		else
+			lo = j + 1;
+	}
+}
+
+/*
+ * ANN_KERNEL_TIMING=1: where a large-k search's time goes, from GPU timestamps (CUDA events on the
+ * lane's stream around the candidate scan and the candidate copies) and host clocks (selection and
+ * re-scoring), averaged per query and printed every 10 s, with no profiler attached.
+ */
+typedef struct StageTimes
+{
+	double		candidatesMs;
+	double		copyMs;
+	double		selectMs;
+	double		rescoreMs;
+	uint64_t	passes;
+	uint64_t	queries;
+} StageTimes;
+
+static StageTimes stageTotals;
+static double stageLastPrint;
+static pthread_mutex_t stageMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+KernelTiming(void)
+{
+	static int	enabled = -1;
+
+	if (enabled < 0)
+	{
+		const char *value = getenv("ANN_KERNEL_TIMING");
+
+		enabled = value != NULL && strcmp(value, "0") != 0;
+	}
+	return enabled;
+}
+
+static double
+MonotonicMs(void)
+{
+	struct timespec now;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &now);
+	return (double) now.tv_sec * 1000.0 + (double) now.tv_nsec / 1e6;
+}
+
+static int
+TimingEvents(AnnCuvsDevice *lane)
+{
+	if (!lane->timingReady)
+	{
+		for (int i = 0; i < 4; i++)
+			if (cudaEventCreate(&lane->timing[i]) != cudaSuccess)
+				return 0;
+		lane->timingReady = 1;
+	}
+	return 1;
+}
+
+static void
+StageAdd(const StageTimes *pass)
+{
+	double		now = MonotonicMs();
+
+	(void) pthread_mutex_lock(&stageMutex);
+	stageTotals.candidatesMs += pass->candidatesMs;
+	stageTotals.copyMs += pass->copyMs;
+	stageTotals.selectMs += pass->selectMs;
+	stageTotals.rescoreMs += pass->rescoreMs;
+	stageTotals.passes += pass->passes;
+	stageTotals.queries += pass->queries;
+	if (stageLastPrint == 0)
+		stageLastPrint = now;
+	else if (now - stageLastPrint >= 10000 && stageTotals.queries)
+	{
+		double		per = (double) stageTotals.queries;
+
+		fprintf(stderr, "kernel timing: %llu queries in %llu passes; ms per query: candidate scan %.3f (GPU), "
+				"candidate copy %.3f (GPU), selection %.3f (host), re-score %.3f (host)\n",
+				(unsigned long long) stageTotals.queries, (unsigned long long) stageTotals.passes,
+				stageTotals.candidatesMs / per, stageTotals.copyMs / per, stageTotals.selectMs / per,
+				stageTotals.rescoreMs / per);
+		memset(&stageTotals, 0, sizeof(stageTotals));
+		stageLastPrint = now;
+	}
+	(void) pthread_mutex_unlock(&stageMutex);
+}
+
+/* Grouped large-k scans unless ANN_BLACKWELL_GROUP_LARGE=off (for measurements). */
+static int
+GroupLargeEnabled(void)
+{
+	static int	enabled = -1;
+
+	if (enabled < 0)
+	{
+		const char *value = getenv("ANN_BLACKWELL_GROUP_LARGE");
+
+		enabled = value == NULL || strcmp(value, "off") != 0;
+	}
+	return enabled;
+}
+
+/* Sampled candidate bounds for large k unless ANN_BLACKWELL_CANDIDATES=off (for measurements). */
+static int
+CandidatesEnabled(void)
+{
+	static int	enabled = -1;
+
+	if (enabled < 0)
+	{
+		const char *value = getenv("ANN_BLACKWELL_CANDIDATES");
+
+		enabled = value == NULL || strcmp(value, "off") != 0;
+	}
+	return enabled;
+}
+
+/* Bytes of [queries][rows] distances one lane holds per grouped large-k pass (ANN_GROUP_SCORE_MB). */
+static size_t
+GroupScoreBytes(void)
+{
+	static size_t bytes = 0;
+
+	if (bytes == 0)
+	{
+		const char *value = getenv("ANN_GROUP_SCORE_MB");
+		long		mb = value ? atol(value) : 512;
+
+		bytes = (size_t) (mb > 16 ? mb : 16) << 20;
+	}
+	return bytes;
+}
+
+/*
+ * Gather scan of m jobs over one filter for k beyond the fused selection
+ * (k + 8 > ANN_BLACKWELL_TOP): each shard's eligible rows are read once per
+ * pass of up to AnnBlackwellGroupLimit queries, scored on the tensor cores
+ * into a [queries][rows] matrix, and cuvsSelectK takes each query's k + slack
+ * best from its row, which the host re-scores in FP32. A pass takes as many
+ * queries as GroupScoreBytes of distances hold. Where a sample of the rows
+ * can bound the candidates (AnnBlackwellCandidateCap), the scan keeps only
+ * rows under the bound instead, about four times k + slack per query, and the
+ * host selects among those: no matrix, no selection over every row, and
+ * single jobs take it too (radix selection over 11.6M scores was 53% of GPU
+ * time at k = 500). Returns 0, with no result written, when the group cannot
+ * take this path, a launch failed or a bound missed; the caller then searches
+ * job by job.
+ */
+static int
+SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
+{
+	uint32_t	dims = file->dimensions;
+	const uint64_t *ordinals = jobs[0]->ordinals;
+	uint64_t	n = jobs[0]->nfilter;
+	uint32_t	limit = (uint32_t) AnnBlackwellGroupLimit((int) dims);
+	uint32_t	k = 0;
+	uint32_t	slack;
+	uint32_t	stride;
+	uint32_t	perPass;
+	uint64_t	start[ANN_INDEX_MAX_SHARDS + 1];
+	uint32_t	wanted[ANN_INDEX_MAX_SHARDS];
+	size_t		keySlot[ANN_INDEX_MAX_SHARDS];
+	size_t		topSlot[ANN_INDEX_MAX_SHARDS];
+	size_t		perDeviceKeys[ANN_CUVS_MAX_DEVICES] = {0};
+	size_t		perDeviceTop[ANN_CUVS_MAX_DEVICES] = {0};
+	uint64_t	widest = 0;
+	uint64_t	widestMatrix = 0;
+	unsigned	cap[ANN_INDEX_MAX_SHARDS] = {0};
+	uint32_t	copy;
+	AnnCuvsShard *shards;
+	AnnIndexHit *lists;
+	uint32_t   *counts;
+	float	   *hostQueries;
+	int64_t    *picked;			/* each pass's candidates: [query][shard][stride] */
+	float	   *pickedD;		/* and their scan distances */
+	int			ok = 1;
+	int			bounded = 0;
+	int			timed = KernelTiming();
+	double		hostStart = 0,
+				hostSelected = 0;
+
+	if (!GroupLargeEnabled() || !state->grouped || !state->quantized || ordinals == NULL || limit < 2)
+		return 0;
+	for (uint32_t j = 0; j < m; j++)
+		if (jobs[j]->k > k)
+			k = jobs[j]->k;
+	if (k + 8 <= ANN_BLACKWELL_TOP || !ScanPreferred(state, k, n))
+		return 0;
+	slack = GatherSlack(state, k);
+	stride = k + slack;
+	if (laneHome < 0)
+		laneHome = (int) (atomic_fetch_add(&nextHome, 1) % ANN_CUVS_MAX_DEVICES);
+	copy = (uint32_t) (laneHome % state->copies);
+	shards = state->shards + (size_t) copy * state->nshards;
+
+	/* Rows are sorted: split them at shard boundaries. */
+	start[0] = 0;
+	start[state->nshards] = n;
+	for (uint32_t s = 1; s < state->nshards; s++)
+	{
+		uint64_t	low = start[s - 1],
+					high = n;
+
+		while (low < high)
+		{
+			uint64_t	middle = low + (high - low) / 2;
+
+			if (ordinals[middle] < file->shards[s].first)
+				low = middle + 1;
+			else
+				high = middle;
+		}
+		start[s] = low;
+	}
+	for (uint32_t s = 0; s < state->nshards; s++)
+	{
+		uint64_t	eligible = start[s + 1] - start[s];
+
+		if (eligible && shards[s].quant.quant == ANN_QUANT_NONE)
+			return 0;
+		if (eligible > widest)
+			widest = eligible;
+		wanted[s] = (uint32_t) (stride < eligible ? stride : eligible);
+
+		/*
+		 * Enough rows for a sample to bound the candidates: no score matrix,
+		 * and single queries take this path too.
+		 */
+		cap[s] = eligible && CandidatesEnabled() ? AnnBlackwellCandidateCap((unsigned) eligible, wanted[s]) : 0;
+		bounded |= cap[s] != 0;
+		if (eligible && cap[s] == 0 && eligible > widestMatrix)
+			widestMatrix = eligible;
+	}
+	perPass = m < limit ? m : limit;
+	while (perPass > 1 && (size_t) perPass * widestMatrix * sizeof(float) > GroupScoreBytes())
+		perPass--;
+	if (widest == 0 || (widestMatrix && (m < 2 || perPass < 2)))
+		return 0;
+	if (getenv("ANN_SCAN_DEBUG"))
+		fprintf(stderr, "grouped large-k scan: %u queries at k=%u in passes of %u over %llu rows%s\n", m, k, perPass,
+				(unsigned long long) n, bounded ? ", bounded candidates" : "");
+	for (uint32_t s = 0; s < state->nshards; s++)
+	{
+		keySlot[s] = perDeviceKeys[shards[s].device];
+		topSlot[s] = perDeviceTop[shards[s].device];
+		perDeviceKeys[shards[s].device] += start[s + 1] - start[s];
+		perDeviceTop[shards[s].device] += (size_t) perPass * wanted[s];
+	}
+	lists = malloc(sizeof(AnnIndexHit) * (size_t) m * state->nshards * stride);
+	counts = calloc((size_t) m * state->nshards, sizeof(uint32_t));
+	hostQueries = malloc(sizeof(float) * (size_t) perPass * dims);
+	picked = malloc(sizeof(int64_t) * (size_t) perPass * state->nshards * stride);
+	pickedD = malloc(sizeof(float) * (size_t) perPass * state->nshards * stride);
+	if (lists == NULL || counts == NULL || hostQueries == NULL || picked == NULL || pickedD == NULL)
+	{
+		free(lists);
+		free(counts);
+		free(hostQueries);
+		free(picked);
+		free(pickedD);
+		return 0;
+	}
+	for (uint32_t first = 0; ok && first < m; first += perPass)
+	{
+		uint32_t	q = m - first < perPass ? m - first : perPass;
+		int			uploaded[ANN_CUVS_MAX_DEVICES] = {0};
+
+		for (uint32_t j = 0; j < q; j++)
+			memcpy(hostQueries + (size_t) j * dims, jobs[first + j]->query, sizeof(float) * dims);
+		for (uint32_t s = 0; ok && s < state->nshards; s++)
+		{
+			AnnCuvsShard *shard = &shards[s];
+			uint32_t	eligible = (uint32_t) (start[s + 1] - start[s]);
+			int64_t		scoreShape[2] = {1, eligible};
+			int64_t		topShape[2] = {1, wanted[s]};
+			DLManagedTensor scores,
+						best,
+						index;
+			AnnCuvsDevice *lane;
+			cudaStream_t stream;
+			const uint32_t *rows = NULL;
+			size_t		have;
+
+			if (eligible == 0)
+				continue;
+			lane = LaneDevice(shard->device, (size_t) q * dims * sizeof(float), 1, 1);
+			if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
+				!GatherBuffers(lane, perDeviceKeys[shard->device], perDeviceTop[shard->device]))
+			{
+				ok = 0;
+				break;
+			}
+			have = lane->groupCapacity;
+			if (!cap[s] &&
+				!GrowDevice((void **) &lane->groupScores, &have, (size_t) perPass * widestMatrix, sizeof(float), 0,
+							stream))
+			{
+				lane->groupCapacity = 0;
+				ok = LaneBufferFailure("grouped scores", (size_t) perPass * widestMatrix);
+				break;
+			}
+			if (!cap[s])
+				lane->groupCapacity = have;
+			if (timed && !TimingEvents(lane))
+				timed = 0;
+			if (!uploaded[shard->device] &&
+				!(uploaded[shard->device] = cudaMemcpyAsync(lane->queries, hostQueries, (size_t) q * dims * sizeof(float),
+															cudaMemcpyHostToDevice, stream) == cudaSuccess))
+			{
+				ok = 0;
+				break;
+			}
+			if (jobs[0]->deviceRows && jobs[0]->deviceRows[(size_t) copy * state->nshards + s])
+				rows = jobs[0]->deviceRows[(size_t) copy * state->nshards + s];
+			else
+			{
+				uint32_t   *staged = (uint32_t *) (void *) (lane->hostKeys + keySlot[s]);
+				uint64_t	shardFirst = file->shards[s].first;
+
+				for (uint32_t i = 0; i < eligible; i++)
+					staged[i] = (uint32_t) (ordinals[start[s] + i] - shardFirst);
+				rows = lane->gatherRows + keySlot[s];
+				if (cudaMemcpyAsync(lane->gatherRows + keySlot[s], staged, eligible * sizeof(uint32_t),
+									cudaMemcpyHostToDevice, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+			}
+			if (cap[s])
+			{
+				if (timed && s == 0)
+					(void) cudaEventRecord(lane->timing[0], stream);
+				if (AnnBlackwellCandidates(&shard->quant, shard->device, s, rows, eligible, lane->queries, q, (int) dims,
+										   wanted[s], stream) != cap[s])
+				{
+					fprintf(stderr, "Blackwell module: large-k candidates of %u queries failed on device %d\n", q,
+							shard->device);
+					ok = 0;
+				}
+				if (timed && s == 0)
+					(void) cudaEventRecord(lane->timing[1], stream);
+				continue;
+			}
+
+			/* One scoring pass for the group; cuvsSelectK takes one row at a time. */
+			ok = AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, eligible, lane->queries, q, (int) dims,
+										lane->groupScores, stream);
+			for (uint32_t j = 0; ok && j < q; j++)
+			{
+				size_t		slot = topSlot[s] + (size_t) j * wanted[s];
+
+				scores = Tensor(lane->groupScores + (size_t) j * eligible, kDLCUDA, shard->device, kDLFloat, 2,
+								scoreShape);
+				best = Tensor(lane->gatherBest + slot, kDLCUDA, shard->device, kDLFloat, 2, topShape);
+				index = Tensor(lane->gatherIndex + slot, kDLCUDA, shard->device, kDLInt, 2, topShape);
+				index.dl_tensor.dtype.bits = 64;
+				ok = cuvsSelectK(lane->resources, &scores, &best, &index) == CUVS_SUCCESS;
+			}
+			if (!ok ||
+				cudaMemcpyAsync(lane->hostIndex + topSlot[s], lane->gatherIndex + topSlot[s],
+								(size_t) q * wanted[s] * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+				(AnnIndexConfig.rescore == ANN_RESCORE_OFF &&
+				 cudaMemcpyAsync(lane->hostBest + topSlot[s], lane->gatherBest + topSlot[s],
+								 (size_t) q * wanted[s] * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess))
+			{
+				const char *message = cuvsGetLastErrorText();
+
+				fprintf(stderr, "Blackwell module: grouped large-k search of %u queries failed on device %d: %s\n",
+						q, shard->device, message ? message : "launch failed");
+				ok = 0;
+			}
+		}
+		for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+			if (laneDevices[d].resources && uploaded[d] &&
+				(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+				ok = 0;
+
+		/*
+		 * Bounded candidates: copy each query's list back. A list shorter
+		 * than wanted (the bound fell inside the answer) or longer than its
+		 * capacity sends the group to the job-by-job searches.
+		 */
+		if (ok && bounded)
+		{
+			for (uint32_t s = 0; ok && s < state->nshards; s++)
+			{
+				const unsigned *found;
+				unsigned	take[ANN_BLACKWELL_GROUP_MAX];
+				cudaStream_t stream;
+
+				if (cap[s] == 0)
+					continue;
+				found = AnnBlackwellCandidateCounts(shards[s].device, s);
+				for (uint32_t j = 0; ok && j < q; j++)
+				{
+					if (found[j] < wanted[s] || found[j] > cap[s])
+					{
+						if (getenv("ANN_SCAN_DEBUG"))
+							fprintf(stderr, "large-k candidates: %u of %u wanted (capacity %u); searching job by job\n",
+									found[j], wanted[s], cap[s]);
+						ok = 0;
+					}
+					take[j] = found[j];
+				}
+				if (ok && (cudaSetDevice(shards[s].device) != cudaSuccess ||
+						   cuvsStreamGet(laneDevices[shards[s].device].resources, &stream) != CUVS_SUCCESS))
+					ok = 0;
+				if (ok && timed && s == 0)
+					(void) cudaEventRecord(laneDevices[shards[s].device].timing[2], stream);
+				if (ok && !AnnBlackwellCopyCandidates(shards[s].device, s, q, cap[s], take, stream))
+					ok = 0;
+				if (ok && timed && s == 0)
+					(void) cudaEventRecord(laneDevices[shards[s].device].timing[3], stream);
+			}
+			for (int d = 0; ok && d < ANN_CUVS_MAX_DEVICES; d++)
+				if (laneDevices[d].resources && uploaded[d] &&
+					(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+					ok = 0;
+		}
+
+		if (timed)
+			hostStart = MonotonicMs();
+		/* Each query's candidates on each shard: positions in the rows, and the scan's distances. */
+		for (uint32_t s = 0; ok && s < state->nshards; s++)
+		{
+			uint32_t	eligible = (uint32_t) (start[s + 1] - start[s]);
+
+			if (eligible == 0)
+				continue;
+			for (uint32_t j = 0; j < q; j++)
+			{
+				size_t		at = ((size_t) j * state->nshards + s) * stride;
+				const int64_t *positions = laneDevices[shards[s].device].hostIndex + topSlot[s] +
+					(size_t) j * wanted[s];
+				const float *distances = laneDevices[shards[s].device].hostBest + topSlot[s] + (size_t) j * wanted[s];
+
+				if (cap[s])
+				{
+					float	   *candidateDistances;
+					unsigned   *candidates;
+
+					AnnBlackwellCandidateRows(shards[s].device, s, j, cap[s], &candidateDistances, &candidates);
+					SmallestFirst(candidateDistances, candidates, AnnBlackwellCandidateCounts(shards[s].device, s)[j],
+								  wanted[s]);
+					for (uint32_t i = 0; i < wanted[s]; i++)
+					{
+						picked[at + i] = candidates[i];
+						pickedD[at + i] = candidateDistances[i];
+					}
+				}
+				else
+					for (uint32_t i = 0; i < wanted[s]; i++)
+					{
+						picked[at + i] = positions[i];
+						pickedD[at + i] = distances[i];
+					}
+			}
+		}
+
+		/* --rescore fp8-gpu: every candidate scored again on the GPU from the FP8 rows. */
+		if (ok && AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && state->rescoreGpu)
+		{
+			int			used[ANN_CUVS_MAX_DEVICES] = {0};
+
+			for (uint32_t s = 0; ok && s < state->nshards; s++)
+			{
+				AnnCuvsDevice *lane = &laneDevices[shards[s].device];
+				uint32_t	eligible = (uint32_t) (start[s + 1] - start[s]);
+				cudaStream_t stream;
+
+				if (eligible == 0)
+					continue;
+				if (cudaSetDevice(shards[s].device) != cudaSuccess ||
+					cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
+					!RescoreBuffers(lane, (size_t) q * stride * state->nshards, stream))
+				{
+					ok = 0;
+					break;
+				}
+				for (uint32_t j = 0; j < q; j++)
+				{
+					size_t		at = ((size_t) j * state->nshards + s) * stride;
+
+					for (uint32_t i = 0; i < wanted[s]; i++)
+						lane->hostRescoreRows[at + i] = picked[at + i] >= 0 && (uint64_t) picked[at + i] < eligible ?
+							(uint32_t) (ordinals[start[s] + (uint64_t) picked[at + i]] - file->shards[s].first) :
+							UINT32_MAX;
+					if (cudaMemcpyAsync(lane->rescoreRows + at, lane->hostRescoreRows + at, wanted[s] * sizeof(uint32_t),
+										cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+						!AnnBlackwellScore(&shards[s].rescore, shards[s].device, lane->rescoreRows + at, wanted[s],
+										   (const float *) lane->queries + (size_t) j * dims, (int) dims,
+										   lane->rescoreOut + at, stream) ||
+						cudaMemcpyAsync(lane->hostRescoreOut + at, lane->rescoreOut + at, wanted[s] * sizeof(float),
+										cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+					{
+						fprintf(stderr, "Blackwell module: FP8 re-scoring failed on device %d\n", shards[s].device);
+						ok = 0;
+						break;
+					}
+				}
+				used[shards[s].device] = 1;
+			}
+			for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+				if (used[d] && (cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+					ok = 0;
+		}
+
+		if (timed)
+			hostSelected = MonotonicMs();
+		/* The hits: candidates re-scored as --rescore says; rows are known. */
+		for (uint32_t s = 0; ok && s < state->nshards; s++)
+		{
+			uint32_t	eligible = (uint32_t) (start[s + 1] - start[s]);
+
+			if (eligible == 0)
+				continue;
+			for (uint32_t j = 0; j < q; j++)
+			{
+				AnnIndexJob *job = jobs[first + j];
+				AnnIndexHit *hits = lists + ((size_t) (first + j) * state->nshards + s) * stride;
+				uint32_t   *found = &counts[(size_t) (first + j) * state->nshards + s];
+				size_t		at = ((size_t) j * state->nshards + s) * stride;
+
+				if (!AnnIndexPositionsDistinct(picked + at, wanted[s]))
+				{
+					AnnIndexJob part = *job;
+
+					if (atomic_fetch_add(&gatherRepairs, 1) < 100)
+						fprintf(stderr, "Blackwell module: repeated candidates in shard %u; scoring it exactly\n", s);
+					part.results = hits;
+					AnnIndexExact(file, &part, ordinals + start[s], eligible);
+					*found = part.nresults;
+					continue;
+				}
+				for (uint32_t i = 0; i < wanted[s]; i++)
+				{
+					uint64_t	row;
+					float		distance;
+
+					if (picked[at + i] < 0 || (uint64_t) picked[at + i] >= eligible)
+						continue;
+					row = ordinals[start[s] + (uint64_t) picked[at + i]];
+					if (AnnIndexConfig.rescore == ANN_RESCORE_OFF)
+						distance = sqrtf(fmaxf(pickedD[at + i], 0.0f));
+					else if (AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && state->rescoreGpu)
+						distance = sqrtf(fmaxf(laneDevices[shards[s].device].hostRescoreOut[at + i], 0.0f));
+					else if (AnnIndexConfig.rescore == ANN_RESCORE_FP16 && file->halfVectors)
+						distance = HalfDistance(file, row, job->query);
+					else
+						distance = ExactDistance(file, row, job->query);
+					hits[*found].key = file->keys[row];
+					hits[*found].ordinal = row;
+					hits[*found].distance = distance;
+					(*found)++;
+				}
+				qsort(hits, *found, sizeof(*hits), HitCompare);
+				if (*found > job->k)
+					*found = job->k;
+			}
+		}
+		if (timed && ok && cap[0])
+		{
+			StageTimes pass = {0};
+			float		candidates = 0,
+						copy = 0;
+			AnnCuvsDevice *lane = &laneDevices[shards[0].device];
+
+			(void) cudaEventElapsedTime(&candidates, lane->timing[0], lane->timing[1]);
+			(void) cudaEventElapsedTime(&copy, lane->timing[2], lane->timing[3]);
+			pass.candidatesMs = candidates;
+			pass.copyMs = copy;
+			pass.selectMs = hostSelected - hostStart;
+			pass.rescoreMs = MonotonicMs() - hostSelected;
+			pass.passes = 1;
+			pass.queries = q;
+			StageAdd(&pass);
+		}
+	}
+	if (ok)
+		for (uint32_t j = 0; j < m; j++)
+		{
+			MergeJob(jobs[j], lists + (size_t) j * state->nshards * stride, counts + (size_t) j * state->nshards,
+					 state->nshards, stride);
+			jobs[j]->route = ANN_ROUTE_EXACT;
+		}
+	free(lists);
+	free(counts);
+	free(hostQueries);
+	free(picked);
+	free(pickedD);
+	return ok;
+}
+
+/*
  * Filtered jobs over one filter. Selective filters run exactly, one by one.
  * On a quantized index, several jobs scan the filter's rows together on the
  * tensor cores up to --group-gather-limit (exact; 82k QPS of 10% filters on
@@ -3142,17 +4024,21 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 {
 	uint32_t	n = jobs[0]->nfilter;
 
-	if (CalibratedFilteredGroup(file, state, jobs, m))
+	/* Scan-only indexes have no graph for a calibrated route to choose. */
+	if (!state->scanOnly && CalibratedFilteredGroup(file, state, jobs, m))
 		return;
 
-	if (n > AnnIndexConfig.exact_limit && n <= AnnIndexConfig.group_gather_limit)
+	if (n > AnnIndexConfig.exact_limit && (n <= AnnIndexConfig.group_gather_limit || state->scanOnly))
 	{
 		if (m > 1 && SearchGatherGroup(file, state, jobs, m))
 			return;
-		if (AnnIndexConfig.matrix_gather && SearchGatherMatrix(file, state, jobs, m))
+		if (!state->scanOnly && AnnIndexConfig.matrix_gather && SearchGatherMatrix(file, state, jobs, m))
 			return;
 	}
-	if (m > 1 && jobs[0]->bitsets != NULL && n > AnnIndexConfig.bitset_gather_limit)
+	if (n > AnnIndexConfig.exact_limit && SearchGatherGroupLarge(file, state, jobs, m))
+		return;
+	if (m > 1 && jobs[0]->bitsets != NULL && n > AnnIndexConfig.bitset_gather_limit && !state->scanOnly &&
+		!(jobs[0]->filter != NULL && ScanPreferred(state, jobs[0]->k, n)))
 	{
 		SearchFilteredGroupGraph(file, state, jobs, m);
 		return;
@@ -3306,7 +4192,7 @@ AnnCuvsBackend(void)
 {
 	static const AnnBackend backend = {
 		"cuvs", 1, 7, "cagra", "fp32", 0, 128, 1024, Build, Search, Destroy,
-		SearchGathered, DeviceJobs, LoadIndex, SearchIndex, Lost
+		SearchGathered, DeviceJobs, LoadIndex, SearchIndex, Lost, ScanPreferredIndex
 	};
 
 	AnnIndexRoutingStats = ReplicaStats;

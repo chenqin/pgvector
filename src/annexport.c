@@ -184,8 +184,10 @@ WriteExactVectors(Relation index, const AnnFrozenMetaData *meta, const char *dir
  * ann_index_export(index, directory): write a frozen index's rows in the
  * worker's directory format: keys.i64, vectors.f32, one attr-COLUMN.i32 per
  * INCLUDE column after the key (for text, codes of the index's dictionary,
- * written as attr-COLUMN.strings and attr-COLUMN.starts), and a manifest
- * with the index's generation and no CAGRA shards. scripts/ann/build_cuvs_index.py --from-export adds
+ * written as attr-COLUMN.strings and attr-COLUMN.starts; for integer[],
+ * every row's elements, with attr-COLUMN.offsets, a u32 start per row plus
+ * the end, on a "multivalued" line), and a manifest with the index's
+ * generation and no CAGRA shards. scripts/ann/build_cuvs_index.py --from-export adds
  * the shards; ann_index_load checks the generation against the table.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_index_export);
@@ -239,6 +241,8 @@ ann_index_export(PG_FUNCTION_ARGS)
 		appendStringInfo(&manifest, "attribute %s attr-%s.i32\n", name, name);
 		if (AnnFrozenTextType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
 			appendStringInfo(&manifest, "dictionary %s attr-%s.strings attr-%s.starts\n", name, name, name);
+		if (AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
+			appendStringInfo(&manifest, "multivalued %s attr-%s.offsets\n", name, name);
 	}
 	appendStringInfo(&manifest, "generation %016llx\n", (unsigned long long) meta->generation);
 
@@ -262,6 +266,9 @@ ann_index_export(PG_FUNCTION_ARGS)
 			WriteArrayFile(index, &AnnFrozenGetExtra(meta)[c].starts, directory,
 						   psprintf("attr-%s.starts", name), 0, sizeof(uint32));
 		}
+		if (AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
+			WriteArrayFile(index, &AnnFrozenGetExtra(meta)[c].starts, directory,
+						   psprintf("attr-%s.offsets", name), 0, sizeof(uint32));
 	}
 
 	/* The manifest comes last, so a partial export is never loadable. */

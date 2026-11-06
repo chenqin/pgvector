@@ -1,9 +1,9 @@
 # Blackwell module: quantized filtered search on B200
 
-The cuVS worker keeps using cuVS CAGRA for graph search. On Blackwell GPUs (compute capability 10.x, such as the B200), filtered searches that go to the GPU gather scan use the worker's Blackwell module instead:
+The cuVS worker keeps using cuVS CAGRA for graph search. On Blackwell GPUs (compute capability 10.x, such as the B200, or 12.x, such as the RTX PRO 4500), filtered searches that go to the GPU gather scan use the worker's Blackwell module instead:
 
 - **Quantized index.** The builder writes a 4-bit (NVFP4) or 8-bit (FP8 E4M3) copy of the vectors next to the exact FP32 ones. The worker keeps it in each shard's GPU memory.
-- **Blackwell kernels.** The worker compiles the module with NVRTC for `sm_100a`, the Blackwell-specific target. It decodes with Blackwell's conversion instructions (`cvt.rn.f16x2.e2m1x2` for FP4 and `cvt.rn.f16x2.e4m3x2` for FP8), which were checked bit-exact against a host decoder on the B200s.
+- **Blackwell kernels.** The worker compiles the module with NVRTC for the device's Blackwell-specific target (`sm_100a` or `sm_120a`). On 12.x devices each grouped kernel's dynamic shared memory is capped at the device's opt-in limit (99 KB rather than B200's 227 KB) less its static shared memory, so wide vectors take smaller query groups. It decodes with Blackwell's conversion instructions (`cvt.rn.f16x2.e2m1x2` for FP4 and `cvt.rn.f16x2.e4m3x2` for FP8), which were checked bit-exact against a host decoder on the B200s.
 - **Fused search.** One kernel launch scores the eligible rows and selects the best 32, replacing the gather path's separate key lookup, scoring kernel, `cuvsSelectK` and copies.
 - **Exact results.** The worker re-scores the 32 candidates with the FP32 vectors and returns the top k, so distances match `<->`.
 
@@ -35,7 +35,7 @@ The CPU worker loads quantized indexes too. It validates the files and keeps ans
 
 ## In the worker
 
-At load, each shard's slice of the quantized copy goes to the GPU holding that shard, or to every GPU with `--replicate on`. If every GPU is compute capability 10.x and NVRTC compiles the module for `sm_100a`, the index's gather scans use the module. The worker's log says so (`Blackwell module: nvfp4 gather scan for index docs on (724.8 MB of quantized rows on the GPUs)`), and so do the replies to load and index info (`quant nvfp4 quant_scan on`). On other GPUs, or with `--quantized-scan off`, the copy isn't uploaded and the scan reads the CAGRA dataset as before.
+At load, each shard's slice of the quantized copy goes to the GPU holding that shard, or to every GPU with `--replicate on`. If every GPU is compute capability 10.x or 12.x and NVRTC compiles the module for its target, the index's gather scans use the module. The worker's log says so (`Blackwell module: nvfp4 gather scan for index docs on (724.8 MB of quantized rows on the GPUs)`), and so do the replies to load and index info (`quant nvfp4 quant_scan on`). On other GPUs, or with `--quantized-scan off`, the copy isn't uploaded and the scan reads the CAGRA dataset as before.
 
 **Fused search kernel.** For each query and shard:
 1. The worker uploads the eligible rows. Filters that arrive with their ordinals (cached bitmaps, attribute values) become 4-byte shard rows on the host. Key lists are uploaded as keys and found by the existing lookup kernel.

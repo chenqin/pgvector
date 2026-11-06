@@ -16,9 +16,10 @@
 
 #define ANN_MAGIC_NUMBER 0xA991A991
 #define ANN_VERSION 1			/* mutable layout: index tuples */
-#define ANN_FROZEN_VERSION 4	/* frozen layout: arrays by ordinal; 3 adds
+#define ANN_FROZEN_VERSION 5	/* frozen layout: arrays by ordinal; 3 adds
 								 * bitset pages and text dictionaries to 2, 4
-								 * the attribute names */
+								 * the attribute names, 5 integer[] attributes */
+#define ANN_FROZEN_VERSION_SINGLE 4 /* written when no attribute is an array */
 #define AnnVersionFrozen(version) ((version) >= 2 && (version) <= ANN_FROZEN_VERSION)
 #define ANN_PAGE_ID 0xFF92
 #define ANN_METAPAGE_BLKNO 0
@@ -80,7 +81,13 @@ typedef struct AnnArray
 	uint64		count;
 } AnnArray;
 
-/* An INCLUDE column after the key: forward values and its inverted index. */
+/*
+ * An INCLUDE column after the key: forward values and its inverted index.
+ * For an integer[] column, values holds every row's elements in ordinal
+ * order (each row's as stored, a NULL array as one ANN_FROZEN_NULL), the
+ * extra directory's starts where each row's begin, and the postings the
+ * distinct (value, ordinal) pairs, so a row is under each of its values.
+ */
 typedef struct AnnFrozenColumn
 {
 	AnnArray	values;			/* int32 per ordinal, ANN_FROZEN_NULL for NULL */
@@ -100,7 +107,8 @@ typedef struct AnnFrozenColumnExtra
 	AnnArray	strings;		/* text: the distinct strings' bytes, in
 								 * collation order (code 0 first) */
 	AnnArray	starts;			/* text: uint32 offset of each code's string,
-								 * plus the end */
+								 * plus the end; integer[]: of each row's
+								 * first element, plus the end */
 } AnnFrozenColumnExtra;
 
 typedef struct AnnFrozenMetaData
@@ -136,7 +144,8 @@ typedef struct AnnFrozenMetaData
 /*
  * Frozen metapages whose build flushed every page to the files say so in
  * insertPage (unused by frozen indexes); only those are read through
- * read-only mappings of the files.
+ * read-only mappings of the files. VACUUM's first TID invalidation turns
+ * PRISTINE into FLUSHED, after which the table is never immutable again.
  */
 #define ANN_FROZEN_FLUSHED ((BlockNumber) 0xFFFFFFFE)
 /* Flushed build whose TIDs have never been invalidated by VACUUM. */
@@ -238,6 +247,10 @@ bool		AnnFrozenFlushed(Relation index);
 IndexBuildResult *AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo);
 void		AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
 							   BufferAccessStrategy strategy);
+void		AnnArrayReaderInitExtended(AnnArrayReader *reader, Relation index, const AnnArray *array,
+									   BufferAccessStrategy strategy, bool immutable);
+bool		AnnFrozenImmutable(Relation heap, Relation index);
+bool		AnnFrozenIndexImmutable(Relation index);
 char	   *AnnArrayLockPage(AnnArrayReader *reader, BlockNumber page, uint32 *count);
 void		AnnArrayUnlockPage(AnnArrayReader *reader);
 void		AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out);
@@ -307,11 +320,15 @@ typedef struct AnnPredicateColumns
 
 /*
  * Attribute columns hold int32 values: smallint, integer, bigint, bool,
- * date, and codes of a dictionary for text and varchar.
+ * date, and codes of a dictionary for text and varchar; integer[] columns
+ * of frozen indexes hold any number per row.
  */
 #define AnnFrozenTextType(type) ((type) == TEXTOID || (type) == VARCHAROID)
+/* Multi-valued attributes: integer[], each element an int32 value. */
+#define AnnFrozenMultiType(type) ((type) == INT4ARRAYOID)
 bool		AnnFrozenAttributeType(Oid type);
 Datum		AnnFrozenTextDatum(Relation index, const AnnFrozenMetaData *meta, int column, int32 code);
+Datum		AnnFrozenArrayDatum(AnnArrayReader *values, AnnArrayReader *starts, uint64 ordinal, bool *isnull);
 int64		AnnFrozenTextSearch(Relation index, const AnnFrozenMetaData *meta, int column, Oid collation,
 								text *value, bool upper);
 int32		AnnFrozenAttributeValue(Datum value, bool isnull, Oid type);
@@ -370,6 +387,8 @@ bool		AnnFilterCacheGet(Oid index, uint64 generation, const char *program, size_
 void		AnnFilterCachePut(Oid index, uint64 generation, const char *program, size_t size,
 							  const uint32 *words, size_t nwords, uint64 eligible);
 extern bool ann_frozen_mmap;
+extern bool ann_frozen_immutable;
+extern bool ann_frozen_complete_short;
 void		AnnFrozenScanInit(void);
 IndexBulkDeleteResult *AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 										   IndexBulkDeleteCallback callback, void *callback_state);

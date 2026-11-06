@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+struct AnnIndexFile;
+
 #define ANN_MAX_BYTES (64U * 1024U * 1024U)
 #define ANN_MAX_DIM 16000U
 
@@ -129,6 +131,13 @@ typedef struct AnnBackend
 	 * ANN_EXIT_DEVICE_LOST.
 	 */
 	const char *(*lost) (void);
+
+	/*
+	 * Whether a search for k results over every row of a loaded index runs as
+	 * an exact scan of a cached row list rather than a graph search; NULL when
+	 * a backend always searches its graph.
+	 */
+	int			(*scan_preferred) (const struct AnnIndexFile *file, uint32_t k);
 } AnnBackend;
 
 /* The worker's exit status when a device context is lost. */

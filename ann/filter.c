@@ -163,9 +163,12 @@ typedef struct Run
 								 * several */
 } Run;
 
-/* Union of postings runs: a sorted list when small, else bits. */
+/*
+ * Union of postings runs: a sorted list when small, else bits. Runs of a
+ * multi-valued column can share rows, so its lists are deduplicated.
+ */
 static int
-FromRuns(Evaluator *e, int column, const Run *runs, uint32_t nruns, int sorted, Set *out)
+FromRuns(Evaluator *e, int column, const Run *runs, uint32_t nruns, int sorted, int multi, Set *out)
 {
 	uint64_t	total = 0;
 
@@ -191,7 +194,16 @@ FromRuns(Evaluator *e, int column, const Run *runs, uint32_t nruns, int sorted, 
 		}
 		out->n = total;
 		if (nruns > 1 || !sorted)
+		{
 			qsort(out->list, total, sizeof(uint32_t), OrdinalCompare);
+			if (multi && total > 1)
+			{
+				out->n = 1;
+				for (uint64_t i = 1; i < total; i++)
+					if (out->list[i] != out->list[out->n - 1])
+						out->list[out->n++] = out->list[i];
+			}
+		}
 		return 1;
 	}
 	if ((out->words = NewWords(e, 0)) == NULL)
@@ -248,8 +260,9 @@ ValueRun(Evaluator *e, int column, uint64_t count, int32_t value, Run *run)
 }
 
 /*
- * A leaf: VALUES, RANGE or NULL on one column. Negated leaves complement
- * the union of the match and the NULL rows.
+ * A leaf: VALUES, RANGE, OVERLAP or NULL on one column. Negated leaves
+ * complement the union of the match and the NULL rows. OVERLAP is VALUES
+ * over a multi-valued column's elements.
  */
 static int
 Leaf(Evaluator *e, int op, const unsigned char *at, Set *out)
@@ -258,6 +271,7 @@ Leaf(Evaluator *e, int op, const unsigned char *at, Set *out)
 	uint32_t	nameLength = at[1];
 	int			negate;
 	int			column;
+	int			multi;
 	uint64_t	count;
 	Run		   *runs = NULL;
 	uint32_t	nruns = 0;
@@ -272,8 +286,14 @@ Leaf(Evaluator *e, int op, const unsigned char *at, Set *out)
 		e->error = ANN_FILTER_UNKNOWN_COLUMN;
 		return 0;
 	}
+	multi = e->source->multi && e->source->multi(e->source->arg, column);
+	if (multi ? op == ANN_FILTER_VALUES || op == ANN_FILTER_RANGE : op == ANN_FILTER_OVERLAP)
+	{
+		e->error = ANN_FILTER_COLUMN_KIND;
+		return 0;
+	}
 	count = e->source->count(e->source->arg, column);
-	if (op == ANN_FILTER_VALUES)
+	if (op == ANN_FILTER_VALUES || op == ANN_FILTER_OVERLAP)
 	{
 		uint32_t	n = (uint32_t) Read(at, 4);
 		int32_t    *values = Alloc(e, (size_t) n * sizeof(int32_t));
@@ -326,7 +346,7 @@ Leaf(Evaluator *e, int op, const unsigned char *at, Set *out)
 		ValueRun(e, column, count, ANN_FILTER_NULL_VALUE, &runs[nruns]))
 		nruns++;
 	/* A range's run spans several values, so it is not in ordinal order. */
-	ok = FromRuns(e, column, runs, nruns, op != ANN_FILTER_RANGE, out) && (!negate || Complement(e, out));
+	ok = FromRuns(e, column, runs, nruns, op != ANN_FILTER_RANGE, multi, out) && (!negate || Complement(e, out));
 	Release(e, runs);
 	return ok;
 }
@@ -438,6 +458,7 @@ StepSize(const unsigned char *program, size_t size, size_t offset)
 		case ANN_FILTER_VALUES:
 		case ANN_FILTER_RANGE:
 		case ANN_FILTER_NULL:
+		case ANN_FILTER_OVERLAP:
 			if (size - offset < 3)
 				return 0;
 			nameLength = program[offset + 1];
@@ -525,6 +546,7 @@ AnnFilterEvaluate(const AnnFilterSource *source, const unsigned char *program, s
 			case ANN_FILTER_VALUES:
 			case ANN_FILTER_RANGE:
 			case ANN_FILTER_NULL:
+			case ANN_FILTER_OVERLAP:
 				ok = Leaf(&e, op, program + offset, &result);
 				break;
 			case ANN_FILTER_BITMAP:

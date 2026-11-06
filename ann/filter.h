@@ -11,6 +11,7 @@
  * ordinal space. A program is postfix, little-endian:
  *
  *   VALUES  u8 op, u8 name length, name, u8 negate, u32 n, i32 values[n]
+ *   OVERLAP the same layout as VALUES
  *   RANGE   u8 op, u8 name length, name, u8 negate, i32 low, i32 high
  *   NULL    u8 op, u8 name length, name, u8 negate
  *   BITMAP  u8 op, u64 stored filter id
@@ -22,6 +23,11 @@
  * which is SQL's NOT for comparisons, so translators push NOT down to the
  * leaves; the NOT instruction complements over all rows. The result is a
  * bitset over ordinals, bit i of word i / 32.
+ *
+ * A multi-valued column holds an array per row. OVERLAP matches rows whose
+ * array has an element among the values (SQL's &&), NULL those whose array
+ * is NULL; VALUES and RANGE apply only to single-valued columns and OVERLAP
+ * only to multi-valued ones (ANN_FILTER_COLUMN_KIND otherwise).
  */
 #define ANN_FILTER_VALUES 1
 #define ANN_FILTER_RANGE 2
@@ -32,6 +38,7 @@
 #define ANN_FILTER_NOT 7
 #define ANN_FILTER_ALL 8
 #define ANN_FILTER_NONE 9
+#define ANN_FILTER_OVERLAP 10
 
 #define ANN_FILTER_NULL_VALUE INT32_MIN
 #define ANN_FILTER_MAX_DEPTH 64
@@ -46,11 +53,15 @@
 #define ANN_FILTER_NO_MEMORY (-3)
 #define ANN_FILTER_UNKNOWN_BITMAP (-4)
 #define ANN_FILTER_SOURCE_ERROR (-5)
+#define ANN_FILTER_COLUMN_KIND (-6) /* leaf of the wrong kind for its column */
 
 /*
  * Where the rows come from. A column's distinct values are sorted; value i
  * owns postings start(i) .. start(i + 1) - 1, ascending ordinals. bitset and
- * bitmap may be NULL; alloc and release default to malloc and free.
+ * bitmap may be NULL; alloc and release default to malloc and free. A row of
+ * a multi-valued column appears once under each distinct element, so
+ * start(count) is the total number of postings; multi says which columns
+ * are multi-valued, and NULL means none are.
  */
 typedef struct AnnFilterSource
 {
@@ -65,6 +76,7 @@ typedef struct AnnFilterSource
 	int			(*bitmap) (void *arg, uint64_t id, uint32_t *words);
 	void	   *(*alloc) (void *arg, size_t size);
 	void		(*release) (void *arg, void *pointer);
+	int			(*multi) (void *arg, int column);
 } AnnFilterSource;
 
 /* Whether a program is well formed: known opcodes, sizes, one result. */

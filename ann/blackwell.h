@@ -6,10 +6,10 @@
 #include <stdint.h>
 
 /*
- * Blackwell (compute capability 10.x) scan module for the cuVS worker. It
- * keeps an index's quantized copy (NVFP4 or FP8, see indexfile.h) in each
- * shard's GPU memory and scores filtered rows from it with kernels compiled
- * for sm_100a, which decode E2M1 and E4M3 with the hardware conversion
+ * Blackwell (compute capability 10.x or 12.x) scan module for the cuVS
+ * worker. It keeps an index's quantized copy (NVFP4 or FP8, see indexfile.h)
+ * in each shard's GPU memory and scores filtered rows from it with kernels
+ * compiled for sm_100a or sm_120a, which decode E2M1 and E4M3 with the hardware conversion
  * instructions (cvt.rn.f16x2.e2m1x2, cvt.rn.f16x2.e4m3x2). Callers select
  * k + slack candidates from those scores and re-score them in FP32, so
  * returned distances stay exact; graph search stays with cuVS CAGRA.
@@ -31,8 +31,15 @@ typedef struct AnnBlackwellShard
 	size_t		bytes;			/* device memory held */
 } AnnBlackwellShard;
 
-/* Whether the module runs on this device: compute capability 10.x and NVRTC. */
+/* Whether the module runs on this device: compute capability 10.x or 12.x and NVRTC. */
 int			AnnBlackwellReady(int device);
+
+/*
+ * An FP8 (E4M3, row-scaled) copy of FP32 rows on a device, made at load for
+ * re-scoring candidates there (--rescore fp8-gpu); 0 on failure.
+ */
+int			AnnBlackwellUploadFp8(const float *vectors, uint64_t rows, uint32_t dims, int device,
+								  AnnBlackwellShard *out);
 
 /* Copy a shard's quantized rows to the current device; 0 on failure. */
 int			AnnBlackwellUpload(const AnnIndexFile *file, uint32_t shard, int device, AnnBlackwellShard *out);
@@ -53,10 +60,36 @@ void		AnnBlackwellFree(AnnBlackwellShard *shard);
 int			AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32_t *rows, unsigned n,
 							  const float *query, int dims, float *out, void *stream);
 
-/* Tensor-core scores in [queries][rows] order, without a fixed top-k. */
+/*
+ * Squared L2 distances of the listed rows to nq FP32 device queries on the
+ * tensor cores, written to out as a [nq][n] matrix for the caller's own
+ * selection (large k); nq is at most AnnBlackwellGroupLimit(dims).
+ */
 int			AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
 									unsigned n, const float *queries, unsigned nq, int dims,
 									float *out, void *stream);
+
+/*
+ * Large-k candidates for nq queries over the listed rows: a sample of the
+ * rows bounds about four times `wanted` candidates per query, which the
+ * tensor-core scan keeps (up to the returned capacity per query, counting
+ * them all). The counts land in pinned host memory on the stream; after a
+ * sync, AnnBlackwellCopyCandidates copies `take[q]` of each query's (distance,
+ * position in rows) pairs and AnnBlackwellCandidateRows reads them. Every row
+ * scoring at most the wanted-th best is a candidate when a query's count is
+ * between `wanted` and the capacity. AnnBlackwellCandidateCap is that capacity
+ * for n rows, or 0 when the rows are too few for a sample to pay; the same 0
+ * comes back when a launch fails.
+ */
+unsigned	AnnBlackwellCandidateCap(unsigned n, unsigned wanted);
+unsigned	AnnBlackwellCandidates(const AnnBlackwellShard *shard, int device, unsigned slot, const uint32_t *rows,
+								   unsigned n, const float *queries, unsigned nq, int dims, unsigned wanted,
+								   void *stream);
+const unsigned *AnnBlackwellCandidateCounts(int device, unsigned slot);
+int			AnnBlackwellCopyCandidates(int device, unsigned slot, unsigned nq, unsigned cap, const unsigned *take,
+									   void *stream);
+void		AnnBlackwellCandidateRows(int device, unsigned slot, unsigned q, unsigned cap, float **distances,
+									  unsigned **rows);
 
 /*
  * Fused search: score the listed rows for nq queries (contiguous FP32 on

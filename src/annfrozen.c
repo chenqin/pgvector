@@ -33,6 +33,7 @@
 #include "utils/acl.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rls.h"
@@ -71,6 +72,30 @@ ann_frozen_guard(PG_FUNCTION_ARGS)
 	PG_RETURN_NULL();
 }
 
+/*
+ * An unconditional BEFORE trigger calling ann_frozen_guard: for each statement
+ * on every write including TRUNCATE, or (row) for each row on every write.
+ */
+static bool
+GuardShape(const Trigger *trigger, bool row)
+{
+	static Oid	guardFunction = InvalidOid;
+	int16		type = trigger->tgtype;
+	FmgrInfo	flinfo;
+
+	if (trigger->tgnattr > 0 || trigger->tgqual != NULL || TRIGGER_FOR_ROW(type) != row || !TRIGGER_FOR_BEFORE(type) ||
+		!TRIGGER_FOR_INSERT(type) || !TRIGGER_FOR_UPDATE(type) ||
+		!TRIGGER_FOR_DELETE(type) || (!row && !TRIGGER_FOR_TRUNCATE(type)))
+		return false;
+	if (trigger->tgfoid == guardFunction)
+		return true;
+	fmgr_info(trigger->tgfoid, &flinfo);
+	if (flinfo.fn_addr != ann_frozen_guard)
+		return false;
+	guardFunction = trigger->tgfoid;
+	return true;
+}
+
 /* The guard trigger's OID, or InvalidOid when the table has no valid guard. */
 static Oid
 FindGuardKind(Relation heap, bool row)
@@ -82,16 +107,8 @@ FindGuardKind(Relation heap, bool row)
 	for (int i = 0; i < desc->numtriggers; i++)
 	{
 		Trigger    *trigger = &desc->triggers[i];
-		int16		type = trigger->tgtype;
-		FmgrInfo	flinfo;
 
-		if (trigger->tgenabled != TRIGGER_FIRES_ALWAYS || trigger->tgnattr > 0 ||
-			trigger->tgqual != NULL || TRIGGER_FOR_ROW(type) != row || !TRIGGER_FOR_BEFORE(type) ||
-			!TRIGGER_FOR_INSERT(type) || !TRIGGER_FOR_UPDATE(type) ||
-			!TRIGGER_FOR_DELETE(type) || (!row && !TRIGGER_FOR_TRUNCATE(type)))
-			continue;
-		fmgr_info(trigger->tgfoid, &flinfo);
-		if (flinfo.fn_addr == ann_frozen_guard)
+		if (trigger->tgenabled == TRIGGER_FIRES_ALWAYS && GuardShape(trigger, row))
 			return trigger->tgoid;
 	}
 	return InvalidOid;
@@ -101,6 +118,154 @@ static Oid
 FindGuard(Relation heap)
 {
 	return OidIsValid(FindGuardKind(heap, true)) ? FindGuardKind(heap, false) : InvalidOid;
+}
+
+/*
+ * Pages of a table not marked all-frozen (or, with visibleOnly, all-visible),
+ * counting at most limit of them. Bulk loads extend the table ahead of use,
+ * leaving all-zero pages that VACUUM never marks; they hold no rows, so they
+ * don't count.
+ */
+static BlockNumber
+UnmarkedPages(Relation heap, bool visibleOnly, BlockNumber limit)
+{
+	BlockNumber blocks = RelationGetNumberOfBlocks(heap);
+	BlockNumber visible;
+	BlockNumber frozen;
+	BlockNumber pending;
+	BlockNumber unmarked = 0;
+	uint8		marked = visibleOnly ? VISIBILITYMAP_ALL_VISIBLE : VISIBILITYMAP_ALL_FROZEN;
+	Buffer		vmbuf = InvalidBuffer;
+	BufferAccessStrategy strategy;
+
+	visibilitymap_count(heap, &visible, &frozen);
+	pending = blocks - Min(visibleOnly ? visible : frozen, blocks);
+	if (pending == 0)
+		return 0;
+	strategy = GetAccessStrategy(BAS_BULKREAD);
+	for (BlockNumber blkno = 0; blkno < blocks && pending > 0 && unmarked < limit; blkno++)
+	{
+		Buffer		buf;
+
+		if (visibilitymap_get_status(heap, blkno, &vmbuf) & marked)
+			continue;
+		pending--;
+		buf = ReadBufferExtended(heap, MAIN_FORKNUM, blkno, RBM_NORMAL, strategy);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		if (!PageIsNew(BufferGetPage(buf)))
+			unmarked++;
+		UnlockReleaseBuffer(buf);
+	}
+	if (BufferIsValid(vmbuf))
+		ReleaseBuffer(vmbuf);
+	FreeAccessStrategy(strategy);
+	return unmarked;
+}
+
+/*
+ * Whether a frozen index's table is unchanged since the build: VACUUM never
+ * invalidated a TID of the index (ANN_FROZEN_PRISTINE), and every page is still
+ * all-visible, as the build required, so nothing deleted or updated a row
+ * that VACUUM hasn't processed yet. Writing the table means disabling its
+ * guard first, which invalidates the table's relcache entry, so the answer
+ * is kept per index until the table's or the index's entry is invalidated.
+ */
+typedef struct AnnUnchangedEntry
+{
+	Oid			index;			/* hash key */
+	Oid			heap;
+	bool		unchanged;
+} AnnUnchangedEntry;
+
+static HTAB *unchangedTables = NULL;
+
+static void
+ForgetUnchanged(Datum arg, Oid relid)
+{
+	HASH_SEQ_STATUS status;
+	AnnUnchangedEntry *entry;
+
+	hash_seq_init(&status, unchangedTables);
+	while ((entry = hash_seq_search(&status)) != NULL)
+		if (!OidIsValid(relid) || entry->index == relid || entry->heap == relid)
+			(void) hash_search(unchangedTables, &entry->index, HASH_REMOVE, NULL);
+}
+
+static bool
+TableUnchanged(Relation heap, Relation index)
+{
+	Oid			indexOid = RelationGetRelid(index);
+	AnnUnchangedEntry *entry;
+	Buffer		buf;
+	bool		unchanged;
+
+	if (unchangedTables == NULL)
+	{
+		HASHCTL		ctl;
+
+		ctl.keysize = sizeof(Oid);
+		ctl.entrysize = sizeof(AnnUnchangedEntry);
+		unchangedTables = hash_create("ann frozen unchanged tables", 16, &ctl, HASH_ELEM | HASH_BLOBS);
+		CacheRegisterRelcacheCallback(ForgetUnchanged, (Datum) 0);
+	}
+	entry = hash_search(unchangedTables, &indexOid, HASH_FIND, NULL);
+	if (entry)
+		return entry->unchanged;
+
+	/* the metapage itself, not the cached copy: VACUUM clears PRISTINE there */
+	buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	unchanged = AnnPageGetMeta(BufferGetPage(buf))->insertPage == ANN_FROZEN_PRISTINE;
+	UnlockReleaseBuffer(buf);
+	unchanged = unchanged && UnmarkedPages(heap, true, 1) == 0;
+	entry = hash_search(unchangedTables, &indexOid, HASH_ENTER, NULL);
+	entry->heap = RelationGetRelid(heap);
+	entry->unchanged = unchanged;
+	return unchanged;
+}
+
+/*
+ * Whether ann.frozen_immutable applies to a frozen index's table: only while
+ * the statement guard of its build and a row guard fire always (an origin trigger lets
+ * sessions in replica mode and replication workers write), and only if the
+ * table is unchanged since the build (TableUnchanged). Otherwise scans read
+ * TIDs through shared buffers and check visibility as usual.
+ */
+bool
+AnnFrozenImmutable(Relation heap, Relation index)
+{
+	AnnFrozenMetaData *meta;
+	TriggerDesc *desc;
+
+	if (!ann_frozen_immutable || (meta = AnnFrozenMeta(index)) == NULL || !OidIsValid(meta->guard))
+		return false;
+	desc = heap->trigdesc;
+	for (int i = 0; desc != NULL && i < desc->numtriggers; i++)
+	{
+		Trigger    *trigger = &desc->triggers[i];
+
+		if (trigger->tgoid != meta->guard)
+			continue;
+		/* the row guard too: without it, writes through a parent relation get in */
+		return trigger->tgenabled == TRIGGER_FIRES_ALWAYS && GuardShape(trigger, false) &&
+			OidIsValid(FindGuardKind(heap, true)) && TableUnchanged(heap, index);
+	}
+	return false;
+}
+
+/* AnnFrozenImmutable for an index's table. */
+bool
+AnnFrozenIndexImmutable(Relation index)
+{
+	Relation	heap;
+	bool		immutable;
+
+	if (!ann_frozen_immutable)
+		return false;
+	heap = table_open(index->rd_index->indrelid, AccessShareLock);
+	immutable = AnnFrozenImmutable(heap, index);
+	table_close(heap, NoLock);
+	return immutable;
 }
 
 /* Whether a table has the guard trigger (ann_freeze). */
@@ -312,7 +477,8 @@ WriterEnd(ArrayWriter *writer)
  * of the pages in host memory and reads take no buffer pins or locks.
  * Frozen pages never change after the build, which flushed them, so the
  * files hold their final content; TID pages, which VACUUM can still
- * change, always go through shared buffers. During recovery (a standby
+ * change, go through shared buffers unless the table is immutable
+ * (AnnFrozenImmutable). During recovery (a standby
  * replays into shared buffers, not the files) nothing is mapped.
  */
 typedef struct AnnFrozenMap
@@ -324,6 +490,8 @@ typedef struct AnnFrozenMap
 } AnnFrozenMap;
 
 bool		ann_frozen_mmap = true;
+bool		ann_frozen_immutable = false;
+bool		ann_frozen_complete_short = true;
 static HTAB *frozenMaps = NULL;
 static Oid	buildingIndex = InvalidOid; /* reads during its own build use
 										 * buffers */
@@ -545,9 +713,13 @@ AnnFrozenVisibleTids(Relation index, Relation heap, const AnnFrozenMetaData *met
 	return true;
 }
 
+/*
+ * Read an array; immutable (AnnFrozenImmutable of the table) lets the TID
+ * pages be mapped too.
+ */
 void
-AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
-				   BufferAccessStrategy strategy)
+AnnArrayReaderInitExtended(AnnArrayReader *reader, Relation index, const AnnArray *array,
+						   BufferAccessStrategy strategy, bool immutable)
 {
 	const AnnFrozenMap *map;
 	AnnFrozenMetaData *meta;
@@ -561,8 +733,21 @@ AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array
 	reader->map = NULL;
 	if (RelationGetRelid(index) != buildingIndex && (map = CachedMap(index)) != NULL &&
 		(meta = AnnFrozenMeta(index)) != NULL &&
-		array->start != meta->tids.start && MappedArrayValid(map, array))
+		(array->start != meta->tids.start || immutable) && MappedArrayValid(map, array))
 		reader->map = map;
+}
+
+/* Read an array, looking up the table's guard only for mapped TID pages. */
+void
+AnnArrayReaderInit(AnnArrayReader *reader, Relation index, const AnnArray *array,
+				   BufferAccessStrategy strategy)
+{
+	AnnFrozenMetaData *meta;
+
+	AnnArrayReaderInitExtended(reader, index, array, strategy,
+							   ann_frozen_immutable && RelationGetRelid(index) != buildingIndex &&
+							   CachedMap(index) != NULL && (meta = AnnFrozenMeta(index)) != NULL &&
+							   array->start == meta->tids.start && AnnFrozenIndexImmutable(index));
 }
 
 /* CPU-cache hints only for immutable mapped arrays; never bypass TID locks. */
@@ -843,6 +1028,8 @@ typedef struct FrozenBuildState
 	int			vectors;		/* reloption: ANN_FROZEN_VECTORS_* */
 	Oid			keyType;
 	bool		coded[ANN_FROZEN_MAX_COLUMNS];	/* dictionary-coded columns */
+	bool		multi[ANN_FROZEN_MAX_COLUMNS];	/* integer[] columns */
+	uint64		elements[ANN_FROZEN_MAX_COLUMNS];	/* theirs, a NULL array as one */
 	Oid			collations[ANN_FROZEN_MAX_COLUMNS];
 	TupleDesc	sortDesc;
 	TupleTableSlot *slot;
@@ -888,6 +1075,43 @@ AnnFrozenTextDatum(Relation index, const AnnFrozenMetaData *meta, int column, in
 	AnnArrayReaderEnd(&starts);
 	AnnArrayReaderEnd(&strings);
 	return PointerGetDatum(result);
+}
+
+/*
+ * An integer[] attribute's value for an ordinal, from its elements and row
+ * starts, in the current memory context: the stored elements, in order, or
+ * NULL for a row whose only element stands for NULL.
+ */
+Datum
+AnnFrozenArrayDatum(AnnArrayReader *values, AnnArrayReader *starts, uint64 ordinal, bool *isnull)
+{
+	uint32		range[2];
+	uint32		n;
+	Size		size;
+	ArrayType  *array;
+
+	AnnArrayReadRange(starts, ordinal, 2, range);
+	n = range[1] - range[0];
+	*isnull = false;
+	if (n == 0)
+		return PointerGetDatum(construct_empty_array(INT4OID));
+	/* the layout construct_array gives a one-dimensional int4 array */
+	size = ARR_OVERHEAD_NONULLS(1) + sizeof(int32) * (Size) n;
+	array = palloc0(size);
+	SET_VARSIZE(array, size);
+	array->ndim = 1;
+	array->dataoffset = 0;
+	array->elemtype = INT4OID;
+	ARR_DIMS(array)[0] = (int) n;
+	ARR_LBOUND(array)[0] = 1;
+	AnnArrayReadRange(values, range[0], n, ARR_DATA_PTR(array));
+	if (n == 1 && *(int32 *) ARR_DATA_PTR(array) == ANN_FROZEN_NULL)
+	{
+		pfree(array);
+		*isnull = true;
+		return (Datum) 0;
+	}
+	return PointerGetDatum(array);
 }
 
 /*
@@ -982,6 +1206,34 @@ AnnFrozenAttributeDatum(int32 value, Oid type)
 	}
 }
 
+/*
+ * The elements of an integer[] attribute: one-dimensional with lower bound
+ * 1 (so index-only scans return the heap's value), no NULL elements, and
+ * none equal to the value standing for a NULL array.
+ */
+static void
+CheckFrozenArray(ArrayType *array, const char *column)
+{
+	int			n = ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array));
+	const int32 *elements = (const int32 *) ARR_DATA_PTR(array);
+
+	if (ARR_NDIM(array) > 1 || (ARR_NDIM(array) == 1 && ARR_LBOUND(array)[0] != 1))
+		ereport(ERROR,
+				(errcode(ERRCODE_ARRAY_SUBSCRIPT_ERROR),
+				 errmsg("integer[] attribute \"%s\" of a frozen ann index must hold one-dimensional arrays "
+						"starting at 1", column)));
+	if (ARR_HASNULL(array))
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("integer[] attribute \"%s\" of a frozen ann index cannot hold NULL elements", column)));
+	for (int i = 0; i < n; i++)
+		if (elements[i] == ANN_FROZEN_NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("frozen ann index attribute value %d is out of range", ANN_FROZEN_NULL),
+					 errdetail("%d stands for NULL.", ANN_FROZEN_NULL)));
+}
+
 /* Key, heap TID, vector and attributes of each row, sorted by key. */
 static void
 FrozenBuildCallback(Relation index, ItemPointer tid, Datum *values, bool *isnull,
@@ -1019,6 +1271,21 @@ FrozenBuildCallback(Relation index, ItemPointer tid, Datum *values, bool *isnull
 			slot->tts_values[3 + c] = isnull[2 + c] ? (Datum) 0 :
 				PointerGetDatum(PG_DETOAST_DATUM_PACKED(values[2 + c]));
 		}
+		else if (bs->multi[c])
+		{
+			ArrayType  *array = isnull[2 + c] ? NULL : DatumGetArrayTypeP(values[2 + c]);
+
+			if (array)
+				CheckFrozenArray(array, NameStr(TupleDescAttr(RelationGetDescr(index), 2 + c)->attname));
+			slot->tts_isnull[3 + c] = isnull[2 + c];
+			slot->tts_values[3 + c] = PointerGetDatum(array);
+			bs->elements[c] += array ? ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array)) : 1;
+			if (bs->elements[c] >= PG_UINT32_MAX)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("integer[] attributes of frozen ann indexes hold at most %u elements",
+								PG_UINT32_MAX - 1)));
+		}
 		else
 			slot->tts_values[3 + c] = Int32GetDatum(AnnFrozenAttributeValue(values[2 + c], isnull[2 + c],
 																			TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid));
@@ -1039,9 +1306,7 @@ static Oid
 CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 {
 	TupleDesc	desc = RelationGetDescr(index);
-	BlockNumber blocks;
-	BlockNumber visible;
-	BlockNumber frozen;
+	BlockNumber unfrozen;
 	Oid			guard;
 	Oid			type;
 
@@ -1073,10 +1338,10 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("text INCLUDE column \"%s\" of a frozen ann index needs a deterministic collation",
 							NameStr(TupleDescAttr(desc, i)->attname))));
-		if (!AnnFrozenAttributeType(type))
+		if (!AnnFrozenAttributeType(type) && !AnnFrozenMultiType(type))
 			ereport(ERROR,
 					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg("INCLUDE column \"%s\" of a frozen ann index must be smallint, integer, bigint, boolean, date, text or varchar",
+					 errmsg("INCLUDE column \"%s\" of a frozen ann index must be smallint, integer, bigint, boolean, date, text, varchar or integer[]",
 							NameStr(TupleDescAttr(desc, i)->attname))));
 	}
 	guard = FindGuard(heap);
@@ -1086,39 +1351,12 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 				 errmsg("table \"%s\" is not frozen", RelationGetRelationName(heap)),
 				 errhint("Run SELECT ann_freeze('%s') and VACUUM (FREEZE) on it, then create the index.",
 						 RelationGetRelationName(heap))));
-	blocks = RelationGetNumberOfBlocks(heap);
-	visibilitymap_count(heap, &visible, &frozen);
-
-	/*
-	 * Bulk loads extend the table ahead of use, leaving all-zero pages that
-	 * VACUUM never marks; they hold no rows, so they count as frozen.
-	 */
-	if (frozen < blocks)
-	{
-		Buffer		vmbuf = InvalidBuffer;
-		BufferAccessStrategy strategy = GetAccessStrategy(BAS_BULKREAD);
-
-		for (BlockNumber blkno = 0; blkno < blocks && frozen < blocks; blkno++)
-		{
-			Buffer		buf;
-
-			if (VM_ALL_FROZEN(heap, blkno, &vmbuf))
-				continue;
-			buf = ReadBufferExtended(heap, MAIN_FORKNUM, blkno, RBM_NORMAL, strategy);
-			LockBuffer(buf, BUFFER_LOCK_SHARE);
-			if (PageIsNew(BufferGetPage(buf)))
-				frozen++;
-			UnlockReleaseBuffer(buf);
-		}
-		if (BufferIsValid(vmbuf))
-			ReleaseBuffer(vmbuf);
-		FreeAccessStrategy(strategy);
-	}
-	if (frozen < blocks)
+	unfrozen = UnmarkedPages(heap, false, InvalidBlockNumber);
+	if (unfrozen > 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("%u of %u pages of table \"%s\" are not frozen",
-						blocks - frozen, blocks, RelationGetRelationName(heap)),
+						unfrozen, RelationGetNumberOfBlocks(heap), RelationGetRelationName(heap)),
 				 errhint("Run VACUUM (FREEZE) on the table again, then create the index. VACUUM leaves pages "
 						 "unfrozen while other sessions hold them, or until asynchronous commits are flushed.")));
 	return guard;
@@ -1127,10 +1365,12 @@ CheckFrozenTable(Relation heap, Relation index, IndexInfo *indexInfo)
 /*
  * Postings of one column from its (value, ordinal) sort: ordinals grouped by
  * value, then the distinct values and where each one's postings start.
+ * npostings is rows, or for an integer[] column its distinct (value, row)
+ * pairs.
  */
 static void
 WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, AnnFrozenColumnExtra *bitsets,
-			  int64 bitsetMin, uint64 rows)
+			  int64 bitsetMin, uint64 rows, uint64 npostings)
 {
 	ArrayWriter postings;
 	ArrayWriter writer;
@@ -1171,8 +1411,8 @@ WritePostings(Relation index, Tuplesortstate *sort, AnnFrozenColumn *column, Ann
 		position++;
 	}
 	WriterEnd(&postings);
-	if (position != rows)
-		elog(ERROR, "ann postings have " UINT64_FORMAT " of " UINT64_FORMAT " rows", position, rows);
+	if (position != npostings)
+		elog(ERROR, "ann postings have " UINT64_FORMAT " of " UINT64_FORMAT " entries", position, npostings);
 
 	InitArray(&column->dict, sizeof(int32), 0);
 	WriterBegin(&writer, index, &column->dict, false);
@@ -1323,11 +1563,13 @@ WriteDictionary(Relation index, TupleDesc textDesc, Tuplesortstate *textSort, Tu
 	pfree(starts);
 }
 
+static int	Int32Compare(const void *a, const void *b);
+
 /*
  * Lay out the sorted rows: TIDs, keys and attribute values fill reserved
  * pages side by side while vectors are appended after them; each attribute's
  * inverted index follows. The generation hashes every key, vector and value
- * in ordinal order.
+ * in ordinal order (an integer[] attribute's elements, then their count).
  */
 static void
 WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
@@ -1337,6 +1579,9 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	ArrayWriter keys;
 	ArrayWriter vectors;
 	ArrayWriter *values = palloc0(sizeof(ArrayWriter) * Max(bs->ncolumns, 1));
+	ArrayWriter *starts = palloc0(sizeof(ArrayWriter) * Max(bs->ncolumns, 1));
+	uint64	   *elements = palloc0(sizeof(uint64) * Max(bs->ncolumns, 1));
+	uint64	   *npostings = palloc0(sizeof(uint64) * Max(bs->ncolumns, 1));
 	Tuplesortstate **sorts = palloc0(sizeof(Tuplesortstate *) * Max(bs->ncolumns, 1));
 	Tuplesortstate **textSorts = palloc0(sizeof(Tuplesortstate *) * Max(bs->ncolumns, 1));
 	TupleDesc	textDesc;
@@ -1360,8 +1605,16 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	textSlot = MakeSingleTupleTableSlot(textDesc, &TTSOpsVirtual);
 	for (int c = 0; c < bs->ncolumns; c++)
 	{
-		InitArray(&meta->columns[c].values, sizeof(int32), bs->rows);
+		InitArray(&meta->columns[c].values, sizeof(int32), bs->multi[c] ? bs->elements[c] : bs->rows);
 		ReserveArray(index, &meta->columns[c].values);
+		if (bs->multi[c])
+		{
+			AnnArray   *rowStarts = &AnnFrozenGetExtra(meta)[c].starts;
+
+			InitArray(rowStarts, sizeof(uint32), bs->rows + 1);
+			ReserveArray(index, rowStarts);
+			WriterBegin(&starts[c], index, rowStarts, true);
+		}
 		if (!bs->coded[c])
 			WriterBegin(&values[c], index, &meta->columns[c].values, true);
 		else
@@ -1443,6 +1696,34 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 				}
 				continue;
 			}
+			if (bs->multi[c])
+			{
+				/* the elements as stored; postings once per distinct element */
+				uint32		start = (uint32) elements[c];
+				ArrayType  *array = isnull ? NULL : DatumGetArrayTypeP(value);
+				int			n = array ? ArrayGetNItems(ARR_NDIM(array), ARR_DIMS(array)) : 1;
+				int32		null = ANN_FROZEN_NULL;
+				const int32 *data = array ? (const int32 *) ARR_DATA_PTR(array) : &null;
+				int32	   *distinct = palloc(sizeof(int32) * Max(n, 1));
+
+				memcpy(WriterNext(&starts[c]), &start, sizeof(start));
+				for (int i = 0; i < n; i++)
+					memcpy(WriterNext(&values[c]), &data[i], sizeof(int32));
+				elements[c] += n;
+				if (array && n > 0)
+					hash = hash_bytes_extended((const unsigned char *) data, sizeof(int32) * n, hash);
+				row[c] = array ? n : ANN_FROZEN_NULL;
+				memcpy(distinct, data, sizeof(int32) * n);
+				qsort(distinct, n, sizeof(int32), Int32Compare);
+				for (int i = 0; i < n; i++)
+					if (i == 0 || distinct[i] != distinct[i - 1])
+					{
+						tuplesort_putdatum(sorts[c], Int64GetDatum((int64) distinct[i] * INT64CONST(4294967296) +
+																   (int64) ordinal), false);
+						npostings[c]++;
+					}
+				continue;
+			}
 			row[c] = DatumGetInt32(value);
 			memcpy(WriterNext(&values[c]), &row[c], sizeof(int32));
 			/* value * 2^32 + ordinal sorts by value, then ordinal */
@@ -1461,8 +1742,17 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	if (bs->vectors != ANN_FROZEN_VECTORS_HEAP)
 		WriterEnd(&vectors);
 	for (int c = 0; c < bs->ncolumns; c++)
+	{
+		if (bs->multi[c])
+		{
+			uint32		end = (uint32) elements[c];
+
+			memcpy(WriterNext(&starts[c]), &end, sizeof(end));
+			WriterEnd(&starts[c]);
+		}
 		if (!bs->coded[c])
 			WriterEnd(&values[c]);
+	}
 	ExecDropSingleTupleTableSlot(slot);
 	for (int c = 0; c < bs->ncolumns; c++)
 		if (bs->coded[c])
@@ -1477,14 +1767,19 @@ WriteArrays(Relation index, FrozenBuildState *bs, AnnFrozenMetaData *meta)
 	for (int c = 0; c < bs->ncolumns; c++)
 	{
 		WritePostings(index, sorts[c], &meta->columns[c], &AnnFrozenGetExtra(meta)[c],
-					  bs->bitsetMin < 0 ? Max(ordinal / 32, 1) : Max(bs->bitsetMin, 1), ordinal);
+					  bs->bitsetMin < 0 ? Max(ordinal / 32, 1) : Max(bs->bitsetMin, 1), ordinal,
+					  bs->multi[c] ? npostings[c] : ordinal);
 		tuplesort_end(sorts[c]);
 	}
 }
 
-/* Rewrite block 0 as a frozen metapage; pd_lower covers the directory. */
+/*
+ * Rewrite block 0 as a frozen metapage; pd_lower covers the directory.
+ * Indexes without integer[] attributes keep version 4, which older builds
+ * read.
+ */
 static void
-WriteFrozenMeta(Relation index, const AnnFrozenMetaData *frozen)
+WriteFrozenMeta(Relation index, const AnnFrozenMetaData *frozen, uint32 version)
 {
 	Buffer		buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
 	Page		page;
@@ -1493,7 +1788,7 @@ WriteFrozenMeta(Relation index, const AnnFrozenMetaData *frozen)
 	LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 	page = BufferGetPage(buf);
 	AnnCheckMetaPage(page);
-	AnnPageGetMeta(page)->version = ANN_FROZEN_VERSION;
+	AnnPageGetMeta(page)->version = version;
 	AnnPageGetMeta(page)->insertPage = ANN_FROZEN_PRISTINE;
 	stored = AnnPageGetFrozen(page);
 	memcpy(stored, frozen, AnnFrozenMetaSize(frozen->ncolumns));
@@ -1541,8 +1836,10 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	for (int c = 0; c < bs.ncolumns; c++)
 	{
 		bs.coded[c] = AnnFrozenTextType(TupleDescAttr(indexDesc, 2 + c)->atttypid);
+		bs.multi[c] = AnnFrozenMultiType(TupleDescAttr(indexDesc, 2 + c)->atttypid);
 		bs.collations[c] = AnnFrozenColumnCollation(index, 2 + c);
-		TupleDescInitEntry(bs.sortDesc, 4 + c, "value", bs.coded[c] ? TEXTOID : INT4OID, -1, 0);
+		TupleDescInitEntry(bs.sortDesc, 4 + c, "value",
+						   bs.coded[c] ? TEXTOID : bs.multi[c] ? INT4ARRAYOID : INT4OID, -1, 0);
 	}
 #if PG_VERSION_NUM >= 190000
 	TupleDescFinalize(bs.sortDesc);
@@ -1568,7 +1865,14 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	WriteArrays(index, &bs, meta);
 	tuplesort_end(bs.sort);
 	ExecDropSingleTupleTableSlot(bs.slot);
-	WriteFrozenMeta(index, meta);
+	{
+		uint32		version = ANN_FROZEN_VERSION_SINGLE;
+
+		for (int c = 0; c < bs.ncolumns; c++)
+			if (bs.multi[c])
+				version = ANN_FROZEN_VERSION;
+		WriteFrozenMeta(index, meta, version);
+	}
 	result->index_tuples = meta->rows;
 	if (RelationNeedsWAL(index))
 		log_newpage_range(index, MAIN_FORKNUM, 0, RelationGetNumberOfBlocks(index), true);
@@ -1591,6 +1895,7 @@ typedef struct FrozenSource
 	const AnnFrozenMetaData *meta;
 	const AnnFrozenColumnExtra *bitsets;
 	const char *names[ANN_FROZEN_MAX_COLUMNS];
+	bool		multi[ANN_FROZEN_MAX_COLUMNS];	/* integer[] columns */
 	AnnArrayReader dict[ANN_FROZEN_MAX_COLUMNS];
 	AnnArrayReader offsets[ANN_FROZEN_MAX_COLUMNS];
 	AnnArrayReader postings[ANN_FROZEN_MAX_COLUMNS];
@@ -1669,6 +1974,12 @@ SourceBitset(void *arg, int column, uint64_t i, uint32_t *words)
 	return 0;
 }
 
+static int
+SourceMulti(void *arg, int column)
+{
+	return ((FrozenSource *) arg)->multi[column];
+}
+
 static void *
 SourceAlloc(void *arg, size_t size)
 {
@@ -1699,6 +2010,7 @@ AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned 
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 	{
 		state->names[c] = NameStr(AnnFrozenGetNames(meta)[c]);
+		state->multi[c] = AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid);
 		AnnArrayReaderInit(&state->dict[c], index, &meta->columns[c].dict, NULL);
 		AnnArrayReaderInit(&state->offsets[c], index, &meta->columns[c].offsets, NULL);
 		AnnArrayReaderInit(&state->postings[c], index, &meta->columns[c].postings, NULL);
@@ -1716,6 +2028,7 @@ AnnFrozenEvaluate(Relation index, const AnnFrozenMetaData *meta, const unsigned 
 	source.bitset = SourceBitset;
 	source.alloc = SourceAlloc;
 	source.release = SourceRelease;
+	source.multi = SourceMulti;
 	code = AnnFilterEvaluate(&source, program, size, words, count);
 	for (uint32 c = 0; c < meta->ncolumns; c++)
 	{
@@ -1756,7 +2069,8 @@ CpuMicroseconds(void)
  * when evaluating it took clearly more CPU time than that copy (bytes / 2
  * nanoseconds, about four copies at 8 GB/s), when its bitmap is small, or
  * when cache is set: cheap programs over large indexes would only displace
- * expensive ones.
+ * expensive ones. Errors, such as a leaf of the wrong kind for its column
+ * (ANN_FILTER_COLUMN_KIND), are reported.
  */
 void
 AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const char *program,
@@ -1786,6 +2100,11 @@ AnnFrozenEvaluateOrError(Relation index, const AnnFrozenMetaData *meta, const ch
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("stored filter ids in predicates are evaluated on GPU nodes only")));
+	if (code == ANN_FILTER_COLUMN_KIND)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("predicate applies an operator to an attribute of another kind"),
+				 errdetail("Overlap tests apply to integer[] attributes, comparisons to the others.")));
 	if (code != ANN_FILTER_OK)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1831,7 +2150,8 @@ AnnFrozenVectorReaderInit(AnnFrozenVectorReader *reader, Relation index, const A
 		reader->heap = table_open(index->rd_index->indrelid, AccessShareLock);
 		reader->slot = table_slot_create(reader->heap, NULL);
 		reader->attno = index->rd_index->indkey.values[0];
-		AnnArrayReaderInit(&reader->tids, index, &meta->tids, strategy);
+		AnnArrayReaderInitExtended(&reader->tids, index, &meta->tids, strategy,
+								   AnnFrozenImmutable(reader->heap, index));
 	}
 	else
 	{
@@ -2058,8 +2378,9 @@ FindValue(AnnArrayReader *dict, int32 value)
 
 /*
  * ann_frozen_keys(index, column, values): keys of the rows whose column holds
- * one of the values, in key order. The inverted index (distinct values,
- * postings) gives ordinals; the forward index gives their keys.
+ * one of the values (an integer[] column, among its elements), in key order.
+ * The inverted index (distinct values, postings) gives ordinals; the forward
+ * index gives their keys.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_keys);
 Datum
@@ -2071,6 +2392,7 @@ ann_frozen_keys(PG_FUNCTION_ARGS)
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	AnnFrozenMetaData *meta = AnnFrozenGetMeta(index, false);
 	AnnFrozenColumn *column = NULL;
+	bool		multi = false;
 	AnnArrayReader dict;
 	AnnArrayReader offsets;
 	AnnArrayReader postings;
@@ -2092,7 +2414,10 @@ ann_frozen_keys(PG_FUNCTION_ARGS)
 				 errmsg("set-valued function called in context that cannot accept a set")));
 	for (uint32 c = 0; c < meta->ncolumns && column == NULL; c++)
 		if (strcmp(AnnFrozenColumnName(index, 3 + c), name) == 0)
+		{
 			column = &meta->columns[c];
+			multi = AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid);
+		}
 	if (column == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_UNDEFINED_COLUMN),
@@ -2145,6 +2470,16 @@ ann_frozen_keys(PG_FUNCTION_ARGS)
 	}
 	if (nwanted > 1)
 		qsort(ordinals, nordinals, sizeof(uint32), Uint32Compare);
+	if (multi && nwanted > 1 && nordinals > 1)
+	{
+		/* a row of an integer[] column is under each of its values */
+		uint64		unique = 1;
+
+		for (uint64 i = 1; i < nordinals; i++)
+			if (ordinals[i] != ordinals[unique - 1])
+				ordinals[unique++] = ordinals[i];
+		nordinals = unique;
+	}
 
 	oldCtx = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
 	tupdesc = CreateTemplateTupleDesc(1);
@@ -2191,7 +2526,8 @@ PutSize(Tuplestorestate *store, TupleDesc desc, const char *name, const AnnArray
 /*
  * ann_frozen_sizes(index): pages and bytes of each structure of a frozen
  * index: TIDs, keys, vectors (with how they are kept), and per attribute its
- * values, distinct values, offsets, postings, bitsets and text dictionary.
+ * values (and integer[] row starts), distinct values, offsets, postings,
+ * bitsets and text dictionary.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_sizes);
 Datum
@@ -2224,6 +2560,8 @@ ann_frozen_sizes(PG_FUNCTION_ARGS)
 		const char *name = NameStr(AnnFrozenGetNames(meta)[c]);
 
 		PutSize(store, tupdesc, psprintf("%s values", name), &meta->columns[c].values);
+		if (AnnFrozenMultiType(TupleDescAttr(RelationGetDescr(index), 2 + c)->atttypid))
+			PutSize(store, tupdesc, psprintf("%s row starts", name), &extra[c].starts);
 		PutSize(store, tupdesc, psprintf("%s distinct values", name), &meta->columns[c].dict);
 		PutSize(store, tupdesc, psprintf("%s offsets", name), &meta->columns[c].offsets);
 		PutSize(store, tupdesc, psprintf("%s postings", name), &meta->columns[c].postings);
@@ -2320,7 +2658,8 @@ WarmArray(Relation index, const AnnFrozenMap *map, const AnnArray *array, bool b
  * ann_frozen_prewarm(index): read a frozen index into memory ahead of
  * queries: its immutable pages through the file mappings (the operating
  * system's page cache, shared by every backend), its TID pages into shared
- * buffers. Returns the bytes read.
+ * buffers unless ann.frozen_immutable applies (AnnFrozenImmutable), when
+ * they are mapped too. Returns the bytes read.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_prewarm);
 Datum
@@ -2332,7 +2671,7 @@ ann_frozen_prewarm(PG_FUNCTION_ARGS)
 	AnnFrozenColumnExtra *extra = AnnFrozenGetExtra(meta);
 	uint64		bytes = 0;
 
-	bytes += WarmArray(index, map, &meta->tids, true);
+	bytes += WarmArray(index, map, &meta->tids, !AnnFrozenIndexImmutable(index));
 	bytes += WarmArray(index, map, &meta->keys, false);
 	bytes += WarmArray(index, map, &meta->vectors, false);
 	for (uint32 c = 0; c < meta->ncolumns; c++)

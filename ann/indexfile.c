@@ -17,10 +17,72 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0};
 AnnCostProfile *AnnIndexCostProfile = NULL;
 size_t		(*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity) = NULL;
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
+
+/* IEEE half precision, rounded to nearest even. */
+uint16_t
+AnnIndexHalf(float value)
+{
+	uint32_t	bits;
+	uint32_t	sign;
+	int32_t		exponent;
+	uint32_t	mantissa;
+
+	memcpy(&bits, &value, sizeof(bits));
+	sign = (bits >> 16) & 0x8000;
+	exponent = (int32_t) ((bits >> 23) & 0xff) - 127 + 15;
+	mantissa = bits & 0x7fffff;
+	if (exponent >= 31)
+		return (uint16_t) (sign | 0x7c00);
+	if (exponent <= 0)
+	{
+		if (exponent < -10)
+			return (uint16_t) sign;
+		mantissa |= 0x800000;
+		{
+			uint32_t	shift = (uint32_t) (14 - exponent);
+			uint32_t	half = mantissa >> shift;
+			uint32_t	rest = mantissa & ((1U << shift) - 1);
+			uint32_t	middle = 1U << (shift - 1);
+
+			if (rest > middle || (rest == middle && (half & 1)))
+				half++;
+
+			return (uint16_t) (sign | half);
+		}
+	}
+	{
+		uint32_t	half = sign | ((uint32_t) exponent << 10) | (mantissa >> 13);
+		uint32_t	rest = mantissa & 0x1fff;
+
+		if (rest > 0x1000 || (rest == 0x1000 && (half & 1)))
+			half++;
+		return (uint16_t) half;
+	}
+}
+
+float
+AnnIndexHalfFloat(uint16_t half)
+{
+	uint32_t	sign = (uint32_t) (half & 0x8000) << 16;
+	uint32_t	exponent = (half >> 10) & 0x1f;
+	uint32_t	mantissa = half & 0x3ff;
+	uint32_t	bits;
+	float		value;
+
+	if (exponent == 0)
+	{
+		/* Zero or subnormal: mantissa * 2^-24. */
+		value = (float) mantissa * 5.9604644775390625e-08f;
+		return sign ? -value : value;
+	}
+	bits = exponent == 31 ? sign | 0x7f800000 | (mantissa << 13) : sign | ((exponent - 15 + 127) << 23) | (mantissa << 13);
+	memcpy(&value, &bits, sizeof(value));
+	return value;
+}
 
 /*
  * Reject repeated nonnegative GPU selection positions without changing their
@@ -287,6 +349,36 @@ FindValue(const AnnIndexAttribute *attribute, int32_t value)
 	return low < attribute->nvalues && attribute->postings[low].value == value ? low : attribute->nvalues;
 }
 
+/* Per-shard bitsets of the values with more than bitset_min rows. */
+static int
+PostingBitsets(AnnIndexFile *file, AnnIndexAttribute *attribute)
+{
+	for (uint32_t v = 0; file->nshards && v < attribute->nvalues; v++)
+	{
+		AnnIndexPosting *posting = &attribute->postings[v];
+		uint32_t	s = 0;
+
+		if (posting->count <= AnnIndexConfig.bitset_min)
+			continue;
+		posting->bitsets = calloc(file->nshards, sizeof(uint32_t *));
+		if (posting->bitsets == NULL)
+			return 0;
+		for (uint32_t t = 0; t < file->nshards; t++)
+			if ((posting->bitsets[t] = calloc(((size_t) file->shards[t].rows + 31) / 32, sizeof(uint32_t))) == NULL)
+				return 0;
+		for (uint64_t i = 0; i < posting->count; i++)
+		{
+			uint64_t	ordinal = attribute->ordinals[posting->offset + i];
+
+			while (ordinal >= file->shards[s].first + file->shards[s].rows)
+				s++;
+			ordinal -= file->shards[s].first;
+			posting->bitsets[s][ordinal / 32] |= UINT32_C(1) << (ordinal % 32);
+		}
+	}
+	return 1;
+}
+
 /*
  * Invert one int32 column: distinct values by sorting a copy, then a
  * counting pass and a placement pass in ordinal order, so each value's rows
@@ -340,31 +432,88 @@ InvertAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute, const int32_t 
 		attribute->keys[at] = file->keys[i];
 	}
 	free(fill);
+	attribute->npostings = file->rows;
+	return PostingBitsets(file, attribute);
+}
 
-	for (uint32_t v = 0; file->nshards && v < nvalues; v++)
+/* A multi-valued row's distinct elements into row, sorted; their count. */
+static uint32_t
+RowValues(const AnnIndexAttribute *attribute, uint64_t i, int32_t *row)
+{
+	uint32_t	n = attribute->rowOffsets[i + 1] - attribute->rowOffsets[i];
+	uint32_t	distinct = 0;
+
+	if (n == 0)
+		return 0;
+	memcpy(row, attribute->elements + attribute->rowOffsets[i], sizeof(int32_t) * n);
+	if (n > 1)
+		qsort(row, n, sizeof(int32_t), Int32Compare);
+	for (uint32_t j = 0; j < n; j++)
+		if (j == 0 || row[j] != row[j - 1])
+			row[distinct++] = row[j];
+	return distinct;
+}
+
+/*
+ * Invert a multi-valued column the same way, over each row's distinct
+ * elements (row has room for the longest row), so a value lists a row once.
+ */
+static int
+InvertMulti(AnnIndexFile *file, AnnIndexAttribute *attribute, int32_t *row)
+{
+	int32_t    *sorted;
+	uint64_t   *fill;
+	uint32_t	nvalues = 0;
+	uint64_t	total = 0;
+
+	sorted = malloc(sizeof(int32_t) * (attribute->nelements ? attribute->nelements : 1));
+	if (sorted == NULL)
+		return 0;
+	if (attribute->nelements)
+		memcpy(sorted, attribute->elements, sizeof(int32_t) * attribute->nelements);
+	qsort(sorted, attribute->nelements, sizeof(int32_t), Int32Compare);
+	for (uint64_t i = 0; i < attribute->nelements; i++)
+		if (i == 0 || sorted[i] != sorted[i - 1])
+			sorted[nvalues++] = sorted[i];
+	attribute->nvalues = nvalues;
+	attribute->postings = calloc(nvalues ? nvalues : 1, sizeof(AnnIndexPosting));
+	fill = calloc(nvalues ? nvalues : 1, sizeof(uint64_t));
+	if (attribute->postings == NULL || fill == NULL)
 	{
-		AnnIndexPosting *posting = &attribute->postings[v];
-		uint32_t	s = 0;
-
-		if (posting->count <= AnnIndexConfig.bitset_min)
-			continue;
-		posting->bitsets = calloc(file->nshards, sizeof(uint32_t *));
-		if (posting->bitsets == NULL)
-			return 0;
-		for (uint32_t t = 0; t < file->nshards; t++)
-			if ((posting->bitsets[t] = calloc(((size_t) file->shards[t].rows + 31) / 32, sizeof(uint32_t))) == NULL)
-				return 0;
-		for (uint64_t i = 0; i < posting->count; i++)
-		{
-			uint64_t	ordinal = attribute->ordinals[posting->offset + i];
-
-			while (ordinal >= file->shards[s].first + file->shards[s].rows)
-				s++;
-			ordinal -= file->shards[s].first;
-			posting->bitsets[s][ordinal / 32] |= UINT32_C(1) << (ordinal % 32);
-		}
+		free(sorted);
+		free(fill);
+		return 0;
 	}
-	return 1;
+	for (uint32_t v = 0; v < nvalues; v++)
+		attribute->postings[v].value = sorted[v];
+	free(sorted);
+	for (uint64_t i = 0; i < file->rows; i++)
+		for (uint32_t j = 0, n = RowValues(attribute, i, row); j < n; j++)
+			attribute->postings[FindValue(attribute, row[j])].count++;
+	for (uint32_t v = 0; v < nvalues; v++)
+	{
+		attribute->postings[v].offset = total;
+		total += attribute->postings[v].count;
+	}
+	attribute->npostings = total;
+	attribute->keys = malloc(sizeof(int64_t) * (total ? total : 1));
+	attribute->ordinals = malloc(sizeof(uint64_t) * (total ? total : 1));
+	if (attribute->keys == NULL || attribute->ordinals == NULL)
+	{
+		free(fill);
+		return 0;
+	}
+	for (uint64_t i = 0; i < file->rows; i++)
+		for (uint32_t j = 0, n = RowValues(attribute, i, row); j < n; j++)
+		{
+			uint32_t	v = FindValue(attribute, row[j]);
+			uint64_t	at = attribute->postings[v].offset + fill[v]++;
+
+			attribute->ordinals[at] = i;
+			attribute->keys[at] = file->keys[i];
+		}
+	free(fill);
+	return PostingBitsets(file, attribute);
 }
 
 /* A text attribute's dictionary: "dictionary NAME STRINGS STARTS". */
@@ -379,10 +528,31 @@ DictionaryLine(AnnIndexFile *file, const char *line)
 		strchr(starts, '/'))
 		return 0;
 	for (uint32_t a = 0; a < file->nattributes; a++)
-		if (strcmp(file->attributes[a].name, name) == 0)
+		if (strcmp(file->attributes[a].name, name) == 0 && !file->attributes[a].multi)
 		{
 			strcpy(file->attributes[a].stringsFile, strings);
 			strcpy(file->attributes[a].startsFile, starts);
+			return 1;
+		}
+	return 0;
+}
+
+/* A multi-valued attribute's row offsets: "multivalued NAME OFFSETS". */
+static int
+MultiLine(AnnIndexFile *file, const char *line)
+{
+	char		name[64];
+	char		offsets[256];
+
+	if (sscanf(line, "%*s %63s %255s", name, offsets) != 2 || strchr(offsets, '/'))
+		return 0;
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		if (strcmp(file->attributes[a].name, name) == 0)
+		{
+			if (file->attributes[a].multi || file->attributes[a].stringsFile[0])
+				return 0;		/* repeated, or a text attribute */
+			strcpy(file->attributes[a].offsetsFile, offsets);
+			file->attributes[a].multi = 1;
 			return 1;
 		}
 	return 0;
@@ -429,12 +599,74 @@ LoadDictionary(AnnIndexFile *file, AnnIndexAttribute *attribute)
 	return 1;
 }
 
+/*
+ * Map a multi-valued column: rows + 1 offsets starting at 0, never
+ * decreasing, ending at the element count the column file holds; a NULL
+ * array is a row whose sole element is INT32_MIN.
+ */
+static int
+LoadMulti(AnnIndexFile *file, AnnIndexAttribute *attribute)
+{
+	const void *data;
+	size_t		bytes;
+	const uint32_t *offsets;
+	uint32_t	longest = 0;
+	int32_t    *row;
+	int			ok;
+
+	if (!MapFile(file->directory, attribute->offsetsFile, (file->rows + 1) * sizeof(uint32_t), &data,
+				 &attribute->offsetsBytes))
+		return 0;
+	attribute->rowOffsets = offsets = data;
+	if (offsets[0] != 0)
+	{
+		fprintf(stderr, "ann index: %s does not start at 0\n", attribute->offsetsFile);
+		return 0;
+	}
+	for (uint64_t i = 0; i < file->rows; i++)
+	{
+		if (offsets[i + 1] < offsets[i])
+		{
+			fprintf(stderr, "ann index: %s decreases at row %llu\n", attribute->offsetsFile,
+					(unsigned long long) i);
+			return 0;
+		}
+		if (offsets[i + 1] - offsets[i] > longest)
+			longest = offsets[i + 1] - offsets[i];
+	}
+	attribute->nelements = offsets[file->rows];
+	if (!MapFile(file->directory, attribute->file, attribute->nelements * sizeof(int32_t), &data, &bytes))
+		return 0;
+	attribute->elements = data;
+	attribute->mapped = data;
+	attribute->columnBytes = bytes;
+	for (uint64_t i = 0; i < file->rows; i++)
+		for (uint32_t j = offsets[i]; j < offsets[i + 1]; j++)
+			if (attribute->elements[j] == INT32_MIN && offsets[i + 1] - offsets[i] > 1)
+			{
+				fprintf(stderr, "ann index: %s: row %llu has a NULL element\n", attribute->file,
+						(unsigned long long) i);
+				return 0;
+			}
+	if ((row = malloc(sizeof(int32_t) * (longest ? longest : 1))) == NULL)
+		return 0;
+	ok = InvertMulti(file, attribute, row);
+	free(row);
+	if (ok)
+		fprintf(stderr, "ann index %s: multivalued %s: %llu elements, %u values, %llu postings\n", file->name,
+				attribute->name, (unsigned long long) attribute->nelements, attribute->nvalues,
+				(unsigned long long) attribute->npostings);
+	return ok;
+}
+
 static int
 LoadAttribute(AnnIndexFile *file, AnnIndexAttribute *attribute)
 {
 	const void *data;
 	size_t		bytes;
 
+	if (attribute->multi)
+		return LoadMulti(file, attribute);
 	if (!MapFile(file->directory, attribute->file, file->rows * sizeof(int32_t), &data, &bytes))
 		return 0;
 	/* Kept mapped: hits return their rows' values (ANN_PREDICATE_ATTRIBUTES). */
@@ -639,6 +871,15 @@ AnnIndexMatch(const AnnIndexFile *file, const char *name, const int32_t *values,
 		total += found[j]->count;
 	}
 	qsort(mergedOrdinals, total, sizeof(uint64_t), OrdinalCompare);
+	if (attribute->multi)
+	{
+		uint64_t	unique = 0;
+
+		for (uint64_t i = 0; i < total; i++)
+			if (unique == 0 || mergedOrdinals[i] != mergedOrdinals[unique - 1])
+				mergedOrdinals[unique++] = mergedOrdinals[i];
+		total = unique;
+	}
 	for (uint64_t i = 0; i < total; i++)
 		mergedKeys[i] = file->keys[mergedOrdinals[i]];
 	*keys = mergedKeys;
@@ -872,7 +1113,13 @@ SourceStart(void *arg, int column, uint64_t i)
 	AnnIndexFile *file = arg;
 	const AnnIndexAttribute *attribute = &file->attributes[column];
 
-	return i < attribute->nvalues ? attribute->postings[i].offset : file->rows;
+	return i < attribute->nvalues ? attribute->postings[i].offset : attribute->npostings;
+}
+
+static int
+SourceMulti(void *arg, int column)
+{
+	return ((AnnIndexFile *) arg)->attributes[column].multi;
 }
 
 static int
@@ -995,6 +1242,7 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.start = SourceStart;
 	source.postings = SourcePostings;
 	source.bitmap = SourceBitmap;
+	source.multi = SourceMulti;
 	code = AnnFilterEvaluate(&source, program, size, words, count);
 	if (code == ANN_FILTER_OK && deleted && !snapshot)
 	{
@@ -1214,6 +1462,8 @@ ParseManifest(AnnIndexFile *file)
 			strcpy(file->attributes[file->nattributes++].file, text);
 		else if (strcmp(key, "dictionary") == 0 && DictionaryLine(file, line))
 			continue;
+		else if (strcmp(key, "multivalued") == 0 && MultiLine(file, line))
+			continue;
 		else if (strcmp(key, "quant") == 0 && sscanf(line, "%*s %15s", text) == 1 &&
 				 (strcmp(text, "nvfp4") == 0 || strcmp(text, "fp8") == 0))
 			file->quant = strcmp(text, "nvfp4") == 0 ? ANN_QUANT_NVFP4 : ANN_QUANT_FP8;
@@ -1322,6 +1572,20 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 	if (AnnIndexConfig.prewarm)
 		fprintf(stderr, "ann index %s: prewarmed %.1f MB in %.2f s\n", file->name,
 				(double) warmBytes / 1048576.0, warmSeconds);
+	if (AnnIndexConfig.rescore == ANN_RESCORE_FP16)
+	{
+		size_t		count = (size_t) file->rows * file->dimensions;
+
+		if ((file->halfVectors = malloc(count * sizeof(uint16_t) + 1)) == NULL)
+		{
+			AnnIndexFileClose(file);
+			return ANN_NOMEM;
+		}
+		for (size_t i = 0; i < count; i++)
+			file->halfVectors[i] = AnnIndexHalf(file->vectors[i]);
+		fprintf(stderr, "ann index %s: FP16 copy of the rows for re-scoring, %.1f MB\n", file->name,
+				(double) count * sizeof(uint16_t) / 1048576.0);
+	}
 	if (AnnIndexConfig.lock_memory)
 	{
 		int			refused = 0;
@@ -1329,7 +1593,11 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 
 		/* What searches and filters read: the files, the inverted columns. */
 		locked += Lock(file->keys, file->rows * sizeof(int64_t), &refused);
-		locked += Lock(file->vectors, file->rows * file->dimensions * sizeof(float), &refused);
+		/* With an FP16 or GPU FP8 re-score only fallbacks read the FP32 rows. */
+		if (AnnIndexConfig.rescore != ANN_RESCORE_FP16 && AnnIndexConfig.rescore != ANN_RESCORE_FP8_GPU)
+			locked += Lock(file->vectors, file->rows * file->dimensions * sizeof(float), &refused);
+		else if (file->halfVectors)
+			locked += Lock(file->halfVectors, (size_t) file->rows * file->dimensions * sizeof(uint16_t), &refused);
 		if (file->quant != ANN_QUANT_NONE)
 		{
 			locked += Lock(file->quantData, file->rows * file->quantRowBytes, &refused);
@@ -1341,8 +1609,8 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 			AnnIndexAttribute *attribute = &file->attributes[a];
 
 			locked += Lock(attribute->postings, sizeof(AnnIndexPosting) * attribute->nvalues, &refused);
-			locked += Lock(attribute->keys, sizeof(int64_t) * file->rows, &refused);
-			locked += Lock(attribute->ordinals, sizeof(uint64_t) * file->rows, &refused);
+			locked += Lock(attribute->keys, sizeof(int64_t) * attribute->npostings, &refused);
+			locked += Lock(attribute->ordinals, sizeof(uint64_t) * attribute->npostings, &refused);
 		}
 		if (refused)
 			fprintf(stderr, "ann index %s: warning: could not lock index memory (%s; locked %.1f MB); "
@@ -1365,6 +1633,7 @@ AnnIndexFileClose(AnnIndexFile *file)
 		(void) munmap((void *) file->keys, file->keysBytes);
 	if (file->vectors)
 		(void) munmap((void *) file->vectors, file->vectorsBytes);
+	free(file->halfVectors);
 	if (file->quantData)
 		(void) munmap((void *) file->quantData, file->quantDataBytes);
 	if (file->quantScales)
@@ -1383,13 +1652,15 @@ AnnIndexFileClose(AnnIndexFile *file)
 				free(attribute->postings[v].bitsets);
 			}
 		Unlock(attribute->postings, sizeof(AnnIndexPosting) * attribute->nvalues);
-		Unlock(attribute->keys, sizeof(int64_t) * file->rows);
-		Unlock(attribute->ordinals, sizeof(uint64_t) * file->rows);
+		Unlock(attribute->keys, sizeof(int64_t) * attribute->npostings);
+		Unlock(attribute->ordinals, sizeof(uint64_t) * attribute->npostings);
 		free(attribute->postings);
 		free(attribute->keys);
 		free(attribute->ordinals);
 		if (attribute->mapped)
 			(void) munmap((void *) attribute->mapped, attribute->columnBytes);
+		if (attribute->rowOffsets)
+			(void) munmap((void *) attribute->rowOffsets, attribute->offsetsBytes);
 		for (uint32_t v = 0; attribute->oldPostings && v < attribute->oldValues; v++)
 			if (attribute->oldPostings[v].bitsets)
 			{

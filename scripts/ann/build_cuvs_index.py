@@ -12,18 +12,25 @@ ann_index_load(name, path); see docs/ann-cuvs-index.md.
 
 This is offline tooling: Python, NumPy, psycopg, CuPy and the cuVS Python
 package are needed here only, never on the query path. --no-cagra writes the
-manifest, keys and vectors only, for CPU-only testing.
+manifest, keys and vectors only, for CPU-only testing. --scan-only with
+--quantize writes the shards without graphs: the cuVS worker then holds only
+each shard's keys and quantized rows on the GPU and answers every search with
+the Blackwell module's scan, re-scored in FP32 from the host's vectors.
 
 --attribute COLUMN (repeatable) also writes attr-COLUMN.i32, one int32 per
 row in key order, so the worker can resolve "COLUMN IN (values)" filters
 itself (ann_attribute_search) instead of receiving key lists. NULL is stored
-as -2147483648, which therefore never matches.
+as -2147483648, which therefore never matches. Array columns are refused
+here; integer[] attributes come from an export.
 
 --from-export DIR builds from a directory written by SQL ann_index_export(index,
 DIR) instead of reading the table: a frozen ann index's keys, vectors and
 attribute columns plus its generation, which ann_index_load checks against the
 table. Its files are hard-linked (or copied) into --out; --dsn, --table, --key,
---vector and --attribute are taken from the export.
+--vector and --attribute are taken from the export. An integer[] attribute
+has a "multivalued NAME attr-NAME.offsets" line after its attribute line:
+attr-NAME.i32 then holds every row's elements, and attr-NAME.offsets a u32
+start per row plus the end.
 
 --from-export may be repeated to build one index (a part of an ann collection)
 from several partitions' exports, for example the key-range partitions of a
@@ -31,6 +38,7 @@ table. Their keys must not overlap; the members are concatenated in key
 order, so keys stay sorted across the whole index. Each member becomes one
 shard unless --shards says otherwise. The generation is a hash of the
 members' generations, and each member is recorded on a "# member" line.
+Members' integer[] elements are concatenated and their row offsets rebased.
 
 --quantize nvfp4|fp8 also writes a quantized copy of the vectors for the
 worker's Blackwell module, which scores filtered rows from it on compute
@@ -118,17 +126,25 @@ def export_attribute(dsn, table, key, vector, column, keys):
         key=sql.Identifier(key), column=sql.Identifier(column), vector=sql.Identifier(vector),
         table=sql.Identifier(*table.split('.')))
     with psycopg.connect(dsn) as db:
+        kind = db.execute(sql.SQL('SELECT t.typcategory FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid '
+                                  'WHERE a.attrelid = {}::regclass AND a.attname = {}').format(
+            sql.Literal(sql.Identifier(*table.split('.')).as_string(db)), sql.Literal(column))).fetchone()
+        if kind and kind[0] == 'A':
+            raise SystemExit(f'--attribute {column} is an array; export integer[] attributes from a frozen index')
         rows = db.execute(query).fetchall()
     if len(rows) != len(keys) or any(row[0] != k for row, k in zip(rows, keys.tolist())):
         raise SystemExit(f'table changed while exporting attribute {column}')
     return np.asarray([row[1] for row in rows], dtype='<i4')
 
 
+PER_ATTRIBUTE = ('attribute ', 'dictionary ', 'multivalued ')
+
+
 def read_export(directory):
     """Manifest lines, keys and memory-mapped vectors of an ann_index_export directory."""
     with open(os.path.join(directory, 'manifest')) as manifest:
         lines = [line.rstrip('\n') for line in manifest if line.strip()]
-    fields = dict(line.split(' ', 1) for line in lines if not line.startswith(('attribute ', 'dictionary ')))
+    fields = dict(line.split(' ', 1) for line in lines if not line.startswith(PER_ATTRIBUTE))
     if fields.get('pgvector-ann-index') != '1' or 'generation' not in fields or fields.get('shards') != '0':
         raise SystemExit(f'{directory} is not an ann_index_export directory')
     rows, dimensions = int(fields['rows']), int(fields['dimensions'])
@@ -178,6 +194,25 @@ def merge_dictionary(name, parts, out):
         target.write(b''.join(strings))
 
 
+def merge_offsets(name, parts, out):
+    """attr-NAME.offsets over every member: each member's row offsets without its end, shifted by the
+    elements of the members before it, then the total."""
+    base = 0
+    with open(os.path.join(out, f'attr-{name}.offsets'), 'wb') as target:
+        for index, part in enumerate(parts):
+            files = dict(line.split()[1:3] for line in part[2] if line.startswith('multivalued '))
+            elements_file = dict((column, file) for column, file in part[4])[name]
+            offsets = np.fromfile(os.path.join(part[1], files[name]), dtype='<u4').astype(np.uint64)
+            elements = os.path.getsize(os.path.join(part[1], elements_file)) // 4
+            if len(offsets) != len(part[5]) + 1 or offsets[0] != 0 or offsets[-1] != elements or \
+                    np.any(offsets[1:] < offsets[:-1]):
+                raise SystemExit(f'{part[1]}/{files[name]} does not hold the row offsets of {name}')
+            if base + elements > 0xFFFFFFFF:
+                raise SystemExit(f'multi-valued attribute {name} has more than 2^32 - 1 elements')
+            ((offsets if index == len(parts) - 1 else offsets[:-1]) + base).astype('<u4').tofile(target)
+            base += elements
+
+
 def combine_exports(directories, out):
     """Concatenate several exports, in key order, into out; returns the merged manifest lines,
     keys, memory-mapped vectors and (source, first row, rows, generation) per member."""
@@ -187,7 +222,7 @@ def combine_exports(directories, out):
     parts = []
     for directory in directories:
         lines, keys, vectors = read_export(directory)
-        fields = dict(line.split(' ', 1) for line in lines if not line.startswith(('attribute ', 'dictionary ')))
+        fields = dict(line.split(' ', 1) for line in lines if not line.startswith(PER_ATTRIBUTE))
         attributes = [line.split()[1:] for line in lines if line.startswith('attribute ')]
         parts.append((keys[0] if len(keys) else 0, directory, lines, fields, attributes, keys, vectors))
     parts.sort(key=lambda part: part[0])
@@ -212,6 +247,12 @@ def combine_exports(directories, out):
             raise SystemExit(f'{part[1]} has other text attributes than {parts[0][1]}')
     for name in sorted(dictionaries):
         merge_dictionary(name, parts, out)
+    multivalued = {line.split()[1] for line in parts[0][2] if line.startswith('multivalued ')}
+    for part in parts:
+        if {line.split()[1] for line in part[2] if line.startswith('multivalued ')} != multivalued:
+            raise SystemExit(f'{part[1]} has other multi-valued attributes than {parts[0][1]}')
+    for name in sorted(multivalued):
+        merge_offsets(name, parts, out)
     names = ['keys.i64', 'vectors.f32'] + [f'attr-{name}.i32' for name in attributes if name not in dictionaries]
     for name in names:
         source_names = {'keys.i64': 'keys.i64', 'vectors.f32': 'vectors.f32'}
@@ -223,7 +264,10 @@ def combine_exports(directories, out):
                     shutil.copyfileobj(source, target, 64 << 20)
     rows = first
     lines = [line for line in parts[0][2] if line.split(' ', 1)[0] in ('source', 'key', 'vector')]
-    lines += [f'attribute {name} attr-{name}.i32' for name in attributes]
+    for name in attributes:
+        lines.append(f'attribute {name} attr-{name}.i32')
+        if name in multivalued:
+            lines.append(f'multivalued {name} attr-{name}.offsets')
     lines += [f'dictionary {name} attr-{name}.strings attr-{name}.starts' for name in sorted(dictionaries)]
     lines.append(f'generation {digest.hexdigest()[:16]}')
     keys = np.fromfile(os.path.join(out, 'keys.i64'), dtype='<i8')
@@ -298,7 +342,8 @@ def write_quantized(directory, vectors, kind, chunk=1 << 18):
     """Write the --quantize files for vectors (FP32, key order), chunk by chunk."""
     try:
         import cupy as xp
-    except ImportError:
+        xp.asarray(np.zeros(1, dtype=np.float32))  # raises without a usable GPU
+    except Exception:  # no cupy, or no GPU on this node (a split setup's CPU node)
         xp = np
     names = {'nvfp4': ['vectors.nvfp4', 'scales.e4m3', 'rowscale.f32'], 'fp8': ['vectors.e4m3', 'rowscale.f32']}[kind]
     outputs = [open(os.path.join(directory, name), 'wb') for name in names]
@@ -350,7 +395,11 @@ def main():
     parser.add_argument('--quantize', choices=['nvfp4', 'fp8'],
                         help='also write a quantized copy for the worker\'s Blackwell scans')
     parser.add_argument('--no-cagra', action='store_true', help='write keys/vectors only (CPU tests)')
+    parser.add_argument('--scan-only', action='store_true',
+                        help='shards without CAGRA graphs, served by quantized scans (needs --quantize)')
     args = parser.parse_args()
+    if args.scan_only and not args.quantize:
+        parser.error('--scan-only needs --quantize')
 
     if args.from_export:
         if args.dsn or args.table or args.attribute or args.limit:
@@ -367,7 +416,7 @@ def main():
         exported, keys, vectors = read_export(args.from_export[0])
         rows, dimensions = vectors.shape
         for line in exported:
-            for file in (line.split()[2:3] if line.startswith('attribute ') else
+            for file in (line.split()[2:3] if line.startswith(('attribute ', 'multivalued ')) else
                          line.split()[2:4] if line.startswith('dictionary ') else []):
                 link_or_copy(os.path.join(args.from_export[0], file), os.path.join(args.out, file))
         for name in ('keys.i64', 'vectors.f32'):
@@ -392,7 +441,11 @@ def main():
         log(f'exported attribute {column}')
 
     shards = []
-    if not args.no_cagra:
+    if args.scan_only:
+        count = args.shards or 1
+        bounds = [rows * i // count for i in range(count + 1)]
+        shards = [(i, bounds[i], bounds[i + 1] - bounds[i]) for i in range(count) if bounds[i + 1] > bounds[i]]
+    elif not args.no_cagra:
         import cupy
         devices = cupy.cuda.runtime.getDeviceCount()
         count = args.shards or (len(members) if members else devices)
@@ -412,17 +465,17 @@ def main():
     if exported:
         # Keep the export's table, columns, attributes and generation.
         kept = [line for line in exported
-                if line.split(' ', 1)[0] in ('source', 'key', 'vector', 'attribute', 'dictionary')]
+                if line.split(' ', 1)[0] in ('source', 'key', 'vector', 'attribute', 'dictionary', 'multivalued')]
         generation = [line for line in exported if line.startswith('generation ')]
     else:
         kept = [f'source {args.table}', f'key {args.key}', f'vector {args.vector}']
         kept += [f'attribute {column} attr-{column}.i32' for column in args.attribute]
         generation = []
     lines = ['pgvector-ann-index 1', f'dimensions {dimensions}', f'rows {rows}', 'metric l2',
-             f'dtype {args.dtype}'] + [line for line in kept if not line.startswith(('attribute ', 'dictionary '))]
+             f'dtype {args.dtype}'] + [line for line in kept if not line.startswith(PER_ATTRIBUTE)]
     lines += [f'shards {len(shards)}']
-    lines += [f'shard {i} {first} {n} shard-{i}.cagra' for i, first, n in shards]
-    lines += [line for line in kept if line.startswith(('attribute ', 'dictionary '))] + generation
+    lines += [f'shard {i} {first} {n} {"-" if args.scan_only else f"shard-{i}.cagra"}' for i, first, n in shards]
+    lines += [line for line in kept if line.startswith(PER_ATTRIBUTE)] + generation
     lines += [f'# member {source} {first} {n} {member_generation}' for source, first, n, member_generation in members]
     if args.quantize:
         lines.append(f'quant {args.quantize}')
