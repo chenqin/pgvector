@@ -6,6 +6,8 @@ reranking. The current B200 calibration targets **95% recall@k** on its
 reference samples. This is a measured ANN target, not a per-query guarantee.
 See the [implementation audit](ann-cost-model-review.md) for routing cliffs,
 measurement boundaries, planner conversion and multi-vector limitations.
+The separate [native FP32 CAGRA path](ann-fp32-cagra.md) skips rescoring and
+is not included in this FP16-specific profile.
 
 PostgreSQL uses `ann.frozen_cost_profile = '/absolute/path/profile.tsv'`.
 The worker uses `--cost-profile /absolute/path/profile.tsv`. Both settings

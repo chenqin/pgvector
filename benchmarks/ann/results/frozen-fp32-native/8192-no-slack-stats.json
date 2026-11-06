@@ -1,0 +1,100 @@
+{
+  "cpu_rescore": {
+    "policy": "home",
+    "slack": 1,
+    "copies": 1,
+    "matrix_queries": 0,
+    "matrix_peak_score_bytes": 0,
+    "gpu_rerank_candidates": 0,
+    "cost_queries": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "replicas": [
+      {
+        "copy": 0,
+        "device": 0,
+        "device_mask": 1,
+        "rerank_bytes": 0,
+        "rerank_ready": false,
+        "active": 0,
+        "device_active": 0,
+        "started": 313,
+        "finished": 313,
+        "queries": 3528,
+        "migrations": 0,
+        "failures": 0,
+        "reserved_ns": 4896136888,
+        "device_batch_ns": 1608750
+      }
+    ]
+  },
+  "gpu_rescore": {
+    "policy": "home",
+    "slack": 1,
+    "copies": 1,
+    "matrix_queries": 0,
+    "matrix_peak_score_bytes": 0,
+    "gpu_rerank_candidates": 1764000,
+    "cost_queries": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "replicas": [
+      {
+        "copy": 0,
+        "device": 0,
+        "device_mask": 1,
+        "rerank_bytes": 0,
+        "rerank_ready": true,
+        "active": 0,
+        "device_active": 0,
+        "started": 293,
+        "finished": 293,
+        "queries": 3528,
+        "migrations": 0,
+        "failures": 0,
+        "reserved_ns": 3888684353,
+        "device_batch_ns": 818815
+      }
+    ]
+  },
+  "native_fp32": {
+    "policy": "home",
+    "slack": 1,
+    "copies": 1,
+    "matrix_queries": 0,
+    "matrix_peak_score_bytes": 0,
+    "gpu_rerank_candidates": 0,
+    "cagra_fp32_queries": 3528,
+    "graph_cpu_rerank_candidates": 0,
+    "cost_queries": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "replicas": [
+      {
+        "copy": 0,
+        "device": 0,
+        "device_mask": 1,
+        "rerank_bytes": 0,
+        "rerank_ready": true,
+        "active": 0,
+        "device_active": 0,
+        "started": 297,
+        "finished": 297,
+        "queries": 3528,
+        "migrations": 0,
+        "failures": 0,
+        "reserved_ns": 3883293659,
+        "device_batch_ns": 906277
+      }
+    ]
+  }
+}

@@ -605,6 +605,8 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t matrix_queries;
 	atomic_uint_fast64_t matrix_peak_score_bytes;
 	atomic_uint_fast64_t gpu_rerank_candidates;
+	atomic_uint_fast64_t cagra_fp32_queries;
+	atomic_uint_fast64_t graph_cpu_rerank_candidates;
 	atomic_uint_fast64_t cost_queries[4];
 } AnnCuvsIndex;
 
@@ -705,11 +707,13 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"gpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cagra_fp32_queries, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->graph_cpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[0], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[1], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[2], memory_order_relaxed),
@@ -975,11 +979,15 @@ LoadShard(void *argument)
 	}
 	if (cuvsCagraIndexGetDims(shard->index, &dims) != CUVS_SUCCESS ||
 		cuvsCagraIndexGetSize(shard->index, &size) != CUVS_SUCCESS ||
-		dims != args->file->dimensions || size != args->file->shards[args->shard].rows)
+		dims != args->file->dimensions || size != args->file->shards[args->shard].rows ||
+		shard->index->dtype.code != kDLFloat || shard->index->dtype.lanes != 1 ||
+		shard->index->dtype.bits != (args->state->fp16 ? 16 : 32))
 	{
-		fprintf(stderr, "cuVS: %s has %lld rows x %lld dims, manifest says %u x %u\n", path,
-				(long long) size, (long long) dims, args->file->shards[args->shard].rows,
-				args->file->dimensions);
+		fprintf(stderr, "cuVS: %s has %lld rows x %lld dims, dtype %u/%u/%u; manifest says %u x %u %s\n", path,
+				(long long) size, (long long) dims,
+				(unsigned) shard->index->dtype.code, (unsigned) shard->index->dtype.bits,
+				(unsigned) shard->index->dtype.lanes, args->file->shards[args->shard].rows,
+				args->file->dimensions, args->file->dtype);
 		args->status = ANN_INVALID;
 		return NULL;
 	}
@@ -1342,6 +1350,8 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->matrix_queries, 0);
 	atomic_init(&state->matrix_peak_score_bytes, 0);
 	atomic_init(&state->gpu_rerank_candidates, 0);
+	atomic_init(&state->cagra_fp32_queries, 0);
+	atomic_init(&state->graph_cpu_rerank_candidates, 0);
 	for (int mode = 0; mode < 4; mode++)
 		atomic_init(&state->cost_queries[mode], 0);
 	for (uint32_t c = 0; c < copies; c++)
@@ -1489,13 +1499,13 @@ PrefetchExactVector(const AnnIndexFile *file, uint64_t row)
 }
 
 /*
- * Turn one shard's CAGRA neighbours into a sorted hit list, re-scoring each
- * with FP32 vectors so FP16 datasets still return exact distances. Rows
+ * Turn one shard's CAGRA neighbours into a sorted hit list. Native FP32
+ * CAGRA scores are squared L2; reranked scores are already Euclidean. Rows
  * outside the eligibility bitset (when given) and padding are dropped.
  */
 static uint32_t
 ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint32_t n,
-		  const float *query, const uint32_t *bitset, AnnIndexHit *hits, const float *exact)
+		  const float *query, const uint32_t *bitset, AnnIndexHit *hits, const float *exact, int squared)
 {
 	uint32_t	count = 0;
 
@@ -1517,7 +1527,8 @@ ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint3
 			continue;
 		hits[count].key = file->keys[file->shards[s].first + local];
 		hits[count].ordinal = file->shards[s].first + local;
-		hits[count].distance = exact ? exact[i] : ExactDistance(file, file->shards[s].first + local, query);
+		hits[count].distance = exact ? (squared ? sqrtf(exact[i] < 0 ? 0 : exact[i]) : exact[i]) :
+			ExactDistance(file, file->shards[s].first + local, query);
 		count++;
 	}
 	qsort(hits, count, sizeof(*hits), HitCompare);
@@ -1688,7 +1699,12 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			ok = 0;
 			break;
 		}
-		if (shard->rerank && laneRerank != 0 && (!state->fp16 || exactHost))
+
+		/*
+		 * FP32 CAGRA already computed the final distances; only FP16 needs
+		 * reranking.
+		 */
+		if (state->fp16 && shard->rerank && laneRerank != 0 && exactHost)
 		{
 			const float *exactQueries = lane->queries;
 			int			ready = 1;
@@ -1710,13 +1726,14 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 									  lane->distances + slot[s], stream, 0))
 			{
 				exactGpu[s] = 1;
-				if (cudaMemcpyAsync(lane->hostDistances + slot[s], lane->distances + slot[s],
-									(size_t) m * k * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
-				{
-					ok = 0;
-					break;
-				}
 			}
+		}
+		if ((!state->fp16 || exactGpu[s]) &&
+			cudaMemcpyAsync(lane->hostDistances + slot[s], lane->distances + slot[s],
+							(size_t) m * k * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+		{
+			ok = 0;
+			break;
 		}
 		if (cudaMemcpyAsync(lane->hostNeighbors + slot[s], lane->neighbors + slot[s],
 							(size_t) m * k * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
@@ -1739,9 +1756,13 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 
 			counts[j * state->nshards + s] = useShard[s] ?
 				ShardHits(file, s, laneDevices[shards[s].device].hostNeighbors + slot[s] + (size_t) j * k,
-						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits, exactGpu[s] ?
-						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL) : 0;
+						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits, (!state->fp16 || exactGpu[s]) ?
+						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL, !state->fp16) : 0;
+			if (state->fp16 && !exactGpu[s])
+				(void) atomic_fetch_add_explicit(&state->graph_cpu_rerank_candidates, counts[j * state->nshards + s], memory_order_relaxed);
 		}
+	if (ok && !state->fp16)
+		(void) atomic_fetch_add_explicit(&state->cagra_fp32_queries, m, memory_order_relaxed);
 	if (ok)
 		for (uint32_t s = 0; s < state->nshards; s++)
 			if (exactGpu[s])

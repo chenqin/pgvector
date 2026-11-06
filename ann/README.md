@@ -198,3 +198,22 @@ candidates before FP32 reranking, with total overfetched output bounded at
 1024 candidates. Calibrated batches use the profile's measured frontier and
 overfetch budget. Kernel modules publish their ready state atomically;
 concurrent cold callers wait for initialization instead of falling back.
+
+FP32 CAGRA searches use the graph's FP32 distances directly, without CPU or
+GPU rescoring. The worker converts squared L2 to Euclidean distance before
+merging shards and returning SQL results. This is automatic for indexes built with `--dtype float32`, regardless of
+`--gpu-rerank`; that setting still controls
+FP16 graph rescoring and compressed-vector scan rescoring. Optional
+`--filtered-slack` still requests more graph candidates, which can change
+traversal and recall; FP32 scores are used directly to select the final k.
+Native scores can differ from PostgreSQL's distance arithmetic by FP32
+rounding, especially near zero. Graph traversal remains approximate.
+Statistics expose `cagra_fp32_queries` and `graph_cpu_rerank_candidates`,
+alongside `gpu_rerank_candidates`, to verify the selected path. A resident
+`rerank_ready` buffer may still be used by scans of the same index.
+
+The current v5 cost profile was calibrated for FP16 CAGRA with rescoring;
+it does not price native FP32 CAGRA. Clear `ann.frozen_cost_profile` in sessions
+using an FP32 rebuild of the same export generation until it has a suitable
+profile. Worker dispatch already excludes FP32 graphs from that calibration.
+See the [FP32 CAGRA guide](../docs/ann-fp32-cagra.md) for setup and validation.

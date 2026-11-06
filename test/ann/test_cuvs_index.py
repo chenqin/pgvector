@@ -275,6 +275,90 @@ class CuvsIndexTests(unittest.TestCase):
     def test_graph_gpu_rerank_overfetch(self):
         self._graph_gpu_rerank(256)
 
+    def _graph_fp32_native(self, enabled):
+        import json
+        import struct
+        from test_index import search_frame, decode_hits
+        from test_predicate_cache import search_batch_frame, search_predicate_frame, values_program
+        query = self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1')
+        vector = json.loads(query)
+        expected = {}
+        for filtered in (False, True):
+            where = 'tenant = 7' if filtered else 'true'
+            expected[filtered] = dict((int(key), float(distance)) for key, distance in
+                (line.split('|') for line in self.psql(f"SELECT id, emb <-> '{query}'::vector FROM {self.table} WHERE {where}").splitlines()))
+        server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gather-limit', '0',
+                        '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', enabled,
+                        '--filtered-itopk', '1024', '--filtered-slack', '256',
+                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+        name = self.table + '_fp32_native_' + enabled
+        try:
+            self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float32')", server)
+            with server.connect() as connection:
+                queries = 0
+                for filtered, batch in [(False, 1), (True, 1), (True, 8), (False, 8)]:
+                    program = values_program('tenant', [7]) if filtered else b'\x08'
+                    packet = (search_frame(1, name, vector, 500) if not filtered and batch == 1 else
+                              search_predicate_frame(1, name, vector, 500, program) if batch == 1 else
+                              search_batch_frame(1, name, [vector] * batch, 500, program))
+                    connection.sendall(packet)
+                    _, _, status, data = receive(connection)
+                    self.assertEqual(status, 0)
+                    offset = 4 if batch > 1 else 0
+                    for _ in range(batch):
+                        if not filtered and batch == 1:
+                            _, hits = decode_hits(data)
+                        else:
+                            count, _, eligible = struct.unpack_from('<IIQ', data, offset)
+                            self.assertEqual(eligible, 800 if filtered else 40000)
+                            hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
+                            offset += 16 + count * 12
+                        self.assertEqual(len(hits), 500)
+                        self.assertEqual(len({key for key, _ in hits}), 500)
+                        want = expected[filtered]
+                        self.assertTrue(all(key in want for key, _ in hits))
+                        nearest = set(sorted(want, key=lambda key: (want[key], key))[:500])
+                        self.assertGreaterEqual(len({key for key, _ in hits} & nearest) / 500, .9)
+                        self.assertEqual(hits, sorted(hits, key=lambda hit: (hit[1], hit[0])))
+                        # cuVS returns squared L2. Check its FP32 error before sqrt,
+                        # including cancellation near a self-match, and the L2 units.
+                        self.assertTrue(all(d >= 0 and abs(d*d - want[key]*want[key]) < 1e-4 for key, d in hits))
+                        self.assertTrue(all(abs(d-want[key]) < 1e-4 for key, d in hits if want[key] > .1))
+                    queries += batch
+                connection.sendall(frame(31, 2, name.encode()))
+                _, _, status, data = receive(connection)
+                self.assertEqual(status, 0)
+                stats = json.loads(data)
+                self.assertEqual(stats['cagra_fp32_queries'], queries)
+                self.assertEqual(stats['graph_cpu_rerank_candidates'], 0)
+                self.assertEqual(stats['gpu_rerank_candidates'], 0)
+                self.assertEqual(stats['matrix_queries'], 0)
+        finally:
+            server.close()
+
+    def test_graph_fp32_native_gpu_rerank_on(self):
+        self._graph_fp32_native('on')
+
+    def test_graph_fp32_native_gpu_rerank_off(self):
+        self._graph_fp32_native('off')
+
+    def test_graph_dtype_must_match_manifest(self):
+        from pathlib import Path
+        from test_index import load_frame
+        # A mislabeled FP16 graph must never enter the no-rescoring FP32 path.
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(self.directory.name)/'float16'
+            for entry in source.iterdir():
+                target = Path(directory)/entry.name
+                if entry.name == 'manifest':
+                    target.write_text(entry.read_text().replace('dtype float16', 'dtype float32'))
+                else:
+                    target.symlink_to(entry)
+            with self.graph.connect() as connection:
+                connection.sendall(load_frame(1, self.table+'_wrong_dtype', directory))
+                _, _, status, _ = receive(connection)
+                self.assertEqual(status, 1)  # ANN_INVALID
+
     def test_concurrent_blackwell_module_load(self):
         import json
         import struct

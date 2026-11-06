@@ -1,0 +1,19 @@
+{
+  "platform": "NVIDIA B200 GPU 7, cuVS 26.10, CUDA 13",
+  "dataset": "10M x 128 original FP32, one CAGRA shard built from the same stress export",
+  "baseline_commit": "0eea3ee",
+  "k": 500,
+  "recall_target": 0.95,
+  "note": "Warm isolated worker round-trip latency. Not SQL QPS. Historical commands retain node paths.",
+  "validation": "CPU/reference suite and 24 GPU tests passed, including native FP32 on/off, four-shard distance/filter/order checks, and mislabeled graph rejection.",
+  "caveats": [
+    "Completion of the benchmark does not enforce a recall target. Inspect request means and individual query recalls.",
+    "Single 15-repeat runs, grouped by worker mode rather than randomized interleaving; speed differences need repeated runs to establish significance.",
+    "4,096 frontier without extra candidates failed 95% mean recall on some broad cases. Larger frontier alone did not fix it.",
+    "The 4,096 frontier plus 256 extra candidates run reached at least 95% mean recall across its 12 native points. Lowest individual query recall was 53.8%.",
+    "All pipelines use the same graph and configured candidate budgets within a run; approximate multi-CTA traversal can vary between executions.",
+    "v5 planner/worker calibration remains FP16-specific and was not retuned for native FP32.",
+    "The final datatype validation is loader-only and was added after timing collection; the measured search path is unchanged."
+  ],
+  "deployed_source_sha256": "e2a5696bd1abdd67d4c45693be29ab4ff0693813660ea8bd3760000db63560d1"
+}
