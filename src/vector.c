@@ -328,18 +328,6 @@ vector_out(PG_FUNCTION_ARGS)
 }
 
 /*
- * Print vector - useful for debugging
- */
-void
-PrintVector(char *msg, Vector * vector)
-{
-	char	   *out = DatumGetPointer(DirectFunctionCall1(vector_out, PointerGetDatum(vector)));
-
-	elog(INFO, "%s = %s", msg, out);
-	pfree(out);
-}
-
-/*
  * Convert type modifier
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(vector_typmod_in);
@@ -1029,7 +1017,7 @@ subvector(PG_FUNCTION_ARGS)
 /*
  * Internal helper to compare vectors
  */
-int
+static int
 vector_cmp_internal(Vector * a, Vector * b)
 {
 	int			dim = Min(a->dim, b->dim);
