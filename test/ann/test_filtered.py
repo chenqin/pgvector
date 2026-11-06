@@ -16,6 +16,8 @@ class FilteredTests(unittest.TestCase):
         self.dsn = os.environ['ANN_PG_DSN']
         self.db = psycopg.connect(self.dsn, autocommit=True, prepare_threshold=None)
         self.db.execute("LOAD 'vector'")
+        # These assertions measure local distance evaluation, independent of DB defaults.
+        self.db.execute("SET ann.worker_socket = ''")
         self.db.execute('SET ann.enable_filtered_search = on')
         self.db.execute('SET max_parallel_workers_per_gather = 0')
         self.schema = 'ann_filtered_' + uuid.uuid4().hex

@@ -155,7 +155,7 @@ Vectors are stored as whole `Vector` values, so the distance function reads them
 
 **Build.** `table_index_build_scan` feeds `(key, TID, vector, attributes)` to a tuplesort on the key (`maintenance_work_mem`). The sorted output assigns ordinals: TIDs, keys and attribute values fill pages reserved for them, while vectors are appended after them, all in one pass. Each attribute also feeds a datum sort of `value × 2^32 + ordinal`, which yields its postings in order; distinct values, offsets and bitset pages follow. A text column first goes through a `(string, ordinal)` sort in its collation, which assigns codes, writes the dictionary and fills its value pages. The build memory beyond the sorts is the distinct values and offsets of one column at a time (plus one int32 per row for a text column). The pages go through shared buffers and are WAL-logged with `log_newpage_range`, like other `ann` builds.
 
-**Reading pages from host memory.** A frozen index's pages never change after its build, apart from the TIDs VACUUM can invalidate, so backends read them through read-only mappings of the index files rather than shared buffers. Every backend maps the same files, the operating system keeps one copy in memory (the host's memory, not `shared_buffers`, bounds what stays resident), and reads take no buffer pins or content locks. TID pages always go through shared buffers. The build flushes the index's buffers and marks its metapage (`insertPage = 0xFFFFFFFE`); only marked indexes are mapped, so indexes built before this change use buffers until a `REINDEX` (which keeps the generation). Before a backend maps an index it flushes the index's buffers again (pages replayed after a crash or a promotion may not have reached the files yet), each mapped array is checked on open (its first and last pages must be finished `ann` pages), a mapping is checked against the relation's size once per relcache entry, and nothing is mapped during recovery or on a hot standby, where replay writes go to shared buffers first. `ann.frozen_mmap = off` reads everything through shared buffers. A backend asks the kernel to read a file ahead (`MADV_WILLNEED`) when it first maps it, and `ann_frozen_prewarm(index)` reads every page ahead of queries: the mapped arrays into the page cache, the TID pages into shared buffers. On the GPU node, the worker keeps its copies resident already: the CAGRA graph, the NVFP4 rows and every cached predicate's bitsets and rows live in GPU memory, and its attribute postings in host memory.
+**Reading pages from host memory.** A frozen index's pages never change after its build, apart from the TIDs VACUUM can invalidate, so backends read them through read-only mappings of the index files rather than shared buffers. Every backend maps the same files, the operating system keeps one copy in memory (the host's memory, not `shared_buffers`, bounds what stays resident), and reads take no buffer pins or content locks. TIDs use shared buffers except for the bounded unchanged-TID batches described below. The build flushes the index's buffers and marks its metapage (`insertPage = 0xFFFFFFFD` for unchanged TIDs, `0xFFFFFFFE` after invalidation or in older flushed builds); only flushed indexes are mapped, so earlier unmarked indexes use buffers until a `REINDEX` (which keeps the generation). Before a backend maps an index it flushes the index's buffers again (pages replayed after a crash or a promotion may not have reached the files yet), each mapped array is checked on open (its first and last pages must be finished `ann` pages), a mapping is checked against the relation's size once per relcache entry, and nothing is mapped during recovery or on a hot standby, where replay writes go to shared buffers first. `ann.frozen_mmap = off` reads everything through shared buffers. A backend asks the kernel to read a file ahead (`MADV_WILLNEED`) when it first maps it, and `ann_frozen_prewarm(index)` reads every page ahead of queries: the mapped arrays into the page cache, the TID pages into shared buffers. On the GPU node, the worker keeps its copies resident already: the CAGRA graph, the NVFP4 rows and every cached predicate's bitsets and rows live in GPU memory, and its attribute postings in host memory.
 
 **Attribute names.** The metapage keeps each attribute's name as of the build. Predicate programs and exports use those names, while SQL resolves columns by position, so renaming (even swapping) columns after the build can't make a program read another column.
 
@@ -361,3 +361,63 @@ ANN_CUVS_TEST=1 ANN_PG_DSN='host=/tmp dbname=postgres' python3 test/ann/test_fro
 ```
 
 `make -C ann check`, `check-postgres` and `check-cuvs` include them.
+
+### Batched TID visibility checks
+
+`ann.frozen_materialize_batch` controls bounded visibility windows for covering
+`AnnFrozenSearch` results (default 64; 0 disables, up to 1024 rows). New
+frozen builds mark TIDs as unchanged. While this marker holds, a window reads mapped TIDs and
+checks their heap visibility bits under one shared metapage lock. This avoids
+a separate shared-buffer lookup and TID-page lock for every returned row.
+`EXPLAIN ANALYZE` reports `Mapped TID Rows` for these validated proofs; the
+counter can exceed emitted rows because a window validates rows ahead.
+The SQL matrix function uses the same checks for each vector's result list.
+
+VACUUM takes an exclusive metapage lock and WAL-logs clearing the marker
+before invalidating its first TID. It never waits for that lock while holding
+a TID-page content lock. A no-op VACUUM preserves the marker. After physical
+deletion, reads fall back directly to live TID pages until REINDEX builds
+a fresh index.
+Already validated rows remain protected by the statement snapshot; no content
+lock survives result delivery or an open cursor. Soft tombstones retain their
+usual statement-snapshot checks and do not mutate TIDs.
+
+Existing indexes use the buffered fallback until REINDEX. Deploy this library
+with a PostgreSQL restart before creating or rebuilding indexes, so every
+backend (including VACUUM) participates in the marker protocol. This avoids
+mixing old writers with new readers. Mapped reads remain unavailable during
+recovery, when mapping is disabled, or when files cannot be mapped.
+
+### Multi-vector SQL batches
+
+`ann_frozen_search_batch(name text, queries vector[], k integer, filter text DEFAULT NULL)`
+returns `(query_no integer, id bigint, distance real)`. `query_no` is the
+one-based position in the array. It accepts 1–64 non-null vectors of the
+index's dimension and a predicate over its INCLUDE attributes. For example:
+
+```sql
+SELECT * FROM ann_frozen_search_batch(
+  'my_loaded_index', ARRAY['[1,2,3]'::vector, '[3,2,1]'::vector],
+  500, 'tenant = 7');
+```
+
+A batch sends one worker IPC request containing the matrix, rather than
+calling the single-vector function in a loop. The worker holds one index
+reference and one predicate bitmap for submission, schedules separate query
+jobs through its usual batcher, and replies once with a separate top-k for
+each vector. This does not guarantee a single CUDA kernel launch.
+
+The SQL function requires SELECT on the source table, refuses row-level
+security, and pins the catalog generation. Every query uses the same
+statement snapshot for heap visibility and local tombstones. Workers retain
+soft-deleted candidates for this operation: only PostgreSQL knows which
+tombstones that snapshot can see. If local visibility checks consume hits,
+the affected query is refilled by an exact local SQL search under that
+snapshot. Ordinary worker searches continue applying worker tombstones.
+
+The benchmark script accepts `--batch-queries N --index-name NAME`. Its
+`qps` is completed transactions per second; `vector_qps` multiplies that
+by the vectors per transaction. Batch latency is measured for the whole
+transaction. Covering scans default to 64-row mapped TID visibility windows;
+set `ann.frozen_materialize_batch = 0` for an unbatched control. The earlier
+page-sorting prototypes were removed after regressing throughput.

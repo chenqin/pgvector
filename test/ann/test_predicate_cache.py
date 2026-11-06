@@ -42,6 +42,14 @@ def search_predicate_frame(request, name, query, k, program, flags=0):
     return frame(SEARCH_PREDICATE, request, payload)
 
 
+def search_batch_frame(request, name, queries, k, program, flags=0):
+    payload = struct.pack('<I', len(name)) + name.encode()
+    payload += struct.pack('<IIIII', len(queries[0]), k, flags, len(program), len(queries))
+    payload += program
+    payload += b''.join(struct.pack('<%df' % len(q), *q) for q in queries)
+    return frame(30, request, payload)
+
+
 def predicate_frame(request, name, program):
     return frame(PREDICATE, request, struct.pack('<I', len(name)) + name.encode() + program)
 
@@ -129,6 +137,92 @@ class PredicateCacheTests(unittest.TestCase):
         self.assertEqual([key for key, _ in hits], [key for _, key in want])
         for (_, distance), (expected, _) in zip(hits, want):
             self.assertAlmostEqual(distance, expected, places=4)
+
+    def test_query_matrix(self):
+        """One IPC preserves each query's top-k, ordering and shared filter."""
+        self.start('--lanes', '4')
+        try:
+            rng = random.Random(109)
+            for count in (1, 7, 64):
+                queries = [[round(rng.uniform(-3, 3), 2) for _ in range(DIMENSIONS)]
+                           for _ in range(count)]
+                for program in (b'\x08', b'\x09', values_program('a', [3, 7, 11])):
+                    expected = []
+                    for q in queries:
+                        _, _, status, data = self.call(
+                            search_predicate_frame(1, 'docs', q, 17, program))
+                        self.assertEqual(status, 0)
+                        expected.append(data)
+                    op, request, status, data = self.call(
+                        search_batch_frame(2, 'docs', queries, 17, program))
+                    self.assertEqual((op, request, status), (30, 2, 0))
+                    self.assertEqual(struct.unpack_from('<I', data)[0], count)
+                    offset = 4
+                    for want in expected:
+                        n = struct.unpack_from('<I', data, offset)[0]
+                        size = 16 + n * 12
+                        self.assertEqual(data[offset:offset + size], want)
+                        offset += size
+                    self.assertEqual(offset, len(data))
+        finally:
+            self.stop()
+
+    def test_query_matrix_snapshot_candidates(self):
+        self.start('--predicate-cache-mb', str(BUDGET_MB))
+        try:
+            query = [1., 2., 3., 4.]
+            program = values_program('a', [3, 7, 11])
+            want = [key for _, key in exact(self.keys, self.vectors, query, 17, set(self.rows([3, 7, 11])))]
+            payload = struct.pack('<I', 4) + b'docs' + struct.pack('<I3q', 3, *want[:3])
+            self.assertEqual(self.call(frame(29, 1, payload))[2], 0)
+            for flags in (8, 0, 8):
+                _, _, status, data = self.call(search_batch_frame(2, 'docs', [query] * 7, 17, program, flags))
+                self.assertEqual(status, 0)
+                offset = 4
+                for _ in range(7):
+                    count, _, eligible = struct.unpack_from('<IIQ', data, offset)
+                    got = [struct.unpack_from('<qf', data, offset + 16 + i * 12)[0] for i in range(count)]
+                    if flags:
+                        self.assertEqual(got, want)
+                        self.assertEqual(eligible, 120)
+                    else:
+                        self.assertFalse(set(got) & set(want[:3]))
+                        self.assertEqual(eligible, 117)
+                    offset += 16 + count * 12
+                self.assertEqual(offset, len(data))
+            stats = self.stats()
+            self.assertEqual(stats['predicate_entries'], 2)
+            self.assertLessEqual(stats['predicate_bytes'], BUDGET_MB << 20)
+        finally:
+            self.stop()
+
+    def test_query_matrix_validation(self):
+        self.start()
+        try:
+            queries = [[0.] * DIMENSIONS] * 3
+            valid = search_batch_frame(1, 'docs', queries, 5, b'\x08')
+            cases = [valid[:-1], valid + b'\0',
+                     search_batch_frame(1, 'docs', queries, 0, b'\x08'),
+                     search_batch_frame(1, 'docs', queries * 22, 5, b'\x08'),
+                     search_batch_frame(1, 'docs', queries, 5, b'\xff'),
+                     search_batch_frame(1, 'docs', queries, 5, b'\x08', flags=2)]
+            # Reframe truncated/extended payloads so framing itself remains valid.
+            for data in cases:
+                data = frame(30, 1, data[32:])
+                self.assertEqual(self.call(data)[2], 1)
+            stale = bytearray(valid)
+            struct.pack_into('<Q', stale, 16, 1)  # fixture generation is zero
+            self.assertEqual(self.call(bytes(stale))[2], 12)
+            # Errors after creating the composite must reply exactly once, too.
+            for name, program in [('missing', b'\x08'),
+                                  ('docs', values_program('missing', [1]))]:
+                self.assertNotEqual(self.call(
+                    search_batch_frame(2, name, queries, 5, program))[2], 0)
+            self.assertEqual(self.call(search_predicate_frame(3, 'docs', queries[0], 5, b'\x08', flags=8))[2], 1)
+            self.assertEqual(self.call(valid)[2], 0)
+            self.assertEqual(self.stats()['failed'], 0)
+        finally:
+            self.stop()
 
     def test_sparse_results_keep_rows_only(self):
         """Results under 1/64 of the rows keep their rows, not a bitmap; replies and searches are unchanged."""

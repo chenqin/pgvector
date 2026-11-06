@@ -362,7 +362,7 @@ RdmaOperation(uint16 operation)
 	return operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED ||
 		operation == ANN_OP_INDEX_SEARCH_MATCH || operation == ANN_OP_INDEX_SEARCH_BITMAP ||
 		operation == ANN_OP_INDEX_SEARCH_CACHED || operation == ANN_OP_INDEX_SEARCH_PREDICATE ||
-		operation == ANN_OP_COLLECTION_SEARCH;
+		operation == ANN_OP_COLLECTION_SEARCH || operation == ANN_OP_INDEX_SEARCH_BATCH;
 }
 
 /* Reap the previous send's completion before reusing the send buffer. */

@@ -32,33 +32,53 @@ AnnFrozenBulkDelete(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 		ItemPointerData *tids;
 		uint32		count = p + 1 < meta->tids.pages ? meta->tids.perPage :
 			(uint32) (meta->tids.count - (uint64) p * meta->tids.perPage);
-		bool		changed = false;
+		uint32		dead[BLCKSZ / sizeof(ItemPointerData)];
+		uint32		ndead = 0;
 
 		vacuum_delay_point();
 		buf = ReadBufferExtended(index, MAIN_FORKNUM, meta->tids.start + p, RBM_NORMAL, info->strategy);
-		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
 		AnnCheckPage(BufferGetPage(buf));
-		state = GenericXLogStart(index);
-		page = GenericXLogRegisterBuffer(state, buf, 0);
-		tids = (ItemPointerData *) PageGetContents(page);
+		tids = (ItemPointerData *) PageGetContents(BufferGetPage(buf));
 		for (uint32 i = 0; i < count; i++)
 		{
 			if (!ItemPointerIsValid(&tids[i]))
 				continue;
 			if (callback(&tids[i], callback_state))
-			{
-				ItemPointerSetInvalid(&tids[i]);
-				changed = true;
-				stats->tuples_removed++;
-			}
+				dead[ndead++] = i;
 			else
 				stats->num_index_tuples++;
 		}
-		if (changed)
+		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		if (ndead)
+		{
+			Buffer		metabuf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
+
+			/* No TID page lock while waiting for readers of mapped TIDs. */
+			LockBuffer(metabuf, BUFFER_LOCK_EXCLUSIVE);
+			if (AnnPageGetMeta(BufferGetPage(metabuf))->insertPage == ANN_FROZEN_PRISTINE)
+			{
+				state = GenericXLogStart(index);
+				page = GenericXLogRegisterBuffer(state, metabuf, 0);
+				AnnPageGetMeta(page)->insertPage = ANN_FROZEN_FLUSHED;
+				GenericXLogFinish(state);
+			}
+			UnlockReleaseBuffer(metabuf);
+			/* The WAL barrier precedes all physical TID invalidation. */
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+			state = GenericXLogStart(index);
+			page = GenericXLogRegisterBuffer(state, buf, 0);
+			tids = (ItemPointerData *) PageGetContents(page);
+			for (uint32 i = 0; i < ndead; i++)
+				if (ItemPointerIsValid(&tids[dead[i]]))
+				{
+					ItemPointerSetInvalid(&tids[dead[i]]);
+					stats->tuples_removed++;
+				}
 			GenericXLogFinish(state);
-		else
-			GenericXLogAbort(state);
-		UnlockReleaseBuffer(buf);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		}
+		ReleaseBuffer(buf);
 	}
 	pfree(meta);
 	return stats;

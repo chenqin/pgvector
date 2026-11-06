@@ -32,6 +32,9 @@ libannbatch.a: batching.o cpu.o indexfile.o filter.o
 ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
 	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c -lm -o $@
 
+ann-replica-tests: ../test/ann/replica_test.c replica.h
+	$(CC) $(CFLAGS) -pthread -I. ../test/ann/replica_test.c -o $@
+
 ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
 	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c -lm -o $@
 
@@ -50,13 +53,22 @@ endif
 ann-worker: $(WORKER_DEPS)
 	$(CC) $(CFLAGS) -pthread $(WORKER_SRCS) $(WORKER_LIBS) -lm -o $@
 
-# Requires the cuVS 26.10 C SDK (libcuvs_c), DLPack, and CUDA runtime headers.
-# A different executable keeps the dependency-free CPU build reproducible.
-ann-worker-cuvs: $(WORKER_DEPS) cuvs.c nvrtc.c nvrtc.h blackwell.c blackwell.h
-	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
-	$(CC) $(CFLAGS) -pthread -DANN_USE_CUVS -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) $(WORKER_SRCS) cuvs.c nvrtc.c blackwell.c -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) $(WORKER_LIBS) -lcuvs_c -lcudart -lcuda -ldl -lm -o $@
+# Monolithic SDKs keep these headers under CUVS_PREFIX/include; pip SDKs
+# split them into sibling packages. CUVS_CXXFLAGS can supply other layouts.
+CUVS_CPP_DIRS = $(wildcard $(CUVS_PREFIX)/../libraft/include $(CUVS_PREFIX)/../librmm/include $(CUVS_PREFIX)/../rapids_logger/include $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/libcudacxx $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/cub $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/thrust)
 
-check: ann-worker ann-batch-tests
+select_batch.o: select_batch.cpp select_batch.h
+	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
+	$(CXX) $(CXXFLAGS) -O2 -std=c++20 -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) $(CPPFLAGS) $(CUVS_CXXFLAGS) -c select_batch.cpp -o $@
+
+# Requires cuVS 26.10 C/C++ SDKs, RAFT/RMM/CCCL, DLPack and CUDA runtime headers.
+# A different executable keeps the dependency-free CPU build reproducible.
+ann-worker-cuvs: $(WORKER_DEPS) cuvs.c replica.h nvrtc.c nvrtc.h blackwell.c blackwell.h select_batch.o select_batch.h
+	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
+	$(CC) $(CFLAGS) -pthread -DANN_USE_CUVS -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) $(WORKER_SRCS) cuvs.c nvrtc.c blackwell.c select_batch.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) $(WORKER_LIBS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lcuda -ldl -lm -o $@
+
+check: ann-worker ann-batch-tests ann-replica-tests
+	./ann-replica-tests
 	python3 ../test/ann/test_worker.py
 	python3 ../test/ann/test_batching.py
 	python3 ../test/ann/test_server.py
@@ -87,11 +99,13 @@ check-postgres: ann-worker
 
 clean:
 	rm -f ann-worker
+	rm -f ann-replica-tests
+	rm -rf ann-replica-tests.dSYM
 	rm -f batching.o cpu.o indexfile.o filter.o libannbatch.a ann-batch-tests
 	rm -f ann-batch-bench
 	rm -rf ann-batch-bench.dSYM
 	rm -rf ann-batch-tests.dSYM
-	rm -f ann-worker-cuvs
+	rm -f ann-worker-cuvs select_batch.o
 	rm -rf ann-worker.dSYM
 	rm -rf ann-worker-cuvs.dSYM
 

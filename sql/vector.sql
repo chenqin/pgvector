@@ -1365,6 +1365,12 @@ CREATE FUNCTION ann_index_filter(name text, filter text, OUT eligible bigint, OU
 
 COMMENT ON FUNCTION ann_index_filter(text, text) IS 'rows of a filter over an exported frozen index''s attributes, evaluated on the GPU node';
 
+CREATE FUNCTION ann_frozen_search_batch(name text, queries vector[], k integer, filter text DEFAULT NULL,
+	OUT query_no integer, OUT id bigint, OUT distance real) RETURNS SETOF record
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 500;
+
+COMMENT ON FUNCTION ann_frozen_search_batch(text, vector[], integer, text) IS 'search up to 64 vectors with one worker request and a shared predicate and statement snapshot; query_no is the one-based input position';
+
 CREATE FUNCTION ann_frozen_cache(OUT entries bigint, OUT bytes bigint, OUT hits bigint, OUT misses bigint,
 	OUT evictions bigint) RETURNS record
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

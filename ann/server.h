@@ -24,10 +24,14 @@
 #define ANN_OP_DICTIONARY 27
 #define ANN_OP_REMAP 28
 #define ANN_OP_DELETE_KEYS 29
+#define ANN_OP_INDEX_SEARCH_BATCH 30
+#define ANN_OP_INDEX_ROUTING_STATS 31
 #define ANN_OP_INDEX_PREDICATE 23
 
 /* Operation 22 flags. */
 #define ANN_PREDICATE_ORDINALS 1	/* reply with ordinals instead of keys */
+#define ANN_PREDICATE_SNAPSHOT 8	/* coordinator applies snapshot-visible
+									 * tombstones */
 #define ANN_PREDICATE_ATTRIBUTES 2	/* append each hit's attribute values */
 /* Text codes are the collection's: an unmapped index answers stale. */
 #define ANN_PREDICATE_COLLECTION_CODES 4

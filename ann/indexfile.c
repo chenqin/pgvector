@@ -17,7 +17,8 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 8};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 8, 0, 1, 0, 0, UINT64_C(64) << 20};
+size_t		(*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity) = NULL;
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
 
 /*
@@ -684,7 +685,7 @@ Account(AnnIndexFile *file, const AnnIndexBitmap *bitmap, int sign)
 		file->nbitmaps++;
 		file->bitmapBytes += host;
 		file->bitmapDeviceBytes += device;
-		if (bitmap->kind == ANN_BITMAP_PREDICATE)
+		if (bitmap->kind != ANN_BITMAP_PUSHED)
 		{
 			file->predicateEntries++;
 			file->predicateBytes += host;
@@ -696,7 +697,7 @@ Account(AnnIndexFile *file, const AnnIndexBitmap *bitmap, int sign)
 		file->nbitmaps--;
 		file->bitmapBytes -= host;
 		file->bitmapDeviceBytes -= device;
-		if (bitmap->kind == ANN_BITMAP_PREDICATE)
+		if (bitmap->kind != ANN_BITMAP_PUSHED)
 		{
 			file->predicateEntries--;
 			file->predicateBytes -= host;
@@ -786,7 +787,7 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 	 * limits) is only ever scanned from its rows, so its bitmap goes: at 10M
 	 * rows that is 1.25 MB an entry, eight times a 0.1% filter's rows.
 	 */
-	if (kind == ANN_BITMAP_PREDICATE && bitmap->ordinals && bitmap->count < file->rows / 64 &&
+	if (kind != ANN_BITMAP_PUSHED && bitmap->ordinals && bitmap->count < file->rows / 64 &&
 		bitmap->count <= AnnIndexConfig.bitset_gather_limit)
 	{
 		for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
@@ -956,7 +957,7 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 		{
 			for (AnnIndexBitmap **link = &file->bitmaps[b]; *link;)
 			{
-				if ((*link)->kind == ANN_BITMAP_PREDICATE)
+				if ((*link)->kind != ANN_BITMAP_PUSHED)
 				{
 					AnnIndexBitmap *victim = *link;
 
@@ -978,7 +979,7 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 
 int
 AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
-				 uint32_t *words, uint64_t *count)
+				 uint32_t *words, uint64_t *count, int snapshot)
 {
 	AnnFilterSource source;
 	int			code;
@@ -994,7 +995,7 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.postings = SourcePostings;
 	source.bitmap = SourceBitmap;
 	code = AnnFilterEvaluate(&source, program, size, words, count);
-	if (code == ANN_FILTER_OK && deleted)
+	if (code == ANN_FILTER_OK && deleted && !snapshot)
 	{
 		/* Tombstoned rows never qualify. */
 		uint64_t	removed = 0;
@@ -1049,11 +1050,11 @@ OverBudget(const AnnIndexFile *file, uint64_t hostBudget, uint64_t deviceBudget,
 }
 
 AnnStatus
-AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords, uint64_t expandLimit,
+AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords, uint64_t expandLimit,
 					 AnnIndexBitmap **result)
 {
 	AnnIndexBitmap *kept = NULL;
-	AnnStatus	status = AnnIndexBitmapPut(file, id, ANN_BITMAP_PREDICATE, words, nwords, expandLimit, &kept);
+	AnnStatus	status = AnnIndexBitmapPut(file, id, kind, words, nwords, expandLimit, &kept);
 	uint64_t	hostBudget = PredicateHostBudget();
 	uint64_t	deviceBudget = AnnIndexConfig.predicate_device_bytes;
 	uint64_t	entryCap = AnnIndexConfig.predicate_cache;
@@ -1071,7 +1072,7 @@ AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, siz
 		/* Least recently used first, down to 90% of the budget. */
 		for (uint32_t b = 0; b < ANN_INDEX_BITMAP_BUCKETS; b++)
 			for (AnnIndexBitmap *bitmap = file->bitmaps[b]; bitmap; bitmap = bitmap->next)
-				if (bitmap->kind == ANN_BITMAP_PREDICATE && bitmap != kept)
+				if (bitmap->kind != ANN_BITMAP_PUSHED && bitmap != kept)
 					victims[n++] = bitmap;
 		qsort(victims, n, sizeof(*victims), UsedCompare);
 		/* The new result goes last: alone over budget, it is not kept. */
@@ -1131,12 +1132,21 @@ AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind)
 		if (bitmap->id == id && bitmap->kind == kind)
 		{
 			bitmap->references++;
-			if (kind == ANN_BITMAP_PREDICATE)
+			if (kind != ANN_BITMAP_PUSHED)
 				bitmap->used = ++file->clock;
 			break;
 		}
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 	return bitmap;
+}
+
+/* The caller already holds a reference, so this entry cannot be freed. */
+void
+AnnIndexBitmapHold(AnnIndexFile *file, AnnIndexBitmap *bitmap)
+{
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	bitmap->references++;
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
 }
 
 /* The cache holds one reference, dropped when the entry is replaced. */

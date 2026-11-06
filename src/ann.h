@@ -139,6 +139,8 @@ typedef struct AnnFrozenMetaData
  * read-only mappings of the files.
  */
 #define ANN_FROZEN_FLUSHED ((BlockNumber) 0xFFFFFFFE)
+/* Flushed build whose TIDs have never been invalidated by VACUUM. */
+#define ANN_FROZEN_PRISTINE ((BlockNumber) 0xFFFFFFFD)
 
 struct AnnFrozenMap;
 
@@ -241,6 +243,11 @@ void		AnnArrayUnlockPage(AnnArrayReader *reader);
 void		AnnArrayRead(AnnArrayReader *reader, uint64 element, void *out);
 void		AnnArrayPrefetch(AnnArrayReader *reader, uint64 element);
 void		AnnArrayReaderEnd(AnnArrayReader *reader);
+void		AnnFrozenReadTid(AnnArrayReader *reader, Relation heap, uint64 ordinal,
+							 ItemPointerData *tid, bool *visible, Buffer *vmbufs, int nvmbufs);
+bool		AnnFrozenVisibleTids(Relation index, Relation heap, const AnnFrozenMetaData *meta,
+								 const uint64 *ordinals, uint64 count, ItemPointerData *tids,
+								 bool *visible, Buffer *vmbufs, int nvmbufs);
 const char *AnnFrozenColumnName(Relation index, int column);
 Oid			AnnFrozenColumnCollation(Relation index, int column);
 void		AnnArrayReadRange(AnnArrayReader *reader, uint64 first, uint64 n, void *out);
@@ -343,7 +350,10 @@ Relation	AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode);
 #define ANN_OP_INDEX_PREDICATE 23
 #define ANN_OP_DELETE_KEYS 29
 #define ANN_TOMBSTONE_BATCH 100000	/* keys per delete request */
+#define ANN_OP_INDEX_SEARCH_BATCH 30
 #define ANN_PREDICATE_ORDINALS 1
+#define ANN_PREDICATE_SNAPSHOT 8	/* coordinator applies snapshot-visible
+									 * tombstones */
 #define ANN_PREDICATE_ATTRIBUTES 2
 
 bool		AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs,

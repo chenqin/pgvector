@@ -1,0 +1,3199 @@
+{
+  "platform": "B200 node 10.184.160.72, eight replicated GPUs, 64 worker lanes",
+  "workload": "10M rows x 128 dimensions, k=500, 64 PostgreSQL clients, 32 client threads, 15 seconds per measurement, 500 keys returned per vector",
+  "measurement_notes": [
+    "qps counts transactions; vector_qps counts vectors. p99_ms covers a complete batch transaction.",
+    "matrix0 is the ordinary frozen Custom Scan route. matrix1/4/8/16 use the initial SQL batch API.",
+    "matrixvm1/4/8/16 retain 32 visibility-map page pins and avoid an unnecessary vector parse in query setup. These changes were measured together; the sweep does not isolate their contributions.",
+    "Measurements precede final validation-only checks restricting the snapshot flag to matrix requests, pinning generation checks to the leased worker file, and handling short approximate results. Longer saturation tests remain pending."
+  ],
+  "results": [
+    {
+      "label": "matrix0",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 0,
+      "index_name": "frozen_stress",
+      "vector_qps": 52074.812999,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.048364168033004,
+      "qps": 52074.812999,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 779831,
+      "latency_samples": 38881,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.179,
+      "p95_ms": 1.43,
+      "p99_ms": 1.657,
+      "cpu_seconds": {
+        "worker": 326.54,
+        "client": 51.17,
+        "postgres": 580.79
+      },
+      "average_cpu_cores": {
+        "worker": 21.69936853958277,
+        "client": 3.4003695968960934,
+        "postgres": 38.59489267502994
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4294,
+        "idle:Client:ClientRead": 54,
+        "active:Client:ClientRead": 132,
+        "idle:none:none": 192
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 13,
+        "postgres:0": 2951,
+        "postgres:do_poll.constprop.0": 1604,
+        "postgres:ep_poll": 117,
+        "client:do_poll.constprop.0": 61
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 7,
+        "postgres:R": 2891,
+        "postgres:S": 1781,
+        "client:S": 67
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 47.07142857142857,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21630.0
+        },
+        "1": {
+          "utilization_mean": 47.142857142857146,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21630.0
+        },
+        "2": {
+          "utilization_mean": 47.214285714285715,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21630.0
+        },
+        "3": {
+          "utilization_mean": 47.285714285714285,
+          "utilization_max": 52.0,
+          "memory_mb_max": 21630.0
+        },
+        "4": {
+          "utilization_mean": 47.57142857142857,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21630.0
+        },
+        "5": {
+          "utilization_mean": 47.42857142857143,
+          "utilization_max": 54.0,
+          "memory_mb_max": 21630.0
+        },
+        "6": {
+          "utilization_mean": 46.92857142857143,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21630.0
+        },
+        "7": {
+          "utilization_mean": 47.5,
+          "utilization_max": 52.0,
+          "memory_mb_max": 21630.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix0",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 0,
+      "index_name": "frozen_stress",
+      "vector_qps": 50213.698177,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.048032630933449,
+      "qps": 50213.698177,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 752272,
+      "latency_samples": 37803,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.224,
+      "p95_ms": 1.535,
+      "p99_ms": 2.319900000000016,
+      "cpu_seconds": {
+        "worker": 339.96,
+        "client": 48.06,
+        "postgres": 576.3299999999999
+      },
+      "average_cpu_cores": {
+        "worker": 22.591657550048243,
+        "client": 3.193772978748437,
+        "postgres": 38.2993587357904
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4288,
+        "idle:Client:ClientRead": 54,
+        "idle:none:none": 182,
+        "active:Client:ClientRead": 148
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 7,
+        "postgres:do_poll.constprop.0": 1619,
+        "postgres:0": 2944,
+        "postgres:ep_poll": 106,
+        "client:do_poll.constprop.0": 67,
+        "postgres:wake_affine": 1,
+        "postgres:__x64_sys_poll": 1,
+        "postgres:rmqueue": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 10,
+        "postgres:S": 1788,
+        "postgres:R": 2884,
+        "client:S": 64
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 35.642857142857146,
+          "utilization_max": 45.0,
+          "memory_mb_max": 21630.0
+        },
+        "1": {
+          "utilization_mean": 35.785714285714285,
+          "utilization_max": 51.0,
+          "memory_mb_max": 21630.0
+        },
+        "2": {
+          "utilization_mean": 36.214285714285715,
+          "utilization_max": 52.0,
+          "memory_mb_max": 21630.0
+        },
+        "3": {
+          "utilization_mean": 36.07142857142857,
+          "utilization_max": 50.0,
+          "memory_mb_max": 21630.0
+        },
+        "4": {
+          "utilization_mean": 33.357142857142854,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21630.0
+        },
+        "5": {
+          "utilization_mean": 32.142857142857146,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21630.0
+        },
+        "6": {
+          "utilization_mean": 32.214285714285715,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21630.0
+        },
+        "7": {
+          "utilization_mean": 33.857142857142854,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21630.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix0",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 0,
+      "index_name": "frozen_stress",
+      "vector_qps": 34327.964123,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.045304259983823,
+      "qps": 34327.964123,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 514066,
+      "latency_samples": 25459,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.799,
+      "p95_ms": 2.379,
+      "p99_ms": 3.115839999999997,
+      "cpu_seconds": {
+        "worker": 456.84,
+        "client": 33.07,
+        "postgres": 400.3100000000001
+      },
+      "average_cpu_cores": {
+        "worker": 30.364291217098405,
+        "client": 2.198027997875502,
+        "postgres": 26.60697271936929
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4370,
+        "active:Client:ClientRead": 110,
+        "idle:none:none": 135,
+        "idle:Client:ClientRead": 57
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 7,
+        "postgres:do_poll.constprop.0": 2592,
+        "postgres:0": 1994,
+        "postgres:ep_poll": 83,
+        "client:do_poll.constprop.0": 67,
+        "postgres:newidle_balance": 2,
+        "postgres:dequeue_entity": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:S": 69,
+        "postgres:S": 2704,
+        "postgres:R": 1968,
+        "client:R": 5
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 92.07142857142857,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        },
+        "1": {
+          "utilization_mean": 91.64285714285714,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        },
+        "2": {
+          "utilization_mean": 90.92857142857143,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        },
+        "3": {
+          "utilization_mean": 93.35714285714286,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        },
+        "4": {
+          "utilization_mean": 93.28571428571429,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        },
+        "5": {
+          "utilization_mean": 92.42857142857143,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        },
+        "6": {
+          "utilization_mean": 92.28571428571429,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21662.0
+        },
+        "7": {
+          "utilization_mean": 93.35714285714286,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21662.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix1",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 1,
+      "index_name": "frozen_stress",
+      "vector_qps": 37820.792213,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.045127901015803,
+      "qps": 37820.792213,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 566549,
+      "latency_samples": 28532,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.654,
+      "p95_ms": 2.092,
+      "p99_ms": 2.422,
+      "cpu_seconds": {
+        "worker": 231.86,
+        "client": 36.28,
+        "postgres": 660.9000000000003
+      },
+      "average_cpu_cores": {
+        "worker": 15.410969021030755,
+        "client": 2.411411869589389,
+        "postgres": 43.92784191322018
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4246,
+        "active:Client:ClientRead": 143,
+        "idle:Client:ClientRead": 87,
+        "idle:none:none": 196
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 9,
+        "postgres:0": 3372,
+        "postgres:do_poll.constprop.0": 1138,
+        "client:do_poll.constprop.0": 65,
+        "postgres:ep_poll": 159,
+        "postgres:unix_stream_read_generic": 1,
+        "postgres:ttwu_queue_wakelist": 1,
+        "postgres:do_sys_poll": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 7,
+        "postgres:R": 3362,
+        "postgres:S": 1310,
+        "client:S": 67
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 35.857142857142854,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21662.0
+        },
+        "1": {
+          "utilization_mean": 36.214285714285715,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21662.0
+        },
+        "2": {
+          "utilization_mean": 35.92857142857143,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21662.0
+        },
+        "3": {
+          "utilization_mean": 35.57142857142857,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21662.0
+        },
+        "4": {
+          "utilization_mean": 35.714285714285715,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21662.0
+        },
+        "5": {
+          "utilization_mean": 35.714285714285715,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21662.0
+        },
+        "6": {
+          "utilization_mean": 36.142857142857146,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21662.0
+        },
+        "7": {
+          "utilization_mean": 36.0,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21662.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix1",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 1,
+      "index_name": "frozen_stress",
+      "vector_qps": 36368.173543,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.045632197987288,
+      "qps": 36368.173543,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 544623,
+      "latency_samples": 27182,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.719,
+      "p95_ms": 2.177,
+      "p99_ms": 2.514,
+      "cpu_seconds": {
+        "worker": 244.25,
+        "client": 34.39,
+        "postgres": 648.9199999999995
+      },
+      "average_cpu_cores": {
+        "worker": 16.233947286885975,
+        "client": 2.285713192204744,
+        "postgres": 43.130125172593814
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4230,
+        "idle:none:none": 201,
+        "active:Client:ClientRead": 139,
+        "idle:Client:ClientRead": 102
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 14,
+        "postgres:do_poll.constprop.0": 1263,
+        "postgres:0": 3252,
+        "postgres:ep_poll": 154,
+        "client:do_poll.constprop.0": 60,
+        "postgres:__schedule": 1,
+        "postgres:update_sd_lb_stats.constprop.0": 1,
+        "postgres:unix_stream_read_actor": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 14,
+        "postgres:R": 3239,
+        "postgres:S": 1433,
+        "client:S": 60
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 23.928571428571427,
+          "utilization_max": 27.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 26.142857142857142,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 27.0,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 26.571428571428573,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 23.428571428571427,
+          "utilization_max": 26.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 24.285714285714285,
+          "utilization_max": 27.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 24.142857142857142,
+          "utilization_max": 27.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 23.928571428571427,
+          "utilization_max": 26.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix1",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 1,
+      "index_name": "frozen_stress",
+      "vector_qps": 30393.986202,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.04073989810422,
+      "qps": 30393.986202,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 455260,
+      "latency_samples": 22530,
+      "sampling_rate": 0.05,
+      "p50_ms": 2.063,
+      "p95_ms": 2.624,
+      "p99_ms": 2.922,
+      "cpu_seconds": {
+        "worker": 399.88,
+        "client": 28.63,
+        "postgres": 454.68000000000006
+      },
+      "average_cpu_cores": {
+        "worker": 26.5864580272678,
+        "client": 1.9034967823363935,
+        "postgres": 30.22989580833781
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4328,
+        "idle:none:none": 162,
+        "active:Client:ClientRead": 104,
+        "idle:Client:ClientRead": 78
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 9,
+        "postgres:do_poll.constprop.0": 2177,
+        "postgres:0": 2372,
+        "postgres:ep_poll": 122,
+        "client:do_poll.constprop.0": 64,
+        "client:dequeue_task": 1,
+        "postgres:__schedule": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 12,
+        "postgres:S": 2313,
+        "postgres:R": 2359,
+        "client:S": 62
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 88.92857142857143,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 89.64285714285714,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 87.92857142857143,
+          "utilization_max": 97.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 89.28571428571429,
+          "utilization_max": 97.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 87.92857142857143,
+          "utilization_max": 97.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 88.78571428571429,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 88.85714285714286,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 87.35714285714286,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix16",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 49655.567744,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.053453111089766,
+      "qps": 3103.472984,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 46518,
+      "latency_samples": 2309,
+      "sampling_rate": 0.05,
+      "p50_ms": 19.863,
+      "p95_ms": 26.0256,
+      "p99_ms": 27.4386,
+      "cpu_seconds": {
+        "worker": 305.85,
+        "client": 26.83,
+        "postgres": 892.2800000000002
+      },
+      "average_cpu_cores": {
+        "worker": 20.317597413890546,
+        "client": 1.7823153134369243,
+        "postgres": 59.27410763598581
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4605,
+        "idle:none:none": 40,
+        "active:Client:ClientRead": 19,
+        "idle:Client:ClientRead": 8
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 5,
+        "postgres:0": 4436,
+        "postgres:do_poll.constprop.0": 217,
+        "client:do_poll.constprop.0": 69,
+        "postgres:ep_poll": 19
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 2,
+        "postgres:R": 4434,
+        "postgres:S": 238,
+        "client:S": 72
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 36.857142857142854,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 36.357142857142854,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 36.142857142857146,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 36.142857142857146,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 35.785714285714285,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 37.214285714285715,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 36.07142857142857,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 35.857142857142854,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix16",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 48321.765056,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.05203553615138,
+      "qps": 3020.110316,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 45264,
+      "latency_samples": 2255,
+      "sampling_rate": 0.05,
+      "p50_ms": 20.783,
+      "p95_ms": 27.101499999999998,
+      "p99_ms": 28.772000000000002,
+      "cpu_seconds": {
+        "worker": 323.26,
+        "client": 26.06,
+        "postgres": 890.4999999999997
+      },
+      "average_cpu_cores": {
+        "worker": 21.476165082364243,
+        "client": 1.7313272970562772,
+        "postgres": 59.16143353908727
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4623,
+        "idle:none:none": 23,
+        "active:Client:ClientRead": 15,
+        "idle:Client:ClientRead": 11
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 7,
+        "postgres:0": 4416,
+        "postgres:do_poll.constprop.0": 235,
+        "client:do_poll.constprop.0": 67,
+        "postgres:ep_poll": 21
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 4,
+        "postgres:R": 4411,
+        "postgres:S": 261,
+        "client:S": 70
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 27.142857142857142,
+          "utilization_max": 30.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 29.0,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 29.214285714285715,
+          "utilization_max": 39.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 27.714285714285715,
+          "utilization_max": 31.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 26.285714285714285,
+          "utilization_max": 30.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 27.571428571428573,
+          "utilization_max": 30.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 27.285714285714285,
+          "utilization_max": 31.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 28.571428571428573,
+          "utilization_max": 35.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix16",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 45172.14256,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.048004623968154,
+      "qps": 2823.25891,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 42333,
+      "latency_samples": 2109,
+      "sampling_rate": 0.05,
+      "p50_ms": 22.171,
+      "p95_ms": 27.5174,
+      "p99_ms": 30.28196,
+      "cpu_seconds": {
+        "worker": 548.28,
+        "client": 24.19,
+        "postgres": 834.7599999999994
+      },
+      "average_cpu_cores": {
+        "worker": 36.43539550265095,
+        "client": 1.6075221004033096,
+        "postgres": 55.47313553256162
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4619,
+        "idle:none:none": 31,
+        "active:Client:ClientRead": 13,
+        "idle:Client:ClientRead": 9
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:do_poll.constprop.0": 69,
+        "postgres:0": 4102,
+        "postgres:do_poll.constprop.0": 553,
+        "postgres:ep_poll": 17,
+        "client:0": 5
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:S": 73,
+        "postgres:R": 4099,
+        "postgres:S": 573,
+        "client:R": 1
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 86.71428571428571,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 86.64285714285714,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 85.57142857142857,
+          "utilization_max": 95.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 87.21428571428571,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 85.78571428571429,
+          "utilization_max": 97.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 86.71428571428571,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 86.57142857142857,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 85.35714285714286,
+          "utilization_max": 96.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix4",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 4,
+      "index_name": "frozen_stress",
+      "vector_qps": 47003.810684,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.049259413033724,
+      "qps": 11750.952671,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 176100,
+      "latency_samples": 8874,
+      "sampling_rate": 0.05,
+      "p50_ms": 5.317,
+      "p95_ms": 6.73435,
+      "p99_ms": 7.136,
+      "cpu_seconds": {
+        "worker": 277.09,
+        "client": 28.89,
+        "postgres": 847.6500000000002
+      },
+      "average_cpu_cores": {
+        "worker": 18.412201716718393,
+        "client": 1.9196957941318504,
+        "postgres": 56.32503080290285
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 9,
+        "active:none:none": 4549,
+        "idle:none:none": 63,
+        "active:Client:ClientRead": 52
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 3,
+        "postgres:0": 4251,
+        "postgres:do_poll.constprop.0": 378,
+        "postgres:ep_poll": 42,
+        "client:do_poll.constprop.0": 71,
+        "postgres:free_unref_page_prepare": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 4,
+        "postgres:R": 4251,
+        "postgres:S": 421,
+        "client:S": 70
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 38.857142857142854,
+          "utilization_max": 44.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 40.357142857142854,
+          "utilization_max": 45.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 39.5,
+          "utilization_max": 45.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 41.42857142857143,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 39.285714285714285,
+          "utilization_max": 44.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 38.785714285714285,
+          "utilization_max": 44.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 38.785714285714285,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 38.714285714285715,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix4",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 4,
+      "index_name": "frozen_stress",
+      "vector_qps": 44188.498256,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.047554069198668,
+      "qps": 11047.124564,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 165500,
+      "latency_samples": 8417,
+      "sampling_rate": 0.05,
+      "p50_ms": 5.633,
+      "p95_ms": 7.0944,
+      "p99_ms": 7.4748399999999995,
+      "cpu_seconds": {
+        "worker": 287.73,
+        "client": 27.17,
+        "postgres": 845.8900000000007
+      },
+      "average_cpu_cores": {
+        "worker": 19.12138003803316,
+        "client": 1.8056090627788584,
+        "postgres": 56.21445160522671
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4560,
+        "active:Client:ClientRead": 34,
+        "idle:none:none": 60,
+        "idle:Client:ClientRead": 18
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 6,
+        "postgres:0": 4169,
+        "postgres:do_poll.constprop.0": 463,
+        "postgres:ep_poll": 40,
+        "client:do_poll.constprop.0": 68
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 5,
+        "postgres:R": 4167,
+        "postgres:S": 505,
+        "client:S": 69
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 29.357142857142858,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 27.357142857142858,
+          "utilization_max": 30.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 29.214285714285715,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 28.0,
+          "utilization_max": 30.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 29.071428571428573,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 29.714285714285715,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 29.142857142857142,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 29.214285714285715,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix4",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 4,
+      "index_name": "frozen_stress",
+      "vector_qps": 41260.215368,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.044804912991822,
+      "qps": 10315.053842,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 154517,
+      "latency_samples": 7719,
+      "sampling_rate": 0.05,
+      "p50_ms": 6.148,
+      "p95_ms": 7.385399999999998,
+      "p99_ms": 8.029459999999998,
+      "cpu_seconds": {
+        "worker": 557.83,
+        "client": 24.95,
+        "postgres": 719.0000000000005
+      },
+      "average_cpu_cores": {
+        "worker": 37.077915149188165,
+        "client": 1.658379762601948,
+        "postgres": 47.79058313870948
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 7,
+        "active:none:none": 4556,
+        "active:Client:ClientRead": 44,
+        "idle:none:none": 66
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 4,
+        "postgres:0": 3527,
+        "postgres:do_poll.constprop.0": 1111,
+        "client:do_poll.constprop.0": 70,
+        "postgres:ep_poll": 34
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 4,
+        "postgres:R": 3524,
+        "postgres:S": 1148,
+        "client:S": 70
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 92.78571428571429,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 92.35714285714286,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 92.71428571428571,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 92.57142857142857,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 92.64285714285714,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 92.85714285714286,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 91.42857142857143,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 92.71428571428571,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix8",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 8,
+      "index_name": "frozen_stress",
+      "vector_qps": 48851.663816,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.050482056103647,
+      "qps": 6106.457977,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 91498,
+      "latency_samples": 4628,
+      "sampling_rate": 0.05,
+      "p50_ms": 10.1555,
+      "p95_ms": 13.143949999999998,
+      "p99_ms": 13.883379999999997,
+      "cpu_seconds": {
+        "worker": 296.73,
+        "client": 26.9,
+        "postgres": 875.7599999999996
+      },
+      "average_cpu_cores": {
+        "worker": 19.715647571544903,
+        "client": 1.787318166934782,
+        "postgres": 58.18816943772506
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4597,
+        "active:Client:ClientRead": 26,
+        "idle:none:none": 34,
+        "idle:Client:ClientRead": 15
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 8,
+        "postgres:0": 4344,
+        "postgres:do_poll.constprop.0": 290,
+        "client:do_poll.constprop.0": 66,
+        "postgres:ep_poll": 37,
+        "postgres:zap_pte_range": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 10,
+        "postgres:R": 4350,
+        "postgres:S": 322,
+        "client:S": 64
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 37.857142857142854,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 37.5,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 38.142857142857146,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 37.0,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 38.07142857142857,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 37.07142857142857,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 37.714285714285715,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 37.42857142857143,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix8",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 8,
+      "index_name": "frozen_stress",
+      "vector_qps": 46319.78044,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.05225337203592,
+      "qps": 5789.972555,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 86753,
+      "latency_samples": 4304,
+      "sampling_rate": 0.05,
+      "p50_ms": 10.7635,
+      "p95_ms": 13.80885,
+      "p99_ms": 14.687940000000001,
+      "cpu_seconds": {
+        "worker": 308.13,
+        "client": 25.26,
+        "postgres": 874.3099999999993
+      },
+      "average_cpu_cores": {
+        "worker": 20.47068916421803,
+        "client": 1.6781540527963763,
+        "postgres": 58.08499089075212
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "idle:none:none": 36,
+        "active:none:none": 4610,
+        "idle:Client:ClientRead": 10,
+        "active:Client:ClientRead": 17
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 7,
+        "postgres:do_poll.constprop.0": 291,
+        "postgres:0": 4342,
+        "client:do_poll.constprop.0": 67,
+        "postgres:ep_poll": 39
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 5,
+        "postgres:S": 337,
+        "postgres:R": 4335,
+        "client:S": 69
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 28.785714285714285,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 29.071428571428573,
+          "utilization_max": 42.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 26.857142857142858,
+          "utilization_max": 29.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 28.857142857142858,
+          "utilization_max": 41.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 27.285714285714285,
+          "utilization_max": 29.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 28.714285714285715,
+          "utilization_max": 40.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 28.857142857142858,
+          "utilization_max": 38.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 27.285714285714285,
+          "utilization_max": 30.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrix8",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 8,
+      "index_name": "frozen_stress",
+      "vector_qps": 43513.131608,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.044926084112376,
+      "qps": 5439.141451,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 81503,
+      "latency_samples": 4015,
+      "sampling_rate": 0.05,
+      "p50_ms": 11.568,
+      "p95_ms": 14.1996,
+      "p99_ms": 15.38472,
+      "cpu_seconds": {
+        "worker": 561.32,
+        "client": 23.64,
+        "postgres": 792.8599999999997
+      },
+      "average_cpu_cores": {
+        "worker": 37.309588419497835,
+        "client": 1.571293861321401,
+        "postgres": 52.69949453837925
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "idle:none:none": 28,
+        "active:none:none": 4612,
+        "active:Client:ClientRead": 30,
+        "idle:Client:ClientRead": 3
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 5,
+        "postgres:do_poll.constprop.0": 685,
+        "postgres:0": 3960,
+        "client:do_poll.constprop.0": 69,
+        "postgres:ep_poll": 27
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 5,
+        "postgres:S": 717,
+        "postgres:R": 3955,
+        "client:S": 69
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 89.71428571428571,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "1": {
+          "utilization_mean": 89.71428571428571,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21694.0
+        },
+        "2": {
+          "utilization_mean": 89.92857142857143,
+          "utilization_max": 97.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 90.71428571428571,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 89.85714285714286,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 90.0,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 90.07142857142857,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 89.92857142857143,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm1",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 1,
+      "index_name": "frozen_stress",
+      "vector_qps": 54724.542803,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.051750923972577,
+      "qps": 54724.542803,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 819608,
+      "latency_samples": 40880,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.157,
+      "p95_ms": 1.351,
+      "p99_ms": 1.494,
+      "cpu_seconds": {
+        "worker": 337.75,
+        "client": 51.39,
+        "postgres": 572.3399999999999
+      },
+      "average_cpu_cores": {
+        "worker": 22.439249872390153,
+        "client": 3.414220728178031,
+        "postgres": 38.02481205614738
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "None:none:none": 1,
+        "active:none:none": 4171,
+        "idle:none:none": 232,
+        "active:Client:ClientRead": 184,
+        "idle:Client:ClientRead": 85
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:vm_mmap_pgoff": 1,
+        "postgres:0": 2929,
+        "postgres:do_poll.constprop.0": 1554,
+        "postgres:ep_poll": 187,
+        "client:do_poll.constprop.0": 67,
+        "postgres:x64_sys_call": 1,
+        "client:0": 6,
+        "postgres:rmqueue": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:D": 1,
+        "postgres:R": 2921,
+        "postgres:S": 1751,
+        "client:S": 65,
+        "client:R": 8
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 48.0,
+          "utilization_max": 55.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 48.214285714285715,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 48.42857142857143,
+          "utilization_max": 54.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 48.5,
+          "utilization_max": 54.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 47.214285714285715,
+          "utilization_max": 54.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 47.5,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 47.92857142857143,
+          "utilization_max": 54.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 48.42857142857143,
+          "utilization_max": 55.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm1",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 1,
+      "index_name": "frozen_stress",
+      "vector_qps": 51790.980757,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.050753720104694,
+      "qps": 51790.980757,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 776033,
+      "latency_samples": 38814,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.221,
+      "p95_ms": 1.429,
+      "p99_ms": 1.61,
+      "cpu_seconds": {
+        "postgres": 560.13,
+        "worker": 349.97,
+        "client": 47.66
+      },
+      "average_cpu_cores": {
+        "postgres": 37.21607637840636,
+        "worker": 23.25265608010797,
+        "client": 3.1666188209787856
+      },
+      "disk_read_bytes": {
+        "postgres": 0,
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "postgres": 0,
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 87,
+        "active:none:none": 4198,
+        "active:Client:ClientRead": 162,
+        "idle:none:none": 226
+      },
+      "os_wait_channels": {
+        "postgres:0": 2836,
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 10,
+        "postgres:do_poll.constprop.0": 1659,
+        "postgres:ep_poll": 177,
+        "client:do_poll.constprop.0": 64,
+        "postgres:__x64_sys_poll": 1
+      },
+      "os_states": {
+        "postgres:S": 1842,
+        "worker:S": 74,
+        "client:R": 8,
+        "postgres:R": 2831,
+        "client:S": 66
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 36.07142857142857,
+          "utilization_max": 51.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 36.0,
+          "utilization_max": 43.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 34.214285714285715,
+          "utilization_max": 36.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 33.07142857142857,
+          "utilization_max": 37.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 36.357142857142854,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 36.5,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 36.142857142857146,
+          "utilization_max": 50.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 36.07142857142857,
+          "utilization_max": 52.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm1",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 1,
+      "index_name": "frozen_stress",
+      "vector_qps": 35436.052073,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.045532261952758,
+      "qps": 35436.052073,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 530867,
+      "latency_samples": 26563,
+      "sampling_rate": 0.05,
+      "p50_ms": 1.776,
+      "p95_ms": 2.248,
+      "p99_ms": 2.4983800000000014,
+      "cpu_seconds": {
+        "worker": 474.51,
+        "client": 32.72,
+        "postgres": 377.02999999999986
+      },
+      "average_cpu_cores": {
+        "worker": 31.53826609377882,
+        "client": 2.1747319689541693,
+        "postgres": 25.059266328080387
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4327,
+        "idle:none:none": 153,
+        "active:Client:ClientRead": 117,
+        "idle:Client:ClientRead": 75
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 4,
+        "postgres:do_poll.constprop.0": 2613,
+        "postgres:0": 1937,
+        "postgres:ep_poll": 122,
+        "client:do_poll.constprop.0": 70
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 6,
+        "postgres:S": 2770,
+        "postgres:R": 1902,
+        "client:S": 68
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 92.28571428571429,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 93.71428571428571,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 93.28571428571429,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 93.28571428571429,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 93.35714285714286,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 91.0,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 91.57142857142857,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 93.21428571428571,
+          "utilization_max": 98.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm16",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 109101.662336,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.047613268019632,
+      "qps": 6818.853896,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 102151,
+      "latency_samples": 5055,
+      "sampling_rate": 0.05,
+      "p50_ms": 9.284,
+      "p95_ms": 11.6273,
+      "p99_ms": 13.517880000000002,
+      "cpu_seconds": {
+        "worker": 745.64,
+        "client": 62.94,
+        "postgres": 772.5799999999999
+      },
+      "average_cpu_cores": {
+        "worker": 49.55204434876676,
+        "client": 4.182723125518186,
+        "postgres": 51.34236149210105
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4561,
+        "active:Client:ClientRead": 45,
+        "idle:none:none": 59,
+        "idle:Client:ClientRead": 7
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 9,
+        "postgres:0": 3910,
+        "postgres:do_poll.constprop.0": 713,
+        "postgres:ep_poll": 49,
+        "client:do_poll.constprop.0": 65
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 10,
+        "postgres:R": 3898,
+        "postgres:S": 774,
+        "client:S": 64
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 70.5,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 69.85714285714286,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 69.71428571428571,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 74.85714285714286,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 70.0,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 70.0,
+          "utilization_max": 79.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 69.5,
+          "utilization_max": 78.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 70.14285714285714,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm16",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 104357.055408,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.047059038188308,
+      "qps": 6522.315963,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 97782,
+      "latency_samples": 4895,
+      "sampling_rate": 0.05,
+      "p50_ms": 9.692,
+      "p95_ms": 12.832600000000001,
+      "p99_ms": 14.909540000000003,
+      "cpu_seconds": {
+        "postgres": 768.9100000000002,
+        "worker": 716.34,
+        "client": 56.68
+      },
+      "average_cpu_cores": {
+        "postgres": 51.100351108383656,
+        "worker": 47.6066451378959,
+        "client": 3.7668490471227902
+      },
+      "disk_read_bytes": {
+        "postgres": 0,
+        "worker": 0,
+        "client": 0
+      },
+      "disk_write_bytes": {
+        "postgres": 0,
+        "worker": 0,
+        "client": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 8,
+        "active:none:none": 4579,
+        "idle:none:none": 40,
+        "active:Client:ClientRead": 46
+      },
+      "os_wait_channels": {
+        "postgres:ep_poll": 44,
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 18,
+        "postgres:0": 3851,
+        "postgres:do_poll.constprop.0": 777,
+        "client:do_poll.constprop.0": 56,
+        "postgres:rmqueue": 1
+      },
+      "os_states": {
+        "postgres:S": 834,
+        "worker:S": 74,
+        "client:R": 12,
+        "postgres:R": 3839,
+        "client:S": 62
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 58.285714285714285,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 56.785714285714285,
+          "utilization_max": 59.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 58.57142857142857,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 53.142857142857146,
+          "utilization_max": 59.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 57.92857142857143,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 58.57142857142857,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 58.42857142857143,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 58.42857142857143,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm16",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 86599.767552,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.045996229862794,
+      "qps": 5412.485472,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 81108,
+      "latency_samples": 4080,
+      "sampling_rate": 0.05,
+      "p50_ms": 11.6405,
+      "p95_ms": 15.066299999999998,
+      "p99_ms": 16.88241,
+      "cpu_seconds": {
+        "worker": 704.65,
+        "client": 45.37,
+        "postgres": 611.5599999999998
+      },
+      "average_cpu_cores": {
+        "worker": 46.833057062810774,
+        "client": 3.015420136152309,
+        "postgres": 40.64602906028887
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4592,
+        "active:Client:ClientRead": 35,
+        "idle:none:none": 39,
+        "idle:Client:ClientRead": 6
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 7,
+        "postgres:0": 2981,
+        "postgres:do_poll.constprop.0": 1661,
+        "client:do_poll.constprop.0": 67,
+        "postgres:ep_poll": 30
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 6,
+        "postgres:R": 2989,
+        "postgres:S": 1683,
+        "client:S": 68
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 94.07142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 96.14285714285714,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 95.78571428571429,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 94.28571428571429,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 92.64285714285714,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 94.35714285714286,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 94.07142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 92.57142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm4",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 4,
+      "index_name": "frozen_stress",
+      "vector_qps": 93027.88648,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.052374227903783,
+      "qps": 23256.97162,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 348530,
+      "latency_samples": 17533,
+      "sampling_rate": 0.05,
+      "p50_ms": 2.734,
+      "p95_ms": 3.174,
+      "p99_ms": 3.40368,
+      "cpu_seconds": {
+        "worker": 645.06,
+        "client": 58.72,
+        "postgres": 732.1400000000002
+      },
+      "average_cpu_cores": {
+        "worker": 42.85436903396947,
+        "client": 3.901045716173204,
+        "postgres": 48.63950290597838
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4419,
+        "idle:none:none": 130,
+        "active:Client:ClientRead": 106,
+        "idle:Client:ClientRead": 17
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 17,
+        "postgres:0": 3693,
+        "postgres:do_poll.constprop.0": 906,
+        "postgres:ep_poll": 73,
+        "client:do_poll.constprop.0": 57
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:D": 1,
+        "postgres:R": 3668,
+        "postgres:S": 1004,
+        "client:S": 66,
+        "client:R": 7
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 66.21428571428571,
+          "utilization_max": 73.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 68.42857142857143,
+          "utilization_max": 73.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 66.28571428571429,
+          "utilization_max": 73.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 66.14285714285714,
+          "utilization_max": 73.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 66.14285714285714,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 66.28571428571429,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 66.28571428571429,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 66.28571428571429,
+          "utilization_max": 73.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm4",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 4,
+      "index_name": "frozen_stress",
+      "vector_qps": 89026.669868,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.052426586858928,
+      "qps": 22256.667467,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 333512,
+      "latency_samples": 16685,
+      "sampling_rate": 0.05,
+      "p50_ms": 2.856,
+      "p95_ms": 3.301,
+      "p99_ms": 3.5241599999999997,
+      "cpu_seconds": {
+        "worker": 635.57,
+        "client": 53.31,
+        "postgres": 735.8000000000001
+      },
+      "average_cpu_cores": {
+        "worker": 42.22375683631405,
+        "client": 3.541621657636298,
+        "postgres": 48.88248388086266
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4477,
+        "active:Client:ClientRead": 71,
+        "idle:none:none": 110,
+        "idle:Client:ClientRead": 14
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 14,
+        "postgres:0": 3690,
+        "postgres:do_poll.constprop.0": 925,
+        "postgres:ep_poll": 57,
+        "client:do_poll.constprop.0": 60
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 17,
+        "postgres:R": 3657,
+        "postgres:S": 1015,
+        "client:S": 57
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 52.5,
+          "utilization_max": 53.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 50.214285714285715,
+          "utilization_max": 54.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 50.357142857142854,
+          "utilization_max": 55.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 54.285714285714285,
+          "utilization_max": 71.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 53.857142857142854,
+          "utilization_max": 71.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 53.714285714285715,
+          "utilization_max": 60.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 53.285714285714285,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 54.0,
+          "utilization_max": 71.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm4",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 4,
+      "index_name": "frozen_stress",
+      "vector_qps": 62488.984472,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.050553590990603,
+      "qps": 15622.246118,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 234092,
+      "latency_samples": 11678,
+      "sampling_rate": 0.05,
+      "p50_ms": 4.03,
+      "p95_ms": 4.94715,
+      "p99_ms": 5.471,
+      "cpu_seconds": {
+        "worker": 710.07,
+        "client": 36.71,
+        "postgres": 484.7599999999999
+      },
+      "average_cpu_cores": {
+        "worker": 47.1789954905748,
+        "client": 2.4391129388074426,
+        "postgres": 32.20878202713963
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4525,
+        "idle:none:none": 76,
+        "idle:Client:ClientRead": 10,
+        "active:Client:ClientRead": 61
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:do_poll.constprop.0": 70,
+        "postgres:ep_poll": 49,
+        "postgres:do_poll.constprop.0": 2257,
+        "postgres:0": 2364,
+        "client:0": 4,
+        "postgres:__call_rcu_common": 2
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:S": 68,
+        "postgres:S": 2321,
+        "postgres:R": 2351,
+        "client:R": 6
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 96.57142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 93.85714285714286,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 96.07142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 94.85714285714286,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 96.42857142857143,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 96.57142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 96.5,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 96.57142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm8",
+      "workload": "0.1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 8,
+      "index_name": "frozen_stress",
+      "vector_qps": 103212.827624,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.049858137965202,
+      "qps": 12901.603453,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 193269,
+      "latency_samples": 9721,
+      "sampling_rate": 0.05,
+      "p50_ms": 4.918,
+      "p95_ms": 6.055,
+      "p99_ms": 6.895799999999996,
+      "cpu_seconds": {
+        "worker": 724.87,
+        "client": 60.07,
+        "postgres": 759.8
+      },
+      "average_cpu_cores": {
+        "worker": 48.16457360295126,
+        "client": 3.99139974937476,
+        "postgres": 50.4855257129173
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4512,
+        "idle:none:none": 96,
+        "active:Client:ClientRead": 57,
+        "idle:Client:ClientRead": 7
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 18,
+        "postgres:0": 3763,
+        "postgres:do_poll.constprop.0": 868,
+        "postgres:ep_poll": 40,
+        "client:do_poll.constprop.0": 56,
+        "postgres:find_busiest_group": 1
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:R": 16,
+        "postgres:R": 3745,
+        "postgres:S": 927,
+        "client:S": 58
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 69.0,
+          "utilization_max": 76.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 68.78571428571429,
+          "utilization_max": 76.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 68.71428571428571,
+          "utilization_max": 77.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 69.0,
+          "utilization_max": 76.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 68.64285714285714,
+          "utilization_max": 76.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 69.57142857142857,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 69.07142857142857,
+          "utilization_max": 76.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 71.78571428571429,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm8",
+      "workload": "1pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 8,
+      "index_name": "frozen_stress",
+      "vector_qps": 99836.694536,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.04576832917519,
+      "qps": 12479.586817,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 186943,
+      "latency_samples": 9538,
+      "sampling_rate": 0.05,
+      "p50_ms": 5.097,
+      "p95_ms": 6.33115,
+      "p99_ms": 7.38718999999999,
+      "cpu_seconds": {
+        "worker": 705.78,
+        "client": 54.21,
+        "postgres": 767.8400000000003
+      },
+      "average_cpu_cores": {
+        "worker": 46.90887062453466,
+        "client": 3.6030064277197202,
+        "postgres": 51.033618436825506
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "idle:Client:ClientRead": 7,
+        "active:none:none": 4528,
+        "idle:none:none": 83,
+        "active:Client:ClientRead": 55
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:0": 9,
+        "postgres:0": 3865,
+        "postgres:do_poll.constprop.0": 758,
+        "client:do_poll.constprop.0": 65,
+        "postgres:ep_poll": 49
+      },
+      "os_states": {
+        "worker:S": 73,
+        "client:D": 1,
+        "postgres:R": 3878,
+        "postgres:S": 794,
+        "client:S": 67,
+        "client:R": 6,
+        "worker:R": 1
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 54.785714285714285,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 57.5,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 57.857142857142854,
+          "utilization_max": 75.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 57.5,
+          "utilization_max": 74.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 52.0,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 55.07142857142857,
+          "utilization_max": 58.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 54.714285714285715,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 52.42857142857143,
+          "utilization_max": 57.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    },
+    {
+      "label": "matrixvm8",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 8,
+      "index_name": "frozen_stress",
+      "vector_qps": 76628.513008,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 15.0447640910279,
+      "qps": 9578.564126,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 143581,
+      "latency_samples": 7269,
+      "sampling_rate": 0.05,
+      "p50_ms": 6.552,
+      "p95_ms": 8.354,
+      "p99_ms": 9.640159999999996,
+      "cpu_seconds": {
+        "worker": 716.7,
+        "client": 40.33,
+        "postgres": 559.1000000000001
+      },
+      "average_cpu_cores": {
+        "worker": 47.63783570573974,
+        "client": 2.680666825746454,
+        "postgres": 37.16243050520315
+      },
+      "disk_read_bytes": {
+        "worker": 0,
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "worker": 0,
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 4563,
+        "idle:Client:ClientRead": 12,
+        "idle:none:none": 54,
+        "active:Client:ClientRead": 43
+      },
+      "os_wait_channels": {
+        "worker:do_poll.constprop.0": 74,
+        "client:do_poll.constprop.0": 66,
+        "postgres:do_poll.constprop.0": 1897,
+        "postgres:0": 2736,
+        "postgres:ep_poll": 39,
+        "client:0": 8
+      },
+      "os_states": {
+        "worker:S": 74,
+        "client:S": 63,
+        "postgres:S": 1939,
+        "postgres:R": 2733,
+        "client:R": 11
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 96.5,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21816.0
+        },
+        "1": {
+          "utilization_mean": 94.28571428571429,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21816.0
+        },
+        "2": {
+          "utilization_mean": 94.64285714285714,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "3": {
+          "utilization_mean": 96.57142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "4": {
+          "utilization_mean": 94.78571428571429,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "5": {
+          "utilization_mean": 96.64285714285714,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "6": {
+          "utilization_mean": 96.57142857142857,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        },
+        "7": {
+          "utilization_mean": 94.64285714285714,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21694.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ],
+  "final_source_smoke": [
+    {
+      "label": "matrix-final",
+      "workload": "10pct",
+      "clients": 64,
+      "k": 500,
+      "plan_cache_mode": "force_generic_plan",
+      "setup_cost": 1000.0,
+      "prefetch_distance": null,
+      "materialize_batch": 0,
+      "batch_queries": 16,
+      "index_name": "frozen_stress",
+      "vector_qps": 85520.534544,
+      "mmap": "on",
+      "local_cache_mb": 16,
+      "client_threads": 32,
+      "table": "public.frozen_stress",
+      "query_table": "public.frozen_stress_queries",
+      "count_only": false,
+      "seconds": 5.0260824400465935,
+      "qps": 5345.033409,
+      "returncode": 0,
+      "failed_transactions": 0,
+      "transactions": 26672,
+      "latency_samples": 1332,
+      "sampling_rate": 0.05,
+      "p50_ms": 11.3585,
+      "p95_ms": 14.9528,
+      "p99_ms": 16.79387,
+      "cpu_seconds": {
+        "client": 14.77,
+        "postgres": 192.26999999999995
+      },
+      "average_cpu_cores": {
+        "client": 2.9386704607780123,
+        "postgres": 38.254446140405435
+      },
+      "disk_read_bytes": {
+        "client": 0,
+        "postgres": 0
+      },
+      "disk_write_bytes": {
+        "client": 4096,
+        "postgres": 0
+      },
+      "postgres_wait_samples": {
+        "active:none:none": 1513,
+        "idle:Client:ClientRead": 3,
+        "idle:none:none": 10,
+        "active:Client:ClientRead": 10
+      },
+      "os_wait_channels": {
+        "client:do_poll.constprop.0": 23,
+        "postgres:0": 1029,
+        "postgres:do_poll.constprop.0": 495,
+        "client:0": 2,
+        "postgres:ep_poll": 12
+      },
+      "os_states": {
+        "client:S": 24,
+        "postgres:R": 1024,
+        "postgres:S": 512,
+        "client:R": 1
+      },
+      "gpu_samples": {
+        "0": {
+          "utilization_mean": 79.8,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21598.0
+        },
+        "1": {
+          "utilization_mean": 79.4,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21598.0
+        },
+        "2": {
+          "utilization_mean": 79.2,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21598.0
+        },
+        "3": {
+          "utilization_mean": 79.4,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21598.0
+        },
+        "4": {
+          "utilization_mean": 79.4,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21598.0
+        },
+        "5": {
+          "utilization_mean": 79.2,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21598.0
+        },
+        "6": {
+          "utilization_mean": 79.4,
+          "utilization_max": 100.0,
+          "memory_mb_max": 21598.0
+        },
+        "7": {
+          "utilization_mean": 79.0,
+          "utilization_max": 99.0,
+          "memory_mb_max": 21598.0
+        }
+      },
+      "monitor_errors": []
+    }
+  ]
+}

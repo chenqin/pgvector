@@ -345,6 +345,27 @@ main(int argc, char **argv)
 			AnnIndexConfig.persistent = strcmp(value, "on") == 0;
 		else if (strcmp(argv[i], "--replicate") == 0)
 			AnnIndexConfig.replicate = strcmp(value, "on") == 0;
+		else if (strcmp(argv[i], "--replica-routing") == 0)
+		{
+			if (strcmp(value, "home") != 0 && strcmp(value, "load") != 0)
+			{
+				fprintf(stderr, "--replica-routing takes home or load\n");
+				return 2;
+			}
+			AnnIndexConfig.replica_routing = strcmp(value, "load") == 0;
+		}
+		else if (strcmp(argv[i], "--replica-load-slack") == 0)
+		{
+			char	   *end;
+			unsigned long slack = strtoul(value, &end, 10);
+
+			if (!value[0] || value[0] == '-' || *end || slack > 64)
+			{
+				fprintf(stderr, "--replica-load-slack takes 0..64 active batches\n");
+				return 2;
+			}
+			AnnIndexConfig.replica_load_slack = (uint32_t) slack;
+		}
 		else if (strcmp(argv[i], "--gather-limit") == 0)
 			AnnIndexConfig.gather_limit = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--bitset-min") == 0)
@@ -353,6 +374,36 @@ main(int argc, char **argv)
 			AnnIndexConfig.filtered_algo = strcmp(value, "single") == 0 ? 1 : strcmp(value, "multi") == 0 ? 2 : 0;
 		else if (strcmp(argv[i], "--filtered-width") == 0)
 			AnnIndexConfig.filtered_width = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--matrix-gather") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--matrix-gather takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.matrix_gather = strcmp(value, "on") == 0;
+		}
+		else if (strcmp(argv[i], "--gpu-rerank") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--gpu-rerank takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.gpu_rerank = strcmp(value, "on") == 0;
+		}
+		else if (strcmp(argv[i], "--matrix-max-mb") == 0)
+		{
+			char	   *end;
+			unsigned long mb = strtoul(value, &end, 10);
+
+			if (!value[0] || value[0] == '-' || *end || mb < 1 || mb > 1024)
+			{
+				fprintf(stderr, "--matrix-max-mb takes 1..1024 megabytes\n");
+				return 2;
+			}
+			AnnIndexConfig.matrix_max_bytes = (uint64_t) mb << 20;
+		}
 		else if (strcmp(argv[i], "--group-gather-limit") == 0)
 			AnnIndexConfig.group_gather_limit = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--quantized-scan") == 0)
@@ -565,15 +616,15 @@ usage:
 #ifdef ANN_USE_CUVS
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
-			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
+			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
-			"  [--quantized-scan on|off] [--quant-slack N] [--rerank-prefetch N] [--predicate-cache N]\n"
+			"  [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N] [--quantized-scan on|off] [--quant-slack N] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
-			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--gather-limit ROWS] [--bitset-min ROWS]\n"
+			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"cuvs, hipvs, and fused-nvfp4 require vendor adapters\n");

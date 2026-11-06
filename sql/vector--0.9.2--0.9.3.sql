@@ -133,3 +133,9 @@ CREATE FUNCTION ann_frozen_sizes(index regclass, OUT structure text, OUT pages b
 	RETURNS SETOF record AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
 COMMENT ON FUNCTION ann_frozen_sizes(regclass) IS 'pages and bytes of each structure of a frozen ann index, with how it keeps the vectors';
+
+CREATE FUNCTION ann_frozen_search_batch(name text, queries vector[], k integer, filter text DEFAULT NULL,
+	OUT query_no integer, OUT id bigint, OUT distance real) RETURNS SETOF record
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 500;
+
+COMMENT ON FUNCTION ann_frozen_search_batch(text, vector[], integer, text) IS 'search up to 64 vectors with one worker request and a shared predicate and statement snapshot; query_no is the one-based input position';

@@ -433,6 +433,8 @@ CachedMap(Relation index)
 	AnnIndexCache *cache = IndexCache(index);
 	const AnnFrozenMap *map;
 
+	if (!ann_frozen_mmap)
+		return NULL;
 	if (cache->mapChecked)
 		return cache->map;
 	map = MapIndex(index);
@@ -469,6 +471,77 @@ MappedArrayValid(const AnnFrozenMap *map, const AnnArray *array)
 			((PageHeader) page)->pd_lower != MAXALIGN(SizeOfPageHeaderData) + count * array->width)
 			return false;
 	}
+	return true;
+}
+
+/* Keep the live TID stable until its VM proof is established. */
+void
+AnnFrozenReadTid(AnnArrayReader *reader, Relation heap, uint64 ordinal,
+				 ItemPointerData *tid, bool *visible, Buffer *vmbufs, int nvmbufs)
+{
+	const AnnArray *array = reader->array;
+	char	   *page = AnnArrayLockPage(reader, ordinal / array->perPage, NULL);
+	uint32		blocksPerPage = (BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) *
+		(BITS_PER_BYTE / BITS_PER_HEAPBLOCK);
+
+	memcpy(tid, page + (ordinal % array->perPage) * array->width, sizeof(*tid));
+	*visible = false;
+	if (ItemPointerIsValid(tid))
+	{
+		BlockNumber block = ItemPointerGetBlockNumber(tid);
+
+		*visible = VM_ALL_VISIBLE(heap, block, &vmbufs[(block / blocksPerPage) % nvmbufs]);
+	}
+	AnnArrayUnlockPage(reader);
+}
+
+/*
+ * Copy TIDs and validate all-visible proofs while the metapage is share-locked.
+ * VACUUM clears PRISTINE under its exclusive lock before any TID mutation.
+ * Thus no mapped TID can refer to a recycled heap slot during these checks.
+ * The caller's registered statement snapshot protects proven-visible rows
+ * after we release this short barrier; never hold it across result delivery.
+ * Old indexes and indexes vacuumed after physical deletion use live buffers.
+ */
+bool
+AnnFrozenVisibleTids(Relation index, Relation heap, const AnnFrozenMetaData *meta,
+					 const uint64 *ordinals, uint64 count, ItemPointerData *tids,
+					 bool *visible, Buffer *vmbufs, int nvmbufs)
+{
+	const AnnFrozenMap *map;
+	Buffer		buf;
+	uint32		blocksPerPage = (BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) *
+		(BITS_PER_BYTE / BITS_PER_HEAPBLOCK);
+
+	if (RelationGetRelid(index) == buildingIndex ||
+		(map = CachedMap(index)) == NULL || !MappedArrayValid(map, &meta->tids))
+		return false;
+	for (uint64 i = 0; i < count; i++)
+		if (ordinals[i] >= meta->rows)
+			elog(ERROR, "invalid frozen ann result ordinal");
+	buf = ReadBuffer(index, ANN_METAPAGE_BLKNO);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	if (AnnPageGetMeta(BufferGetPage(buf))->insertPage != ANN_FROZEN_PRISTINE)
+	{
+		UnlockReleaseBuffer(buf);
+		return false;
+	}
+	for (uint64 i = 0; i < count; i++)
+	{
+		uint64		ordinal = ordinals[i];
+		Page		page = MappedPage(map, meta->tids.start + ordinal / meta->tids.perPage);
+		ItemPointerData *tid = &tids[i];
+		BlockNumber block;
+
+		memcpy(tid, PageGetContents(page) + (ordinal % meta->tids.perPage) * meta->tids.width,
+			   sizeof(*tid));
+		visible[i] = false;
+		if (!ItemPointerIsValid(tid))
+			continue;
+		block = ItemPointerGetBlockNumber(tid);
+		visible[i] = VM_ALL_VISIBLE(heap, block, &vmbufs[(block / blocksPerPage) % nvmbufs]);
+	}
+	UnlockReleaseBuffer(buf);
 	return true;
 }
 
@@ -726,7 +799,8 @@ ReadFrozenMeta(Relation index, AnnFrozenMetaData *meta, bool *flushed)
 		   version == 2 ? AnnFrozenMetaSizeV2(AnnPageGetFrozen(page)->ncolumns) :
 		   version == 3 ? AnnFrozenMetaSizeV3(AnnPageGetFrozen(page)->ncolumns) :
 		   AnnFrozenMetaSize(AnnPageGetFrozen(page)->ncolumns));
-	*flushed = AnnPageGetMeta(page)->insertPage == ANN_FROZEN_FLUSHED;
+	*flushed = AnnPageGetMeta(page)->insertPage == ANN_FROZEN_FLUSHED ||
+		AnnPageGetMeta(page)->insertPage == ANN_FROZEN_PRISTINE;
 	UnlockReleaseBuffer(buf);
 	if (version < 4)
 		for (uint32 c = 0; c < meta->ncolumns; c++)
@@ -1420,7 +1494,7 @@ WriteFrozenMeta(Relation index, const AnnFrozenMetaData *frozen)
 	page = BufferGetPage(buf);
 	AnnCheckMetaPage(page);
 	AnnPageGetMeta(page)->version = ANN_FROZEN_VERSION;
-	AnnPageGetMeta(page)->insertPage = ANN_FROZEN_FLUSHED;
+	AnnPageGetMeta(page)->insertPage = ANN_FROZEN_PRISTINE;
 	stored = AnnPageGetFrozen(page);
 	memcpy(stored, frozen, AnnFrozenMetaSize(frozen->ncolumns));
 	((PageHeader) page)->pd_lower = ((char *) stored + AnnFrozenMetaSize(frozen->ncolumns)) - (char *) page;

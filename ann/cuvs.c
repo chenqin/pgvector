@@ -1,6 +1,6 @@
 /*
- * Resident CAGRA search is an unvalidated draft. Gathered search (exact
- * brute force over each request's eligible vectors) is GPU-validated.
+ * Resident CAGRA and gathered searches share loaded shard data and
+ * per-lane streams; grouped gathers can score, select and rerank matrices.
  */
 #include "backend.h"
 #include "indexfile.h"
@@ -19,6 +19,9 @@
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
+#include <time.h>
+#include "replica.h"
+#include "select_batch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -555,7 +558,7 @@ done:
  * Loaded indexes: one CAGRA graph per shard file, each on GPU (shard modulo
  * devices). Lanes search with their own per-device resources and buffers.
  */
-#define ANN_CUVS_MAX_DEVICES 16
+#define ANN_CUVS_MAX_DEVICES ANN_REPLICA_MAX_DEVICES
 #define ANN_CUVS_WORKSPACE_BYTES (64 * 1024 * 1024)
 
 typedef struct AnnCuvsShard
@@ -567,14 +570,29 @@ typedef struct AnnCuvsShard
 	const void *rows;			/* device view of the CAGRA dataset */
 	int64_t    *keys;			/* device copy of the shard's sorted keys */
 	int64_t		stride;			/* elements between rows */
+	float	   *rerank;			/* FP32 dataset for exact GPU reranking */
+	int64_t		rerankStride;
+	size_t		rerankBytes;	/* owned bytes, zero when reusing FP32 CAGRA
+								 * rows */
 	AnnBlackwellShard quant;	/* quantized rows for Blackwell scans */
 } AnnCuvsShard;
 
 /*
  * Shard s of copy c is shards[c * nshards + s]. Without replication there is
  * one copy and shard s lives on GPU s mod devices; with it, every GPU holds a
- * full copy and each lane searches its home GPU's copy only.
+ * full copy. A batch reserves its home or a less loaded GPU copy.
  */
+typedef struct AnnCuvsRoute
+{
+	atomic_uint active;
+	atomic_uint_fast64_t started;
+	atomic_uint_fast64_t finished;
+	atomic_uint_fast64_t queries;
+	atomic_uint_fast64_t migrations;
+	atomic_uint_fast64_t failures;
+	atomic_uint_fast64_t reserved_ns;
+} AnnCuvsRoute;
+
 typedef struct AnnCuvsIndex
 {
 	uint32_t	nshards;
@@ -583,10 +601,151 @@ typedef struct AnnCuvsIndex
 	int			quantized;		/* every shard copy has its quantized rows */
 	int			grouped;		/* every shard copy can be scored in groups */
 	AnnCuvsShard *shards;
+	AnnCuvsRoute routing[ANN_CUVS_MAX_DEVICES];
+	atomic_uint_fast64_t matrix_queries;
+	atomic_uint_fast64_t matrix_peak_score_bytes;
+	atomic_uint_fast64_t gpu_rerank_candidates;
 } AnnCuvsIndex;
 
-static _Thread_local int laneHome = -1;
+/* Keep the full lane ordinal: wrapping before modulo copies biases 3/6/7 GPUs. */
+static _Thread_local int64_t laneHome = -1;
 static atomic_uint nextHome;
+static _Thread_local uint32_t laneCopy;
+static _Alignas(64)
+AnnReplicaRouter replicaRouter;
+
+static uint64_t
+ReplicaNow(void)
+{
+	struct timespec now;
+
+	(void) clock_gettime(CLOCK_MONOTONIC, &now);
+	return (uint64_t) now.tv_sec * UINT64_C(1000000000) + (uint64_t) now.tv_nsec;
+}
+
+/* One reservation spans a batch's device work and host reranking. */
+static uint32_t
+ReplicaAcquire(AnnCuvsIndex *state, uint32_t queries, uint64_t now)
+{
+	int			devices[ANN_CUVS_MAX_DEVICES];
+	uint32_t	copy;
+
+	if (laneHome < 0)
+		laneHome = (int64_t) atomic_fetch_add(&nextHome, 1);
+	for (uint32_t c = 0; c < state->copies; c++)
+		devices[c] = state->shards[(size_t) c * state->nshards].device;
+	copy = AnnReplicaAcquire(&replicaRouter, devices, state->copies, (uint64_t) laneHome,
+							 AnnIndexConfig.replica_routing, AnnIndexConfig.replica_load_slack, now);
+	if (state->copies == 1)
+	{
+		uint32_t	seen = UINT32_C(1) << devices[0];
+
+		/* A sharded, unreplicated batch occupies all its devices. */
+		for (uint32_t s = 0; s < state->nshards; s++)
+		{
+			int			d = state->shards[s].device;
+
+			if (!(seen & (UINT32_C(1) << d)))
+			{
+				(void) atomic_fetch_add_explicit(&replicaRouter.devices[d].active, 1, memory_order_relaxed);
+				seen |= UINT32_C(1) << d;
+			}
+		}
+	}
+	(void) atomic_fetch_add_explicit(&state->routing[copy].active, 1, memory_order_relaxed);
+	(void) atomic_fetch_add_explicit(&state->routing[copy].started, 1, memory_order_relaxed);
+	(void) atomic_fetch_add_explicit(&state->routing[copy].queries, queries, memory_order_relaxed);
+	if (copy != (uint64_t) laneHome % state->copies)
+		(void) atomic_fetch_add_explicit(&state->routing[copy].migrations, 1, memory_order_relaxed);
+	laneCopy = copy;
+	return copy;
+}
+
+static void
+ReplicaRelease(AnnCuvsIndex *state, uint32_t copy, AnnIndexJob **jobs, uint32_t queries, uint64_t started)
+{
+	uint32_t	seen = 0;
+	int			failed = 0;
+	uint64_t	finished = ReplicaNow();
+	uint64_t	elapsed = finished - started;
+
+	for (uint32_t j = 0; j < queries; j++)
+		if (jobs[j]->status != ANN_OK)
+			failed = 1;
+	for (uint32_t s = 0; s < state->nshards; s++)
+	{
+		int			d = state->shards[(size_t) copy * state->nshards + s].device;
+
+		if (!(seen & (UINT32_C(1) << d)))
+		{
+			AnnReplicaSample(&replicaRouter, d, elapsed, finished);
+			AnnReplicaRelease(&replicaRouter, d);
+			seen |= UINT32_C(1) << d;
+		}
+	}
+	(void) atomic_fetch_add_explicit(&state->routing[copy].reserved_ns, elapsed, memory_order_relaxed);
+	(void) atomic_fetch_add_explicit(&state->routing[copy].failures, (uint64_t) failed, memory_order_relaxed);
+	(void) atomic_fetch_add_explicit(&state->routing[copy].finished, 1, memory_order_relaxed);
+	(void) atomic_fetch_sub_explicit(&state->routing[copy].active, 1, memory_order_relaxed);
+}
+
+/* Independent counters are approximate while searches run; no scheduler lock. */
+static size_t
+ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
+{
+	const AnnCuvsIndex *state = file->device;
+	size_t		used;
+	int			written;
+
+	if (state == NULL)
+		return 0;
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"gpu_rerank_candidates\":%llu,\"replicas\":[",
+					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
+					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed));
+	if (written < 0 || (size_t) written >= capacity)
+		return 0;
+	used = (size_t) written;
+	for (uint32_t c = 0; c < state->copies; c++)
+	{
+		const AnnCuvsRoute *r = &state->routing[c];
+		int			device = state->shards[(size_t) c * state->nshards].device;
+		uint32_t	deviceMask = 0;
+		uint64_t	rerankBytes = 0;
+		int			rerankReady = 1;
+
+		for (uint32_t s = 0; s < state->nshards; s++)
+		{
+			const AnnCuvsShard *shard = &state->shards[(size_t) c * state->nshards + s];
+
+			deviceMask |= UINT32_C(1) << shard->device;
+			rerankBytes += shard->rerankBytes;
+			rerankReady &= shard->rerank != NULL;
+		}
+
+		written = snprintf(data + used, capacity - used,
+						   "%s{\"copy\":%u,\"device\":%d,\"device_mask\":%u,\"rerank_bytes\":%llu,\"rerank_ready\":%s,\"active\":%u,\"device_active\":%u,"
+						   "\"started\":%llu,\"finished\":%llu,\"queries\":%llu,\"migrations\":%llu,"
+						   "\"failures\":%llu,\"reserved_ns\":%llu,\"device_batch_ns\":%llu}", c ? "," : "", c, device, deviceMask, (unsigned long long) rerankBytes, rerankReady ? "true" : "false",
+						   atomic_load_explicit(&r->active, memory_order_relaxed),
+						   atomic_load_explicit(&replicaRouter.devices[device].active, memory_order_relaxed),
+						   (unsigned long long) atomic_load_explicit(&r->started, memory_order_relaxed),
+						   (unsigned long long) atomic_load_explicit(&r->finished, memory_order_relaxed),
+						   (unsigned long long) atomic_load_explicit(&r->queries, memory_order_relaxed),
+						   (unsigned long long) atomic_load_explicit(&r->migrations, memory_order_relaxed),
+						   (unsigned long long) atomic_load_explicit(&r->failures, memory_order_relaxed),
+						   (unsigned long long) atomic_load_explicit(&r->reserved_ns, memory_order_relaxed),
+						   (unsigned long long) AnnReplicaPredictCost(&replicaRouter.devices[device], ReplicaNow()));
+		if (written < 0 || (size_t) written >= capacity - used)
+			return 0;
+		used += (size_t) written;
+	}
+	if (capacity - used < 3)
+		return 0;
+	memcpy(data + used, "]}", 3);
+	return used + 2;
+}
 
 typedef struct AnnCuvsDevice
 {
@@ -610,6 +769,22 @@ typedef struct AnnCuvsDevice
 	size_t		queryBytes;
 	size_t		resultCount;
 	size_t		bitsetWords;
+	float	   *matrixScores,
+			   *matrixCandidates,
+			   *matrixValues;
+	int64_t    *matrixIndices,
+			   *matrixRows;
+	float	   *matrixHostValues;
+	int64_t    *matrixHostRows;
+	float	   *rerankQueries;
+	size_t		rerankQueryCap;
+	size_t		matrixScoreCap,
+				matrixCandidateCap,
+				matrixValueCap;
+	size_t		matrixIndexCap,
+				matrixRowCap,
+				matrixHostValueCap,
+				matrixHostRowCap;
 } AnnCuvsDevice;
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
@@ -837,6 +1012,36 @@ LoadShard(void *argument)
 		(void) AnnBlackwellView(shard->rows, shard->stride, strcmp(args->file->dtype, "float16") == 0,
 								args->file->dimensions, shard->device, &shard->quant);
 	}
+	if (AnnIndexConfig.gpu_rerank)
+	{
+		if (strcmp(args->file->dtype, "float32") == 0 && shard->rows)
+		{
+			shard->rerank = (float *) shard->rows;
+			shard->rerankStride = shard->stride;
+		}
+		else
+		{
+			size_t		bytes = (size_t) args->file->shards[args->shard].rows * args->file->dimensions * sizeof(float);
+
+			if (cudaMalloc((void **) &shard->rerank, bytes) == cudaSuccess &&
+				cudaMemcpy(shard->rerank, args->file->vectors +
+						   args->file->shards[args->shard].first * args->file->dimensions,
+						   bytes, cudaMemcpyHostToDevice) == cudaSuccess)
+			{
+				shard->rerankBytes = bytes;
+				shard->rerankStride = args->file->dimensions;
+			}
+			else
+			{
+				if (shard->rerank)
+					(void) cudaFree(shard->rerank);
+				shard->rerank = NULL;
+				(void) cudaGetLastError();
+				fprintf(stderr, "cuVS: FP32 rerank copy unavailable on device %d shard %u; using host reranking\n",
+						shard->device, args->shard);
+			}
+		}
+	}
 	args->status = ANN_OK;
 	return NULL;
 }
@@ -855,6 +1060,8 @@ DestroyIndexState(AnnCuvsIndex *state)
 			AnnBlackwellFree(&shard->quant);
 		if (shard->keys)
 			(void) cudaFree(shard->keys);
+		if (shard->rerankBytes)
+			(void) cudaFree(shard->rerank);
 		if (shard->index)
 			(void) cuvsCagraIndexDestroy(shard->index);
 		if (shard->dataset)
@@ -1121,6 +1328,20 @@ LoadIndex(const char *name, const char *directory)
 	}
 	state->nshards = file->nshards;
 	state->copies = copies;
+	atomic_init(&state->matrix_queries, 0);
+	atomic_init(&state->matrix_peak_score_bytes, 0);
+	atomic_init(&state->gpu_rerank_candidates, 0);
+	for (uint32_t c = 0; c < copies; c++)
+	{
+		atomic_init(&state->routing[c].active, 0);
+		atomic_init(&state->routing[c].started, 0);
+		atomic_init(&state->routing[c].finished, 0);
+		atomic_init(&state->routing[c].queries, 0);
+		atomic_init(&state->routing[c].migrations, 0);
+		atomic_init(&state->routing[c].failures, 0);
+		atomic_init(&state->routing[c].reserved_ns, 0);
+	}
+
 	state->fp16 = strcmp(file->dtype, "float16") == 0;
 	cuvsSetLogLevel(CUVS_LOG_LEVEL_OFF);
 
@@ -1261,7 +1482,7 @@ PrefetchExactVector(const AnnIndexFile *file, uint64_t row)
  */
 static uint32_t
 ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint32_t n,
-		  const float *query, const uint32_t *bitset, AnnIndexHit *hits)
+		  const float *query, const uint32_t *bitset, AnnIndexHit *hits, const float *exact)
 {
 	uint32_t	count = 0;
 
@@ -1270,7 +1491,7 @@ ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint3
 		uint32_t	local = neighbors[i];
 		uint32_t	distance = AnnIndexConfig.rerank_prefetch;
 
-		if (distance && n - i > distance)
+		if (!exact && distance && n - i > distance)
 		{
 			uint32_t	future = neighbors[i + distance];
 
@@ -1283,7 +1504,7 @@ ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint3
 			continue;
 		hits[count].key = file->keys[file->shards[s].first + local];
 		hits[count].ordinal = file->shards[s].first + local;
-		hits[count].distance = ExactDistance(file, file->shards[s].first + local, query);
+		hits[count].distance = exact ? exact[i] : ExactDistance(file, file->shards[s].first + local, query);
 		count++;
 	}
 	qsort(hits, count, sizeof(*hits), HitCompare);
@@ -1319,6 +1540,10 @@ UploadQueries(AnnCuvsDevice *lane, const AnnIndexJob *const *jobs, uint32_t m, u
 						   stream) == cudaSuccess;
 }
 
+static int	RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
+						 uint32_t eligible, uint32_t nrows, void *positions, uint32_t top,
+						 uint32_t nq, const float *queries, float *out, cudaStream_t stream, int wide);
+
 static uint32_t
 RoundTopK(uint32_t value)
 {
@@ -1339,6 +1564,9 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	size_t		unit = state->fp16 ? 2 : 4;
 	void	   *host = malloc((size_t) m * dims * unit);
 	int			uploaded[ANN_CUVS_MAX_DEVICES] = {0};
+	int			exactUploaded[ANN_CUVS_MAX_DEVICES] = {0};
+	int			exactGpu[ANN_INDEX_MAX_SHARDS] = {0};
+	float	   *exactHost = AnnIndexConfig.gpu_rerank && state->fp16 ? malloc((size_t) m * dims * sizeof(float)) : NULL;
 	size_t		slot[ANN_INDEX_MAX_SHARDS];
 	size_t		bitsetSlot[ANN_INDEX_MAX_SHARDS];
 	size_t		perDevice[ANN_CUVS_MAX_DEVICES] = {0};
@@ -1347,9 +1575,10 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	uint32_t	copy;
 	int			ok = host != NULL;
 
-	if (laneHome < 0)
-		laneHome = (int) (atomic_fetch_add(&nextHome, 1) % ANN_CUVS_MAX_DEVICES);
-	copy = (uint32_t) (laneHome % state->copies);
+	if (exactHost)
+		for (uint32_t j = 0; j < m; j++)
+			memcpy(exactHost + (size_t) j * dims, jobs[j]->query, dims * sizeof(float));
+	copy = laneCopy;
 	shards = state->shards + (size_t) copy * state->nshards;
 
 	/*
@@ -1441,8 +1670,42 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			filter.addr = (uintptr_t) &mask;
 		}
 		if (cuvsCagraSearch(lane->resources, lane->params, shard->index, &queries, &neighbors,
-							&distances, filter) != CUVS_SUCCESS ||
-			cudaMemcpyAsync(lane->hostNeighbors + slot[s], lane->neighbors + slot[s],
+							&distances, filter) != CUVS_SUCCESS)
+		{
+			ok = 0;
+			break;
+		}
+		if (shard->rerank && (!state->fp16 || exactHost))
+		{
+			const float *exactQueries = lane->queries;
+			int			ready = 1;
+
+			if (state->fp16)
+			{
+				ready = GrowDevice((void **) &lane->rerankQueries, &lane->rerankQueryCap,
+								   (size_t) m * dims, sizeof(float), 0, stream);
+				if (ready && !exactUploaded[shard->device])
+				{
+					ready = cudaMemcpyAsync(lane->rerankQueries, exactHost, (size_t) m * dims * sizeof(float),
+											cudaMemcpyHostToDevice, stream) == cudaSuccess;
+					exactUploaded[shard->device] = ready;
+				}
+				exactQueries = lane->rerankQueries;
+			}
+			if (ready && RerankDevice(shard, dims, NULL, file->shards[s].rows, file->shards[s].rows,
+									  lane->neighbors + slot[s], k, m, exactQueries,
+									  lane->distances + slot[s], stream, 0))
+			{
+				exactGpu[s] = 1;
+				if (cudaMemcpyAsync(lane->hostDistances + slot[s], lane->distances + slot[s],
+									(size_t) m * k * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+			}
+		}
+		if (cudaMemcpyAsync(lane->hostNeighbors + slot[s], lane->neighbors + slot[s],
 							(size_t) m * k * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
 		{
 			const char *message = cuvsGetLastErrorText();
@@ -1463,8 +1726,14 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 
 			counts[j * state->nshards + s] = useShard[s] ?
 				ShardHits(file, s, laneDevices[shards[s].device].hostNeighbors + slot[s] + (size_t) j * k,
-						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits) : 0;
+						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits, exactGpu[s] ?
+						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL) : 0;
 		}
+	if (ok)
+		for (uint32_t s = 0; s < state->nshards; s++)
+			if (exactGpu[s])
+				(void) atomic_fetch_add_explicit(&state->gpu_rerank_candidates, (uint64_t) m * k, memory_order_relaxed);
+	free(exactHost);
 	free(host);
 	return ok;
 }
@@ -1521,6 +1790,25 @@ static const char GatherSource[] =
 "extern \"C\" __global__ void gather_f16(const unsigned short *d, long long st, const unsigned *r,\n"
 "    unsigned n, const float *q, int dims, float *o) { gather(d, st, r, n, q, dims, o); }\n";
 
+static const char RerankSource[] =
+"template <typename T> __device__ void rerank(const float *data, long long stride, const unsigned *rows,\n"
+"    unsigned eligible, unsigned nr, T *positions, unsigned top, unsigned nq, const float *queries, int dims, float *out)\n"
+"{\n"
+"  unsigned i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;\n"
+"  int lane = threadIdx.x & 31; if (i >= top * nq) return;\n"
+"  long long p = (long long) positions[i];\n"
+"  unsigned row = p < 0 || (unsigned long long)p >= eligible ? 0xffffffffu : rows ? rows[p] : (unsigned)p;\n"
+"  if (row >= nr) { if (!lane) { positions[i] = (T)-1; out[i] = __int_as_float(0x7f800000); } return; }\n"
+"  const float *v = data + (long long) row * stride, *q = queries + (i / top) * dims;\n"
+"  double sum = 0.; for (int d = lane; d < dims; d += 32) { double x = (double)v[d] - q[d]; sum += x * x; }\n"
+"  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);\n"
+"  if (!lane) { positions[i] = (T)row; out[i] = (float)sqrt(sum); }\n"
+"}\n"
+"extern \"C\" __global__ void rerank_i64(const float *v, long long st, const unsigned *r, unsigned ne, unsigned nr,\n"
+"  long long *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
+"extern \"C\" __global__ void rerank_u32(const float *v, long long st, const unsigned *r, unsigned ne, unsigned nr,\n"
+"  unsigned *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n";
+
 #define ANN_GATHER_BLOCK 256
 #define ANN_GATHER_SLACK 32		/* extra FP16 candidates re-scored in FP32 */
 #define ANN_EXACT_FALLBACK 20000	/* CPU exact limit when gather cannot run */
@@ -1533,6 +1821,8 @@ typedef struct GatherModule
 	CUfunction	lookup;
 	CUfunction	f32;
 	CUfunction	f16;
+	CUfunction	rerank64;
+	CUfunction	rerank32;
 } GatherModule;
 
 static GatherModule gatherModules[ANN_CUVS_MAX_DEVICES];
@@ -1545,6 +1835,7 @@ GatherKernels(int device)
 	GatherModule *module = &gatherModules[device];
 	char		arch[32];
 	char	   *image = NULL;
+	char	   *source = NULL;
 	size_t		size = 0;
 	int			major = 0,
 				minor = 0;
@@ -1563,17 +1854,25 @@ GatherKernels(int device)
 		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
-	if ((image = AnnNvrtcCompile(GatherSource, "cuVS gather kernel", arch, &size)) == NULL ||
+	source = malloc(strlen(GatherSource) + strlen(RerankSource) + 1);
+	if (source == NULL)
+		goto fail;
+	strcpy(source, GatherSource);
+	strcat(source, RerankSource);
+	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->lookup, module->module, "lookup") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->f32, module->module, "gather_f32") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->f16, module->module, "gather_f16") != CUDA_SUCCESS)
+		cuModuleGetFunction(&module->f16, module->module, "gather_f16") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->rerank64, module->module, "rerank_i64") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->rerank32, module->module, "rerank_u32") != CUDA_SUCCESS)
 		goto fail;
 	module->state = 1;
 	goto unlock;
 fail:
 	fprintf(stderr, "cuVS: gather scan unavailable on device %d; filtered queries use CAGRA\n", device);
 unlock:
+	free(source);
 	free(image);
 	(void) pthread_mutex_unlock(&gatherMutex);
 	return module->state > 0 ? module : NULL;
@@ -1625,6 +1924,23 @@ GatherBuffers(AnnCuvsDevice *lane, size_t rows, size_t top)
 	return 1;
 }
 
+static int
+RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
+			 uint32_t eligible, uint32_t nrows, void *positions, uint32_t top,
+			 uint32_t nq, const float *queries, float *out, cudaStream_t stream, int wide)
+{
+	GatherModule *module = GatherKernels(shard->device);
+	int			dimensions = (int) dims;
+	long long	stride = shard->rerankStride;
+	unsigned	blocks = (unsigned) (((uint64_t) nq * top * 32 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
+	void	   *args[] = {(void *) &shard->rerank, &stride, (void *) &rows, &eligible, &nrows,
+	&positions, &top, &nq, (void *) &queries, &dimensions, &out};
+
+	return module && cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+		cuLaunchKernel(wide ? module->rerank64 : module->rerank32, blocks, 1, 1,
+					   ANN_GATHER_BLOCK, 1, 1, 0, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
+}
+
 static atomic_ullong gatherRepairs;
 
 /*
@@ -1671,9 +1987,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 
 	if (fused)
 		slack = ANN_BLACKWELL_TOP - k;
-	if (laneHome < 0)
-		laneHome = (int) (atomic_fetch_add(&nextHome, 1) % ANN_CUVS_MAX_DEVICES);
-	copy = (uint32_t) (laneHome % state->copies);
+	copy = laneCopy;
 	shards = state->shards + (size_t) copy * state->nshards;
 
 	/* Split the keys at each shard's first key. */
@@ -2246,9 +2560,7 @@ SearchGatherGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 	for (uint32_t j = 0; j < m; j++)
 		if (jobs[j]->k + 8 > ANN_BLACKWELL_TOP)
 			return 0;
-	if (laneHome < 0)
-		laneHome = (int) (atomic_fetch_add(&nextHome, 1) % ANN_CUVS_MAX_DEVICES);
-	copy = (uint32_t) (laneHome % state->copies);
+	copy = laneCopy;
 	shards = state->shards + (size_t) copy * state->nshards;
 
 	/* Rows are sorted: split them at shard boundaries. */
@@ -2412,6 +2724,316 @@ SearchGatherGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 	return ok;
 }
 
+static int
+MatrixScores(AnnCuvsDevice *lane, size_t needed, cudaStream_t stream)
+{
+	size_t		maximum = (size_t) (AnnIndexConfig.matrix_max_bytes / sizeof(float));
+	size_t		capacity;
+
+	if (needed > maximum)
+		return 0;
+	if (needed <= lane->matrixScoreCap)
+		return 1;
+	capacity = lane->matrixScoreCap * 2;
+	if (capacity < needed)
+		capacity = needed;
+	if (capacity > maximum)
+		capacity = maximum;
+	if (lane->matrixScores)
+		(void) cudaFreeAsync(lane->matrixScores, stream);
+	lane->matrixScores = NULL;
+	lane->matrixScoreCap = 0;
+	if (cudaMallocAsync((void **) &lane->matrixScores, capacity * sizeof(float), stream) != cudaSuccess)
+		return 0;
+	lane->matrixScoreCap = capacity;
+	return 1;
+}
+
+/* Independently sized buffers also recover cleanly from a partial allocation failure. */
+static int
+MatrixBuffers(AnnCuvsDevice *lane, size_t scores, size_t candidates, size_t output, size_t host,
+			  cudaStream_t stream)
+{
+	return MatrixScores(lane, scores, stream) &&
+		GrowDevice((void **) &lane->matrixCandidates, &lane->matrixCandidateCap, candidates, sizeof(float), 0, stream) &&
+		GrowDevice((void **) &lane->matrixIndices, &lane->matrixIndexCap, candidates, sizeof(int64_t), 0, stream) &&
+		GrowDevice((void **) &lane->matrixValues, &lane->matrixValueCap, output, sizeof(float), 0, stream) &&
+		GrowDevice((void **) &lane->matrixRows, &lane->matrixRowCap, output, sizeof(int64_t), 0, stream) &&
+		GrowPinned((void **) &lane->matrixHostValues, &lane->matrixHostValueCap, host, sizeof(float), 0) &&
+		GrowPinned((void **) &lane->matrixHostRows, &lane->matrixHostRowCap, host, sizeof(int64_t), 0);
+}
+
+/*
+ * General top-k: score a matrix once, select k+slack for every query, then
+ * rerank in FP32 on device when resident, otherwise with the host vectors.
+ * A shared filter is uploaded once per shard; GPU buffers are reused on its
+ * stream and each shard copies results to its own pinned output segment.
+ */
+static int
+SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
+{
+	uint32_t	dims = file->dimensions;
+	uint32_t	limit = (uint32_t) AnnBlackwellGroupLimit((int) dims);
+	uint32_t	maxk = 0;
+	uint32_t	slack = state->quantized ? AnnIndexConfig.quant_slack : ANN_GATHER_SLACK;
+	uint32_t	capacity;
+	uint64_t	start[ANN_INDEX_MAX_SHARDS + 1];
+	uint32_t	selected[ANN_INDEX_MAX_SHARDS];
+	int			gpu[ANN_INDEX_MAX_SHARDS];
+	const uint64_t *ordinals = jobs[0]->ordinals;
+	AnnCuvsShard *shards = state->shards + (size_t) laneCopy * state->nshards;
+	AnnIndexHit *lists;
+	AnnIndexHit *scratch;
+	uint32_t   *counts;
+	float	   *hostQueries;
+	uint64_t	reranked = 0;
+	int			ok = 1;
+
+	if (!state->grouped || ordinals == NULL || limit < 2 || m == 0)
+		return 0;
+	for (uint32_t j = 0; j < m; j++)
+		if (jobs[j]->k > maxk)
+			maxk = jobs[j]->k;
+	if (maxk + 8 <= ANN_BLACKWELL_TOP)
+		return 0;
+	capacity = (uint32_t) ((uint64_t) maxk + slack < jobs[0]->nfilter ?
+						   (uint64_t) maxk + slack : jobs[0]->nfilter);
+	if (capacity == 0)
+		return 0;
+	start[0] = 0;
+	start[state->nshards] = jobs[0]->nfilter;
+	for (uint32_t s = 1; s < state->nshards; s++)
+	{
+		uint64_t	low = start[s - 1],
+					high = jobs[0]->nfilter;
+
+		while (low < high)
+		{
+			uint64_t	mid = low + (high - low) / 2;
+
+			if (ordinals[mid] < file->shards[s].first)
+				low = mid + 1;
+			else
+				high = mid;
+		}
+		start[s] = low;
+	}
+	for (uint32_t s = 0; s < state->nshards; s++)
+	{
+		uint64_t	n = start[s + 1] - start[s];
+		uint64_t	fit;
+
+		if (!n)
+			continue;
+		if (shards[s].quant.quant == ANN_QUANT_NONE)
+			return 0;
+		fit = AnnIndexConfig.matrix_max_bytes / (n * sizeof(float));
+		if (!fit)
+			return 0;
+		if (fit < limit)
+			limit = (uint32_t) fit;
+	}
+	lists = malloc(sizeof(AnnIndexHit) * (size_t) m * state->nshards * maxk);
+	scratch = malloc(sizeof(AnnIndexHit) * capacity);
+	counts = calloc((size_t) m * state->nshards, sizeof(uint32_t));
+	hostQueries = malloc(sizeof(float) * (size_t) limit * dims);
+	if (lists == NULL || scratch == NULL || counts == NULL || hostQueries == NULL)
+	{
+		free(lists);
+		free(scratch);
+		free(counts);
+		free(hostQueries);
+		return 0;
+	}
+	for (uint32_t first = 0; ok && first < m; first += limit)
+	{
+		uint32_t	q = m - first < limit ? m - first : limit;
+		int			uploaded[ANN_CUVS_MAX_DEVICES] = {0};
+		int			used[ANN_CUVS_MAX_DEVICES] = {0};
+
+		for (uint32_t j = 0; j < q; j++)
+			memcpy(hostQueries + (size_t) j * dims, jobs[first + j]->query, sizeof(float) * dims);
+		for (uint32_t s = 0; ok && s < state->nshards; s++)
+		{
+			AnnCuvsShard *shard = &shards[s];
+			uint32_t	n = (uint32_t) (start[s + 1] - start[s]);
+			uint32_t	candidates = capacity < n ? capacity : n;
+			uint32_t	outk = maxk < candidates ? maxk : candidates;
+			AnnCuvsDevice *lane;
+			cudaStream_t stream;
+			const uint32_t *rows;
+			size_t		hostOffset = (size_t) s * limit * capacity;
+
+			selected[s] = 0;
+			gpu[s] = 0;
+			if (n == 0)
+				continue;
+			lane = LaneDevice(shard->device, (size_t) q * dims * sizeof(float), 1, 1);
+			if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
+				!GatherBuffers(lane, jobs[0]->nfilter, 1) ||
+				!MatrixBuffers(lane, (size_t) q * n, (size_t) q * candidates,
+							   (size_t) q * outk, (size_t) state->nshards * limit * capacity, stream))
+			{
+				ok = 0;
+				break;
+			}
+			used[shard->device] = 1;
+			if (!uploaded[shard->device])
+			{
+				if (cudaMemcpyAsync(lane->queries, hostQueries, (size_t) q * dims * sizeof(float),
+									cudaMemcpyHostToDevice, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+				uploaded[shard->device] = 1;
+			}
+			rows = jobs[0]->deviceRows ? jobs[0]->deviceRows[(size_t) laneCopy * state->nshards + s] : NULL;
+			if (rows == NULL)
+			{
+				uint32_t   *staged = (uint32_t *) (void *) (lane->hostKeys + start[s]);
+
+				for (uint32_t i = 0; i < n; i++)
+					staged[i] = (uint32_t) (ordinals[start[s] + i] - file->shards[s].first);
+				if (cudaMemcpyAsync(lane->gatherRows + start[s], staged, (size_t) n * sizeof(uint32_t),
+									cudaMemcpyHostToDevice, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+				rows = lane->gatherRows + start[s];
+			}
+			{
+				uint_fast64_t peak = atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed);
+				uint_fast64_t bytes = (uint64_t) q * n * sizeof(float);
+
+				while (peak < bytes && !atomic_compare_exchange_weak_explicit(&state->matrix_peak_score_bytes,
+																			  &peak, bytes, memory_order_relaxed, memory_order_relaxed))
+					;
+			}
+			if (!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
+										 (int) dims, lane->matrixScores, stream) ||
+				AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
+							   lane->matrixIndices, q, n, candidates, 0) != CUVS_SUCCESS)
+			{
+				ok = 0;
+				break;
+			}
+			if (shard->rerank)
+			{
+				if (!RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
+								  candidates, q, lane->queries, lane->matrixCandidates, stream, 1) ||
+					AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices,
+								   lane->matrixValues, lane->matrixRows, q, candidates, outk, 1) != CUVS_SUCCESS ||
+					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
+									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,
+									(size_t) q * outk * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+				selected[s] = outk;
+				gpu[s] = 1;
+				reranked += (uint64_t) q * candidates;
+			}
+			else
+			{
+				if (cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixIndices,
+									(size_t) q * candidates * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+				selected[s] = candidates;
+			}
+		}
+
+		/*
+		 * Even failed submissions must finish before pageable query storage
+		 * is reused/freed.
+		 */
+		for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+			if (used[d] && (cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+				ok = 0;
+		for (uint32_t s = 0; ok && s < state->nshards; s++)
+			for (uint32_t j = 0; selected[s] && j < q; j++)
+			{
+				AnnIndexJob *job = jobs[first + j];
+				AnnIndexHit *hits = lists + ((size_t) (first + j) * state->nshards + s) * maxk;
+				uint32_t   *found = &counts[(size_t) (first + j) * state->nshards + s];
+				AnnCuvsDevice *lane = &laneDevices[shards[s].device];
+				const int64_t *positions = lane->matrixHostRows + (size_t) s * limit * capacity + (size_t) j * selected[s];
+				const float *distances = lane->matrixHostValues + (size_t) s * limit * capacity + (size_t) j * selected[s];
+				uint32_t	n = (uint32_t) (start[s + 1] - start[s]);
+				int			ordered = 1;
+
+				if (!AnnIndexPositionsDistinct(positions, selected[s]))
+				{
+					AnnIndexJob part = *job;
+
+					part.results = hits;
+					AnnIndexExact(file, &part, ordinals + start[s], n);
+					*found = part.nresults;
+					continue;
+				}
+				for (uint32_t i = 0; i < selected[s]; i++)
+				{
+					int64_t		pos = positions[i];
+					uint64_t	row;
+					AnnIndexHit hit;
+
+					if (pos < 0 || (uint64_t) pos >= (gpu[s] ? file->shards[s].rows : n))
+						continue;
+					row = gpu[s] ? file->shards[s].first + (uint64_t) pos : ordinals[start[s] + (uint64_t) pos];
+					hit.key = file->keys[row];
+					hit.ordinal = row;
+					hit.distance = gpu[s] ? distances[i] : ExactDistance(file, row, job->query);
+					if (gpu[s] && isnan(hit.distance))
+						hit.distance = ExactDistance(file, row, job->query);
+					if (!gpu[s])
+					{
+						scratch[(*found)++] = hit;
+						ordered = 0;
+					}
+					else
+					{
+						if (*found && HitCompare(hits + *found - 1, &hit) > 0)
+							ordered = 0;
+						hits[(*found)++] = hit;
+					}
+				}
+				if (!gpu[s])
+				{
+					qsort(scratch, *found, sizeof(*scratch), HitCompare);
+					if (*found > maxk)
+						*found = maxk;
+					memcpy(hits, scratch, sizeof(*hits) * *found);
+				}
+				else if (!ordered)
+					qsort(hits, *found, sizeof(*hits), HitCompare);
+				if (*found > job->k)
+					*found = job->k;
+			}
+	}
+	if (ok)
+	{
+		for (uint32_t j = 0; j < m; j++)
+		{
+			MergeJob(jobs[j], lists + (size_t) j * state->nshards * maxk,
+					 counts + (size_t) j * state->nshards, state->nshards, maxk);
+			jobs[j]->route = ANN_ROUTE_EXACT;
+		}
+		(void) atomic_fetch_add_explicit(&state->matrix_queries, m, memory_order_relaxed);
+		(void) atomic_fetch_add_explicit(&state->gpu_rerank_candidates, reranked, memory_order_relaxed);
+	}
+	free(lists);
+	free(scratch);
+	free(counts);
+	free(hostQueries);
+	return ok;
+}
+
 /*
  * Filtered jobs over one filter. Selective filters run exactly, one by one.
  * On a quantized index, several jobs scan the filter's rows together on the
@@ -2425,9 +3047,13 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 {
 	uint32_t	n = jobs[0]->nfilter;
 
-	if (m > 1 && n > AnnIndexConfig.exact_limit && n <= AnnIndexConfig.group_gather_limit &&
-		SearchGatherGroup(file, state, jobs, m))
-		return;
+	if (n > AnnIndexConfig.exact_limit && n <= AnnIndexConfig.group_gather_limit)
+	{
+		if (m > 1 && SearchGatherGroup(file, state, jobs, m))
+			return;
+		if (AnnIndexConfig.matrix_gather && SearchGatherMatrix(file, state, jobs, m))
+			return;
+	}
 	if (m > 1 && jobs[0]->bitsets != NULL && n > AnnIndexConfig.bitset_gather_limit)
 	{
 		SearchFilteredGroupGraph(file, state, jobs, m);
@@ -2505,10 +3131,22 @@ SearchIndex(AnnIndexJob *jobs, uint32_t count)
 					members[g++] = filtered[b];
 					filtered[b] = NULL;
 				}
-			SearchFilteredGroup(file, state, members, g);
+			{
+				uint64_t	started = ReplicaNow();
+				uint32_t	copy = ReplicaAcquire(state, g, started);
+
+				SearchFilteredGroup(file, state, members, g);
+				ReplicaRelease(state, copy, members, g, started);
+			}
 		}
 		if (m && group && file && state)
+		{
+			uint64_t	started = ReplicaNow();
+			uint32_t	copy = ReplicaAcquire(state, m, started);
+
 			SearchUnfiltered(file, state, group, m);
+			ReplicaRelease(state, copy, group, m, started);
+		}
 		if (file)
 			AnnIndexPut(file);
 	}
@@ -2573,5 +3211,6 @@ AnnCuvsBackend(void)
 		SearchGathered, DeviceJobs, LoadIndex, SearchIndex, Lost
 	};
 
+	AnnIndexRoutingStats = ReplicaStats;
 	return &backend;
 }

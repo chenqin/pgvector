@@ -91,6 +91,8 @@ The C worker uses version 1, 32-byte little-endian headers: magic `PVAN`, u16 ve
 | 27 | A loaded index's dictionary for a text attribute: u32 name length, name, u32 attribute length, attribute | u32 count, count + 1 u32 offsets, the strings' bytes, then u32 1 and count i32 collection codes if remapped, else u32 0 |
 | 28 | Map a text attribute's codes to a collection's: the same payload, then u32 count and count i32 codes, one per dictionary string. The node rewrites the attribute's column and postings; done once, before predicates are cached (the same map again is accepted). Operations 22 and 25 with flag 4 answer stale for an index whose text attributes aren't mapped | |
 | 29 | Delete rows by key (tombstones): u32 name length, name, u32 count, i64 keys. Keys the index doesn't hold are ignored. Deleted rows leave predicate results (cached ones are dropped), unfiltered searches over-fetch past them, and every route's hits are checked; they stay until the index is unloaded | u64 rows newly deleted, u64 rows deleted in all |
+| 30 | Query matrix: u32 name length, name, u32 dimensions, k, flags, program length, query count (1–64), predicate program, row-major FP32 queries. One generation and predicate serve every query. Flag 1 returns ordinals; flag 8 retains tombstoned candidates so the coordinator can apply its own snapshot-visible tombstones. Other flags are rejected | u32 query count; per query u32 hit count, u32 route, u64 eligible, then (i64 key or u64 ordinal, f32 distance) per hit in distance order |
+| 31 | Routing statistics for one loaded index: UTF-8 index name, without a length prefix | JSON policy, slack, replica/device bindings, active reservations, started/finished batches, queries, migrations, failed batches, reserved nanoseconds, and estimated device batch time. Requires a backend with routing statistics; control requests use the ordinary socket or TCP connection |
 | 22–23 | Search by predicate program and evaluate a predicate program ([filter.h](filter.h)), cached under the program's hash ([frozen indexes](../docs/ann-frozen-index.md#worker-operations-and-caching)); [collections](../docs/ann-collections.md) send operation 22 to one replica of every part at once and merge the replies | |
 
 Metric values: 0 L2, 1 negative inner product, 2 cosine. Filter values: 0 none, 1 shared IDs, 2 IDs per query. Allowlists are u32 count followed by strictly increasing unique u32 ordinals; an empty list differs from no filter. Capability masks use `1 << enum_value`. The CPU backend uses FP32 input and double accumulation.
@@ -131,3 +133,57 @@ make -C ann CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -pedantic -fsanitize=a
 The stdin-mode resident CAGRA build (operations 1–4 with `--backend cuvs`) is still the older unvalidated draft. Use loaded indexes instead. hipVS and NVFP4 adapters are not implemented: cuVS 26.10 CAGRA supports FP32, FP16, int8 and uint8 datasets, and no FP4 or FP8 path.
 
 C PostgreSQL worker integration is implemented: `--listen PATH` serves pipelined gathered searches (operations 7–10) to `AnnFilteredSearch`, with a `mock-gpu` backend standing in for accelerators ([guide](../docs/ann-worker-pipeline.md)). Sustained-load validation remains. Python remains test/benchmark tooling only.
+
+### Replica routing
+
+With `--replicate on`, `--replica-routing home` keeps each worker lane on its
+home GPU. `--replica-routing load` compares active search batches and a
+smoothed observation of their service time across GPUs. It retains home
+when the estimate differs by no more than `--replica-load-slack N` batches
+(default 1). These settings are worker-wide. Load counters include searches
+of other loaded indexes and unreplicated indexes spanning several GPUs.
+
+Reservations span device work and host reranking, so the time estimate is
+not CUDA kernel time. It reflects the recent workload mix as well as device
+contention. Cold initialization and timing outliers are bounded before the
+1/16 moving-average update. Idle slow estimates decay toward the initial
+100 microseconds, halving the difference once a second, so the router can
+probe and reuse a GPU after temporary contention. Counter operations use
+C11 atomics; replica choice takes no scheduler mutex.
+
+Operation 31 exposes per-index counts and global per-device load estimates.
+`device_mask` names every GPU a copy spans; `device` is its first shard's
+GPU. Snapshots are approximate while work runs. `frozen_stress.py` records
+before/after snapshots when `--index-name` is supplied, outside the measured
+workload. Home routing remains the default while performance tuning continues.
+
+### Generalized matrix selection and GPU reranking
+
+The cuVS build now requires the C++20 SDK headers and `libcuvs` as well as
+the C API. RAFT, RMM and CCCL headers must be available; the Makefile finds
+standard sibling pip packages automatically, or `CUVS_CXXFLAGS` can supply
+include paths for another SDK layout. The CPU-only build is unchanged.
+
+`--matrix-gather on` enables Blackwell tensor-core matrix scoring and cuVS
+batched selection for larger k, including k=500. `--group-gather-limit ROWS`
+sets the largest shared filter it scans; the existing fused top-32 path is
+retained for small k. `--matrix-max-mb N` (default 64, range 1–1024) bounds
+one lane's input score matrix. Query batches split into tiles to respect it.
+This bound excludes selector workspace, output buffers and resident vectors.
+
+`--gpu-rerank on` reranks CAGRA candidates using resident original FP32
+vectors. Matrix gathers select extra candidates, rerank on device, then
+select each query's final top-k with row-ID payloads. Accumulation uses
+double precision, matching the host rerank arithmetic. FP32 CAGRA datasets
+are reused; other datasets need an additional FP32 copy, about 5.12 GB per
+GPU for 10M × 128 dimensions. If a copy cannot be allocated, that shard
+retains host reranking. Both switches default to off; GPU reranking adds resident memory and matrix
+gathers require the Blackwell scorer. The measured B200 configuration enables
+both and uses `--group-gather-limit 500000`, `--replica-routing home`,
+64 lanes and batches up to 32. The 500k cutoff sends broader filters to CAGRA.
+
+Routing statistics include `matrix_queries`, `matrix_peak_score_bytes`,
+`gpu_rerank_candidates`, and per-copy `rerank_ready`/`rerank_bytes`, so a test
+can verify which path actually ran and how much resident memory was added.
+The benchmark comparison is documented in
+[the k=500 profile](../docs/ann-k500-profile.md).

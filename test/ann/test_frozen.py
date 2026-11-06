@@ -586,6 +586,97 @@ class FrozenTests(unittest.TestCase):
         self.db.execute('SET ann.worker_socket = %s' % self.sql.Literal(server.path).as_string(self.db))
         self.db.execute('SELECT ann_index_load(%s, %s)', (name, path))
 
+    def test_sql_query_matrix(self):
+        server = Server('--backend', 'cpu-exact')
+        try:
+            self.create()
+            name = 'batch_' + uuid.uuid4().hex[:8]
+            self.load(server, name)
+            queries = ['[1,2,3,4]', '[40,-20,10,2]', '[-10,30,20,1]']
+
+            def batch(predicate=None, qs=queries, k=40):
+                return self.db.execute('SELECT * FROM ann_frozen_search_batch(%s, %s::vector[], %s, %s)',
+                                       (name, qs, k, predicate)).fetchall()
+
+            def exact(predicate=None, deleted=()):
+                result = []
+                for q, query in enumerate(queries, 1):
+                    result += [(q, key) for key, in self.db.execute(
+                        f'SELECT id FROM docs WHERE ({predicate or "true"}) AND id <> ALL(%s::bigint[]) '
+                        'ORDER BY (emb <-> %s::vector)::real, id LIMIT 40', (list(deleted), query))]
+                return result
+
+            for predicate in (None, 'tenant IN (2,5)', 'tenant = -1', 'category IS NULL'):
+                got = batch(predicate)
+                self.assertEqual([(q, key) for q, key, _ in got], exact(predicate))
+                for q in range(1, 4):
+                    distances = [d for query_no, _, d in got if query_no == q]
+                    self.assertEqual(distances, sorted(distances))
+            self.assertEqual(batch(qs=[]), [])
+            for qs in ([None], queries * 22, ['[1,2]'], ['[1,2,3,4]', '[1,2]']):
+                self.assertIn('batch', self.error(
+                    'SELECT * FROM ann_frozen_search_batch(%s, %s::vector[], 10)', (name, qs)))
+            # Uncommitted tombstones have not reached the worker. Every vector
+            # must filter them using this statement's snapshot and refill locally.
+            deleted = [key for _, key in exact()[:5]]
+            with self.db.transaction(force_rollback=True):
+                self.db.execute('SELECT ann_frozen_delete(%s, %s)', ('docs', deleted))
+                self.assertEqual([(q, key) for q, key, _ in batch()], exact(deleted=deleted))
+            self.assertEqual([(q, key) for q, key, _ in batch()], exact())
+            role = self.schema + '_batch_reader'
+            self.db.execute(f'CREATE ROLE {role}')
+            try:
+                self.db.execute(f'GRANT USAGE ON SCHEMA {self.schema} TO {role}')
+                self.db.execute(f'SET ROLE {role}')
+                try:
+                    self.assertIn('permission denied', self.error(
+                        'SELECT * FROM ann_frozen_search_batch(%s, %s::vector[], 10)', (name, queries)))
+                finally:
+                    self.db.execute('RESET ROLE')
+                self.db.execute(f'GRANT SELECT ON docs TO {role}')
+                self.db.execute('ALTER TABLE docs ENABLE ROW LEVEL SECURITY')
+                self.db.execute('CREATE POLICY hidden ON docs USING (false)')
+                self.db.execute(f'SET ROLE {role}')
+                try:
+                    self.assertIn('row-level security', self.error(
+                        'SELECT * FROM ann_frozen_search_batch(%s, %s::vector[], 10)', (name, queries)))
+                finally:
+                    self.db.execute('RESET ROLE')
+                self.db.execute('ALTER TABLE docs DISABLE ROW LEVEL SECURITY')
+            finally:
+                self.db.execute(f'DROP OWNED BY {role}')
+                self.db.execute(f'DROP ROLE {role}')
+            # Dropping the guard permits real DELETEs, which must still obey MVCC.
+            self.db.execute('DROP TRIGGER ann_frozen_guard ON docs')
+            old = exact()
+            with self.db.transaction():
+                self.db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+                self.value('SELECT count(*) FROM docs')  # establish snapshot
+                with self.psycopg.connect(DSN, autocommit=True) as other:
+                    other.execute(self.sql.SQL('DELETE FROM {}.docs WHERE id = ANY(%s)').format(
+                        self.sql.Identifier(self.schema)), (deleted,))
+                self.assertEqual([(q, key) for q, key, _ in batch()], old)
+            self.db.execute('DELETE FROM docs WHERE id = ANY(%s)', (deleted,))
+            self.assertEqual([(q, key) for q, key, _ in batch()], exact())
+            # Another transaction can commit soft deletes after our snapshot.
+            # The worker must supply those rows; only PostgreSQL knows which
+            # tombstones this statement can see.
+            self.db.execute("SELECT ann_freeze('docs')")
+            old = exact()
+            more = [key for _, key in old[:5]]
+            with self.db.transaction():
+                self.db.execute('SET TRANSACTION ISOLATION LEVEL REPEATABLE READ')
+                self.value('SELECT count(*) FROM docs')
+                with self.psycopg.connect(DSN, autocommit=True) as other:
+                    other.execute('SET ann.worker_socket = %s' % self.sql.Literal(server.path).as_string(other))
+                    other.execute('SELECT ann_frozen_delete(%s, %s)', (self.schema + '.docs', more))
+                self.assertEqual([(q, key) for q, key, _ in batch()], old)
+                self.assertEqual([(q, key) for q, key, _ in batch('tenant < 7')], exact('tenant < 7'))
+            self.assertEqual([(q, key) for q, key, _ in batch()], exact(deleted=more))
+            self.assertEqual([(q, key) for q, key, _ in batch('tenant < 7')], exact('tenant < 7', more))
+        finally:
+            server.close()
+
     def test_worker_route_and_bitmap_identity(self):
         subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
@@ -691,6 +782,55 @@ class FrozenTests(unittest.TestCase):
             self.assertEqual(self.db.execute(statement).fetchall(), [])
         finally:
             self.db.execute('RESET enable_sort')
+
+    def test_materialize_batches(self):
+        self.create()
+        statement = ("SELECT id, emb::text, tenant, category FROM docs WHERE tenant = 1 "
+                     "ORDER BY emb <-> '[1,2,3,4]', id LIMIT 500")
+        self.db.execute('SET ann.enable_frozen_search = off')
+        expected = self.db.execute(statement).fetchall()
+        self.db.execute('RESET ann.enable_frozen_search')
+        for size in (1, 16, 64, 1024):
+            self.db.execute("SELECT set_config('ann.frozen_materialize_batch', %s, false)", (str(size),))
+            self.assertEqual(self.db.execute(statement).fetchall(), expected)
+            self.assertIn(f'Materialized Rows: {len(expected)}', self.plan(statement))
+        self.db.execute('RESET ann.frozen_materialize_batch')
+
+    def test_mapped_tids_vacuum_barrier(self):
+        self.create()
+        self.db.execute('SET ann.frozen_materialize_batch = 64')
+        statement = ("SELECT id, tenant FROM docs ORDER BY emb <-> '[1,2,3,4]', id LIMIT 500")
+        self.assertRegex(self.plan(statement), r'Mapped TID Rows: [1-9][0-9]*')
+        self.db.execute('VACUUM docs')
+        self.assertRegex(self.plan(statement), r'Mapped TID Rows: [1-9][0-9]*')
+        self.db.execute('SET ann.frozen_mmap = off')
+        self.assertIn('Mapped TID Rows: 0', self.plan(statement))
+        self.db.execute('RESET ann.frozen_mmap')
+        self.assertRegex(self.plan(statement), r'Mapped TID Rows: [1-9][0-9]*')
+        self.db.execute('DROP TRIGGER ann_frozen_guard ON docs')
+        self.db.execute('DELETE FROM docs WHERE id % 3 = 0')
+        # Start a cursor before VACUUM: no content lock may survive delivery.
+        self.db.execute('BEGIN')
+        self.db.execute('DECLARE frozen_cursor CURSOR FOR ' + statement)
+        first = self.db.execute('FETCH 1 FROM frozen_cursor').fetchall()
+        with self.psycopg.connect(DSN, autocommit=True) as writer:
+            writer.execute("SET lock_timeout = '2s'")
+            writer.execute(self.sql.SQL('VACUUM {}.docs').format(self.sql.Identifier(self.schema)))
+        actual = first + self.db.execute('FETCH ALL FROM frozen_cursor').fetchall()
+        self.db.execute('COMMIT')
+        self.db.execute('SET ann.enable_frozen_search = off')
+        expected = self.db.execute(statement).fetchall()
+        self.db.execute('RESET ann.enable_frozen_search')
+        self.assertEqual(actual, expected)
+        self.assertEqual(self.db.execute(statement).fetchall(), expected)
+        self.assertIn('Mapped TID Rows: 0', self.plan(statement))
+        # REINDEX compacts the physical deletes and restores immutable TIDs.
+        self.db.execute("SELECT ann_freeze('docs')")
+        self.vacuum('docs')
+        self.db.execute('REINDEX INDEX docs_ann')
+        self.assertEqual(self.db.execute(statement).fetchall(), expected)
+        self.assertRegex(self.plan(statement), r'Mapped TID Rows: [1-9][0-9]*')
+        self.db.execute('RESET ann.frozen_materialize_batch')
 
     def test_prefetch_boundaries(self):
         self.create(rows=17)

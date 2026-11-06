@@ -145,6 +145,225 @@ class CuvsIndexTests(unittest.TestCase):
             self.assertLess(float(stats[1]), 1e-4, quant)
             self.assertEqual(stats[2], '0', quant)
 
+    def test_generalized_matrix_k500(self):
+        """Matrix selection and device/host reranking preserve each top-k."""
+        import json
+        import struct
+        from test_predicate_cache import search_batch_frame, values_program
+        rows = self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 8').splitlines()
+        queries = [json.loads(row) for row in rows]
+        expected = []
+        for query in rows:
+            expected.append(dict((int(key), float(distance)) for key, distance in
+                                 (line.split('|') for line in self.psql(f"""SELECT id, (emb <-> '{query}'::vector)::real
+                                    FROM {self.table} WHERE tenant = 7 ORDER BY 2, id LIMIT 500""").splitlines())))
+        all_expected = []
+        for query in rows:
+            all_expected.append(dict((int(key), float(distance)) for key, distance in
+                (line.split('|') for line in self.psql(f"""SELECT id, (emb <-> '{query}'::vector)::real
+                    FROM {self.table} ORDER BY 2, id LIMIT 500""").splitlines())))
+        for enabled in ('off', 'on'):
+            server = Server('--backend', 'cuvs', '--lanes', '1', '--exact-limit', '0',
+                            '--group-gather-limit', '4000000', '--matrix-gather', 'on', '--gpu-rerank', enabled,
+                            '--matrix-max-mb', '1', '--delay-us', '1000',
+                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+            try:
+                for dtype in ('float32', 'float16', 'nvfp4', 'fp8'):
+                    name = self.table + '_matrix_' + dtype + '_' + enabled
+                    self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/{dtype}')", server)
+                    self.psql(f"SELECT ann_filter_bitmap_build('{name}', 'tenant = 7')", server)
+                    filter_id = int(self.psql(f"SELECT id FROM ann_filter_bitmap WHERE index_name = '{name}'", server))
+                    program = struct.pack('<BQ', 4, filter_id & ((1 << 64) - 1))
+                    with server.connect() as connection:
+                        for nq in (1, 3, 16, 64):
+                            vectors = [queries[q % 8] for q in range(nq)]
+                            connection.sendall(search_batch_frame(nq, name, vectors, 500, program))
+                            op, request, status, data = receive(connection)
+                            self.assertEqual((op, request, status), (30, nq, 0), (dtype, enabled))
+                            self.assertEqual(struct.unpack_from('<I', data)[0], nq)
+                            offset = 4
+                            for q in range(nq):
+                                count, _, eligible = struct.unpack_from('<IIQ', data, offset)
+                                self.assertEqual((count, eligible), (500, 800))
+                                hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
+                                want = expected[q % 8]
+                                self.assertEqual({key for key, _ in hits}, set(want), (dtype, enabled, nq, q))
+                                self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
+                                self.assertLess(max(abs(d - want[key]) for key, d in hits), 1e-4)
+                                offset += 16 + count * 12
+                            self.assertEqual(offset, len(data))
+                        # 10k eligible rows per shard exercises the radix selector
+                        # at k+slack and forces tiling under the 1 MB input cap.
+                        self.psql(f"SELECT ann_filter_bitmap_build('{name}', 'true')", server)
+                        all_id = int(self.psql(f"SELECT id FROM ann_filter_bitmap WHERE index_name = '{name}' AND filter = 'true'", server))
+                        extra = 64 if enabled == 'on' else 3
+                        vectors = [queries[q % 8] for q in range(extra)]
+                        connection.sendall(search_batch_frame(65, name, vectors, 500,
+                                               struct.pack('<BQ', 4, all_id & ((1 << 64) - 1))))
+                        _, _, status, data = receive(connection)
+                        self.assertEqual(status, 0)
+                        offset = 4
+                        for q in range(extra):
+                            count, _, eligible = struct.unpack_from('<IIQ', data, offset)
+                            self.assertEqual((count, eligible), (500, 40000))
+                            hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
+                            want = all_expected[q % 8]
+                            self.assertEqual({key for key, _ in hits}, set(want))
+                            self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
+                            self.assertLess(max(abs(d - want[key]) for key, d in hits), 1e-4)
+                            offset += 16 + count * 12
+                        self.assertEqual(offset, len(data))
+                        connection.sendall(frame(31, 1, name.encode()))
+                        _, _, status, data = receive(connection)
+                        self.assertEqual(status, 0)
+                        stats = json.loads(data)
+                        self.assertEqual(stats['matrix_queries'], 84 + extra, (dtype, enabled, stats))
+                        self.assertLessEqual(stats['matrix_peak_score_bytes'], 1024 * 1024)
+                        self.assertGreater(stats['matrix_peak_score_bytes'], 0)
+                        if enabled == 'on':
+                            self.assertGreater(stats['gpu_rerank_candidates'], 0)
+                            self.assertTrue(all(r['rerank_ready'] for r in stats['replicas']))
+                        else:
+                            self.assertEqual(stats['gpu_rerank_candidates'], 0)
+            finally:
+                server.close()
+
+    def test_graph_gpu_rerank_k500(self):
+        import json
+        import struct
+        from test_predicate_cache import search_batch_frame, values_program
+        query = self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1')
+        expected = dict((int(key), float(distance)) for key, distance in
+                        (line.split('|') for line in self.psql(f"""SELECT id, (emb <-> '{query}'::vector)::real
+                            FROM {self.table} WHERE tenant = 7 ORDER BY 2, id""").splitlines()))
+        nearest = set(sorted(expected, key=lambda key: (expected[key], key))[:500])
+        server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gather-limit', '0',
+                        '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', 'on',
+                        '--filtered-itopk', '1024', executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+        name = self.table + '_gpu_rerank'
+        try:
+            self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float16')", server)
+            with server.connect() as connection:
+                connection.sendall(search_batch_frame(1, name, [json.loads(query)] * 8, 500,
+                                                       values_program('tenant', [7])))
+                _, _, status, data = receive(connection)
+                self.assertEqual(status, 0)
+                offset = 4
+                for q in range(8):
+                    count, _, eligible = struct.unpack_from('<IIQ', data, offset)
+                    self.assertEqual((count, eligible), (500, 800))
+                    hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
+                    self.assertEqual(len({key for key, _ in hits}), 500)
+                    self.assertTrue(all(key in expected for key, _ in hits))
+                    self.assertGreaterEqual(len({key for key, _ in hits} & nearest) / 500, 0.9)
+                    self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
+                    self.assertLess(max(abs(d - expected[key]) for key, d in hits), 1e-4)
+                    offset += 16 + count * 12
+                connection.sendall(frame(31, 2, name.encode()))
+                _, _, status, data = receive(connection)
+                self.assertEqual(status, 0)
+                stats = json.loads(data)
+                self.assertEqual(stats['matrix_queries'], 0)
+                self.assertGreater(stats['gpu_rerank_candidates'], 0)
+                self.assertTrue(all(r['rerank_ready'] for r in stats['replicas']))
+        finally:
+            server.close()
+
+    def test_replica_load_routing(self):
+        """Replicated GPU requests retain results and release every reservation."""
+        import ctypes
+        import json
+        import struct
+        import threading
+        from test_predicate_cache import search_batch_frame, values_program
+
+        devices = ctypes.c_int()
+        ctypes.CDLL('libcudart.so').cudaGetDeviceCount(ctypes.byref(devices))
+        if devices.value < 2:
+            self.skipTest('needs at least two GPUs')
+        server = Server('--backend', 'cuvs', '--lanes', '8', '--replicate', 'on',
+                        '--replica-routing', 'load', '--replica-load-slack', '0', '--exact-limit', '0',
+                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'),
+                        env={'CUDA_VISIBLE_DEVICES': ','.join(os.environ.get('CUDA_VISIBLE_DEVICES', '0,1').split(',')[:2])})
+        name = self.table + '_replicas'
+        try:
+            self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float32')", server)
+            query = self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1')
+            want = [int(x) for x in self.psql(f"""SELECT id FROM {self.table} WHERE tenant = 7
+                ORDER BY emb <-> '{query}'::vector, id LIMIT 500""").splitlines()]
+            vector = json.loads(query)
+            failures = []
+
+            def client():
+                try:
+                    with server.connect() as connection:
+                        for request in range(8):
+                            connection.sendall(search_batch_frame(request + 1, name, [vector] * 4, 500,
+                                                                   values_program('tenant', [7])))
+                        for _ in range(8):
+                            _, _, status, data = receive(connection)
+                            self.assertEqual(status, 0)
+                            offset = 4
+                            for _ in range(4):
+                                count, _, eligible = struct.unpack_from('<IIQ', data, offset)
+                                self.assertEqual((count, eligible), (500, 800))
+                                hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12)
+                                        for i in range(count)]
+                                self.assertEqual({key for key, _ in hits}, set(want))
+                                self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
+                                offset += 16 + count * 12
+                except Exception as error:  # noqa: BLE001
+                    failures.append(error)
+            threads = [threading.Thread(target=client) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            self.assertEqual(failures, [])
+            with server.connect() as connection:
+                connection.sendall(frame(31, 1, name.encode()))
+                _, _, status, data = receive(connection)
+            self.assertEqual(status, 0)
+            stats = json.loads(data)
+            self.assertEqual((stats['policy'], stats['copies']), ('load', 2))
+            self.assertEqual(sum(r['queries'] for r in stats['replicas']), 256)
+            for r in stats['replicas']:
+                self.assertGreater(r['queries'], 0)
+                self.assertEqual((r['active'], r['device_active'], r['failures']), (0, 0, 0))
+                self.assertEqual(r['started'], r['finished'])
+                self.assertGreater(r['reserved_ns'], 0)
+        finally:
+            server.close()
+
+    def test_query_matrix_k500(self):
+        """One multi-vector frame exercises GPU gather at the production k."""
+        import struct
+        from test_predicate_cache import search_batch_frame, values_program
+        rows = self.psql(f"SELECT id, emb::text FROM {self.table} ORDER BY id LIMIT 8").splitlines()
+        queries = [[float(x) for x in line.split('|')[1].strip('[]').split(',')] for line in rows]
+        expected = []
+        for line in rows:
+            qid = int(line.split('|')[0])
+            expected.append([int(x) for x in self.psql(f"""
+                SELECT t.id FROM {self.table} t, {self.table} q WHERE q.id = {qid} AND t.tenant = 7
+                ORDER BY t.emb <-> q.emb, t.id LIMIT 500""").splitlines()])
+        for dtype in ('float32', 'float16'):
+            with self.server.connect() as connection:
+                connection.sendall(search_batch_frame(101, f'{self.table}_{dtype}', queries, 500,
+                                                       values_program('tenant', [7])))
+                operation, request, status, data = receive(connection)
+            self.assertEqual((operation, request, status), (30, 101, 0))
+            self.assertEqual(struct.unpack_from('<I', data)[0], len(queries))
+            offset = 4
+            for want in expected:
+                count, route, eligible = struct.unpack_from('<IIQ', data, offset)
+                self.assertEqual((count, eligible), (500, 800))
+                hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
+                self.assertEqual([key for key, _ in hits], want, dtype)
+                self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
+                offset += 16 + count * 12
+            self.assertEqual(offset, len(data))
+
     def test_same_filter_searches_group_exactly(self):
         # Searches over one cached bitmap, pipelined from several connections
         # so they queue up, are grouped into shared tensor-core scans (of

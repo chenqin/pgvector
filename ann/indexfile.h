@@ -95,7 +95,7 @@ typedef struct AnnIndexAttribute
 typedef struct AnnIndexBitmap
 {
 	uint64_t	id;
-	int			kind;			/* ANN_BITMAP_PUSHED or ANN_BITMAP_PREDICATE */
+	int			kind;			/* pushed, predicate, or snapshot predicate */
 	uint64_t	count;
 	uint32_t   *words;			/* NULL for a sparse predicate result: its
 								 * ordinals are the only form kept */
@@ -215,11 +215,20 @@ typedef struct AnnIndexOptions
 	int			plain_allocator;	/* --device-allocator plain: cuVS
 									 * allocates with cudaMalloc, no pool */
 	uint32_t	rerank_prefetch;	/* candidate lookahead for host vector
-									 * reads; last: the initializer is
-									 * positional */
+									 * reads */
+	int			replica_routing;	/* 0 home, 1 latency-weighted batch load */
+	uint32_t	replica_load_slack;
+	int			matrix_gather;	/* general batched top-k, beyond the fused
+								 * top32 */
+	int			gpu_rerank;		/* optional FP32 device copy, else host
+								 * reranking */
+	uint64_t	matrix_max_bytes;	/* per-lane score-matrix bound */
 } AnnIndexOptions;
 
 extern AnnIndexOptions AnnIndexConfig;
+
+/* Optional backend routing snapshot, JSON written within capacity. */
+extern size_t (*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity);
 
 const char *AnnIndexQuantName(int quant);
 
@@ -268,7 +277,7 @@ extern void (*AnnIndexDeviceDestroy) (void *device);
  */
 void		AnnIndexBitmapWords(const AnnIndexFile *file, const AnnIndexBitmap *bitmap, uint32_t *words);
 int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
-							 uint32_t *words, uint64_t *count);
+							 uint32_t *words, uint64_t *count, int snapshot);
 
 /*
  * Cache a predicate's result under its id like a pushed bitmap. Predicate
@@ -277,7 +286,7 @@ int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t 
  * predicate_cache entries): past it, the least recently used ones are
  * dropped down to 90% of the budget. Pushed bitmaps are never dropped.
  */
-AnnStatus	AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, const uint32_t *words, size_t nwords,
+AnnStatus	AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
 								 uint64_t expandLimit, AnnIndexBitmap **result);
 
 /* Totals over loaded indexes, for the stats reply. */
@@ -313,11 +322,13 @@ AnnStatus	AnnIndexMatch(const AnnIndexFile *file, const char *attribute, const i
  */
 #define ANN_BITMAP_PUSHED 0
 #define ANN_BITMAP_PREDICATE 1
+#define ANN_BITMAP_SNAPSHOT 2
 AnnStatus	AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
 							  uint64_t expandLimit, AnnIndexBitmap **result);
 
 /* A referenced cached bitmap, or NULL; release it with AnnIndexBitmapRelease. */
 AnnIndexBitmap *AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind);
+void		AnnIndexBitmapHold(AnnIndexFile *file, AnnIndexBitmap *bitmap);
 void		AnnIndexBitmapRelease(AnnIndexFile *file, AnnIndexBitmap *bitmap);
 
 /* Map sorted unique keys to sorted global ordinals; returns the count found. */

@@ -53,6 +53,11 @@ void		AnnBlackwellFree(AnnBlackwellShard *shard);
 int			AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32_t *rows, unsigned n,
 							  const float *query, int dims, float *out, void *stream);
 
+/* Tensor-core scores in [queries][rows] order, without a fixed top-k. */
+int			AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
+									unsigned n, const float *queries, unsigned nq, int dims,
+									float *out, void *stream);
+
 /*
  * Fused search: score the listed rows for nq queries (contiguous FP32 on
  * the device) and select each query's best ANN_BLACKWELL_TOP in one launch,

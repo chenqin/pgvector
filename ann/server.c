@@ -70,6 +70,7 @@ typedef struct Job
 	struct Job *fnext;			/* the same filter's jobs, or the plain jobs
 								 * of this kind, oldest first */
 	struct FilterEntry *filter; /* NULL for a job that cannot share a scan */
+	uint32_t	compositePart;	/* query position for operation 30 */
 	struct Composite *composite;	/* operation 25: the request this part
 									 * answers into */
 	uint64_t	arrived;		/* --trace: frame read (ns, realtime) */
@@ -82,6 +83,13 @@ typedef struct Job
  * searched with one program and query. Each part runs as an operation 22
  * job; each hands its hits here, and the last merges them and replies once.
  */
+typedef struct BatchPart
+{
+	uint32_t	count;
+	uint32_t	route;
+	uint64_t	eligible;
+} BatchPart;
+
 typedef struct Composite
 {
 	pthread_mutex_t mutex;
@@ -89,6 +97,8 @@ typedef struct Composite
 	uint32_t	parts;
 	uint32_t	k;
 	AnnStatus	status;
+	BatchPart  *batch;			/* operation 30: separate results per query */
+	uint32_t	flags;
 	uint64_t	eligible;
 	uint32_t	nhits;
 	AnnIndexHit *hits;			/* up to k per part; ordinal: position in
@@ -115,6 +125,7 @@ static _Thread_local uint32_t submittingWanted = 0;
 
 /* Set while a reader or RDMA lane submits a composite's parts. */
 static _Thread_local Composite *submittingComposite = NULL;
+static _Thread_local uint32_t submittingPart = 0;
 
 /*
  * A filter the worker already holds (a cached bitmap's rows, an attribute
@@ -372,6 +383,75 @@ HitAttributes(const AnnIndexFile *file, const AnnIndexHit *hits, uint32_t nhits,
 				file->attributes[a].column[hits[i].ordinal] : INT32_MIN;
 }
 
+/* One reply for a matrix of queries, preserving query and distance order. */
+static void
+BatchAnswer(Composite *composite, uint32_t part, uint32_t route, AnnStatus status,
+			const AnnIndexHit *hits, uint32_t nhits, uint64_t eligible)
+{
+	int			last;
+
+	(void) pthread_mutex_lock(&composite->mutex);
+	if (status == ANN_OK)
+	{
+		uint32_t	n = nhits < composite->k ? nhits : composite->k;
+
+		if (n)
+			memcpy(composite->hits + (size_t) part * composite->k, hits, sizeof(AnnIndexHit) * n);
+		composite->batch[part].count = n;
+		composite->batch[part].route = route;
+		composite->batch[part].eligible = eligible;
+	}
+	else if (composite->status == ANN_OK)
+		composite->status = status;
+	last = --composite->remaining == 0;
+	(void) pthread_mutex_unlock(&composite->mutex);
+	if (last)
+	{
+		size_t		size = 4;
+		unsigned char *data = NULL;
+		AnnStatus	result = composite->status;
+
+		for (uint32_t p = 0; p < composite->parts; p++)
+			size += 16 + (size_t) composite->batch[p].count * 12;
+		if (result == ANN_OK && (data = malloc(size)) == NULL)
+			result = ANN_NOMEM;
+		if (result == ANN_OK)
+		{
+			size_t		offset = 4;
+
+			Write(data, composite->parts, 4);
+			for (uint32_t p = 0; p < composite->parts; p++)
+			{
+				BatchPart  *partResult = &composite->batch[p];
+
+				Write(data + offset, partResult->count, 4);
+				Write(data + offset + 4, partResult->route, 4);
+				Write(data + offset + 8, partResult->eligible, 8);
+				offset += 16;
+				for (uint32_t i = 0; i < partResult->count; i++)
+				{
+					AnnIndexHit *hit = &composite->hits[(size_t) p * composite->k + i];
+					uint32_t	bits;
+
+					memcpy(&bits, &hit->distance, sizeof(bits));
+					Write(data + offset, (composite->flags & ANN_PREDICATE_ORDINALS) ?
+						  hit->ordinal : (uint64_t) hit->key, 8);
+					Write(data + offset + 8, bits, 4);
+					offset += 12;
+				}
+			}
+		}
+		SendReply(composite->connection, composite->rdma, ANN_OP_INDEX_SEARCH_BATCH,
+				  composite->request, result, data, result == ANN_OK ? size : 0);
+		free(data);
+		Release(composite->connection);
+		(void) pthread_mutex_destroy(&composite->mutex);
+		free(composite->hits);
+		free(composite->batch);
+		free(composite);
+	}
+}
+
 /*
  * A part of a composite is answered (status, its hits and eligible rows);
  * the last one replies with the k nearest of all parts: u32 count, u32
@@ -379,11 +459,16 @@ HitAttributes(const AnnIndexFile *file, const AnnIndexHit *hits, uint32_t nhits,
  * distance) per hit, ascending.
  */
 static void
-CompositeAnswer(Composite *composite, AnnStatus status, const AnnIndexHit *hits, uint32_t nhits,
+CompositeAnswer(Composite *composite, uint32_t part, uint32_t route, AnnStatus status, const AnnIndexHit *hits, uint32_t nhits,
 				uint64_t eligible, const AnnIndexFile *file)
 {
 	int			last;
 
+	if (composite->batch)
+	{
+		BatchAnswer(composite, part, route, status, hits, nhits, eligible);
+		return;
+	}
 	(void) pthread_mutex_lock(&composite->mutex);
 	if (status == ANN_OK && composite->attributes && file &&
 		composite->nattributes >= 0 && (uint32_t) composite->nattributes != file->nattributes)
@@ -474,6 +559,7 @@ Finish(Service *service, Job *job)
 
 	/* Tombstoned rows never come back, whichever route found them. */
 	if (job->kind == JOB_INDEX && job->bitmapFile && job->index.status == ANN_OK &&
+		!(job->operation == ANN_OP_INDEX_SEARCH_BATCH && (job->flags & ANN_PREDICATE_SNAPSHOT)) &&
 		__atomic_load_n(&job->bitmapFile->ndeleted, __ATOMIC_ACQUIRE) > 0)
 	{
 		uint32_t	kept = 0;
@@ -489,7 +575,7 @@ Finish(Service *service, Job *job)
 	if (job->composite)
 	{
 		job->job.status = job->index.status;
-		CompositeAnswer(job->composite, job->index.status, job->index.results, job->index.nresults,
+		CompositeAnswer(job->composite, job->compositePart, job->index.route, job->index.status, job->index.results, job->index.nresults,
 						job->bitmap ? job->bitmap->count : job->bitmapFile ? job->bitmapFile->rows : 0,
 						job->bitmapFile);
 	}
@@ -1186,7 +1272,7 @@ static AnnStatus SubmitBitmapJob(Service *service, Connection *connection, int r
 								 AnnIndexBitmap *bitmap, const char *name, uint32_t dimensions,
 								 uint32_t k, size_t offset, uint16_t operation, uint32_t flags);
 static AnnStatus PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program,
-								 uint32_t size, AnnIndexBitmap **result);
+								 uint32_t size, AnnIndexBitmap **result, int snapshot);
 
 static AnnStatus
 SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operation, uint64_t request,
@@ -1226,10 +1312,10 @@ SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operati
 		return ANN_INVALID;
 	if (nfilter == UINT32_MAX)
 	{
-		char name[ANN_INDEX_NAME_MAX + 1];
+		char		name[ANN_INDEX_NAME_MAX + 1];
 		AnnIndexFile *file;
 		AnnIndexBitmap *bitmap = NULL;
-		AnnStatus status = ANN_OK;
+		AnnStatus	status = ANN_OK;
 		const unsigned char all = ANN_FILTER_ALL;
 
 		memcpy(name, payload + 4, nameLength);
@@ -1238,7 +1324,7 @@ SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operati
 			return ANN_STALE;
 		/* Legacy searches must honor the same tombstones as operation 22. */
 		if (__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) > 0)
-			status = PredicateBitmap(service, file, &all, 1, &bitmap);
+			status = PredicateBitmap(service, file, &all, 1, &bitmap, 0);
 		if (status == ANN_OK)
 			status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap,
 									 name, dimensions, k, offset, operation, 0);
@@ -1840,6 +1926,7 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	job->payload = payload;
 	job->charge = (uint64_t) size + sizeof(AnnIndexHit) * k;
 	job->composite = submittingComposite;
+	job->compositePart = submittingPart;
 	job->wanted = submittingWanted;
 	if (file)
 		AnnIndexHold(file);		/* until Finish: unloading waits for it */
@@ -1871,7 +1958,7 @@ MicrosecondsSince(const struct timespec *start)
  * --predicate-cache). Returns a referenced bitmap.
  */
 static AnnStatus PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program,
-								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result);
+								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot);
 
 /*
  * Programs being evaluated: a search that misses the cache while another
@@ -1899,7 +1986,7 @@ Evaluating(const AnnIndexFile *file, uint64_t id)
 
 static AnnStatus
 PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
-				AnnIndexBitmap **result)
+				AnnIndexBitmap **result, int snapshot)
 {
 	uint64_t	id = AnnFilterHash(program, size);
 	size_t		nwords = ((size_t) file->rows + 31) / 32;
@@ -1908,7 +1995,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 
 	for (;;)
 	{
-		if ((*result = AnnIndexBitmapGet(file, id, ANN_BITMAP_PREDICATE)) != NULL)
+		if ((*result = AnnIndexBitmapGet(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE)) != NULL)
 		{
 			/* Not under service->mutex: every search would contend for it. */
 			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
@@ -1933,7 +2020,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 		(void) pthread_mutex_unlock(&evaluatingMutex);
 		break;					/* evaluate (unclaimed if every slot is busy) */
 	}
-	status = PredicateEvaluate(service, file, program, size, id, nwords, result);
+	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot);
 	if (slot >= 0)
 	{
 		(void) pthread_mutex_lock(&evaluatingMutex);
@@ -1946,7 +2033,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 
 static AnnStatus
 PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
-				  uint64_t id, size_t nwords, AnnIndexBitmap **result)
+				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot)
 {
 	uint32_t   *words;
 	uint64_t	count;
@@ -1957,7 +2044,7 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	if ((words = malloc(nwords * 4 + 4)) == NULL)
 		return ANN_NOMEM;
 	(void) clock_gettime(CLOCK_MONOTONIC, &start);
-	code = AnnIndexEvaluate(file, program, size, words, &count);
+	code = AnnIndexEvaluate(file, program, size, words, &count, snapshot);
 	if (code != ANN_FILTER_OK)
 	{
 		free(words);
@@ -1967,7 +2054,7 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 
 	/* Keep rows for every filter a scan may take; see SubmitCached. */
 	/* The entry comes back referenced: an eviction meanwhile can't lose it. */
-	status = AnnIndexPredicatePut(file, id, words, nwords, file->device == NULL ? UINT64_MAX :
+	status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words, nwords, file->device == NULL ? UINT64_MAX :
 								  AnnIndexConfig.group_gather_limit > AnnIndexConfig.bitset_gather_limit ?
 								  AnnIndexConfig.group_gather_limit : AnnIndexConfig.bitset_gather_limit, result);
 	free(words);
@@ -2014,6 +2101,7 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 	programLength = (uint32_t) Read(payload + offset + 12, 4);
 	offset += 16;
 	if (dimensions == 0 || dimensions > ANN_MAX_DIM || k == 0 || k > 10000 ||
+		(flags & ~(ANN_PREDICATE_ORDINALS | ANN_PREDICATE_ATTRIBUTES | ANN_PREDICATE_COLLECTION_CODES)) ||
 		(uint64_t) size != offset + (uint64_t) programLength + (uint64_t) dimensions * 4 ||
 		!AnnFilterCheck(payload + offset, programLength))
 		return ANN_INVALID;
@@ -2043,7 +2131,7 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 								 ANN_OP_INDEX_SEARCH_PREDICATE, flags);
 		submittingWanted = 0;
 	}
-	else if ((status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap)) == ANN_OK)
+	else if ((status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap, 0)) == ANN_OK)
 		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
 								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
 	/* The job took its own reference before this one goes. */
@@ -2145,9 +2233,146 @@ SubmitCollection(Service *service, Connection *connection, int rdma, uint64_t re
 				free(part);
 		}
 		if (status != ANN_PENDING)
-			CompositeAnswer(composite, status, NULL, 0, 0, NULL);
+			CompositeAnswer(composite, p, 0, status, NULL, 0, 0, NULL);
 	}
 	free(payload);				/* the parts own their copies */
+	return ANN_PENDING;
+}
+
+/*
+ * Operation 30: u32 name length, name, u32 dimensions, k, flags, program
+ * length, query count, program, then a row-major FP32 query matrix.
+ * A single predicate cache entry and index generation serve all queries.
+ * Reply: u32 query count, then an operation 22 result per query (no
+ * attribute trailer). Queries are scheduled together with other requests.
+ * Up to 64 queries bound both admission overhead and reply allocation.
+ */
+static AnnStatus
+SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request,
+			unsigned char *payload, uint32_t size, uint64_t generation)
+{
+	uint32_t	nameLength,
+				dimensions,
+				k,
+				flags,
+				programLength,
+				parts;
+	size_t		common,
+				queries;
+	Composite  *composite;
+	AnnIndexFile *file;
+	AnnIndexBitmap *bitmap = NULL;
+	AnnStatus	status;
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint32_t	searchK;
+	uint64_t	deleted;
+
+	if (size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
+		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size < 24 + (uint64_t) nameLength ||
+		memchr(payload + 4, '\0', nameLength))
+		return ANN_INVALID;
+	common = 4 + nameLength;
+	dimensions = (uint32_t) Read(payload + common, 4);
+	k = (uint32_t) Read(payload + common + 4, 4);
+	flags = (uint32_t) Read(payload + common + 8, 4);
+	programLength = (uint32_t) Read(payload + common + 12, 4);
+	parts = (uint32_t) Read(payload + common + 16, 4);
+	queries = common + 20 + (size_t) programLength;
+	if (dimensions == 0 || dimensions > ANN_MAX_DIM || k == 0 || k > 10000 ||
+		parts == 0 || parts > 64 || (flags & ~(ANN_PREDICATE_ORDINALS | ANN_PREDICATE_SNAPSHOT)) ||
+		(uint64_t) size != (uint64_t) queries + (uint64_t) parts * dimensions * 4 ||
+		!AnnFilterCheck(payload + common + 20, programLength))
+		return ANN_INVALID;
+	if (service->backend->search_index == NULL)
+		return ANN_UNSUPPORTED;
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
+	if ((file = AnnIndexGet(name)) == NULL)
+		return ANN_STALE;
+
+	/*
+	 * Check the leased file too: another connection can reload after
+	 * dispatch.
+	 */
+	if (generation && file->generationValue != generation)
+	{
+		AnnIndexPut(file);
+		return ANN_GENERATION;
+	}
+	searchK = k;
+	deleted = (flags & ANN_PREDICATE_SNAPSHOT) ? 0 :
+		__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE);
+	if (programLength == 1 && payload[common + 20] == ANN_FILTER_ALL &&
+		(uint64_t) k + deleted <=
+		(service->backend->max_k < 10000 ? service->backend->max_k : 10000))
+		searchK += (uint32_t) deleted;
+	else if ((status = PredicateBitmap(service, file, payload + common + 20,
+									   programLength, &bitmap, (flags & ANN_PREDICATE_SNAPSHOT) != 0)) != ANN_OK)
+	{
+		AnnIndexPut(file);
+		return status;
+	}
+	composite = calloc(1, sizeof(*composite));
+	if (composite == NULL)
+	{
+		if (bitmap)
+			AnnIndexBitmapRelease(file, bitmap);
+		AnnIndexPut(file);
+		return ANN_NOMEM;
+	}
+	composite->hits = malloc(sizeof(AnnIndexHit) * (size_t) k * parts);
+	composite->batch = calloc(parts, sizeof(BatchPart));
+	if (composite->hits == NULL || composite->batch == NULL)
+	{
+		free(composite->hits);
+		free(composite->batch);
+		free(composite);
+		if (bitmap)
+			AnnIndexBitmapRelease(file, bitmap);
+		AnnIndexPut(file);
+		return ANN_NOMEM;
+	}
+	(void) pthread_mutex_init(&composite->mutex, NULL);
+	composite->remaining = composite->parts = parts;
+	composite->k = k;
+	composite->flags = flags;
+	composite->status = ANN_OK;
+	composite->connection = connection;
+	composite->rdma = rdma;
+	composite->request = request;
+	(void) pthread_mutex_lock(&connection->mutex);
+	connection->references++;
+	(void) pthread_mutex_unlock(&connection->mutex);
+	for (uint32_t p = 0; p < parts; p++)
+	{
+		size_t		partSize = (size_t) dimensions * 4;
+		unsigned char *part = malloc(partSize);
+		AnnStatus	partStatus = ANN_NOMEM;
+
+		if (part)
+		{
+			memcpy(part, payload + queries + (size_t) p * dimensions * 4, partSize);
+			if (bitmap)
+				AnnIndexBitmapHold(file, bitmap);
+			submittingWanted = searchK != k ? k : 0;
+			submittingComposite = composite;
+			submittingPart = p;
+			partStatus = SubmitBitmapJob(service, connection, rdma, request, part,
+										 (uint32_t) partSize, file, bitmap, name, dimensions, searchK,
+										 0, ANN_OP_INDEX_SEARCH_BATCH, flags);
+			submittingComposite = NULL;
+			submittingPart = 0;
+			submittingWanted = 0;
+			if (partStatus != ANN_PENDING)
+				free(part);
+		}
+		if (partStatus != ANN_PENDING)
+			CompositeAnswer(composite, p, 0, partStatus, NULL, 0, 0, NULL);
+	}
+	if (bitmap)
+		AnnIndexBitmapRelease(file, bitmap);
+	AnnIndexPut(file);
+	free(payload);
 	return ANN_PENDING;
 }
 
@@ -2178,7 +2403,7 @@ EvaluatePredicate(Service *service, const unsigned char *payload, uint32_t size,
 	name[nameLength] = '\0';
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
-	status = PredicateBitmap(service, file, payload + 4 + nameLength, size - 4 - nameLength, &bitmap);
+	status = PredicateBitmap(service, file, payload + 4 + nameLength, size - 4 - nameLength, &bitmap, 0);
 	if (status == ANN_OK)
 	{
 		nwords = ((size_t) file->rows + 31) / 32;
@@ -2226,7 +2451,8 @@ CheckGeneration(uint16_t operation, const unsigned char *payload, uint32_t size,
 		(operation != ANN_OP_INDEX_SEARCH && operation != ANN_OP_INDEX_SEARCH_PACKED &&
 		 operation != ANN_OP_INDEX_SEARCH_MATCH && operation != ANN_OP_INDEX_SEARCH_BITMAP &&
 		 operation != ANN_OP_INDEX_SEARCH_CACHED && operation != ANN_OP_INDEX_SEARCH_PREDICATE &&
-		 operation != ANN_OP_INDEX_PREDICATE && operation != ANN_OP_BITMAP_PUT) ||
+		 operation != ANN_OP_INDEX_PREDICATE && operation != ANN_OP_INDEX_SEARCH_BATCH &&
+		 operation != ANN_OP_BITMAP_PUT) ||
 		size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
 		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size < 4 + (uint64_t) nameLength)
 		return ANN_OK;
@@ -2449,6 +2675,8 @@ RdmaFrame(void *context, uint64_t peer, unsigned char *frame, size_t size)
 		;
 	else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
 		status = SubmitPredicate(service, connection, 1, request, payload, length);
+	else if (operation == ANN_OP_INDEX_SEARCH_BATCH)
+		status = SubmitBatch(service, connection, 1, request, payload, length, generation);
 	else if (operation == ANN_OP_COLLECTION_SEARCH)
 		status = SubmitCollection(service, connection, 1, request, payload, length);
 	else if (operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED)
@@ -2633,7 +2861,7 @@ Reader(void *argument)
 			(void) pthread_mutex_lock(&service->mutex);
 			if (operation == 0)
 				size = snprintf(message, sizeof(message),
-								"{\"backend\":\"%s\",\"mode\":\"server\",\"operations\":[0,5,7,8,9,10,11,12,13,14,15,16],"
+								"{\"backend\":\"%s\",\"mode\":\"server\",\"operations\":[0,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,25,26,27,28,29,30,31],"
 								"\"metrics_mask\":%u,\"exact\":%s,\"lanes\":%u,\"max_batch_jobs\":%u,"
 								"\"max_frame_bytes\":%u}",
 								service->backend->name, service->backend->metrics,
@@ -2703,12 +2931,43 @@ Reader(void *argument)
 				continue;
 			Reply(connection, operation, request, status, NULL, 0);
 		}
+		else if (operation == ANN_OP_INDEX_SEARCH_BATCH)
+		{
+			status = SubmitBatch(service, connection, 0, request, payload, length, generation);
+			if (status == ANN_PENDING)
+				continue;
+			Reply(connection, operation, request, status, NULL, 0);
+		}
 		else if (operation == ANN_OP_COLLECTION_SEARCH)
 		{
 			status = SubmitCollection(service, connection, 0, request, payload, length);
 			if (status == ANN_PENDING)
 				continue;
 			Reply(connection, operation, request, status, NULL, 0);
+		}
+		else if (operation == ANN_OP_INDEX_ROUTING_STATS)
+		{
+			char		name[ANN_INDEX_NAME_MAX + 1];
+			char		message[8192];
+			size_t		size = 0;
+			AnnIndexFile *file;
+
+			status = ANN_INVALID;
+			if (length > 0 && length <= ANN_INDEX_NAME_MAX && !memchr(payload, '\0', length))
+			{
+				memcpy(name, payload, length);
+				name[length] = '\0';
+				if ((file = AnnIndexGet(name)) == NULL)
+					status = ANN_STALE;
+				else
+				{
+					if (AnnIndexRoutingStats)
+						size = AnnIndexRoutingStats(file, message, sizeof(message));
+					status = size ? ANN_OK : ANN_UNSUPPORTED;
+					AnnIndexPut(file);
+				}
+			}
+			Reply(connection, operation, request, status, (unsigned char *) message, size);
 		}
 		else if (operation == ANN_OP_INDEX_PREDICATE)
 		{

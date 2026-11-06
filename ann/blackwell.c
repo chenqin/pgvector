@@ -878,6 +878,35 @@ AnnBlackwellGroupLimit(int dims)
 }
 
 int
+AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
+						unsigned n, const float *queries, unsigned nq, int dims,
+						float *out, void *stream)
+{
+	BlackwellModule *module = &modules[device];
+	unsigned	rowBytes = shard->rowBytes;
+	unsigned	blocks = shard->blocks;
+	int			count = (int) nq;
+	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
+	unsigned	shared = (16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t);
+	unsigned	grid = (n + 127) / 128;
+	void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+	&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dims, &out};
+
+	if (n == 0 || nq == 0 || nq > (unsigned) AnnBlackwellGroupLimit(dims) ||
+		shard->quant == ANN_QUANT_NONE || module->state <= 0 ||
+		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
+		return 0;
+	if (grid > (unsigned) module->sms * 4)
+		grid = (unsigned) module->sms * 4;
+	if (shard->quant == ANN_QUANT_FP8)
+		blocks = rowBytes / 16;
+	else if (shard->quant >= ANN_BLACKWELL_HALF)
+		blocks = ((unsigned) dims + 15) / 16;
+	return cuLaunchKernel(module->mma[shard->quant - 1][width], grid, 1, 1,
+						  ANN_BLACKWELL_BLOCK, 1, 1, shared, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
+}
+
+int
 AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, const uint32_t *rows, unsigned n,
 				   const float *queries, unsigned nq, int dims, void *stream)
 {

@@ -13,6 +13,8 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
+import struct
 import subprocess
 import tempfile
 import threading
@@ -126,6 +128,36 @@ class Monitor:
                     os_states=dict(self.states), gpu_samples=gpus, monitor_errors=self.errors)
 
 
+def routing_stats(path, index):
+    """A control request outside the timed workload; old workers may lack it."""
+    if not index:
+        return None
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(path)
+            payload = index.encode()
+            connection.sendall(b'PVAN' + struct.pack('<HHQQII', 1, 31, 1, 0, len(payload), 0) + payload)
+
+            def receive(size):
+                data = b''
+                while len(data) < size:
+                    chunk = connection.recv(size - len(data))
+                    if not chunk:
+                        raise EOFError('routing stats connection closed')
+                    data += chunk
+                return data
+
+            header = receive(32)
+            version, operation, request, generation, size, status = struct.unpack('<HHQQII', header[4:])
+            if header[:4] != b'PVAN' or version != 1 or operation != 31 or request != 1 or size > 65536:
+                raise ValueError('malformed routing stats header')
+            data = receive(size)
+            return json.loads(data) if status == 0 else {'status': status}
+    except (OSError, EOFError, ValueError) as error:
+        return {'error': str(error)}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--dsn', default=os.environ.get('ANN_PG_DSN'), required=not os.environ.get('ANN_PG_DSN'))
@@ -135,6 +167,9 @@ def main():
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--log-dir', default='/dev/shm')
     parser.add_argument('--k', type=int, default=500)
+    parser.add_argument('--batch-queries', type=int, default=0, metavar='N',
+                        help='use the SQL matrix API with 1..64 vectors per request; 0 uses the scan route')
+    parser.add_argument('--index-name', help='loaded frozen index name, required with --batch-queries')
     parser.add_argument('--clients', default='1,8,32,64,128')
     parser.add_argument('--threads', type=int, default=32)
     parser.add_argument('--seconds', type=int, default=15)
@@ -147,16 +182,23 @@ def main():
                         default='force_generic_plan')
     parser.add_argument('--setup-cost', type=float, default=1000.0)
     parser.add_argument('--prefetch-distance', type=int, choices=range(65))
+    parser.add_argument('--materialize-batch', type=int, default=0, metavar='ROWS',
+                        help='mapped TID visibility window for covering scans, 0 disables, maximum 1024')
     parser.add_argument('--profile-library', help='optional session preload library for isolated debugger runs')
     parser.add_argument('--count-only', action='store_true', help='diagnostic: aggregate the 500 rows on the server')
     args = parser.parse_args()
+    if not 0 <= args.materialize_batch <= 1024:
+        parser.error('materialization batch must be between 0 and 1024')
     if not 1 <= args.k <= 10000 or args.seconds < 1 or not np.isfinite(args.setup_cost) or args.setup_cost < 0:
         parser.error('k must be 1..10000, seconds must be positive and setup cost must be finite and nonnegative')
+    if not 0 <= args.batch_queries <= 64 or (args.batch_queries and not args.index_name):
+        parser.error('batch queries must be 0..64 and require --index-name when enabled')
     args.output.mkdir(parents=True, exist_ok=True)
     results = []
     with psycopg.connect(args.dsn) as db:
         table = identifier(args.table).as_string(db)
         queries = identifier(args.queries).as_string(db)
+        index_name = sql.Literal(args.index_name).as_string(db) if args.index_name else None
     for workload in args.workloads.split(','):
         if workload not in WORKLOADS:
             parser.error(f'unknown workload: {workload}')
@@ -168,11 +210,22 @@ def main():
             with tempfile.TemporaryDirectory(prefix='frozen-pgbench-', dir=args.log_dir) as directory:
                 script = Path(directory) / 'query.sql'
                 query = f'SELECT id FROM {table} WHERE {WORKLOADS[workload]} ORDER BY emb <-> :v::vector LIMIT {args.k}'
+                setup = (f'SELECT v FROM {queries} WHERE q=:q \\gset\n')
+                if args.batch_queries:
+                    predicate = {
+                        '0.1pct': "format('tenant = %s', :t::integer)",
+                        '1pct': "format('category = %s', :c::integer)",
+                        '10pct': "format('category BETWEEN %s AND %s', :d * 10, :d * 10 + 9)",
+                    }[workload]
+                    query = (f'SELECT id FROM ann_frozen_search_batch({index_name}, :batch::vector[], '
+                             f'{args.k}, {predicate})')
+                    setup = (f'SELECT array_agg(v ORDER BY q)::text AS batch FROM {queries} '
+                             f'WHERE q >= :q AND q < :q + {args.batch_queries} \\gset\n')
                 if args.count_only:
                     query = f'SELECT count(*) FROM ({query}) hits'
-                script.write_text('\\set q random(1,1000)\n\\set t random(0,99)\n'
-                                  '\\set c random(0,99)\n\\set d random(0,9)\n'
-                                  f'SELECT v FROM {queries} WHERE q=:q \\gset\n{query};\n')
+                script.write_text(f'\\set q random(1,{1001 - max(args.batch_queries, 1)})\n'
+                                  '\\set t random(0,99)\n\\set c random(0,99)\n\\set d random(0,9)\n'
+                                  + setup + query + ';\n')
                 env = dict(os.environ, PGAPPNAME=application,
                            PGOPTIONS=(f'-c ann.worker_socket={args.socket} -c ann.enable_frozen_search=on '
                                       f'-c ann.frozen_mmap={args.mmap} -c ann.frozen_filter_local_cache_mb={args.local_cache_mb} '
@@ -182,9 +235,11 @@ def main():
                     env['PGOPTIONS'] += f' -c session_preload_libraries={args.profile_library}'
                 if args.prefetch_distance is not None:
                     env['PGOPTIONS'] += f' -c ann.frozen_prefetch_distance={args.prefetch_distance}'
+                env['PGOPTIONS'] += f' -c ann.frozen_materialize_batch={args.materialize_batch}'
                 command = ['pgbench', args.dsn, '-n', '-M', 'prepared', '-c', str(clients),
                            '-j', str(min(clients, args.threads)), '-T', str(args.seconds), '-r',
                            '-f', str(script), '-l', '--sampling-rate=0.05', '--log-prefix', str(Path(directory) / 'latency')]
+                routing_before = routing_stats(args.socket, args.index_name)
                 monitor = Monitor(args.dsn, application, args.worker_pid)
                 monitor.start()
                 started = time.monotonic()
@@ -216,6 +271,11 @@ def main():
                 row = dict(label=args.label, workload=workload, clients=clients, k=args.k,
                            plan_cache_mode=args.plan_cache_mode, setup_cost=args.setup_cost,
                            prefetch_distance=args.prefetch_distance,
+                           materialize_batch=args.materialize_batch,
+                           batch_queries=args.batch_queries, index_name=args.index_name,
+                           routing_stats_before=routing_before,
+                           routing_stats_after=routing_stats(args.socket, args.index_name),
+                           vector_qps=float(tps.group(1)) * max(args.batch_queries, 1) if tps else None,
                            mmap=args.mmap, local_cache_mb=args.local_cache_mb,
                            client_threads=min(clients,args.threads), table=args.table, query_table=args.queries,
                            count_only=args.count_only, seconds=elapsed,
@@ -227,7 +287,7 @@ def main():
                            **metrics)
                 results.append(row)
                 (args.output / f'{tag}.json').write_text(json.dumps(row, indent=2) + '\n')
-                print(json.dumps({key:row[key] for key in ['label','workload','clients','qps','p50_ms','p95_ms','p99_ms','failed_transactions']}), flush=True)
+                print(json.dumps({key:row[key] for key in ['label','workload','clients','qps','vector_qps','p50_ms','p95_ms','p99_ms','failed_transactions']}), flush=True)
                 if returncode != 0 or not tps or row['failed_transactions']:
                     raise RuntimeError(f'pgbench failed; inspect {args.output / (tag + ".pgbench.txt")}')
     (args.output / f'{args.label}-results.json').write_text(json.dumps(results, indent=2) + '\n')

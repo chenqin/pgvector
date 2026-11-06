@@ -53,6 +53,7 @@
 bool		ann_enable_frozen_search = true;
 static double ann_frozen_setup_cost = 1000.0;
 static int	ann_frozen_prefetch_distance = 4;
+static int	ann_frozen_materialize_batch = 64;
 static set_rel_pathlist_hook_type previous_pathlist_hook = NULL;
 
 typedef struct FrozenScanState
@@ -80,6 +81,12 @@ typedef struct FrozenScanState
 	AnnArrayReader *values;
 	Vector	   *vector;			/* the returned row's vector */
 	MemoryContext resultCtx;
+	MemoryContext batchCtx;
+	bool	   *batchValid;
+	ItemPointerData *batchTids;
+	uint64		batchFirst;
+	uint64		batchEnd;
+	bool		batchUnavailable;
 
 	/* One execution's results, in distance order. */
 	bool		started;
@@ -102,6 +109,8 @@ typedef struct FrozenScanState
 	uint64		heapFetches;
 	uint64		workerCalls;
 	uint64		localRuns;
+	uint64		materializedRows;
+	uint64		mappedTidRows;
 	int			workerRoute;
 } FrozenScanState;
 
@@ -322,6 +331,8 @@ BeginFrozenScan(CustomScanState *node, EState *estate, int eflags)
 		state->vmbufs[i] = InvalidBuffer;
 	state->resultCtx = AllocSetContextCreate(estate->es_query_cxt, "Ann frozen search results",
 											 ALLOCSET_DEFAULT_SIZES);
+	state->batchCtx = AllocSetContextCreate(estate->es_query_cxt, "Ann frozen materialization batch",
+											ALLOCSET_DEFAULT_SIZES);
 	AnnArrayReaderInit(&state->tids, state->index, &state->meta->tids, NULL);
 	AnnArrayReaderInit(&state->keys, state->index, &state->meta->keys, NULL);
 	AnnArrayReaderInit(&state->vectors, state->index, &state->meta->vectors, NULL);
@@ -744,6 +755,7 @@ Fill(FrozenScanState *state)
 	}
 	state->nresults = 0;
 	state->next = 0;
+	state->batchFirst = state->batchEnd = 0;
 	if (!(state->workerName && !state->workerFailed && !state->workerShort && !state->queryIsNull &&
 		  k <= ANN_FROZEN_WORKER_MAX_K && WorkerSearch(state, k)))
 		LocalSearch(state);
@@ -812,24 +824,6 @@ StoreFromPages(FrozenScanState *state, TupleTableSlot *slot, uint64 ordinal)
 	ExecStoreVirtualTuple(slot);
 }
 
-/*
- * Distance-ordered hits jump among heap blocks. Keep a bounded set of VM
- * pages pinned instead of releasing and pinning one page for every jump.
- * Only the pins are reused: VM_ALL_VISIBLE still reads the current bit for
- * every tuple, including after a rescan or a concurrent visibility change.
- * The slot calculation follows PostgreSQL's visibility-map page layout;
- * visibilitymap_get_status itself validates each supplied buffer's tag.
- */
-static bool
-FrozenAllVisible(FrozenScanState *state, Relation heap, BlockNumber block)
-{
-	uint32		blocksPerPage = (BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) *
-		(BITS_PER_BYTE / BITS_PER_HEAPBLOCK);
-	uint32		slot = (block / blocksPerPage) % ANN_FROZEN_VM_BUFFERS;
-
-	return VM_ALL_VISIBLE(heap, block, &state->vmbufs[slot]);
-}
-
 /* Issue cache hints in result order without reading mutable TIDs or VM bits. */
 static void
 PrefetchResult(FrozenScanState *state, uint64 position)
@@ -845,6 +839,49 @@ PrefetchResult(FrozenScanState *state, uint64 position)
 		AnnArrayPrefetch(&state->values[c], ordinal);
 }
 
+/*
+ * Validate a bounded result window using unchanged mapped TIDs. Cache only
+ * all-visible proofs; the statement snapshot protects these rows until emit.
+ * On old or physically vacuumed indexes, use the ordinary live-buffer path.
+ */
+static void
+MaterializeBatch(FrozenScanState *state)
+{
+	ScanState  *node = &state->css.ss;
+	TupleTableSlot *slot = node->ss_ScanTupleSlot;
+	MemoryContext old;
+	uint64		n;
+
+	ExecClearTuple(slot);
+	MemoryContextReset(state->batchCtx);
+	old = MemoryContextSwitchTo(state->batchCtx);
+	state->batchFirst = state->next;
+	n = Min((uint64) ann_frozen_materialize_batch, state->nresults - state->next);
+	state->batchEnd = state->next + n;
+	state->batchValid = palloc0(n * sizeof(bool));
+	state->batchTids = palloc(n * sizeof(ItemPointerData));
+	if (AnnFrozenVisibleTids(state->index, node->ss_currentRelation, state->meta,
+							 state->ordinals + state->next, n, state->batchTids,
+							 state->batchValid, state->vmbufs, ANN_FROZEN_VM_BUFFERS))
+	{
+		for (uint64 i = 0; i < n; i++)
+		{
+			uint64		ordinal = state->ordinals[state->next + i];
+
+			if (AlreadyReturned(state, ordinal) ||
+				(state->ntombstones && bsearch(&ordinal, state->tombstones, state->ntombstones,
+											   sizeof(uint64), OrdinalCompare)))
+				state->batchValid[i] = false;
+			if (state->batchValid[i])
+				state->mappedTidRows++;
+		}
+		MemoryContextSwitchTo(old);
+		return;
+	}
+	state->batchUnavailable = true;
+	MemoryContextSwitchTo(old);
+}
+
 static TupleTableSlot *
 FrozenNext(ScanState *node)
 {
@@ -855,6 +892,7 @@ FrozenNext(ScanState *node)
 	{
 		uint64		ordinal;
 		ItemPointerData tid;
+		bool		visible = false;
 
 		if (!state->started || (state->next >= state->nresults && !state->exhausted))
 		{
@@ -873,17 +911,36 @@ FrozenNext(ScanState *node)
 			if (state->nresults - state->next > distance)
 				PrefetchResult(state, state->next + distance);
 		}
+		if (state->covering && ann_frozen_materialize_batch > 0 && !state->batchUnavailable)
+		{
+			uint64		position;
+
+			if (state->next < state->batchFirst || state->next >= state->batchEnd)
+				MaterializeBatch(state);
+			position = state->next - state->batchFirst;
+			if (state->batchValid[position])
+			{
+				StoreFromPages(state, slot, state->ordinals[state->next]);
+				state->materializedRows++;
+				slot->tts_tid = state->batchTids[position];
+				state->next++;
+				return slot;
+			}
+		}
 		ordinal = state->ordinals[state->next++];
 		if (ordinal >= state->meta->rows || AlreadyReturned(state, ordinal))
 			continue;
 		if (state->ntombstones &&
 			bsearch(&ordinal, state->tombstones, state->ntombstones, sizeof(uint64), OrdinalCompare))
 			continue;			/* deleted (ann_frozen_delete) */
-		AnnArrayRead(&state->tids, ordinal, &tid);
+		if (state->covering)
+			AnnFrozenReadTid(&state->tids, node->ss_currentRelation, ordinal, &tid, &visible,
+							 state->vmbufs, ANN_FROZEN_VM_BUFFERS);
+		else
+			AnnArrayRead(&state->tids, ordinal, &tid);
 		if (!ItemPointerIsValid(&tid))
 			continue;
-		if (state->covering &&
-			FrozenAllVisible(state, node->ss_currentRelation, ItemPointerGetBlockNumber(&tid)))
+		if (visible)
 		{
 			StoreFromPages(state, slot, ordinal);
 			slot->tts_tid = tid;
@@ -920,6 +977,11 @@ ExecFrozenScan(CustomScanState *node)
 static void
 ResetResults(FrozenScanState *state)
 {
+	ExecClearTuple(state->css.ss.ss_ScanTupleSlot);
+	MemoryContextReset(state->batchCtx);
+	state->batchValid = NULL;
+	state->batchTids = NULL;
+	state->batchFirst = state->batchEnd = 0;
 	MemoryContextReset(state->resultCtx);
 	state->started = false;
 	state->ordinals = NULL;
@@ -956,6 +1018,7 @@ EndFrozenScan(CustomScanState *node)
 			ReleaseBuffer(state->vmbufs[i]);
 	index_close(state->index, AccessShareLock);
 	MemoryContextDelete(state->resultCtx);
+	MemoryContextDelete(state->batchCtx);
 }
 
 static void
@@ -975,12 +1038,18 @@ ExplainFrozenScan(CustomScanState *node, List *ancestors, ExplainState *es)
 		ExplainPropertyInteger("Heap Fetches", NULL, state->heapFetches, es);
 		ExplainPropertyInteger("Worker Calls", NULL, state->workerCalls, es);
 		ExplainPropertyInteger("Local Evaluations", NULL, state->localRuns, es);
+		ExplainPropertyInteger("Materialized Rows", NULL, state->materializedRows, es);
+		ExplainPropertyInteger("Mapped TID Rows", NULL, state->mappedTidRows, es);
 	}
 }
 
 void
 AnnFrozenScanInit(void)
 {
+	DefineCustomIntVariable("ann.frozen_materialize_batch",
+							"Validate covering result visibility in batches (0 disables).",
+							NULL, &ann_frozen_materialize_batch, 64, 0, 1024, PGC_USERSET,
+							0, NULL, NULL, NULL);
 	DefineCustomIntVariable("ann.frozen_prefetch_distance",
 							"Result rows ahead to prefetch immutable mapped columns (0 disables).",
 							NULL, &ann_frozen_prefetch_distance, 4, 0, 64, PGC_USERSET,

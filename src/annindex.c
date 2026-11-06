@@ -1,6 +1,11 @@
 #include "postgres.h"
 
 #include "access/table.h"
+#include "access/tableam.h"
+#include "access/visibilitymap.h"
+#include "ann/filter.h"
+#include "executor/executor.h"
+#include "utils/snapmgr.h"
 #include "access/xact.h"
 #include "ann.h"
 #include "catalog/namespace.h"
@@ -39,6 +44,7 @@
 #define ANN_INDEX_MAX_K 10000
 #define ANN_LOAD_TIMEOUT_MS (30 * 60 * 1000)
 #define ANN_KEY_FETCH 65536
+#define ANN_BATCH_VM_BUFFERS 32
 
 
 /* What the worker reports for a loaded index. */
@@ -454,6 +460,7 @@ LookupCatalog(FunctionCallInfo fcinfo, const char *name, AnnCatalogEntry *entry)
 	Oid			types[1] = {TEXTOID};
 	Datum		values[1];
 	bool		found;
+	MemoryContext caller = CurrentMemoryContext;
 
 	values[0] = CStringGetTextDatum(name);
 	if (SPI_connect() != SPI_OK_CONNECT)
@@ -465,7 +472,7 @@ LookupCatalog(FunctionCallInfo fcinfo, const char *name, AnnCatalogEntry *entry)
 	found = SPI_processed == 1;
 	if (found)
 	{
-		MemoryContext old = MemoryContextSwitchTo(fcinfo->flinfo->fn_mcxt);
+		MemoryContext old = MemoryContextSwitchTo(caller);
 
 		entry->source = pstrdup(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1));
 		entry->key = pstrdup(quote_identifier(SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2)));
@@ -1714,6 +1721,295 @@ TombstoneTable(FunctionCallInfo fcinfo)
 	char	   *schema = get_namespace_name(get_func_namespace(fcinfo->flinfo->fn_oid));
 
 	return psprintf("%s.ann_frozen_tombstone", quote_identifier(schema));
+}
+
+/*
+ * One worker request for a query matrix and one predicate. The frozen table
+ * stays locked throughout; visibility and local tombstones use the statement
+ * snapshot for every vector, including exact fallback for an underfilled list.
+ */
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_search_batch);
+Datum
+ann_frozen_search_batch(PG_FUNCTION_ARGS)
+{
+	TupleDesc	tupdesc;
+	Tuplestorestate *store;
+	const char *name;
+	ArrayType  *array;
+	Datum	   *queries;
+	bool	   *queryNulls;
+	int			nqueries;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	Oid			vectorType;
+	int32		k;
+	int			dimensions = 0;
+	AnnCatalogEntry entry;
+	Oid			relid;
+	Relation	heap;
+	Relation	index;
+	AnnFrozenMetaData *meta;
+	AnnPredicateColumns columns;
+	StringInfoData program;
+	StringInfoData payload;
+	char	   *filter = NULL;
+	int64	   *deleted;
+	int			ndeleted;
+	MemoryContext caller = CurrentMemoryContext;
+	uint32		status = 0;
+	char	   *reply = NULL;
+	uint32		replyLength;
+	uint32		count;
+	size_t		offset;
+	AnnArrayReader tids;
+	AnnArrayReader keys;
+	Buffer		vmbufs[ANN_BATCH_VM_BUFFERS];
+	uint64	   *ordinals;
+	ItemPointerData *batchTids;
+	bool	   *visible;
+	IndexFetchTableData *fetch;
+	TupleTableSlot *slot;
+	Snapshot	snapshot = GetActiveSnapshot();
+
+	for (int i = 0; i < ANN_BATCH_VM_BUFFERS; i++)
+		vmbufs[i] = InvalidBuffer;
+	InitResult(fcinfo, &tupdesc, &store);
+	if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2))
+		return (Datum) 0;
+	name = CheckName(PG_GETARG_TEXT_PP(0));
+	array = PG_GETARG_ARRAYTYPE_P(1);
+	k = CheckK(PG_GETARG_INT32(2));
+	if (ARR_NDIM(array) > 1)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("queries must be a one-dimensional vector array")));
+	vectorType = ARR_ELEMTYPE(array);
+	get_typlenbyvalalign(vectorType, &typlen, &typbyval, &typalign);
+	deconstruct_array(array, vectorType, typlen, typbyval, typalign, &queries, &queryNulls, &nqueries);
+	if (nqueries > 64)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg("a batch supports at most 64 queries")));
+	if (nqueries == 0)
+		return (Datum) 0;
+	for (int q = 0; q < nqueries; q++)
+	{
+		Vector	   *query;
+
+		if (queryNulls[q])
+			ereport(ERROR, (errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED), errmsg("batch queries must not contain nulls")));
+		query = DatumGetVector(queries[q]);
+		queries[q] = PointerGetDatum(query);
+		if (q && query->dim != dimensions)
+			ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("batch query dimensions must agree")));
+		dimensions = query->dim;
+	}
+	if (!LookupCatalog(fcinfo, name, &entry) || entry.generation == 0)
+		ereport(ERROR, (errcode(ERRCODE_UNDEFINED_OBJECT),
+						errmsg("ann index \"%s\" is not an export of a frozen index in this database's catalog", name)));
+	relid = DatumGetObjectId(DirectFunctionCall1(regclassin, CStringGetDatum(entry.source)));
+	heap = table_open(relid, AccessShareLock);
+	{
+		AclResult	acl = pg_class_aclcheck(relid, GetUserId(), ACL_SELECT);
+
+		if (acl != ACLCHECK_OK)
+			aclcheck_error(acl, OBJECT_TABLE, get_rel_name(relid));
+		if (check_enable_rls(relid, InvalidOid, false) == RLS_ENABLED)
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("ann_frozen_search_batch does not support row-level security")));
+	}
+	index = AnnFrozenIndexOf(relid, entry.generation, AccessShareLock);
+	if (index == NULL)
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("%s has no frozen ann index with the generation of \"%s\"", entry.source, name)));
+	meta = AnnFrozenGetMeta(index, false);
+	if (TupleDescAttr(RelationGetDescr(index), 0)->atttypmod != dimensions)
+		ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("batch query dimensions do not match the index")));
+	AnnPredicateColumnsInit(index, &columns);
+	initStringInfo(&program);
+	if (!PG_ARGISNULL(3))
+	{
+		filter = text_to_cstring(PG_GETARG_TEXT_PP(3));
+		if (!AnnPredicateFromText(relid, filter, &columns, &program))
+			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							errmsg("batch filter must be a predicate over the index's INCLUDE attributes")));
+	}
+	else
+		appendStringInfoChar(&program, ANN_FILTER_ALL);
+
+	/*
+	 * Read once, with the same active snapshot as every tuple visibility
+	 * check.
+	 */
+	if (SPI_connect() != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed");
+	{
+		Oid			types[1] = {OIDOID};
+		Datum		values[1] = {ObjectIdGetDatum(relid)};
+
+		if (SPI_execute_with_args(psprintf("SELECT key FROM %s WHERE source = $1 ORDER BY key", TombstoneTable(fcinfo)),
+								  1, types, values, NULL, true, 0) != SPI_OK_SELECT)
+			elog(ERROR, "could not read the ann tombstones");
+		ndeleted = (int) SPI_processed;
+		deleted = MemoryContextAlloc(caller, sizeof(int64) * Max(ndeleted, 1));
+		for (int i = 0; i < ndeleted; i++)
+		{
+			bool		isnull;
+
+			deleted[i] = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull));
+		}
+	}
+	SPI_finish();
+	initStringInfo(&payload);
+	Put32(&payload, strlen(name));
+	appendBinaryStringInfo(&payload, name, strlen(name));
+	Put32(&payload, dimensions);
+	Put32(&payload, k);
+	Put32(&payload, ANN_PREDICATE_ORDINALS | ANN_PREDICATE_SNAPSHOT);
+	Put32(&payload, program.len);
+	Put32(&payload, nqueries);
+	appendBinaryStringInfo(&payload, program.data, program.len);
+	for (int q = 0; q < nqueries; q++)
+		appendBinaryStringInfo(&payload, (char *) DatumGetVector(queries[q])->x, sizeof(float) * dimensions);
+	{
+		bool		ok;
+		uint64		previous = ann_request_generation;
+
+		ann_request_generation = entry.generation;
+		PG_TRY();
+		{
+			ok = AnnIndexCall(ANN_OP_INDEX_SEARCH_BATCH, payload.data, payload.len, 0,
+							  &status, &reply, &replyLength);
+		}
+		PG_FINALLY();
+		{
+			ann_request_generation = previous;
+		}
+		PG_END_TRY();
+		CheckWorker(ok, status, name);
+	}
+	if (replyLength < 4)
+		elog(ERROR, "malformed ann worker batch reply");
+	memcpy(&count, reply, 4);
+	if (count != (uint32) nqueries)
+		elog(ERROR, "malformed ann worker batch query count");
+	AnnArrayReaderInit(&tids, index, &meta->tids, NULL);
+	AnnArrayReaderInit(&keys, index, &meta->keys, NULL);
+	fetch = table_index_fetch_begin(heap);
+	slot = table_slot_create(heap, NULL);
+	ordinals = palloc(sizeof(uint64) * k);
+	batchTids = palloc(sizeof(ItemPointerData) * k);
+	visible = palloc(sizeof(bool) * k);
+	offset = 4;
+	for (int q = 0; q < nqueries; q++)
+	{
+		Datum	   *ids;
+		Datum	   *distances;
+		int			kept = 0;
+		uint64		eligible;
+		bool		mapped;
+
+		CHECK_FOR_INTERRUPTS();
+		if (offset + 16 > replyLength)
+			elog(ERROR, "malformed ann worker batch result header");
+		memcpy(&count, reply + offset, 4);
+		memcpy(&eligible, reply + offset + 8, 8);
+		offset += 16;
+		if (count > (uint32) k || count > eligible || eligible > meta->rows || (uint64) offset + (uint64) count * 12 > replyLength)
+			elog(ERROR, "malformed ann worker batch result size");
+		for (uint32 i = 0; i < count; i++)
+			memcpy(&ordinals[i], reply + offset + (size_t) i * 12, 8);
+		mapped = AnnFrozenVisibleTids(index, heap, meta, ordinals, count, batchTids,
+									  visible, vmbufs, ANN_BATCH_VM_BUFFERS);
+		ids = palloc(sizeof(Datum) * Max(count, 1));
+		distances = palloc(sizeof(Datum) * Max(count, 1));
+		for (uint32 i = 0; i < count; i++)
+		{
+			uint64		ordinal;
+			float		distance;
+			int64		key;
+			ItemPointerData tid;
+			bool		callAgain = false;
+			bool		allDead = false;
+			bool		allVisible;
+
+			memcpy(&ordinal, reply + offset, 8);
+			memcpy(&distance, reply + offset + 8, 4);
+			offset += 12;
+			if (ordinal >= meta->rows)
+				elog(ERROR, "ann worker returned an invalid batch ordinal");
+			AnnArrayRead(&keys, ordinal, &key);
+			if (ndeleted && bsearch(&key, deleted, ndeleted, sizeof(int64), KeyCompare))
+				continue;
+			if (mapped && visible[i])
+			{
+				ids[kept] = Int64GetDatum(key);
+				distances[kept++] = Float4GetDatum(distance);
+				continue;
+			}
+			AnnFrozenReadTid(&tids, heap, ordinal, &tid, &allVisible,
+							 vmbufs, ANN_BATCH_VM_BUFFERS);
+			if (!ItemPointerIsValid(&tid))
+				continue;
+			if (!allVisible &&
+				!table_index_fetch_tuple(fetch, &tid, snapshot, slot, &callAgain, &allDead))
+				continue;
+			ids[kept] = Int64GetDatum(key);
+			distances[kept++] = Float4GetDatum(distance);
+		}
+		if (kept < k && (kept < (int) count || count < eligible))
+		{
+			/*
+			 * Local visibility consumed hits, or an approximate worker search
+			 * returned fewer than k while more rows qualify.
+			 */
+			Oid			types[2] = {vectorType, INT4OID};
+			Datum		values[2] = {queries[q], Int32GetDatum(k)};
+			char	   *sql = psprintf("SELECT %s::bigint, (%s <-> $1)::real AS distance FROM %s "
+									   "WHERE (%s) AND NOT EXISTS (SELECT 1 FROM %s d WHERE d.source = %u::oid AND d.key = %s.%s) "
+									   "ORDER BY distance, 1 LIMIT $2", entry.key, entry.vector, entry.source,
+									   filter ? filter : "true", TombstoneTable(fcinfo), relid, entry.source, entry.key);
+
+			if (SPI_connect() != SPI_OK_CONNECT)
+				elog(ERROR, "SPI_connect failed");
+			if (SPI_execute_with_args(sql, 2, types, values, NULL, true, 0) != SPI_OK_SELECT)
+				elog(ERROR, "ann batch visibility fallback failed");
+			for (uint64 i = 0; i < SPI_processed; i++)
+			{
+				Datum		row[3];
+				bool		nulls[3] = {false, false, false};
+
+				row[0] = Int32GetDatum(q + 1);
+				row[1] = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &nulls[1]);
+				row[2] = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &nulls[2]);
+				tuplestore_putvalues(store, tupdesc, row, nulls);
+			}
+			SPI_finish();
+		}
+		else
+			for (int i = 0; i < kept; i++)
+			{
+				Datum		row[3] = {Int32GetDatum(q + 1), ids[i], distances[i]};
+				bool		nulls[3] = {false, false, false};
+
+				tuplestore_putvalues(store, tupdesc, row, nulls);
+			}
+		pfree(ids);
+		pfree(distances);
+	}
+	if (offset != replyLength)
+		elog(ERROR, "malformed ann worker batch reply trailer");
+	pfree(ordinals);
+	pfree(batchTids);
+	pfree(visible);
+	ExecDropSingleTupleTableSlot(slot);
+	table_index_fetch_end(fetch);
+	for (int i = 0; i < ANN_BATCH_VM_BUFFERS; i++)
+		if (BufferIsValid(vmbufs[i]))
+			ReleaseBuffer(vmbufs[i]);
+	AnnArrayReaderEnd(&tids);
+	AnnArrayReaderEnd(&keys);
+	index_close(index, AccessShareLock);
+	table_close(heap, AccessShareLock);
+	return (Datum) 0;
 }
 
 /* After a load or attach: the table's tombstones to the loaded name. */

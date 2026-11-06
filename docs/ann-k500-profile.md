@@ -276,3 +276,298 @@ The retained defaults are SQL lookahead four and worker lookahead eight. Raw
 logs and selector probe sources remain in `~/pgvector-test.tKp5o0/prefetch-test/`
 on the node. Full measurements, source hashes and accuracy checks are in the
 [prefetch result artifact](../benchmarks/ann/results/frozen-k500-prefetch.json).
+
+## Multi-vector SQL follow-up, 2026-11-05
+
+`ann_frozen_search_batch` now sends 1–64 vectors and one shared predicate in
+one worker request, with separate top-k lists. PostgreSQL pins the source
+index generation, checks SELECT permissions and RLS, and uses one statement
+snapshot for visibility and soft deletions. Snapshot searches retain worker
+tombstone candidates and use a separate, budgeted predicate-cache namespace.
+A short result after visibility filtering is filled by exact SQL. This also
+handles soft deletes committed by another session after a repeatable-read
+snapshot was taken.
+
+The first implementation repeatedly switched a single visibility-map buffer
+pin. Retaining 32 pins, as the ordinary frozen route does, and removing an
+unnecessary vector parse from benchmark query setup improved the sweep.
+These two adjustments were measured together. Catalog lookup strings now
+live in the caller's memory context instead of accumulating in the function
+context across prepared-statement executions.
+
+Eight B200s, 64 worker lanes, 64 PostgreSQL clients, 32 pgbench threads,
+10M × 128 dimensions, k=500, 15 seconds per point, all 500 keys returned per
+vector; no failures or physical disk reads:
+
+| SQL path | 0.1% vectors/sec | 1% vectors/sec | 10% vectors/sec | 10% transaction p99 |
+|---|---:|---:|---:|---:|
+| Ordinary frozen scan | 52,075 | 50,214 | 34,328 | 3.12 ms |
+| Batch of 1 | 54,725 | 51,791 | 35,436 | 2.50 ms |
+| Batch of 4 | 93,028 | 89,027 | 62,489 | 5.47 ms |
+| Batch of 8 | 103,213 | 99,837 | 76,629 | 9.64 ms |
+| Batch of 16 | 109,102 | 104,357 | 86,600 | 16.88 ms |
+
+Each batch transaction includes all its vectors and results; its latency is
+not a single-vector latency. `qps` in the result files counts transactions,
+while `vector_qps` counts searches. For the 10% filter, the 16-vector run
+used about 40.6 PostgreSQL cores and 46.8 worker cores, versus 26.6 and 30.4
+for the 64-client ordinary scan. PostgreSQL CPU per search fell from about
+775 to 469 microseconds. GPU utilization remained high in both runs; that
+metric alone does not identify a compute or bandwidth limit.
+
+These are short comparisons at 64 clients. The earlier 256-client scan
+measurements in this document are a different concurrency point; longer
+saturation sweeps remain pending. The raw initial and tuned results, CPU,
+latency and GPU samples are in
+[`frozen-k500-matrix.json`](../benchmarks/ann/results/frozen-k500-matrix.json).
+The measurements precede final checks restricting the snapshot flag to
+matrix requests and handling short approximate results; neither changes
+the normal full-result benchmark path.
+
+Example against the private GPU-node deployment after sourcing its env.sh:
+
+```sh
+python benchmarks/ann/frozen_stress.py \
+  --socket "$task_root/run/k500.sock" \
+  --index-name frozen_stress --batch-queries 8 \
+  --clients 64 --threads 32 --seconds 60 --k 500 \
+  --output "$task_root/replication-next/batch-confirm" --label matrix8
+```
+
+This completes a first implementation of the SQL batch path. Page-local
+materialization still regresses and remains disabled by default. The
+load-aware routing follow-up below implements and benchmarks replica choice;
+generalized k=500 GPU selection/reranking remains unfinished. Existing k=500 gather jobs continue using the existing selector.
+
+Validation: all 16 cuVS tests passed (including the new k=500 query-matrix
+test), all 30 frozen tests passed across CPU/GPU runs, and seven worker
+predicate-cache tests passed. A final build with the leased-generation check
+also passed the GPU k=500 matrix test. Its five-second 10% smoke run returned
+85,521 vectors/sec with zero failures; it is recorded separately from the
+15-second sweep. Local fresh-install and 0.9.0-to-0.9.3 upgrade checks expose
+the new SQL function. The private GPU-node worker remains running.
+
+## Load-aware replica routing follow-up, 2026-11-05
+
+The worker now supports `--replica-routing home|load` and
+`--replica-load-slack N` (default 1). The load policy compares active batch
+reservations weighted by a 1/16 moving average of their service time, keeping
+a lane on its home GPU when estimates are close. Counters are shared across
+loaded indexes, include unreplicated multi-GPU searches, and use C11 atomics
+without the scheduler mutex. Service time includes host reranking; it is not
+a kernel timing or a direct GPU utilization measurement.
+
+Operation 31 returns per-index replica counts and timing; the benchmark
+records snapshots before and after each measurement when `--index-name` is
+supplied. They include device bindings, active reservations, started/finished
+batches, query counts, migrations, failures, total reserved time, and the
+current service-time estimate. This made a startup problem visible: the
+initial load policy retained 173 ms and 39 ms estimates on two GPUs and sent
+neither any work during a scan measurement. The corrected policy ages idle
+estimates toward 100 microseconds, halving the excess each second, and uses
+the decayed estimate when a returning GPU is sampled. It recovered all eight
+replicas in the follow-up runs.
+
+Eight replicated B200 GPUs, 64 worker lanes, 10M × 128 dimensions, k=500,
+10% filter, all 500 keys returned per vector; 15-second measurements after
+warm-up, no failures:
+
+| Condition | Workload | Home vectors/sec | Load vectors/sec |
+|---|---|---:|---:|
+| Uniform | Scan, 256 clients | 72,797 | 71,991 |
+| Uniform | Batch of 16, 64 clients | 89,176 | 86,912 |
+| GPU 0 contended | Scan, 256 clients | 69,786 | 69,166 |
+| GPU 0 contended | Batch of 16, 64 clients | 85,528 | 84,410 |
+
+Contention used an independent 4096 × 4096 FP16 GEMM loop on GPU 0 for
+55 seconds, with the measurements taken while it was running. In the batch
+case, load routing sent GPU 0 about 52.7k queries against home's 93.6k,
+shifting work to the other seven replicas. It did not improve overall
+throughput. The global queue already allows faster home lanes to consume
+more work, which is consistent with this result. Scan p99 under contention
+was 6.85 ms for home and 6.53 ms for load in this short sample; longer repeats
+would be needed to establish a latency advantage.
+
+Both policies used all eight replicas again in a ten-second recovery scan
+after the contender exited. Waiting for it to exit leaves a short idle
+interval, so this is not an immediate-recovery latency measurement. All
+reservations were released, started/finished counts matched, and replica
+failure counters were zero at the sampled endpoints. Raw measurements and
+routing snapshots are in
+[`frozen-k500-routing.json`](../benchmarks/ann/results/frozen-k500-routing.json).
+The contention generator is
+[`gpu_contention.py`](../benchmarks/ann/gpu_contention.py).
+
+Home remains the default and the private GPU-node deployment was restored
+to it. Load-aware routing is available for deployments where this heuristic
+helps. The core test exercises 1.6 million concurrent reservations,
+non-power-of-two GPU counts, overloaded homes, slow-device avoidance and
+idle recovery. All eleven GPU index tests, including a two-GPU k=500 replica
+test, passed with the corrected policy. Thirty frozen tests also passed
+locally (one GPU-only case skipped), along with eight server tests and seven
+predicate-cache tests. Generalized k=500 GPU selection/reranking is implemented in the follow-up
+below; the page-local materializer still requires tuning.
+
+## Generalized GPU selection/reranking, 2026-11-05
+
+The worker now has a C++20 bridge to cuVS matrix selection, a Blackwell
+score-matrix entry point, bounded query tiling, and optional GPU reranking
+from the original FP32 vectors with double-precision accumulation. The
+large-k path keeps candidates on device through a second selection carrying
+row IDs. CAGRA searches can use the same resident vectors for reranking;
+CPU reranking remains available when the copy is disabled or unavailable.
+The switches are `--matrix-gather on`, `--gpu-rerank on`,
+`--group-gather-limit ROWS` and `--matrix-max-mb N`.
+
+Eight B200s, 64 worker lanes, 10M × 128 dimensions, k=500, 15 seconds per
+point. The SQL rows below use 64 clients and 16 vectors per transaction,
+returning all 500 keys per vector:
+
+| Configuration | 0.1% vectors/sec | 1% vectors/sec | 10% vectors/sec |
+|---|---:|---:|---:|
+| Control | 108,127 | 105,780 | 88,848 |
+| GPU reranking, graph for broad filters | 107,934 | 103,918 | 101,491 |
+| Matrix gather up to 4M eligible rows + GPU reranking | 137,008 | 130,513 | 96,702 |
+
+For the 10% filter at 256 clients, ordinary SQL scans reached 72,695, 76,501
+and 80,170 QPS respectively. Native worker throughput was 96,331, 96,977
+and 114,389 QPS. All measured points completed without errors. Resident
+FP32 copies added 40.96 GB over the eight GPUs (5.12 GB per replica).
+These measurements favor matrix gathers for the narrower filters and
+CAGRA plus GPU reranking for the broad SQL batch workload. The combined
+500k-row cutoff was subsequently measured below. Raw data, CPU/GPU samples and path counters are in
+[`frozen-k500-gpu-selection.json`](../benchmarks/ann/results/frozen-k500-gpu-selection.json).
+
+The executed 13-test GPU index suite passed, including matrix sizes 1, 3,
+16 and 64, all four dataset formats, CPU/device reranking, a bounded-score
+matrix case, and CAGRA rerank precision/filter checks. The expanded candidate-list tests for every format also passed in the
+combined validation run.
+
+The materializer also has a third revision: it caches only TIDs and their
+visibility proof in page order, then reads immutable values when emitting
+rows. This reuses the ordinary vector scratch and per-tuple text context,
+removing per-row vector allocations and complete slot copies. The local
+frozen suite passed with a 64-row window (30 tests, one GPU-only skip).
+It remains disabled by default until the GPU-node sweep confirms a gain.
+
+The combined 500k-row cutoff completed its first sweep successfully:
+
+| Filter | SQL batch of 16, 64 clients | Ordinary scan, 256 clients | Native worker, 256 clients |
+|---|---:|---:|---:|
+| 0.1% | 138,065 vectors/sec | 125,332 QPS | 261,366 QPS |
+| 1% | 131,528 vectors/sec | 113,033 QPS | 260,914 QPS |
+| 10% | 101,509 vectors/sec | 76,275 QPS | 96,931 QPS |
+
+These are 15-second points with no failures. The native protocol sends one
+vector per request; SQL batches share a predicate across 16 vectors, so the
+worker's batching opportunities differ. Nine sampled queries returned 500
+unique rows each. Recall@500 was 1.0 for the narrow filters and
+0.990–0.998 for the 10% filter. The expanded 13-test GPU suite and all 30
+frozen tests passed on the node before this run.
+
+The third materializer revision still did not win: at 256 clients on the
+10% filter, its 16/64/256-row windows reached 75,723/75,640/75,765 QPS,
+against bookend controls of 76,399 and 76,469. It stays off. The remaining
+materialization work targets the mutable-TID buffer accesses directly;
+merely sorting a small window does not provide enough locality here.
+The combined results, materializer sweep and selected configuration are
+included in the GPU-selection JSON above. Longer confirmation runs and the
+remaining materialization work are still pending.
+
+
+### Mapped TID validation
+
+The fourth materializer revision removes the per-result TID buffer pin and
+content lock for unchanged frozen indexes. It validates a bounded window
+of mapped TIDs and VM bits under one shared metapage lock, then emits values
+in result order. VACUUM WAL-logs clearing the unchanged-TID marker before
+invalidating any TID; after physical deletion, reads use live buffers until
+REINDEX. No-op VACUUM preserves the fast path. Old backends must be restarted
+before building indexes with the new marker. This is a bounded read barrier,
+not an entirely lock-free PostgreSQL executor.
+
+The 10M-row index was reindexed after restarting the private PostgreSQL
+instance; its generation stayed unchanged and its GPU copy stayed loaded.
+All 31 frozen tests, including the GPU case and cursor/VACUUM barrier test,
+and all 12 filtered tests passed on the node. Local full ANN checks and all
+16 upstream pg_regress cases passed. A local immediate-shutdown/restart
+check after physical deletion and VACUUM recovered the cleared marker from
+WAL and returned the same 500 live rows as the exact SQL oracle.
+
+Initial 20-second measurements:
+
+| Filter | Covering scan, 256 clients | SQL batch16, 64 clients |
+|---|---:|---:|
+| 0.1% | 139,163 QPS | 241,622 vectors/sec |
+| 1% | 130,306 QPS | 228,787 vectors/sec |
+| 10% | 83,940 QPS | 133,320 vectors/sec |
+
+On the broad-filter sweep, controls at window 0 reached 75,670 and 75,257 QPS.
+Window 64 reached 84,151 QPS and window 256 reached 84,192 QPS. Window 16 fell to
+55,942 QPS, indicating that frequent access to the shared metadata barrier
+can erase the gain. The selected default is 64. The sorting fallback from
+earlier prototypes was removed; legacy indexes use direct buffered reads.
+
+PostgreSQL CPU use on the broad case fell from about 84 cores to 54 cores,
+while worker use stayed near 48 cores. SQL batch16 used about 42/45/25
+PostgreSQL cores across the three filters, versus 54/55/41 before mapped
+TID validation, while completing more vectors. GPU utilization samples were
+92–100% during SQL batches, and physical read samples remained zero.
+These are utilization samples, not new kernel-level Nsight attributions.
+The ordinary scan still evaluates SQL projections and vector distances;
+the SQL batch API avoids much of that per-row executor work.
+
+Raw CPU/GPU samples, worker path counters and the initial sweep are in
+[`frozen-k500-mapped-tids.json`](../benchmarks/ann/results/frozen-k500-mapped-tids.json).
+Final-build confirmation completed with the selected 64-row default:
+
+| Filter | Unbatched scan control | 64-row scan | SQL batch16, 64 clients | Batch p99 |
+|---|---:|---:|---:|---:|
+| 0.1% | 126,739 QPS | 141,125 QPS | 244,512 vectors/sec | 5.43 ms |
+| 1% | 115,052 QPS | 134,249 QPS | 231,078 vectors/sec | 5.64 ms |
+| 10% | 77,644 QPS | 85,577 QPS | 133,589 vectors/sec | 10.73 ms |
+
+Optimized points lasted 60 seconds each; the initial scan controls lasted
+30 seconds. A second 60-second broad control reached 78,230 QPS, followed by
+another 60-second window 64 run at 85,563 QPS, a 9.4% gain. Batch latency covers
+all 16 vectors. The confirmation completed 43,333,444 SQL transactions
+(77,588,404 vectors).
+Every point had zero query failures and zero monitor errors;
+all physical-read samples were zero. The complete confirmation series is
+included in the mapped-TID result artifact. The worker was then reloaded
+from the final build with the same configuration and validated again.
+Its executable hash matched the built binary; all eight replicas reported
+GPU reranking ready and the PostgreSQL default was 64. A 15-second deployed
+batch16 smoke reached 240,716 / 228,927 / 133,273 vectors/sec with zero failures.
+
+To reproduce the optimized B200 policy, build with `USE_CUVS=1`, load the
+same index on eight GPUs with replication, and use these worker options:
+
+```sh
+ann/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
+  --lanes 64 --max-batch 32 --replicate on --itopk 512 \
+  --filtered-itopk 1024 --filtered-algo multi --filtered-width 4 \
+  --exact-limit 0 --gather-limit 4000000 --bitset-gather-limit 500000 \
+  --group-gather-limit 500000 --gpu-rerank on --matrix-gather on \
+  --memory-pool 40 --predicate-cache-mb 8192 --predicate-device-mb 16384 \
+  --max-pending-mb 8192 --rerank-prefetch 8 --replica-routing home \
+  --replica-load-slack 1
+```
+
+After loading and warming the same 210 predicates, run the SQL workloads:
+
+```sh
+python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_PID" \
+  --output results --label mapped-scan --clients 256 --seconds 60 --k 500 \
+  --index-name frozen_stress --materialize-batch 64
+python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_PID" \
+  --output results --label mapped-batch16 --clients 64 --seconds 60 --k 500 \
+  --index-name frozen_stress --batch-queries 16
+```
+
+The table and query fixtures are the ones from the stress guide. The data
+and index files reside on the node's RAM-backed filesystem. GPU reranking
+adds 5.12 GB per replica for this dataset; its flags stay opt-in. The
+64-row scan visibility window is the new PostgreSQL default. Home routing
+stays the worker default because the measured adaptive policy did not
+increase throughput, including under the tested single-GPU contention.

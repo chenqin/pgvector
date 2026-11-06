@@ -103,6 +103,25 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(status, 0)
         return json.loads(payload)
 
+    def test_routing_stats_validation(self):
+        with self.server.connect() as connection:
+            for name in (b'', b'a' * 64, b'a\0b'):
+                connection.sendall(frame(31, 1, name))
+                self.assertEqual(receive(connection)[2], 1)
+            connection.sendall(frame(31, 1, b'no-such-index'))
+            self.assertEqual(receive(connection)[2], 3)
+            connection.sendall(frame(5, 2))
+            self.assertEqual(receive(connection)[2], 0)
+
+    def test_replica_option_validation(self):
+        for option, value in (('--replica-routing', 'other'), ('--replica-load-slack', '-1'),
+                              ('--replica-load-slack', '65'), ('--replica-load-slack', 'many'),
+                              ('--matrix-gather', 'other'), ('--gpu-rerank', 'other'),
+                              ('--matrix-max-mb', '0'), ('--matrix-max-mb', '1025')):
+            result = subprocess.run([WORKER, option, value], input=b'', capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(option.encode(), result.stderr)
+
     def test_pipelined_requests_match_exact_results(self):
         rng = random.Random(7)
         connections = [self.server.connect() for _ in range(3)]

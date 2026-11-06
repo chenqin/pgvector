@@ -23,3 +23,6 @@ __pycache__/
 /ann/ann-batch-bench
 /ann/ann-batch-bench.dSYM/
 cufile.log
+
+/ann/ann-replica-tests
+/ann/ann-replica-tests.dSYM/
