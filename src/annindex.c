@@ -1723,14 +1723,28 @@ TombstoneTable(FunctionCallInfo fcinfo)
 	return psprintf("%s.ann_frozen_tombstone", quote_identifier(schema));
 }
 
+/* One result row per query: (query_no, ids bigint[], distances real[]). */
+static void
+StoreQueryArrays(Tuplestorestate *store, TupleDesc tupdesc, int q, Datum *ids, Datum *distances, int n)
+{
+	Datum		row[3];
+	bool		nulls[3] = {false, false, false};
+
+	row[0] = Int32GetDatum(q + 1);
+	row[1] = PointerGetDatum(construct_array(ids, n, INT8OID, sizeof(int64), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
+	row[2] = PointerGetDatum(construct_array(distances, n, FLOAT4OID, sizeof(float4), true, TYPALIGN_INT));
+	tuplestore_putvalues(store, tupdesc, row, nulls);
+}
+
 /*
  * One worker request for a query matrix and one predicate. The frozen table
  * stays locked throughout; visibility and local tombstones use the statement
  * snapshot for every vector, including exact fallback for an underfilled list.
+ * With arrays, each query's hits form one row of id and distance arrays
+ * instead of a row per hit: k times fewer tuples to store and send.
  */
-FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_search_batch);
-Datum
-ann_frozen_search_batch(PG_FUNCTION_ARGS)
+static Datum
+FrozenSearchBatch(FunctionCallInfo fcinfo, bool arrays)
 {
 	TupleDesc	tupdesc;
 	Tuplestorestate *store;
@@ -1771,6 +1785,7 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 	IndexFetchTableData *fetch;
 	TupleTableSlot *slot;
 	Snapshot	snapshot = GetActiveSnapshot();
+	bool		immutable;
 
 	for (int i = 0; i < ANN_BATCH_VM_BUFFERS; i++)
 		vmbufs[i] = InvalidBuffer;
@@ -1823,6 +1838,12 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 	meta = AnnFrozenGetMeta(index, false);
 	if (TupleDescAttr(RelationGetDescr(index), 0)->atttypmod != dimensions)
 		ereport(ERROR, (errcode(ERRCODE_DATA_EXCEPTION), errmsg("batch query dimensions do not match the index")));
+
+	/*
+	 * Under ann.frozen_immutable, a table unchanged since its build has every
+	 * row visible to every snapshot: hits need no TID or visibility check.
+	 */
+	immutable = AnnFrozenImmutable(heap, index);
 	AnnPredicateColumnsInit(index, &columns);
 	initStringInfo(&program);
 	if (!PG_ARGISNULL(3))
@@ -1917,8 +1938,8 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 			elog(ERROR, "malformed ann worker batch result size");
 		for (uint32 i = 0; i < count; i++)
 			memcpy(&ordinals[i], reply + offset + (size_t) i * 12, 8);
-		mapped = AnnFrozenVisibleTids(index, heap, meta, ordinals, count, batchTids,
-									  visible, vmbufs, ANN_BATCH_VM_BUFFERS);
+		mapped = !immutable && AnnFrozenVisibleTids(index, heap, meta, ordinals, count, batchTids,
+													visible, vmbufs, ANN_BATCH_VM_BUFFERS);
 		ids = palloc(sizeof(Datum) * Max(count, 1));
 		distances = palloc(sizeof(Datum) * Max(count, 1));
 		for (uint32 i = 0; i < count; i++)
@@ -1939,7 +1960,7 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 			AnnArrayRead(&keys, ordinal, &key);
 			if (ndeleted && bsearch(&key, deleted, ndeleted, sizeof(int64), KeyCompare))
 				continue;
-			if (mapped && visible[i])
+			if (immutable || (mapped && visible[i]))
 			{
 				ids[kept] = Int64GetDatum(key);
 				distances[kept++] = Float4GetDatum(distance);
@@ -1972,7 +1993,23 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 				elog(ERROR, "SPI_connect failed");
 			if (SPI_execute_with_args(sql, 2, types, values, NULL, true, 0) != SPI_OK_SELECT)
 				elog(ERROR, "ann batch visibility fallback failed");
-			for (uint64 i = 0; i < SPI_processed; i++)
+			if (arrays)
+			{
+				MemoryContext spi = MemoryContextSwitchTo(caller);
+				Datum	   *exactIds = palloc(sizeof(Datum) * Max(SPI_processed, 1));
+				Datum	   *exactDistances = palloc(sizeof(Datum) * Max(SPI_processed, 1));
+
+				MemoryContextSwitchTo(spi);
+				for (uint64 i = 0; i < SPI_processed; i++)
+				{
+					bool		isnull;
+
+					exactIds[i] = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 1, &isnull);
+					exactDistances[i] = SPI_getbinval(SPI_tuptable->vals[i], SPI_tuptable->tupdesc, 2, &isnull);
+				}
+				StoreQueryArrays(store, tupdesc, q, exactIds, exactDistances, (int) SPI_processed);
+			}
+			for (uint64 i = 0; !arrays && i < SPI_processed; i++)
 			{
 				Datum		row[3];
 				bool		nulls[3] = {false, false, false};
@@ -1984,6 +2021,8 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 			}
 			SPI_finish();
 		}
+		else if (arrays)
+			StoreQueryArrays(store, tupdesc, q, ids, distances, kept);
 		else
 			for (int i = 0; i < kept; i++)
 			{
@@ -2010,6 +2049,20 @@ ann_frozen_search_batch(PG_FUNCTION_ARGS)
 	index_close(index, AccessShareLock);
 	table_close(heap, AccessShareLock);
 	return (Datum) 0;
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_search_batch);
+Datum
+ann_frozen_search_batch(PG_FUNCTION_ARGS)
+{
+	return FrozenSearchBatch(fcinfo, false);
+}
+
+FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_frozen_search_batch_arrays);
+Datum
+ann_frozen_search_batch_arrays(PG_FUNCTION_ARGS)
+{
+	return FrozenSearchBatch(fcinfo, true);
 }
 
 /* After a load or attach: the table's tombstones to the loaded name. */

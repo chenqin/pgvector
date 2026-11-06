@@ -29,6 +29,13 @@ WORKLOADS = {
     '0.1pct': 'tenant = :t',
     '1pct': 'category = :c',
     '10pct': 'category BETWEEN :d * 10 AND :d * 10 + 9',
+    # Row-count sweep (10M rows; tenant 0.1%, category 1% per value) and a
+    # mix of 91 distinct overlapping 10% ranges.
+    'rows50k': 'tenant BETWEEN :e * 5 AND :e * 5 + 4',
+    'rows500k': 'category BETWEEN :f * 5 AND :f * 5 + 4',
+    'rows2m': 'category BETWEEN :g * 20 AND :g * 20 + 19',
+    'rows4m': 'category BETWEEN :h * 40 AND :h * 40 + 39',
+    'mixed10': 'category BETWEEN :a AND :a + 9',
 }
 
 
@@ -170,6 +177,12 @@ def main():
     parser.add_argument('--batch-queries', type=int, default=0, metavar='N',
                         help='use the SQL matrix API with 1..64 vectors per request; 0 uses the scan route')
     parser.add_argument('--index-name', help='loaded frozen index name, required with --batch-queries')
+    parser.add_argument('--immutable', action='store_true',
+                        help='set ann.frozen_immutable = on (superuser): mapped TIDs, no visibility checks '
+                             'while the table is unchanged since its build')
+    parser.add_argument('--batch-arrays', action='store_true',
+                        help='with --batch-queries, use ann_frozen_search_batch_arrays: one row of id and '
+                             'distance arrays per vector instead of a row per hit')
     parser.add_argument('--clients', default='1,8,32,64,128')
     parser.add_argument('--threads', type=int, default=32)
     parser.add_argument('--seconds', type=int, default=15)
@@ -217,15 +230,25 @@ def main():
                         '0.1pct': "format('tenant = %s', :t::integer)",
                         '1pct': "format('category = %s', :c::integer)",
                         '10pct': "format('category BETWEEN %s AND %s', :d * 10, :d * 10 + 9)",
+                        'rows50k': "format('tenant BETWEEN %s AND %s', :e * 5, :e * 5 + 4)",
+                        'rows500k': "format('category BETWEEN %s AND %s', :f * 5, :f * 5 + 4)",
+                        'rows2m': "format('category BETWEEN %s AND %s', :g * 20, :g * 20 + 19)",
+                        'rows4m': "format('category BETWEEN %s AND %s', :h * 40, :h * 40 + 39)",
+                        'mixed10': "format('category BETWEEN %s AND %s', :a::integer, :a + 9)",
                     }[workload]
                     query = (f'SELECT id FROM ann_frozen_search_batch({index_name}, :batch::vector[], '
                              f'{args.k}, {predicate})')
+                    if args.batch_arrays:
+                        query = (f'SELECT ids FROM ann_frozen_search_batch_arrays({index_name}, :batch::vector[], '
+                                 f'{args.k}, {predicate})')
                     setup = (f'SELECT array_agg(v ORDER BY q)::text AS batch FROM {queries} '
                              f'WHERE q >= :q AND q < :q + {args.batch_queries} \\gset\n')
                 if args.count_only:
                     query = f'SELECT count(*) FROM ({query}) hits'
                 script.write_text(f'\\set q random(1,{1001 - max(args.batch_queries, 1)})\n'
                                   '\\set t random(0,99)\n\\set c random(0,99)\n\\set d random(0,9)\n'
+                                  '\\set e random(0,199)\n\\set f random(0,19)\n\\set g random(0,4)\n'
+                                  '\\set h random(0,1)\n\\set a random(0,90)\n'
                                   + setup + query + ';\n')
                 env = dict(os.environ, PGAPPNAME=application,
                            PGOPTIONS=(f'-c ann.worker_socket={args.socket} -c ann.enable_frozen_search=on '
@@ -237,6 +260,8 @@ def main():
                 if args.prefetch_distance is not None:
                     env['PGOPTIONS'] += f' -c ann.frozen_prefetch_distance={args.prefetch_distance}'
                 env['PGOPTIONS'] += f' -c ann.frozen_materialize_batch={args.materialize_batch}'
+                if args.immutable:
+                    env['PGOPTIONS'] += ' -c ann.frozen_immutable=on'
                 if args.cost_profile:
                     escaped = ''.join(('\\' + c) if c.isspace() or c == '\\' else c for c in args.cost_profile)
                     env['PGOPTIONS'] += f' -c ann.frozen_cost_profile={escaped}'
@@ -277,6 +302,7 @@ def main():
                            prefetch_distance=args.prefetch_distance,
                            materialize_batch=args.materialize_batch, cost_profile=args.cost_profile,
                            batch_queries=args.batch_queries, index_name=args.index_name,
+                           batch_arrays=args.batch_arrays, immutable=args.immutable,
                            routing_stats_before=routing_before,
                            routing_stats_after=routing_stats(args.socket, args.index_name),
                            vector_qps=float(tps.group(1)) * max(args.batch_queries, 1) if tps else None,

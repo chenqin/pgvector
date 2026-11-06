@@ -255,6 +255,11 @@ typedef struct AnnIndexOptions
 	uint64_t	matrix_max_bytes;	/* per-lane score-matrix bound */
 	uint32_t	filtered_slack; /* extra bitset CAGRA candidates for FP32
 								 * reranking */
+	int			fp16_exact;		/* FP16 indexes: rescore graph results and
+								 * rerank gathers in FP32 (exact distances);
+								 * off uses FP16 distances throughout */
+	int			matrix_prune;	/* matrix gathers select from scores under a
+								 * sampled cutoff instead of all of them */
 } AnnIndexOptions;
 
 /*
@@ -281,6 +286,7 @@ float		AnnIndexHalfFloat(uint16_t half);
 AnnStatus	AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result);
 void		AnnIndexFileClose(AnnIndexFile *file);
 void		AnnIndexHold(AnnIndexFile *file);
+void		AnnIndexHoldCount(AnnIndexFile *file, uint32_t count);
 AnnStatus	AnnIndexUnload(const char *name);
 
 /*
@@ -343,6 +349,7 @@ void		AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *devic
 AnnStatus	AnnIndexRegister(AnnIndexFile *file);
 AnnIndexFile *AnnIndexGet(const char *name);
 void		AnnIndexPut(AnnIndexFile *file);
+void		AnnIndexPutCount(AnnIndexFile *file, uint32_t count);
 
 /*
  * Rows matching attribute IN (values): sorted keys and ordinals, and the
@@ -376,6 +383,10 @@ AnnStatus	AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uin
 AnnIndexBitmap *AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind);
 void		AnnIndexBitmapHold(AnnIndexFile *file, AnnIndexBitmap *bitmap);
 void		AnnIndexBitmapRelease(AnnIndexFile *file, AnnIndexBitmap *bitmap);
+
+/* The same for count references at once (a batch's jobs). */
+void		AnnIndexBitmapHoldCount(AnnIndexFile *file, AnnIndexBitmap *bitmap, uint32_t count);
+void		AnnIndexBitmapReleaseCount(AnnIndexFile *file, AnnIndexBitmap *bitmap, uint32_t count);
 
 /* Map sorted unique keys to sorted global ordinals; returns the count found. */
 uint64_t	AnnIndexOrdinals(const AnnIndexFile *file, const int64_t *keys, uint32_t nkeys,

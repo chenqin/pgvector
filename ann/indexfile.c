@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0};
 AnnCostProfile *AnnIndexCostProfile = NULL;
 size_t		(*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity) = NULL;
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
@@ -1399,8 +1399,14 @@ AnnIndexBitmapGet(AnnIndexFile *file, uint64_t id, int kind)
 void
 AnnIndexBitmapHold(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 {
+	AnnIndexBitmapHoldCount(file, bitmap, 1);
+}
+
+void
+AnnIndexBitmapHoldCount(AnnIndexFile *file, AnnIndexBitmap *bitmap, uint32_t count)
+{
 	(void) pthread_mutex_lock(&file->bitmapMutex);
-	bitmap->references++;
+	bitmap->references += (int) count;
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 }
 
@@ -1408,10 +1414,16 @@ AnnIndexBitmapHold(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 void
 AnnIndexBitmapRelease(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 {
+	AnnIndexBitmapReleaseCount(file, bitmap, 1);
+}
+
+void
+AnnIndexBitmapReleaseCount(AnnIndexFile *file, AnnIndexBitmap *bitmap, uint32_t count)
+{
 	int			last;
 
 	(void) pthread_mutex_lock(&file->bitmapMutex);
-	last = --bitmap->references == 0;
+	last = (bitmap->references -= (int) count) == 0;
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 	if (last)
 		FreeBitmap(file, bitmap);
@@ -1742,13 +1754,20 @@ AnnIndexGet(const char *name)
 void
 AnnIndexHold(AnnIndexFile *file)
 {
+	AnnIndexHoldCount(file, 1);
+}
+
+/* count more references at once: one lock for a whole batch of jobs. */
+void
+AnnIndexHoldCount(AnnIndexFile *file, uint32_t count)
+{
 	(void) pthread_mutex_lock(&registryMutex);
 	for (Entry *entry = registry; entry; entry = entry->next)
 		if (entry->file == file)
-			entry->references++;
+			entry->references += (int) count;
 	for (Entry *entry = retired; entry; entry = entry->next)
 		if (entry->file == file)
-			entry->references++;
+			entry->references += (int) count;
 	(void) pthread_mutex_unlock(&registryMutex);
 }
 
@@ -1765,19 +1784,25 @@ Destroy(AnnIndexFile *file)
 void
 AnnIndexPut(AnnIndexFile *file)
 {
+	AnnIndexPutCount(file, 1);
+}
+
+void
+AnnIndexPutCount(AnnIndexFile *file, uint32_t count)
+{
 	Entry	   *dead = NULL;
 
 	(void) pthread_mutex_lock(&registryMutex);
 	for (Entry *entry = registry; entry; entry = entry->next)
 		if (entry->file == file)
 		{
-			entry->references--;
+			entry->references -= (int) count;
 			break;
 		}
 	for (Entry **link = &retired; *link; link = &(*link)->next)
 		if ((*link)->file == file)
 		{
-			if (--(*link)->references == 0)
+			if (((*link)->references -= (int) count) == 0)
 			{
 				dead = *link;
 				*link = dead->next;

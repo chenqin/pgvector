@@ -415,9 +415,16 @@ SELECT * FROM ann_frozen_search_batch(
 
 A batch sends one worker IPC request containing the matrix, rather than
 calling the single-vector function in a loop. The worker holds one index
-reference and one predicate bitmap for submission, schedules separate query
-jobs through its usual batcher, and replies once with a separate top-k for
-each vector. This does not guarantee a single CUDA kernel launch.
+reference and one predicate bitmap for submission, queues the vectors'
+search jobs together under one lock (so a lane takes them as one
+same-filter group, up to `--max-batch`), and replies once with a separate
+top-k for each vector. This does not guarantee a single CUDA kernel launch.
+
+`ann_frozen_search_batch_arrays(name, queries, k, filter)` takes the same
+arguments and returns one row per vector, `(query_no integer, ids bigint[],
+distances real[])`, its hits in distance order. It stores and sends k times
+fewer tuples: on the 10% k=500 workload it raised throughput from 398k to
+746k vectors/s ([measurements](ann-10pct-throughput.md)).
 
 The SQL function requires SELECT on the source table, refuses row-level
 security, and pins the catalog generation. Every query uses the same

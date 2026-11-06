@@ -1,8 +1,10 @@
 # Native FP32 CAGRA
 
 FP32 CAGRA indexes use their returned distances directly. The worker does not
-run a CPU or GPU distance-rescoring pass after graph search. FP16 CAGRA and
-compressed-vector scans retain FP32 rescoring.
+run a CPU or GPU distance-rescoring pass after graph search. FP16 CAGRA also
+uses its own distances unless the worker runs with `--fp16-exact on`
+([FP16 distances](ann-cuvs-index.md#fp16-distances)); compressed-vector scans
+retain rescoring.
 
 ```mermaid
 flowchart LR

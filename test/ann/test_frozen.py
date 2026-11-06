@@ -750,6 +750,16 @@ class FrozenTests(unittest.TestCase):
                 return self.db.execute('SELECT * FROM ann_frozen_search_batch(%s, %s::vector[], %s, %s)',
                                        (name, qs, k, predicate)).fetchall()
 
+            def arrays(predicate=None, qs=queries, k=40):
+                # One row per query: its ids and distances in distance order.
+                rows = self.db.execute('SELECT * FROM ann_frozen_search_batch_arrays(%s, %s::vector[], %s, %s)',
+                                       (name, qs, k, predicate)).fetchall()
+                self.assertEqual([q for q, _, _ in rows], list(range(1, len(rows) + 1)))
+                for _, ids, distances in rows:
+                    self.assertEqual(len(ids), len(distances))
+                    self.assertEqual(distances, sorted(distances))
+                return [(q, key) for q, ids, _ in rows for key in ids]
+
             def exact(predicate=None, deleted=()):
                 result = []
                 for q, query in enumerate(queries, 1):
@@ -764,7 +774,21 @@ class FrozenTests(unittest.TestCase):
                 for q in range(1, 4):
                     distances = [d for query_no, _, d in got if query_no == q]
                     self.assertEqual(distances, sorted(distances))
+                self.assertEqual(arrays(predicate), exact(predicate))
             self.assertEqual(batch(qs=[]), [])
+            self.assertEqual(arrays(qs=[]), [])
+            # An immutable table (unchanged, all-visible, guards firing always)
+            # skips TID and visibility checks: still exactly SQL's rows.
+            self.db.execute('VACUUM docs')
+            self.db.execute('SET ann.frozen_immutable = on')
+            try:
+                self.assertIn('Columns: index pages\n', self.plan(
+                    "SELECT id FROM docs WHERE tenant IN (2,5) ORDER BY emb <-> '[1,2,3,4]' LIMIT 40") + '\n')
+                for predicate in (None, 'tenant IN (2,5)'):
+                    self.assertEqual([(q, key) for q, key, _ in batch(predicate)], exact(predicate))
+                    self.assertEqual(arrays(predicate), exact(predicate))
+            finally:
+                self.db.execute('RESET ann.frozen_immutable')
             for qs in ([None], queries * 22, ['[1,2]'], ['[1,2,3,4]', '[1,2]']):
                 self.assertIn('batch', self.error(
                     'SELECT * FROM ann_frozen_search_batch(%s, %s::vector[], 10)', (name, qs)))
@@ -774,6 +798,7 @@ class FrozenTests(unittest.TestCase):
             with self.db.transaction(force_rollback=True):
                 self.db.execute('SELECT ann_frozen_delete(%s, %s)', ('docs', deleted))
                 self.assertEqual([(q, key) for q, key, _ in batch()], exact(deleted=deleted))
+                self.assertEqual(arrays(), exact(deleted=deleted))
             self.assertEqual([(q, key) for q, key, _ in batch()], exact())
             role = self.schema + '_batch_reader'
             self.db.execute(f'CREATE ROLE {role}')

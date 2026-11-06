@@ -8,7 +8,7 @@
 extern "C" cuvsError_t
 AnnSelectBatch(cuvsResources_t resources, const float *scores, const int64_t *ids,
                float *values, int64_t *positions, int64_t queries, int64_t rows,
-               int64_t k, int sorted)
+               int64_t k, int sorted, const int64_t *lengths)
 {
     try {
         if (!resources || !scores || !values || !positions || queries < 1 || rows < 1 || k < 1 || k > rows)
@@ -17,11 +17,14 @@ AnnSelectBatch(cuvsResources_t resources, const float *scores, const int64_t *id
         auto output = raft::make_device_matrix_view<float, int64_t>(values, queries, k);
         auto indices = raft::make_device_matrix_view<int64_t, int64_t>(positions, queries, k);
         std::optional<raft::device_matrix_view<const int64_t, int64_t, raft::row_major>> payload;
+        std::optional<raft::device_vector_view<const int64_t, int64_t>> length;
         if (ids)
             payload = raft::make_device_matrix_view<const int64_t, int64_t>(ids, queries, rows);
+        if (lengths)
+            length = raft::make_device_vector_view<const int64_t, int64_t>(lengths, queries);
         cuvs::selection::select_k(*reinterpret_cast<raft::resources *>(resources), input,
                                  payload, output, indices, true, sorted != 0,
-                                 cuvs::selection::SelectAlgo::kAuto);
+                                 cuvs::selection::SelectAlgo::kAuto, length);
         return CUVS_SUCCESS;
     } catch (const std::exception &error) {
         cuvsSetLastErrorText(error.what());

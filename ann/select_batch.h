@@ -8,10 +8,13 @@
 extern "C" {
 #endif
 
-/* Matrix top-k, optionally carrying row IDs rather than column positions. */
+/*
+ * Matrix top-k, optionally carrying row IDs rather than column positions,
+ * and optionally with each row's valid length (the rest is ignored).
+ */
 cuvsError_t AnnSelectBatch(cuvsResources_t resources, const float *scores, const int64_t *ids,
                           float *values, int64_t *positions, int64_t queries, int64_t rows,
-                          int64_t k, int sorted);
+                          int64_t k, int sorted, const int64_t *lengths);
 
 #ifdef __cplusplus
 }

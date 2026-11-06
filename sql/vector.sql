@@ -1371,6 +1371,12 @@ CREATE FUNCTION ann_frozen_search_batch(name text, queries vector[], k integer, 
 
 COMMENT ON FUNCTION ann_frozen_search_batch(text, vector[], integer, text) IS 'search up to 64 vectors with one worker request and a shared predicate and statement snapshot; query_no is the one-based input position';
 
+CREATE FUNCTION ann_frozen_search_batch_arrays(name text, queries vector[], k integer, filter text DEFAULT NULL,
+	OUT query_no integer, OUT ids bigint[], OUT distances real[]) RETURNS SETOF record
+	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 16;
+
+COMMENT ON FUNCTION ann_frozen_search_batch_arrays(text, vector[], integer, text) IS 'ann_frozen_search_batch with one row per query: its hits as id and distance arrays in distance order';
+
 CREATE FUNCTION ann_frozen_cache(OUT entries bigint, OUT bytes bigint, OUT hits bigint, OUT misses bigint,
 	OUT evictions bigint) RETURNS record
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE;

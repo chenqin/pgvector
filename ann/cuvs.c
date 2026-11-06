@@ -571,7 +571,9 @@ typedef struct AnnCuvsShard
 	const void *rows;			/* device view of the CAGRA dataset */
 	int64_t    *keys;			/* device copy of the shard's sorted keys */
 	int64_t		stride;			/* elements between rows */
-	float	   *rerank;			/* FP32 dataset for exact GPU reranking */
+	const void *rerank;			/* GPU reranking source: FP32 rows, or the
+								 * FP16 dataset in place (rerankHalf) */
+	int			rerankHalf;
 	int64_t		rerankStride;
 	size_t		rerankBytes;	/* owned bytes, zero when reusing FP32 CAGRA
 								 * rows */
@@ -608,8 +610,14 @@ typedef struct AnnCuvsIndex
 	AnnCuvsRoute routing[ANN_CUVS_MAX_DEVICES];
 	atomic_uint_fast64_t matrix_queries;
 	atomic_uint_fast64_t matrix_peak_score_bytes;
+	atomic_uint_fast64_t matrix_pruned_queries; /* selected from sampled
+												 * cutoffs */
+	atomic_uint_fast64_t matrix_prune_fallbacks;	/* tiles selected in full
+													 * instead */
 	atomic_uint_fast64_t gpu_rerank_candidates;
 	atomic_uint_fast64_t cagra_fp32_queries;
+	atomic_uint_fast64_t cagra_fp16_queries;	/* FP16 graph distances used
+												 * without rescoring */
 	atomic_uint_fast64_t graph_cpu_rerank_candidates;
 	atomic_uint_fast64_t cost_queries[4];
 } AnnCuvsIndex;
@@ -711,12 +719,15 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->matrix_pruned_queries, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->matrix_prune_fallbacks, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp32_queries, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cagra_fp16_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->graph_cpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[0], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[1], memory_order_relaxed),
@@ -813,6 +824,21 @@ typedef struct AnnCuvsDevice
 				matrixRowCap,
 				matrixHostValueCap,
 				matrixHostRowCap;
+	/* --matrix-prune: sampled cutoffs and the scores under them */
+	float	   *pruneSample;
+	float	   *pruneBounds;
+	int64_t    *pruneBoundRows;
+	float	   *pruneScores;
+	int64_t    *prunePositions;
+	int64_t    *pruneCounts;	/* kept per query: select_k row lengths */
+	int64_t    *pruneHostCounts;
+	size_t		pruneSampleCap,
+				pruneBoundCap,
+				pruneBoundRowCap,
+				pruneScoreCap,
+				prunePositionCap,
+				pruneCountCap,
+				pruneHostCountCap;
 } AnnCuvsDevice;
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
@@ -1026,25 +1052,35 @@ keys:
 	{
 		if (strcmp(args->file->dtype, "float32") == 0 && shard->rows)
 		{
-			shard->rerank = (float *) shard->rows;
+			shard->rerank = shard->rows;
+			shard->rerankStride = shard->stride;
+		}
+		else if (shard->rows && !AnnIndexConfig.fp16_exact)
+		{
+			/* FP16 rerank from the dataset in place: no FP32 copy on the GPU. */
+			shard->rerank = shard->rows;
+			shard->rerankHalf = 1;
 			shard->rerankStride = shard->stride;
 		}
 		else
 		{
 			size_t		bytes = (size_t) args->file->shards[args->shard].rows * args->file->dimensions * sizeof(float);
 
-			if (cudaMalloc((void **) &shard->rerank, bytes) == cudaSuccess &&
-				cudaMemcpy(shard->rerank, args->file->vectors +
+			float	   *copy = NULL;
+
+			if (cudaMalloc((void **) &copy, bytes) == cudaSuccess &&
+				cudaMemcpy(copy, args->file->vectors +
 						   args->file->shards[args->shard].first * args->file->dimensions,
 						   bytes, cudaMemcpyHostToDevice) == cudaSuccess)
 			{
+				shard->rerank = copy;
 				shard->rerankBytes = bytes;
 				shard->rerankStride = args->file->dimensions;
 			}
 			else
 			{
-				if (shard->rerank)
-					(void) cudaFree(shard->rerank);
+				if (copy)
+					(void) cudaFree(copy);
 				shard->rerank = NULL;
 				(void) cudaGetLastError();
 				fprintf(stderr, "cuVS: FP32 rerank copy unavailable on device %d shard %u; using host reranking\n",
@@ -1073,7 +1109,7 @@ DestroyIndexState(AnnCuvsIndex *state)
 		if (shard->keys)
 			(void) cudaFree(shard->keys);
 		if (shard->rerankBytes)
-			(void) cudaFree(shard->rerank);
+			(void) cudaFree((void *) shard->rerank);
 		if (shard->index)
 			(void) cuvsCagraIndexDestroy(shard->index);
 		if (shard->dataset)
@@ -1348,9 +1384,12 @@ LoadIndex(const char *name, const char *directory)
 	state->copies = copies;
 	atomic_init(&state->matrix_queries, 0);
 	atomic_init(&state->matrix_peak_score_bytes, 0);
+	atomic_init(&state->matrix_pruned_queries, 0);
+	atomic_init(&state->matrix_prune_fallbacks, 0);
 	atomic_init(&state->gpu_rerank_candidates, 0);
 	atomic_init(&state->cagra_fp32_queries, 0);
 	atomic_init(&state->graph_cpu_rerank_candidates, 0);
+	atomic_init(&state->cagra_fp16_queries, 0);
 	for (int mode = 0; mode < 4; mode++)
 		atomic_init(&state->cost_queries[mode], 0);
 	for (uint32_t c = 0; c < copies; c++)
@@ -1529,8 +1568,9 @@ PrefetchExactVector(const AnnIndexFile *file, uint64_t row)
 }
 
 /*
- * Turn one shard's CAGRA neighbours into a sorted hit list. Native FP32
- * CAGRA scores are squared L2; reranked scores are already Euclidean. Rows
+ * Turn one shard's CAGRA neighbours into a sorted hit list. Native CAGRA
+ * scores (FP32, or FP16 without --fp16-exact) are squared L2; reranked
+ * scores are already Euclidean. Rows
  * outside the eligibility bitset (when given) and padding are dropped.
  */
 static uint32_t
@@ -1620,7 +1660,10 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	int			uploaded[ANN_CUVS_MAX_DEVICES] = {0};
 	int			exactUploaded[ANN_CUVS_MAX_DEVICES] = {0};
 	int			exactGpu[ANN_INDEX_MAX_SHARDS] = {0};
-	float	   *exactHost = AnnIndexConfig.gpu_rerank && laneRerank != 0 && state->fp16 ? malloc((size_t) m * dims * sizeof(float)) : NULL;
+
+	/* Graph distances are final unless --fp16-exact rescores FP16 graphs. */
+	int			native = !state->fp16 || !AnnIndexConfig.fp16_exact;
+	float	   *exactHost = AnnIndexConfig.gpu_rerank && laneRerank != 0 && !native ? malloc((size_t) m * dims * sizeof(float)) : NULL;
 	size_t		slot[ANN_INDEX_MAX_SHARDS];
 	size_t		bitsetSlot[ANN_INDEX_MAX_SHARDS];
 	size_t		perDevice[ANN_CUVS_MAX_DEVICES] = {0};
@@ -1731,8 +1774,8 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		}
 
 		/*
-		 * FP32 CAGRA already computed the final distances; only FP16 needs
-		 * reranking.
+		 * FP32 CAGRA, and FP16 CAGRA unless --fp16-exact, already computed
+		 * the final distances; only exact FP16 needs reranking.
 		 */
 		if (state->fp16 && shard->rerank && laneRerank != 0 && exactHost)
 		{
@@ -1758,7 +1801,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				exactGpu[s] = 1;
 			}
 		}
-		if ((!state->fp16 || exactGpu[s]) &&
+		if ((native || exactGpu[s]) &&
 			cudaMemcpyAsync(lane->hostDistances + slot[s], lane->distances + slot[s],
 							(size_t) m * k * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
 		{
@@ -1786,13 +1829,15 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 
 			counts[j * state->nshards + s] = useShard[s] ?
 				ShardHits(file, s, laneDevices[shards[s].device].hostNeighbors + slot[s] + (size_t) j * k,
-						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits, (!state->fp16 || exactGpu[s]) ?
-						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL, !state->fp16) : 0;
-			if (state->fp16 && !exactGpu[s])
+						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits, (native || exactGpu[s]) ?
+						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL, !exactGpu[s]) : 0;
+			if (!native && !exactGpu[s])
 				(void) atomic_fetch_add_explicit(&state->graph_cpu_rerank_candidates, counts[j * state->nshards + s], memory_order_relaxed);
 		}
 	if (ok && !state->fp16)
 		(void) atomic_fetch_add_explicit(&state->cagra_fp32_queries, m, memory_order_relaxed);
+	else if (ok && native)
+		(void) atomic_fetch_add_explicit(&state->cagra_fp16_queries, m, memory_order_relaxed);
 	if (ok)
 		for (uint32_t s = 0; s < state->nshards; s++)
 			if (exactGpu[s])
@@ -1908,8 +1953,111 @@ static const char GatherSource[] =
 "extern \"C\" __global__ void gather_f16(const unsigned short *d, long long st, const unsigned *r,\n"
 "    unsigned n, const float *q, int dims, float *o) { gather(d, st, r, n, q, dims, o); }\n";
 
+/*
+ * --matrix-prune: a query's score row is sampled at ANN_PRUNE_SAMPLE evenly
+ * spaced columns; the sample's rank-th smallest score bounds the scores kept
+ * for selection (matrix_compact appends those with their columns, up to cap
+ * per query). The rank expects ANN_PRUNE_MARGIN times the candidates needed
+ * to pass, and at least ANN_PRUNE_RANK.
+ */
+static const char PruneSource[] =
+"extern \"C\" __global__ void matrix_sample(const float *scores, unsigned n, unsigned q, unsigned s, float *out)\n"
+"{\n"
+"  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (i >= q * s) return;\n"
+"  unsigned r = i / s, c = i - r * s;\n"
+"  out[i] = scores[(unsigned long long) r * n + (unsigned long long) c * n / s];\n"
+"}\n"
+"extern \"C\" __global__ void matrix_fill(float *d, long long *r, unsigned long long *counts, unsigned q, unsigned cap)\n"
+"{\n"
+"  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (i < q) counts[i] = 0;\n"
+"  if (i >= q * cap) return;\n"
+"  d[i] = __int_as_float(0x7f800000); r[i] = -1;\n"
+"}\n"
+"extern \"C\" __global__ void matrix_compact(const float *scores, unsigned n, const float *bounds, unsigned rank,\n"
+"    unsigned cap, float *d, long long *r, unsigned long long *counts)\n"
+"{\n"
+"  unsigned row = blockIdx.y;\n"
+"  float bound = bounds[(unsigned long long) row * rank + rank - 1];\n"
+"  const float *v = scores + (unsigned long long) row * n;\n"
+"  for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i - threadIdx.x < n; i += gridDim.x * blockDim.x)\n"
+"  {\n"
+"    bool keep = i < n && v[i] <= bound;\n"
+"    unsigned mask = __ballot_sync(0xffffffffu, keep);\n"
+"    if (!mask) continue;\n"
+"    unsigned lane = threadIdx.x & 31, base = 0;\n"
+"    if (lane == 0) base = (unsigned) atomicAdd(&counts[row], (unsigned long long) __popc(mask));\n"
+"    base = __shfl_sync(0xffffffffu, base, 0);\n"
+"    unsigned slot = base + __popc(mask & ((1u << lane) - 1));\n"
+"    if (keep && slot < cap) { d[(unsigned long long) row * cap + slot] = v[i]; r[(unsigned long long) row * cap + slot] = i; }\n"
+"  }\n"
+"}\n"
+"/* One block per query: bitonic sort of its kept scores (size, a power of\n"
+" * two, in shared memory), then the best k with their columns. */\n"
+"extern \"C\" __global__ void matrix_prune_sort(const float *d, const long long *r, const unsigned long long *counts,\n"
+"    unsigned cap, unsigned size, unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  extern __shared__ float key[];\n"
+"  unsigned *val = (unsigned *) (key + size);\n"
+"  unsigned row = blockIdx.x, n = (unsigned) counts[row];\n"
+"  if (n > cap) n = cap;\n"
+"  for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
+"  {\n"
+"    bool live = i < n;\n"
+"    key[i] = live ? d[(unsigned long long) row * cap + i] : __int_as_float(0x7f800000);\n"
+"    val[i] = live ? (unsigned) r[(unsigned long long) row * cap + i] : 0xffffffffu;\n"
+"  }\n"
+"  __syncthreads();\n"
+"  for (unsigned len = 2; len <= size; len <<= 1)\n"
+"    for (unsigned stride = len >> 1; stride > 0; stride >>= 1)\n"
+"    {\n"
+"      for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
+"      {\n"
+"        unsigned j = i ^ stride;\n"
+"        if (j > i)\n"
+"        {\n"
+"          float a = key[i], b = key[j];\n"
+"          bool up = (i & len) == 0;\n"
+"          if ((a > b) == up) { key[i] = b; key[j] = a; unsigned t = val[i]; val[i] = val[j]; val[j] = t; }\n"
+"        }\n"
+"      }\n"
+"      __syncthreads();\n"
+"    }\n"
+"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
+"  {\n"
+"    bool live = i < n;\n"
+"    outD[(unsigned long long) row * k + i] = live ? key[i] : __int_as_float(0x7f800000);\n"
+"    outR[(unsigned long long) row * k + i] = live && val[i] != 0xffffffffu ? (long long) val[i] : -1;\n"
+"  }\n"
+"}\n";
+
+#define ANN_PRUNE_SAMPLE 8192	/* sampled scores per query */
+#define ANN_PRUNE_RANK 32		/* the sample's least cutoff rank */
+#define ANN_PRUNE_MARGIN 4		/* expected kept / needed candidates */
+#define ANN_PRUNE_CAP 16384		/* most scores kept per query */
+#define ANN_PRUNE_MIN_ROWS 65536	/* smaller rows select in full */
+
+/* ANN_PRUNE_MIN_ROWS, or the environment's (tests prune small indexes). */
+static uint32_t
+PruneMinRows(void)
+{
+	static _Atomic uint32_t rows;
+	uint32_t	value = atomic_load_explicit(&rows, memory_order_relaxed);
+
+	if (value == 0)
+	{
+		const char *text = getenv("ANN_PRUNE_MIN_ROWS");
+		unsigned long parsed = text ? strtoul(text, NULL, 10) : 0;
+
+		value = parsed > 0 && parsed < UINT32_MAX ? (uint32_t) parsed : ANN_PRUNE_MIN_ROWS;
+		atomic_store_explicit(&rows, value, memory_order_relaxed);
+	}
+	return value;
+}
+
 static const char RerankSource[] =
-"template <typename T> __device__ void rerank(const float *data, long long stride, const unsigned *rows,\n"
+"template <typename D, typename T> __device__ void rerank(const D *data, long long stride, const unsigned *rows,\n"
 "    unsigned eligible, unsigned nr, T *positions, unsigned top, unsigned nq, const float *queries, int dims, float *out)\n"
 "{\n"
 "  unsigned i = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;\n"
@@ -1917,15 +2065,21 @@ static const char RerankSource[] =
 "  long long p = (long long) positions[i];\n"
 "  unsigned row = p < 0 || (unsigned long long)p >= eligible ? 0xffffffffu : rows ? rows[p] : (unsigned)p;\n"
 "  if (row >= nr) { if (!lane) { positions[i] = (T)-1; out[i] = __int_as_float(0x7f800000); } return; }\n"
-"  const float *v = data + (long long) row * stride, *q = queries + (i / top) * dims;\n"
-"  double sum = 0.; for (int d = lane; d < dims; d += 32) { double x = (double)v[d] - q[d]; sum += x * x; }\n"
+"  const D *v = data + (long long) row * stride; const float *q = queries + (i / top) * dims;\n"
+"  double sum = 0.; for (int d = lane; d < dims; d += 32) { double x = (double)load(v + d) - q[d]; sum += x * x; }\n"
 "  for (int o = 16; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);\n"
 "  if (!lane) { positions[i] = (T)row; out[i] = (float)sqrt(sum); }\n"
 "}\n"
 "extern \"C\" __global__ void rerank_i64(const float *v, long long st, const unsigned *r, unsigned ne, unsigned nr,\n"
 "  long long *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
 "extern \"C\" __global__ void rerank_u32(const float *v, long long st, const unsigned *r, unsigned ne, unsigned nr,\n"
-"  unsigned *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n";
+"  unsigned *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
+"extern \"C\" __global__ void rerank_h_i64(const unsigned short *v, long long st, const unsigned *r, unsigned ne,\n"
+"  unsigned nr, long long *p, unsigned top, unsigned nq, const float *q, int d, float *o)\n"
+"  { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
+"extern \"C\" __global__ void rerank_h_u32(const unsigned short *v, long long st, const unsigned *r, unsigned ne,\n"
+"  unsigned nr, unsigned *p, unsigned top, unsigned nq, const float *q, int d, float *o)\n"
+"  { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n";
 
 #define ANN_GATHER_BLOCK 256
 #define ANN_GATHER_SLACK 32		/* extra FP16 candidates re-scored in FP32 */
@@ -1961,6 +2115,12 @@ typedef struct GatherModule
 	CUfunction	f16;
 	CUfunction	rerank64;
 	CUfunction	rerank32;
+	CUfunction	rerankHalf64;	/* the same from FP16 rows */
+	CUfunction	rerankHalf32;
+	CUfunction	pruneSample;
+	CUfunction	pruneFill;
+	CUfunction	pruneCompact;
+	CUfunction	pruneSort;
 } GatherModule;
 
 static GatherModule gatherModules[ANN_CUVS_MAX_DEVICES];
@@ -1991,18 +2151,27 @@ GatherKernels(int device)
 		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
-	source = malloc(strlen(GatherSource) + strlen(RerankSource) + 1);
+	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + 1);
 	if (source == NULL)
 		goto fail;
 	strcpy(source, GatherSource);
 	strcat(source, RerankSource);
+	strcat(source, PruneSource);
 	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->lookup, module->module, "lookup") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->f32, module->module, "gather_f32") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->f16, module->module, "gather_f16") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->rerank64, module->module, "rerank_i64") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->rerank32, module->module, "rerank_u32") != CUDA_SUCCESS)
+		cuModuleGetFunction(&module->rerank32, module->module, "rerank_u32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->rerankHalf64, module->module, "rerank_h_i64") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->rerankHalf32, module->module, "rerank_h_u32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneSample, module->module, "matrix_sample") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneFill, module->module, "matrix_fill") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneCompact, module->module, "matrix_compact") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
+		cuFuncSetAttribute(module->pruneSort, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS)
 		goto fail;
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
@@ -2098,7 +2267,8 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 	&positions, &top, &nq, (void *) &queries, &dimensions, &out};
 
 	return module && cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
-		cuLaunchKernel(wide ? module->rerank64 : module->rerank32, blocks, 1, 1,
+		cuLaunchKernel(shard->rerankHalf ? (wide ? module->rerankHalf64 : module->rerankHalf32) :
+					   (wide ? module->rerank64 : module->rerank32), blocks, 1, 1,
 					   ANN_GATHER_BLOCK, 1, 1, 0, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 }
 
@@ -3060,6 +3230,103 @@ MatrixBuffers(AnnCuvsDevice *lane, size_t scores, size_t candidates, size_t outp
 }
 
 /*
+ * --matrix-prune: select the best `candidates` of each query's score row
+ * (lane->matrixScores, q rows of n) from the scores under a sampled cutoff
+ * instead of all n, writing what AnnSelectBatch would: values to
+ * matrixCandidates and columns to matrixIndices. The cutoff is the rank-th
+ * smallest of ANN_PRUNE_SAMPLE evenly spaced scores, so about n * rank /
+ * SAMPLE scores pass: 4k of 1M at the least rank, or ANN_PRUNE_MARGIN times
+ * the candidates when that is more. Returns 0, with nothing
+ * written, when a query keeps fewer than `candidates` or more than the
+ * buffer holds (or a launch fails): the caller then selects in full.
+ */
+static int
+PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q,
+			 uint32_t n, uint32_t candidates)
+{
+	GatherModule *module;
+	unsigned	sample = ANN_PRUNE_SAMPLE,
+				rank = (unsigned) (((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / (n ? n : 1)),
+				cap = ANN_PRUNE_CAP,
+				rows = n,
+				queries = q;
+	size_t		total = (size_t) q * cap;
+	unsigned	sampleBlocks = (unsigned) (((size_t) q * sample + 255) / 256);
+	unsigned	fillBlocks = (unsigned) ((total + 255) / 256);
+	unsigned	compactBlocks = (n + 256 * 16 - 1) / (256 * 16);
+
+	if (rank < ANN_PRUNE_RANK)
+		rank = ANN_PRUNE_RANK;
+
+	/* Too few rows to prune well: the kept share would approach the cap. */
+	if (!AnnIndexConfig.matrix_prune || n < PruneMinRows() || candidates > cap / ANN_PRUNE_MARGIN ||
+		rank > sample / 4 || (uint64_t) n * rank / sample > cap / 2 || (module = GatherKernels(device)) == NULL)
+		return 0;
+	if (!GrowDevice((void **) &lane->pruneSample, &lane->pruneSampleCap, (size_t) q * sample, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneBounds, &lane->pruneBoundCap, (size_t) q * rank, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneBoundRows, &lane->pruneBoundRowCap, (size_t) q * rank, sizeof(int64_t), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneScores, &lane->pruneScoreCap, total, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->prunePositions, &lane->prunePositionCap, total, sizeof(int64_t), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneCounts, &lane->pruneCountCap, q, sizeof(int64_t), 0, stream) ||
+		!GrowPinned((void **) &lane->pruneHostCounts, &lane->pruneHostCountCap, q, sizeof(int64_t), 0))
+		return 0;
+	{
+		void	   *sampleArgs[] = {&lane->matrixScores, &rows, &queries, &sample, &lane->pruneSample};
+		void	   *fillArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &queries, &cap};
+		void	   *compactArgs[] = {&lane->matrixScores, &rows, &lane->pruneBounds, &rank, &cap,
+		&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts};
+
+		if (cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->pruneSample, sampleBlocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   sampleArgs, NULL) != CUDA_SUCCESS ||
+			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
+						   q, sample, rank, 1, NULL) != CUVS_SUCCESS ||
+			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->pruneFill, fillBlocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   fillArgs, NULL) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->pruneCompact, compactBlocks, q, 1, 256, 1, 1, 0, (CUstream) stream,
+						   compactArgs, NULL) != CUDA_SUCCESS ||
+			cudaMemcpyAsync(lane->pruneHostCounts, lane->pruneCounts, (size_t) q * sizeof(int64_t),
+							cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+			cudaStreamSynchronize(stream) != cudaSuccess)
+			return 0;
+	}
+	{
+		int64_t		most = 0;
+		unsigned	size = 1,
+					k = candidates;
+
+		for (uint32_t j = 0; j < q; j++)
+		{
+			if (lane->pruneHostCounts[j] < (int64_t) candidates || lane->pruneHostCounts[j] > (int64_t) cap)
+			{
+				(void) atomic_fetch_add_explicit(&state->matrix_prune_fallbacks, 1, memory_order_relaxed);
+				return 0;
+			}
+			if (lane->pruneHostCounts[j] > most)
+				most = lane->pruneHostCounts[j];
+		}
+		while (size < (unsigned) most)
+			size <<= 1;
+		{
+			/*
+			 * The kept lists are short: sort each in one block's shared
+			 * memory.
+			 */
+			void	   *sortArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &cap, &size, &k,
+			&lane->matrixCandidates, &lane->matrixIndices};
+
+			if (cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+				cuLaunchKernel(module->pruneSort, q, 1, 1, 1024, 1, 1, size * 8, (CUstream) stream,
+							   sortArgs, NULL) != CUDA_SUCCESS)
+				return 0;
+		}
+	}
+	(void) atomic_fetch_add_explicit(&state->matrix_pruned_queries, q, memory_order_relaxed);
+	return 1;
+}
+
+/*
  * General top-k: score a matrix once, select k+slack for every query, then
  * rerank in FP32 on device when resident, otherwise with the host vectors.
  * A shared filter is uploaded once per shard; GPU buffers are reused on its
@@ -3209,8 +3476,9 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			}
 			if (!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
 										 (int) dims, lane->matrixScores, stream) ||
-				AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
-							   lane->matrixIndices, q, n, candidates, 0) != CUVS_SUCCESS)
+				(!PrunedSelect(state, lane, shard->device, stream, q, n, candidates) &&
+				 AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
+								lane->matrixIndices, q, n, candidates, 0, NULL) != CUVS_SUCCESS))
 			{
 				ok = 0;
 				break;
@@ -3220,7 +3488,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				if (!RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
 								  candidates, q, lane->queries, lane->matrixCandidates, stream, 1) ||
 					AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices,
-								   lane->matrixValues, lane->matrixRows, q, candidates, outk, 1) != CUVS_SUCCESS ||
+								   lane->matrixValues, lane->matrixRows, q, candidates, outk, 1, NULL) != CUVS_SUCCESS ||
 					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
 									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
 					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,
@@ -3985,7 +4253,12 @@ CalibratedFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJ
 	int			graph = jobs[0]->bitsets != NULL;
 	int			mode;
 
+	/*
+	 * The profile's FP16 routes were calibrated (and recall-qualified) with
+	 * FP32 rescoring, so they apply only with --fp16-exact.
+	 */
 	if (AnnIndexCostProfile == NULL || file->quant != ANN_QUANT_NVFP4 || file->nshards != 1 || !state->fp16 ||
+		!AnnIndexConfig.fp16_exact ||
 		AnnIndexConfig.filtered_algo != 2 || AnnIndexConfig.quant_slack != 256 || AnnIndexConfig.itopk != 512 ||
 		AnnIndexConfig.filtered_itopk != 1024 || AnnIndexConfig.filtered_width != 4 ||
 		AnnIndexConfig.filtered_iterations != 0 || AnnIndexConfig.persistent || AnnIndexConfig.filtered_slack != 0 ||

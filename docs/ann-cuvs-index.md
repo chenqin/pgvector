@@ -81,11 +81,37 @@ flowchart LR
 - **Host memory.** On Linux the worker reads `keys.i64` and `vectors.f32` into memory backed by transparent huge pages, instead of mapping them, and drops their page cache. Filtered lookups touch rows a page or more apart, so 4 KB pages cost a TLB miss per row. With huge pages, mapping 100k sorted keys to rows took 0.74 ms instead of 2.4 ms on the B200 host. Ordinal mapping also starts each key's search at the position its key gap predicts.
 - **Merge.** The worker re-scores each shard's candidates with FP32 vectors, sorts them, and merges the shard lists pairwise, halving their number each round, down to the global top-k.
 
+## FP16 distances
+
+Rescoring cannot add a neighbour the graph search did not return; it only
+reorders and re-measures the candidates. With the default `--filtered-slack 0`
+a shard returns exactly k candidates, so FP32 rescoring leaves recall@k on
+one shard unchanged. It changes recall only by picking k out of k + slack
+overfetched candidates, or by changing which hits win the merge across shards.
+Measured FP16 graph recall, with rescoring that therefore did not change the
+sets: 0.985 unfiltered (1.0 for FP32), and a 0.988 mean (0.928 to 0.998) at
+k=500 on 0.1–10% filters ([k=500 stress](ann-k500-stress.md)). Both meet a 95%
+mean-recall target.
+
+So by default FP16 indexes skip rescoring: graph searches return the FP16
+dataset's squared-L2 distances (square-rooted), and quantized gather scans
+rerank their NVFP4/FP8 candidates on the GPU from the FP16 dataset instead of
+an FP32 copy. Returned distances then carry FP16 rounding error (the GPU tests
+bound it at 0.01 on 32-dimensional data, against 1e-4 for FP32) and near-ties
+may order differently from SQL. Use `--fp16-exact on`
+when callers need exact distances or SQL's order: distance thresholds, ties,
+or comparisons across indexes. Per-query gather scans still re-score on the
+CPU from `vectors.f32` and stay exact either way. Statistics count native
+FP16 graph queries as `cagra_fp16_queries`; `rerank_bytes` per replica shows
+whether an FP32 copy is on the GPU.
+
 ## B200 throughput options
 
 | Option | Effect |
 | --- | --- |
-| `--dtype float16` (builder) | Stores the CAGRA dataset in FP16: half the HBM traffic and footprint (8.5 GB vs 11 GB on disk for 10M×128). The worker converts queries to FP16, and FP32 re-scoring keeps returned distances exact. |
+| `--dtype float16` (builder) | Stores the CAGRA dataset in FP16: half the HBM traffic and footprint (8.5 GB vs 11 GB on disk for 10M×128). The worker converts queries to FP16. By default graph results keep their FP16 distances, and GPU reranking of quantized gather scans reads the FP16 dataset in place, so no FP32 copy goes to the GPUs; see [FP16 distances](#fp16-distances). |
+| `--matrix-prune on\|off` (worker) | Matrix gathers of at least 65,536 eligible rows per shard select each query's k+slack candidates from the scores under a cutoff sampled from 8,192 of them (about four times the candidates needed pass), sorted in one block's shared memory, instead of a radix select over every row. A query whose cutoff keeps too few or too many falls back to full selection, so the candidates are the same. Default off; statistics `matrix_pruned_queries` and `matrix_prune_fallbacks`. On 10% filters at k=500 it took matrix gathers from 170k to 311k vectors/s ([measurements](ann-10pct-throughput.md)). |
+| `--fp16-exact on\|off` (worker) | For FP16 indexes, rescore graph results in FP32 (on the GPU with `--gpu-rerank on`, else on the CPU) and rerank gathers from an FP32 copy on the GPUs (5.12 GB per replica for 10M×128): exact distances, at the cost of that memory and work. Default off. The worker's cost-profile routing applies only with it on, as the current profile was calibrated with FP32 rescoring. |
 | `--itopk N` (worker) | CAGRA internal top-k for unfiltered queries, at most 512. This is the main recall/throughput dial. The default is 128; 64 kept recall@10 at 1.0 on the 10M benchmark below. |
 | `--filtered-itopk N` | Internal top-k for selective filters: at most 512 with single-CTA search, 4096 with multi-CTA. |
 | `--filtered-algo`, `--filtered-width`, `--filtered-iterations` | CAGRA algorithm (default `multi`), search width (default 4) and iteration limit for bitset-filtered searches. |

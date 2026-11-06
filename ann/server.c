@@ -129,6 +129,14 @@ static _Thread_local Composite *submittingComposite = NULL;
 static _Thread_local uint32_t submittingPart = 0;
 
 /*
+ * While set, SubmitBitmapJob collects prepared jobs here instead of queueing
+ * each: a batch request then queues all its parts under one lock, so lanes
+ * find the whole same-filter group at once (see EnqueueMany).
+ */
+static _Thread_local Job **submittingDeferred = NULL;
+static _Thread_local uint32_t submittingDeferredCount = 0;
+
+/*
  * A filter the worker already holds (a cached bitmap's rows, an attribute
  * value's rows), by its shared row arrays: its queued jobs, oldest first,
  * and the lanes working on it. An entry is freed once no queued or running
@@ -572,9 +580,81 @@ CompositeAnswer(Composite *composite, uint32_t part, uint32_t route, AnnStatus s
 	}
 }
 
-static void
-Finish(Service *service, Job *job)
+/*
+ * What Finish leaves for its lane to settle once per batch: pending bytes,
+ * failures and the jobs' file and bitmap references, grouped by entry, so a
+ * batch of jobs over one filter takes each shared lock once, not per job.
+ */
+#define ANN_SETTLE_ENTRIES 16
+
+typedef struct Settlement
 {
+	uint64_t	charge;
+	uint64_t	failed;
+	uint32_t	n;
+	struct
+	{
+		AnnIndexFile *file;
+		AnnIndexBitmap *bitmap;
+		uint64_t	charge;
+		uint32_t	count;
+	}			entries[ANN_SETTLE_ENTRIES];
+} Settlement;
+
+/* Defer a finished job's accounting; false when the settlement is full. */
+static int
+SettleAdd(Settlement *settle, Job *job)
+{
+	AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
+	uint32_t	i;
+
+	for (i = 0; i < settle->n; i++)
+		if (settle->entries[i].file == file && settle->entries[i].bitmap == job->bitmap)
+			break;
+	if (i == settle->n)
+	{
+		if (settle->n == ANN_SETTLE_ENTRIES)
+			return 0;
+		settle->entries[i].file = file;
+		settle->entries[i].bitmap = job->bitmap;
+		settle->entries[i].charge = 0;
+		settle->entries[i].count = 0;
+		settle->n++;
+	}
+	settle->entries[i].charge += job->charge;
+	settle->entries[i].count++;
+	settle->charge += job->charge;
+	if (job->job.status != ANN_OK)
+		settle->failed++;
+	return 1;
+}
+
+static void
+Settle(Service *service, Settlement *settle)
+{
+	if (settle->n == 0)
+		return;
+	(void) pthread_mutex_lock(&service->mutex);
+	service->pending_bytes -= settle->charge;
+	for (uint32_t i = 0; i < settle->n; i++)
+		if (settle->entries[i].file)
+			settle->entries[i].file->pendingBytes -= settle->entries[i].charge;
+	service->failed += settle->failed;
+	(void) pthread_mutex_unlock(&service->mutex);
+	for (uint32_t i = 0; i < settle->n; i++)
+	{
+		if (settle->entries[i].bitmap)
+			AnnIndexBitmapReleaseCount(settle->entries[i].file, settle->entries[i].bitmap, settle->entries[i].count);
+		if (settle->entries[i].file)
+			AnnIndexPutCount(settle->entries[i].file, settle->entries[i].count);
+	}
+	memset(settle, 0, sizeof(*settle));
+}
+
+static void
+Finish(Service *service, Job *job, Settlement *settle)
+{
+	int			settled;
 	unsigned char *data = NULL;
 	size_t		size = 0;
 	uint64_t	finished = traceFile ? Now() : 0;
@@ -695,13 +775,17 @@ Finish(Service *service, Job *job)
 		(void) pthread_mutex_unlock(&traceMutex);
 	}
 	free(data);
-	(void) pthread_mutex_lock(&service->mutex);
-	service->pending_bytes -= job->charge;
-	if (job->kind == JOB_INDEX && job->bitmapFile)
-		job->bitmapFile->pendingBytes -= job->charge;
-	if (job->job.status != ANN_OK)
-		service->failed++;
-	(void) pthread_mutex_unlock(&service->mutex);
+	settled = settle && SettleAdd(settle, job);
+	if (!settled)
+	{
+		(void) pthread_mutex_lock(&service->mutex);
+		service->pending_bytes -= job->charge;
+		if (job->kind == JOB_INDEX && job->bitmapFile)
+			job->bitmapFile->pendingBytes -= job->charge;
+		if (job->job.status != ANN_OK)
+			service->failed++;
+		(void) pthread_mutex_unlock(&service->mutex);
+	}
 	Release(job->connection);
 	free(job->job.results);
 	free(job->index.results);
@@ -709,9 +793,9 @@ Finish(Service *service, Job *job)
 	free(job->ordinals);
 	for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
 		free(job->ownedBitsets[s]);
-	if (job->bitmap)
+	if (!settled && job->bitmap)
 		AnnIndexBitmapRelease(job->bitmapFile, job->bitmap);
-	if (job->bitmapFile)
+	if (!settled && job->bitmapFile)
 		AnnIndexPut(job->bitmapFile);
 	free(job->payload);
 	free(job);
@@ -1054,8 +1138,14 @@ Lane(void *argument)
 				batch[i]->job = jobs[i];
 		}
 		DeviceLostCheck(service, batch, count);
-		for (uint32_t i = 0; i < count; i++)
-			Finish(service, batch[i]);
+		{
+			Settlement	settle;
+
+			memset(&settle, 0, sizeof(settle));
+			for (uint32_t i = 0; i < count; i++)
+				Finish(service, batch[i], &settle);
+			Settle(service, &settle);
+		}
 		if (owns)
 		{
 			/* The filter is free again: one waiting lane may take its queue. */
@@ -1240,6 +1330,61 @@ Enqueue(Service *service, Connection *connection, Job *job)
 	(void) pthread_cond_signal(&service->condition);
 	(void) pthread_mutex_unlock(&service->mutex);
 	return 1;
+}
+
+/*
+ * Admit and queue several prepared jobs under one lock, waking one lane per
+ * full batch of them; admitted[i] tells which fit the pending budget.
+ */
+static uint32_t
+EnqueueMany(Service *service, Connection *connection, Job **jobs, uint32_t count, char *admitted)
+{
+	uint32_t	n = 0;
+	uint32_t	per = service->options.max_batch_jobs ? service->options.max_batch_jobs : 1;
+
+	(void) pthread_mutex_lock(&service->mutex);
+	for (uint32_t i = 0; i < count; i++)
+	{
+		Job		   *job = jobs[i];
+		AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
+
+		admitted[i] = 0;
+		if (service->pending_bytes + job->charge > service->options.max_pending_bytes)
+		{
+			service->rejected++;
+			continue;
+		}
+		if (file && service->options.index_pending_share < 100 &&
+			file->pendingBytes + job->charge >
+			service->options.max_pending_bytes / 100 * service->options.index_pending_share)
+		{
+			service->rejected++;
+			service->rejected_index++;
+			continue;
+		}
+		if (file)
+			file->pendingBytes += job->charge;
+		service->pending_bytes += job->charge;
+		if (traceFile)
+		{
+			job->arrived = frameArrived;
+			job->queued = Now();
+		}
+		Append		(service, job);
+
+		admitted[i] = 1;
+		n++;
+	}
+	if (n)
+	{
+		(void) pthread_mutex_lock(&connection->mutex);
+		connection->references += n;
+		(void) pthread_mutex_unlock(&connection->mutex);
+		for (uint32_t woken = 0; woken < (n + per - 1) / per; woken++)
+			(void) pthread_cond_signal(&service->condition);
+	}
+	(void) pthread_mutex_unlock(&service->mutex);
+	return n;
 }
 
 static int
@@ -1965,6 +2110,12 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	job->composite = submittingComposite;
 	job->compositePart = submittingPart;
 	job->wanted = submittingWanted;
+	if (submittingDeferred)
+	{
+		/* The batch takes every deferred job's file reference at once. */
+		submittingDeferred[submittingDeferredCount++] = job;
+		return ANN_PENDING;
+	}
 	if (file)
 		AnnIndexHold(file);		/* until Finish: unloading waits for it */
 	if (Enqueue(service, connection, job))
@@ -2307,6 +2458,7 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 	char		name[ANN_INDEX_NAME_MAX + 1];
 	uint32_t	searchK;
 	uint64_t	deleted;
+	Job		   *deferred[64];	/* parts is at most 64 */
 
 	if (size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
 		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size < 24 + (uint64_t) nameLength ||
@@ -2384,6 +2536,16 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 	(void) pthread_mutex_lock(&connection->mutex);
 	connection->references++;
 	(void) pthread_mutex_unlock(&connection->mutex);
+
+	/*
+	 * Prepare every part, then queue them together (EnqueueMany). The parts'
+	 * bitmap references are taken at once; a part that fails to start gives
+	 * its own back.
+	 */
+	if (bitmap)
+		AnnIndexBitmapHoldCount(file, bitmap, parts);
+	submittingDeferred = deferred;
+	submittingDeferredCount = 0;
 	for (uint32_t p = 0; p < parts; p++)
 	{
 		size_t		partSize = (size_t) dimensions * 4;
@@ -2393,8 +2555,6 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 		if (part)
 		{
 			memcpy(part, payload + queries + (size_t) p * dimensions * 4, partSize);
-			if (bitmap)
-				AnnIndexBitmapHold(file, bitmap);
 			submittingWanted = searchK != k ? k : 0;
 			submittingComposite = composite;
 			submittingPart = p;
@@ -2407,8 +2567,36 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 			if (partStatus != ANN_PENDING)
 				free(part);
 		}
+		else if (bitmap)
+			AnnIndexBitmapRelease(file, bitmap);
 		if (partStatus != ANN_PENDING)
 			CompositeAnswer(composite, p, 0, partStatus, NULL, 0, 0, NULL);
+	}
+	submittingDeferred = NULL;
+	if (submittingDeferredCount)
+	{
+		char		admitted[64];
+		uint32_t	count = submittingDeferredCount;
+
+		submittingDeferredCount = 0;
+		AnnIndexHoldCount(file, count); /* until Finish: unloading waits */
+		if (EnqueueMany(service, connection, deferred, count, admitted) < count)
+			for (uint32_t i = 0; i < count; i++)
+			{
+				Job		   *job = deferred[i];
+
+				if (admitted[i])
+					continue;
+				/* As SubmitBitmapJob undoes a job the queue refused. */
+				if (job->bitmapFile)
+					AnnIndexPut(job->bitmapFile);
+				free(job->index.results);
+				if (job->bitmap)
+					AnnIndexBitmapRelease(job->bitmapFile, job->bitmap);
+				free(job->payload);
+				CompositeAnswer(composite, job->compositePart, 0, ANN_OVERLOADED, NULL, 0, 0, NULL);
+				free(job);
+			}
 	}
 	if (bitmap)
 		AnnIndexBitmapRelease(file, bitmap);

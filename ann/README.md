@@ -202,13 +202,15 @@ concurrent cold callers wait for initialization instead of falling back.
 FP32 CAGRA searches use the graph's FP32 distances directly, without CPU or
 GPU rescoring. The worker converts squared L2 to Euclidean distance before
 merging shards and returning SQL results. This is automatic for indexes built with `--dtype float32`, regardless of
-`--gpu-rerank`; that setting still controls
-FP16 graph rescoring and compressed-vector scan rescoring. Optional
+`--gpu-rerank`. FP16 graphs also use their own distances unless
+`--fp16-exact on` rescores them in FP32; without it, GPU reranking of
+quantized gather candidates reads the FP16 dataset in place (see
+[FP16 distances](../docs/ann-cuvs-index.md#fp16-distances)). Optional
 `--filtered-slack` still requests more graph candidates, which can change
 traversal and recall; FP32 scores are used directly to select the final k.
 Native scores can differ from PostgreSQL's distance arithmetic by FP32
 rounding, especially near zero. Graph traversal remains approximate.
-Statistics expose `cagra_fp32_queries` and `graph_cpu_rerank_candidates`,
+Statistics expose `cagra_fp32_queries`, `cagra_fp16_queries` and `graph_cpu_rerank_candidates`,
 alongside `gpu_rerank_candidates`, to verify the selected path. A resident
 `rerank_ready` buffer may still be used by scans of the same index.
 

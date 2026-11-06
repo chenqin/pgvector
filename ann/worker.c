@@ -408,6 +408,24 @@ main(int argc, char **argv)
 			free(AnnIndexCostProfile);
 			AnnIndexCostProfile = profile;
 		}
+		else if (strcmp(argv[i], "--matrix-prune") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--matrix-prune takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.matrix_prune = strcmp(value, "on") == 0;
+		}
+		else if (strcmp(argv[i], "--fp16-exact") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--fp16-exact takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.fp16_exact = strcmp(value, "on") == 0;
+		}
 		else if (strcmp(argv[i], "--gpu-rerank") == 0)
 		{
 			if (strcmp(value, "on") && strcmp(value, "off"))
@@ -666,8 +684,9 @@ usage:
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
-			"  [--quantized-scan on|off] [--quant-slack N] [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT]\n"
-			"  [--rerank-prefetch N] [--predicate-cache N] [--scan-routes on|off] [--scan-max-k N]\n"
+			"  [--fp16-exact on|off] [--matrix-prune on|off] [--quantized-scan on|off] [--quant-slack N]\n"
+			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--rerank-prefetch N] [--predicate-cache N]\n"
+			"  [--scan-routes on|off] [--scan-max-k N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else

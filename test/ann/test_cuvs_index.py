@@ -51,6 +51,11 @@ class CuvsIndexTests(unittest.TestCase):
                 cls.psql(f"SELECT ann_index_load('{cls.table}_{dtype}', '{path}')", server)
         cls.psql(f"""SELECT ann_filter_bitmap_build('{cls.table}_float32', 'tenant = ' || t)
                      FROM generate_series(0, 49) t""")
+        # FP16 graph with an NVFP4 copy, as deployed on B200 nodes.
+        subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{cls.table}', '--key', 'id',
+                        '--vector', 'emb', '--out', os.path.join(cls.directory.name, 'float16_nvfp4'),
+                        '--shards', '4', '--dtype', 'float16', '--quantize', 'nvfp4', '--attribute', 'tenant'],
+                       check=True, capture_output=True)
         # Quantized copies for the Blackwell module's gather scan.
         for quant in ['nvfp4', 'fp8']:
             path = os.path.join(cls.directory.name, quant)
@@ -162,14 +167,37 @@ class CuvsIndexTests(unittest.TestCase):
             all_expected.append(dict((int(key), float(distance)) for key, distance in
                 (line.split('|') for line in self.psql(f"""SELECT id, (emb <-> '{query}'::vector)::real
                     FROM {self.table} ORDER BY 2, id LIMIT 500""").splitlines())))
-        for enabled in ('off', 'on'):
+        def check(hits, want, approximate, context):
+            if approximate:
+                # GPU reranking from an FP16 dataset: near-ties may swap at
+                # the boundary, distances carry FP16 storage error.
+                self.assertGreaterEqual(len({key for key, _ in hits} & set(want)) / len(want), .99, context)
+                self.assertTrue(all(key in want or d >= max(want.values()) - 1e-2 for key, d in hits), context)
+                self.assertLess(max(abs(d - want[key]) for key, d in hits if key in want), 1e-2, context)
+            else:
+                self.assertEqual({key for key, _ in hits}, set(want), context)
+                self.assertLess(max(abs(d - want[key]) for key, d in hits), 1e-4, context)
+            self.assertEqual([d for _, d in hits], sorted(d for _, d in hits), context)
+
+        # GPU reranking off (host FP32), on (FP16 indexes rerank from their
+        # FP16 dataset), on with --fp16-exact (an FP32 copy, exact), and on
+        # with --matrix-prune, here for 10k rows per shard: selection from
+        # the scores under a sampled cutoff must keep every top candidate.
+        for mode in ('off', 'on', 'exact', 'prune'):
+            enabled = 'off' if mode == 'off' else 'on'
             server = Server('--backend', 'cuvs', '--lanes', '1', '--exact-limit', '0',
                             '--group-gather-limit', '4000000', '--matrix-gather', 'on', '--gpu-rerank', enabled,
+                            '--fp16-exact', 'on' if mode == 'exact' else 'off',
+                            '--matrix-prune', 'on' if mode == 'prune' else 'off',
                             '--matrix-max-mb', '1', '--delay-us', '1000',
+                            env={'ANN_PRUNE_MIN_ROWS': '1000'},
                             executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
             try:
-                for dtype in ('float32', 'float16', 'nvfp4', 'fp8'):
-                    name = self.table + '_matrix_' + dtype + '_' + enabled
+                dtypes = {'exact': ('float16', 'float16_nvfp4'), 'prune': ('float32', 'float16')}.get(
+                    mode, ('float32', 'float16', 'float16_nvfp4', 'nvfp4', 'fp8'))
+                for dtype in dtypes:
+                    approximate = mode in ('on', 'prune') and dtype.startswith('float16')
+                    name = self.table + '_matrix_' + dtype + '_' + mode
                     self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/{dtype}')", server)
                     self.psql(f"SELECT ann_filter_bitmap_build('{name}', 'tenant = 7')", server)
                     filter_id = int(self.psql(f"SELECT id FROM ann_filter_bitmap WHERE index_name = '{name}'", server))
@@ -186,10 +214,7 @@ class CuvsIndexTests(unittest.TestCase):
                                 count, _, eligible = struct.unpack_from('<IIQ', data, offset)
                                 self.assertEqual((count, eligible), (500, 800))
                                 hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
-                                want = expected[q % 8]
-                                self.assertEqual({key for key, _ in hits}, set(want), (dtype, enabled, nq, q))
-                                self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
-                                self.assertLess(max(abs(d - want[key]) for key, d in hits), 1e-4)
+                                check(hits, expected[q % 8], approximate, (dtype, mode, nq, q))
                                 offset += 16 + count * 12
                             self.assertEqual(offset, len(data))
                         # 10k eligible rows per shard exercises the radix selector
@@ -207,22 +232,26 @@ class CuvsIndexTests(unittest.TestCase):
                             count, _, eligible = struct.unpack_from('<IIQ', data, offset)
                             self.assertEqual((count, eligible), (500, 40000))
                             hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
-                            want = all_expected[q % 8]
-                            self.assertEqual({key for key, _ in hits}, set(want))
-                            self.assertEqual([d for _, d in hits], sorted(d for _, d in hits))
-                            self.assertLess(max(abs(d - want[key]) for key, d in hits), 1e-4)
+                            check(hits, all_expected[q % 8], approximate, (dtype, mode, 'all', q))
                             offset += 16 + count * 12
                         self.assertEqual(offset, len(data))
                         connection.sendall(frame(31, 1, name.encode()))
                         _, _, status, data = receive(connection)
                         self.assertEqual(status, 0)
                         stats = json.loads(data)
-                        self.assertEqual(stats['matrix_queries'], 84 + extra, (dtype, enabled, stats))
+                        self.assertEqual(stats['matrix_queries'], 84 + extra, (dtype, mode, stats))
+                        if mode == 'prune':
+                            # The 10k-row shards of the all-rows filter prune.
+                            self.assertGreater(stats['matrix_pruned_queries'], 0, stats)
                         self.assertLessEqual(stats['matrix_peak_score_bytes'], 1024 * 1024)
                         self.assertGreater(stats['matrix_peak_score_bytes'], 0)
                         if enabled == 'on':
                             self.assertGreater(stats['gpu_rerank_candidates'], 0)
                             self.assertTrue(all(r['rerank_ready'] for r in stats['replicas']))
+                            # Only --fp16-exact copies FP32 vectors to the GPUs: FP32
+                            # indexes and FP16 ones otherwise rerank in place.
+                            self.assertEqual(all(r['rerank_bytes'] > 0 for r in stats['replicas']),
+                                             mode == 'exact', (dtype, mode))
                         else:
                             self.assertEqual(stats['gpu_rerank_candidates'], 0)
             finally:
@@ -239,7 +268,8 @@ class CuvsIndexTests(unittest.TestCase):
         nearest = set(sorted(expected, key=lambda key: (expected[key], key))[:500])
         server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gather-limit', '0',
                         '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', 'on',
-                        '--filtered-itopk', '1024', '--filtered-slack', str(slack), executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                        '--fp16-exact', 'on', '--filtered-itopk', '1024', '--filtered-slack', str(slack),
+                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
         name = self.table + '_gpu_rerank'
         try:
             self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float16')", server)
@@ -275,7 +305,7 @@ class CuvsIndexTests(unittest.TestCase):
     def test_graph_gpu_rerank_overfetch(self):
         self._graph_gpu_rerank(256)
 
-    def _graph_fp32_native(self, enabled):
+    def _graph_native(self, enabled, dtype='float32'):
         import json
         import struct
         from test_index import search_frame, decode_hits
@@ -291,9 +321,12 @@ class CuvsIndexTests(unittest.TestCase):
                         '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', enabled,
                         '--filtered-itopk', '1024', '--filtered-slack', '256',
                         executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
-        name = self.table + '_fp32_native_' + enabled
+        name = self.table + '_' + dtype + '_native_' + enabled
+        # FP16 graphs return distances over the FP16 dataset: small, bounded
+        # error instead of FP32 roundoff.
+        tolerance = 1e-4 if dtype == 'float32' else 1e-2
         try:
-            self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float32')", server)
+            self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/{dtype}')", server)
             with server.connect() as connection:
                 queries = 0
                 for filtered, batch in [(False, 1), (True, 1), (True, 8), (False, 8)]:
@@ -322,14 +355,14 @@ class CuvsIndexTests(unittest.TestCase):
                         self.assertEqual(hits, sorted(hits, key=lambda hit: (hit[1], hit[0])))
                         # cuVS returns squared L2. Check its FP32 error before sqrt,
                         # including cancellation near a self-match, and the L2 units.
-                        self.assertTrue(all(d >= 0 and abs(d*d - want[key]*want[key]) < 1e-4 for key, d in hits))
-                        self.assertTrue(all(abs(d-want[key]) < 1e-4 for key, d in hits if want[key] > .1))
+                        self.assertTrue(all(d >= 0 and abs(d*d - want[key]*want[key]) < tolerance for key, d in hits))
+                        self.assertTrue(all(abs(d-want[key]) < tolerance for key, d in hits if want[key] > .1))
                     queries += batch
                 connection.sendall(frame(31, 2, name.encode()))
                 _, _, status, data = receive(connection)
                 self.assertEqual(status, 0)
                 stats = json.loads(data)
-                self.assertEqual(stats['cagra_fp32_queries'], queries)
+                self.assertEqual(stats['cagra_fp32_queries' if dtype == 'float32' else 'cagra_fp16_queries'], queries)
                 self.assertEqual(stats['graph_cpu_rerank_candidates'], 0)
                 self.assertEqual(stats['gpu_rerank_candidates'], 0)
                 self.assertEqual(stats['matrix_queries'], 0)
@@ -337,10 +370,16 @@ class CuvsIndexTests(unittest.TestCase):
             server.close()
 
     def test_graph_fp32_native_gpu_rerank_on(self):
-        self._graph_fp32_native('on')
+        self._graph_native('on')
 
     def test_graph_fp32_native_gpu_rerank_off(self):
-        self._graph_fp32_native('off')
+        self._graph_native('off')
+
+    def test_graph_fp16_native_gpu_rerank_on(self):
+        self._graph_native('on', 'float16')
+
+    def test_graph_fp16_native_gpu_rerank_off(self):
+        self._graph_native('off', 'float16')
 
     def test_graph_dtype_must_match_manifest(self):
         from pathlib import Path
@@ -571,11 +610,14 @@ class CuvsIndexTests(unittest.TestCase):
         self.assertEqual(mismatches, '0')
 
     def test_distances_are_exact(self):
-        error = self.psql(f"""
-            SELECT max(abs(s.distance - (t.emb <-> q.emb))) FROM {self.table} q,
-                ann_index_search('{self.table}_float16', q.emb, 10) s JOIN {self.table} t USING (id)
-            WHERE q.id % 2400 = 0""")
-        self.assertLess(float(error), 1e-4)
+        # FP32 graph distances are exact to FP32 roundoff; FP16 graphs return
+        # distances over their FP16 dataset (no rescoring by default).
+        for dtype, tolerance in (('float32', 1e-4), ('float16', 1e-2)):
+            error = self.psql(f"""
+                SELECT max(abs(s.distance - (t.emb <-> q.emb))) FROM {self.table} q,
+                    ann_index_search('{self.table}_{dtype}', q.emb, 10) s JOIN {self.table} t USING (id)
+                WHERE q.id % 2400 = 0""")
+            self.assertLess(float(error), tolerance, dtype)
 
 
 if __name__ == '__main__':
