@@ -163,6 +163,40 @@ the graph: 171.6k, 490.5k and 766.3k for b1, b16 and b32, lowest recall 0.29–0
   range: the gather route does not depend on a filtering rate, and graph routes
   never win below 2M rows.
 
+### The same sweep at k = 100
+
+| Matching rows | Gather b1 | Graph b1 | Gather b16 | Graph b16 | Gather b32 | Graph b32 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10k | 214.7k (0.99) | 10.7k (0.99) | 1,493.3k (0.99) | 10.9k (0.94) | 2,056.2k (0.99) | 11.0k (0.93) |
+| 50k | 197.0k (0.99) | 36.2k (0.97) | 1,394.4k (0.99) | 40.8k (0.64) | 1,852.1k (0.99) | 41.1k (0.65) |
+| 100k | 194.1k (0.99) | 59.9k (0.96) | 1,434.8k (0.99) | 67.2k (0.23) | 1,897.0k (0.99) | 67.7k (0.24) |
+| 500k | 197.3k (0.99) | 160.0k (0.66) | 1,356.7k (0.99) | 193.2k (0.29) | 1,724.2k (0.99) | 196.1k (0.30) |
+| 1M | 207.9k (0.99) | 215.8k (0.66) | 853.4k (0.99) | 315.1k (0.38) | 994.1k (0.99) | 325.9k (0.44) |
+| 2M | 163.5k (1.0) | 215.1k (0.90) | 451.8k (0.99) | 440.5k (0.73) | 288.4k (0.99) | 460.3k (0.68) |
+
+At k=100 the crossover moves down, as the cost argument predicts (graph work grows
+with k / (1 − r)): single-vector SQL ties at 1M rows and the graph wins at 2M;
+batches tie at 2M (b16). The gather's 2M b32 point is below its b16 point and was
+not repeated. Below 1M rows the gather is 1.2× to 190× faster with every query at
+0.99 or better.
+
+### Cost-profile routing against the limits
+
+The deployed FP16 profile ([cost model](ann-cost-model.md)) requires its calibrated
+settings (64 MiB matrices) and, with this change, `--fp16-exact on`. Same worker and
+settings otherwise, k=500, with and without `--cost-profile`:
+
+| Matching rows | Limits b1 | Profile b1 | Limits b32 | Profile b32 | Profile's choice |
+| ---: | ---: | ---: | ---: | ---: | --- |
+| 100k | 159.9k | 156.7k | 864.3k | 866.9k | NVFP4 scan + GPU rerank |
+| 1M | 176.2k | 171.4k | 668.2k | 665.5k | NVFP4 scan + GPU rerank |
+| 2M | 129.9k | 92.2k | 206.4k | 247.8k | mostly CAGRA + GPU rerank |
+
+Recall was the same (lowest query 0.992 or better). The profile matches the
+limits up to 1M rows; at 2M it trades 29% of single-query throughput for 20% more
+batched throughput. An FP32 recalibration was not run: the worker applies profiles
+only to FP16 + NVFP4 indexes, and the difference above appears only near 2M rows.
+
 ### Distinct predicates
 
 `mixed10` draws each search's range from 91 overlapping 10% windows
