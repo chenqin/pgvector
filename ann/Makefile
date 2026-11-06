@@ -57,12 +57,16 @@ ann-worker: $(WORKER_DEPS)
 	$(CC) $(CFLAGS) -pthread $(WORKER_SRCS) $(WORKER_LIBS) -lm -o $@
 
 # Monolithic SDKs keep these headers under CUVS_PREFIX/include; pip SDKs
-# split them into sibling packages. CUVS_CXXFLAGS can supply other layouts.
-CUVS_CPP_DIRS = $(wildcard $(CUVS_PREFIX)/../libraft/include $(CUVS_PREFIX)/../librmm/include $(CUVS_PREFIX)/../rapids_logger/include $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/libcudacxx $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/cub $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/thrust)
+# split them into sibling packages, with the CCCL RAPIDS built against under
+# libraft/include/rapids. That CCCL must come before the CUDA toolkit's, whose
+# older cuda/std would otherwise mix with it header by header; cupy's partial
+# copy is a last resort. CUVS_CXXFLAGS can supply other layouts.
+CUVS_CPP_DIRS = $(wildcard $(CUVS_PREFIX)/../libraft/include/rapids $(CUVS_PREFIX)/../libraft/include $(CUVS_PREFIX)/../librmm/include $(CUVS_PREFIX)/../rapids_logger/include)
+CUVS_CPP_FALLBACK_DIRS = $(wildcard $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/libcudacxx $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/cub $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/thrust)
 
 select_batch.o: select_batch.cpp select_batch.h
 	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
-	$(CXX) $(CXXFLAGS) -O2 -std=c++20 -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) $(CPPFLAGS) $(CUVS_CXXFLAGS) -c select_batch.cpp -o $@
+	$(CXX) $(CXXFLAGS) -O2 -std=c++20 -I"$(CUVS_PREFIX)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_FALLBACK_DIRS)) $(CPPFLAGS) $(CUVS_CXXFLAGS) -c select_batch.cpp -o $@
 
 # Requires cuVS 26.10 C/C++ SDKs, RAFT/RMM/CCCL, DLPack and CUDA runtime headers.
 # A different executable keeps the dependency-free CPU build reproducible.
