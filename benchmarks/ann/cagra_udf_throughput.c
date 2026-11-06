@@ -8,7 +8,10 @@
  *   cagra_udf_throughput INDEX_DIR CASE MODE [threads] [seconds] [batch] [k] [itopk] [slack]
  *
  * CASE: cat50 | cat10 | cat1 | mixed. MODE: bitset (one cached device bitset
- * per batch; for mixed, one cached bitset and one search per query) | udf.
+ * per batch; for mixed, one cached bitset and one search per query) | udf |
+ * udfgroup (mixed: one UDF search per group of queries with the same window
+ * size, each with its own filtering_rate, instead of one at the batch's
+ * highest rate).
  * Prints one JSON line.
  */
 #include <cuda_runtime.h>
@@ -47,7 +50,10 @@ static uint32_t batch = 32,
 			slack = 256,
 			sel;
 static int	mixed,
-			useUdf;
+			useUdf,
+			grouped;
+static uint32_t groupStart[11];	/* udfgroup: query slots of each window size */
+static float groupRate[10];
 static double seconds = 20;
 static atomic_uint_fast64_t totalQueries;
 static atomic_int ready;
@@ -215,6 +221,7 @@ Worker(void *arg)
 			   *dDistances;
 	uint32_t   *dNeighbors;
 	AnnUdfParams *dParams;
+	AnnUdfParams *dGroupParams;
 	AnnUdfStep *dSteps;
 	int32_t    *dValues;
 	uint32_t   *dStarts;
@@ -233,6 +240,7 @@ Worker(void *arg)
 	CUDA(cudaMalloc((void **) &dNeighbors, sizeof(uint32_t) * MAX_BATCH * 1024));
 	CUDA(cudaMalloc((void **) &dDistances, sizeof(float) * MAX_BATCH * 1024));
 	CUDA(cudaMalloc((void **) &dParams, sizeof(AnnUdfParams)));
+	CUDA(cudaMalloc((void **) &dGroupParams, sizeof(AnnUdfParams) * 10));
 	CUDA(cudaMalloc((void **) &dSteps, sizeof(programs.steps)));
 	CUDA(cudaMalloc((void **) &dValues, sizeof(programs.values)));
 	CUDA(cudaMalloc((void **) &dStarts, sizeof(programs.starts)));
@@ -249,6 +257,12 @@ Worker(void *arg)
 		p.values = dValues;
 		p.starts = dStarts;
 		CUDA(cudaMemcpy(dParams, &p, sizeof(p), cudaMemcpyHostToDevice));
+		/* A group's query ids start at 0: its starts begin at its first slot. */
+		for (int g = 0; g < 10; g++)
+		{
+			p.starts = dStarts + groupStart[g];
+			CUDA(cudaMemcpy(dGroupParams + g, &p, sizeof(p), cudaMemcpyHostToDevice));
+		}
 	}
 	/* Each thread its own query set: dataset rows plus noise. */
 	{
@@ -267,7 +281,18 @@ Worker(void *arg)
 	/* Warm up (JIT, pool), then wait for every thread. */
 	for (int w = 0; w < 3; w++)
 	{
-		if (useUdf)
+		if (useUdf && grouped)
+			for (int g = 0; g < 10; g++)
+			{
+				uint32_t	first = groupStart[g],
+							n = groupStart[g + 1] - groupStart[g];
+
+				if (n)
+					CHECK(AnnCagraUdfSearch(res, params, sharedIndex, dQueries + (size_t) first * dims, n, dims,
+											dNeighbors + (size_t) first * sel, dDistances + (size_t) first * sel,
+											sel, dGroupParams + g, groupRate[g]));
+			}
+		else if (useUdf)
 			CHECK(AnnCagraUdfSearch(res, params, sharedIndex, dQueries, batch, dims, dNeighbors, dDistances,
 									sel, dParams, rate));
 		else
@@ -281,7 +306,18 @@ Worker(void *arg)
 		usleep(100);
 	while (!stop)
 	{
-		if (useUdf)
+		if (useUdf && grouped)
+			for (int g = 0; g < 10; g++)
+			{
+				uint32_t	first = groupStart[g],
+							n = groupStart[g + 1] - groupStart[g];
+
+				if (n)
+					CHECK(AnnCagraUdfSearch(res, params, sharedIndex, dQueries + (size_t) first * dims, n, dims,
+											dNeighbors + (size_t) first * sel, dDistances + (size_t) first * sel,
+											sel, dGroupParams + g, groupRate[g]));
+			}
+		else if (useUdf)
 			CHECK(AnnCagraUdfSearch(res, params, sharedIndex, dQueries, batch, dims, dNeighbors, dDistances,
 									sel, dParams, rate));
 		else
@@ -317,7 +353,8 @@ main(int argc, char **argv)
 	}
 	dir = argv[1];
 	caseName = argv[2];
-	useUdf = strcmp(argv[3], "udf") == 0;
+	grouped = strcmp(argv[3], "udfgroup") == 0;
+	useUdf = strcmp(argv[3], "udf") == 0 || grouped;
 	threads = argc > 4 ? (uint32_t) atoi(argv[4]) : 8;
 	seconds = argc > 5 ? atof(argv[5]) : 20;
 	batch = argc > 6 ? (uint32_t) atoi(argv[6]) : 32;
@@ -353,9 +390,10 @@ main(int argc, char **argv)
 			CategoryRange(&p, 7, 7);
 		else
 		{
+			/* 1..10 categories, contiguous slots of each width (udfgroup). */
 			int32_t		lo = (int32_t) ((q * 37) % 90);
 
-			CategoryRange(&p, lo, lo + (int32_t) (q % 10));
+			CategoryRange(&p, lo, lo + (int32_t) (q * 10 / batch));
 		}
 		programs.starts[q] = programs.nsteps;
 		if (AnnUdfCompile(p.b, p.n, Column, NULL, programs.steps, 256, &programs.nsteps, programs.values, 256,
@@ -366,7 +404,11 @@ main(int argc, char **argv)
 		r = (float) (1.0 - match / (double) rows);
 		if (r > rate)
 			rate = r;
+		if (r > groupRate[q * 10 / batch])
+			groupRate[q * 10 / batch] = r > 0.999f ? 0.999f : r;
 	}
+	for (int g = 0; g <= 10; g++)
+		groupStart[g] = (uint32_t) ((g * batch + 9) / 10);
 	if (rate > 0.999f)
 		rate = 0.999f;
 
@@ -403,7 +445,7 @@ main(int argc, char **argv)
 	elapsed = Now() - start;
 	printf("{\"case\":\"%s\",\"mode\":\"%s\",\"threads\":%u,\"batch\":%u,\"k\":%u,\"itopk\":%u,\"candidates\":%u,"
 		   "\"filtering_rate\":%.4f,\"seconds\":%.2f,\"queries\":%llu,\"qps\":%.0f}\n",
-		   caseName, useUdf ? "udf" : (mixed ? "bitset_cached_per_query" : "bitset_cached"), threads, batch, k, itopk,
+		   caseName, grouped ? "udfgroup" : useUdf ? "udf" : (mixed ? "bitset_cached_per_query" : "bitset_cached"), threads, batch, k, itopk,
 		   sel, useUdf ? rate : 0.0, elapsed, (unsigned long long) atomic_load(&totalQueries),
 		   atomic_load(&totalQueries) / elapsed);
 	return 0;

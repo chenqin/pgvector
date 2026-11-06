@@ -1,0 +1,18 @@
+bitset_per_query         b= 1 med=   2.763 ms  rec=1.0000 min=1.000
+udf                      b= 1 med=   1.330 ms  rec=1.0000 min=1.000
+udf_no_rate              b= 1 med=   0.362 ms  rec=0.1700 min=0.170
+bitset_cached_per_query  b= 1 med=   1.341 ms  rec=1.0000 min=1.000
+udf_rate_10x_broad       b= 1 med=   0.607 ms  rec=0.6580 min=0.658
+udf_grouped              b= 1 med=   1.331 ms  rec=1.0000 min=1.000
+bitset_per_query         b=16 med=  28.677 ms  rec=0.9999 min=0.998
+udf                      b=16 med=  12.267 ms  rec=1.0000 min=1.000
+udf_no_rate              b=16 med=   0.739 ms  rec=0.4070 min=0.140
+bitset_cached_per_query  b=16 med=  14.136 ms  rec=0.9998 min=0.996
+udf_rate_10x_broad       b=16 med=   2.542 ms  rec=0.8910 min=0.568
+udf_grouped              b=16 med=  10.448 ms  rec=0.9998 min=0.998
+bitset_per_query         b=32 med=  54.925 ms  rec=0.9996 min=0.998
+udf                      b=32 med=  23.617 ms  rec=0.9998 min=0.994
+udf_no_rate              b=32 med=   1.225 ms  rec=0.6212 min=0.140
+bitset_cached_per_query  b=32 med=  26.000 ms  rec=0.9998 min=0.998
+udf_rate_10x_broad       b=32 med=   4.488 ms  rec=0.9483 min=0.606
+udf_grouped              b=32 med=  16.825 ms  rec=0.9997 min=0.994

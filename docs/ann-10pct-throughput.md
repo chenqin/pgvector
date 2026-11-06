@@ -159,9 +159,12 @@ the graph: 171.6k, 490.5k and 766.3k for b1, b16 and b32, lowest recall 0.29–0
   batches, at k=500. A calibrated FP32 cost profile would only change routes there;
   with the graph's weak queries at these settings, the gather limit of 4M rows is the
   safer rule for a per-query recall target, and the profile was not recalibrated.
-* Rate grouping for the graph route (Phase 3 of the earlier plan) is moot for this
-  range: the gather route does not depend on a filtering rate, and graph routes
-  never win below 2M rows.
+* Rate grouping for the graph route (Phase 3 of the earlier plan) matters where one
+  graph search serves several selectivities: measured on mixed UDF batches, one
+  search per rate group gives 28.7k q/s on 8 GPUs against 11.3k at the batch's
+  highest rate and 22.0k with per-query bitsets, at the same recall
+  ([details](ann-cagra-filter-udf.md#grouping-a-mixed-batch-by-filtering-rate)).
+  The worker's bitset graph route already searches one filter (one rate) per call.
 
 ### The same sweep at k = 100
 
@@ -215,6 +218,12 @@ Recall is identical (lowest query 0.992 or better). Up to 1M rows the profile
 chooses the NVFP4 scan, as the limits do; at 2M it sends single searches to the
 graph (isolated latency favours it, saturated throughput does not) and loses 28%.
 For saturated throughput the 4M gather limit is the better rule here.
+
+At 4M matching rows (gather limit raised to 8M so the gather takes them) the graph
+wins at k=100: 221.7k against 31.6k for single-vector SQL, 884.1k against 45.8k
+(b16) and 1,205.9k against 45.8k (b32), lowest recall 0.85–0.99. At that size the
+gather's cutoff would keep more than the sort holds, so it selects from all 4M
+scores. With the default 4M limit these searches take the graph anyway.
 
 ### Distinct predicates
 

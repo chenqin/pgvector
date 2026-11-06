@@ -378,6 +378,7 @@ main(int argc, char **argv)
 	uint32_t   *dBitset;
 	static uint32_t *dBitsets[64];
 	AnnUdfParams *dParams;
+	AnnUdfParams *dGroupParams;
 	AnnUdfStep *dSteps;
 	int32_t    *dValues;
 	uint32_t   *dStarts;
@@ -431,6 +432,7 @@ main(int argc, char **argv)
 	for (uint32_t q = 0; q < nq; q++)
 		CUDA(cudaMalloc((void **) &dBitsets[q], sizeof(uint32_t) * nwords));
 	CUDA(cudaMalloc((void **) &dParams, sizeof(AnnUdfParams)));
+	CUDA(cudaMalloc((void **) &dGroupParams, sizeof(AnnUdfParams) * 10));
 	CUDA(cudaMalloc((void **) &dSteps, sizeof(AnnUdfStep) * 1024));
 	CUDA(cudaMalloc((void **) &dValues, sizeof(int32_t) * 1024));
 	CUDA(cudaMalloc((void **) &dStarts, sizeof(uint32_t) * 65));
@@ -450,6 +452,12 @@ main(int argc, char **argv)
 		p.starts = dStarts;
 		p.rowBase = 0;
 		CUDA(cudaMemcpy(dParams, &p, sizeof(p), cudaMemcpyHostToDevice));
+		/* udf_grouped: a group's query ids start at its first slot. */
+		for (int g = 0; g < 10; g++)
+		{
+			p.starts = dStarts + (g * nq + 9) / 10;
+			CUDA(cudaMemcpy(dGroupParams + g, &p, sizeof(p), cudaMemcpyHostToDevice));
+		}
 	}
 
 	/* Queries: dataset rows with deterministic noise. */
@@ -505,7 +513,8 @@ main(int argc, char **argv)
 				/* Query q: category in a q-dependent window of 1..10 values. */
 				int32_t		lo = (int32_t) ((q * 37) % 90);
 
-				RangeLeaf(&p, "category", lo, lo + (int32_t) (q % 10));
+				/* 1..10 categories, contiguous slots of each width (udf_grouped). */
+				RangeLeaf(&p, "category", lo, lo + (int32_t) (q * 10 / nq));
 			}
 			AddProgram(b, q, &p);
 		}
@@ -550,12 +559,33 @@ main(int argc, char **argv)
 			if (lowRate < 0)
 				lowRate = 0;
 
+			/* udf_grouped: each window width's slots, searched at its own rate. */
+			uint32_t	groupStart[11];
+			float		groupRate[10] = {0};
+
+			for (int g = 0; g <= 10; g++)
+			{
+				groupStart[g] = (uint32_t) ((g * nq + 9) / 10);
+				if (groupStart[g] > m)
+					groupStart[g] = m;
+			}
+			for (uint32_t q = 0; q < m; q++)
+			{
+				double		match = AnnUdfEstimate(b->steps + b->starts[q], b->starts[q + 1] - b->starts[q],
+												   b->values, CountRows, NULL, rows);
+				float		r = (float) (1.0 - match / (double) rows);
+				int			g = (int) (q * 10 / nq);
+
+				if (r > groupRate[g])
+					groupRate[g] = r > 0.999f ? 0.999f : r;
+			}
+
 			/*
 			 * 0 bitset (cached if uniform, else built per query), 1 udf, 2
 			 * udf without a rate, 3 cached bitsets per query (mixed only), 4
-			 * udf with lowRate.
+			 * udf with lowRate, 5 udf grouped by window width (mixed only).
 			 */
-			for (int mode = 0; mode < 5; mode++)
+			for (int mode = 0; mode < 6; mode++)
 			{
 				double		times[15];
 				double		evalMs = 0;
@@ -567,10 +597,10 @@ main(int argc, char **argv)
 				int			uniform = c != 4;
 				const char *modeName = mode == 0 ? (uniform ? "bitset_cached" : "bitset_per_query") :
 					mode == 1 ? "udf" : mode == 2 ? "udf_no_rate" : mode == 3 ? "bitset_cached_per_query" :
-					"udf_rate_10x_broad";
+					mode == 4 ? "udf_rate_10x_broad" : "udf_grouped";
 				double		usedRate = mode == 1 ? rate : mode == 2 ? -1.0 : mode == 4 ? lowRate : 0.0;
 
-				if (mode == 3 && uniform)
+				if ((mode == 3 || mode == 5) && uniform)
 					continue;
 
 				/* Per-query searches are planned for one query each. */
@@ -618,6 +648,17 @@ main(int argc, char **argv)
 							BitsetSearch(res, params, index, dQueries, dNeighbors, dDistances,
 										 dBitsets[q], q, 1, sel, nwords);
 					}
+					else if (mode == 5)
+						for (int g = 0; g < 10; g++)
+						{
+							uint32_t	first = groupStart[g],
+										n = groupStart[g + 1] - groupStart[g];
+
+							if (n)
+								CHECK(AnnCagraUdfSearch(res, params, index, dQueries + (size_t) first * dims, n, dims,
+														dNeighbors + (size_t) first * sel, dDistances + (size_t) first * sel,
+														sel, dGroupParams + g, groupRate[g]));
+						}
 					else
 						CHECK(AnnCagraUdfSearch(res, params, index, dQueries, m, dims, dNeighbors, dDistances,
 												sel, dParams, mode == 1 ? rate : mode == 4 ? lowRate : -1.0f));

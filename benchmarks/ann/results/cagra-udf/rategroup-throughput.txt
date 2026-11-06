@@ -1,0 +1,3 @@
+bitset_cached_per_query    8 GPUs    21991 q/s  (per GPU 2738-2754)
+udf                        8 GPUs    11331 q/s  (per GPU 1415-1417)
+udfgroup                   8 GPUs    28669 q/s  (per GPU 3577-3595)

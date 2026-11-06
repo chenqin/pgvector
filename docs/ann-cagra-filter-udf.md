@@ -167,6 +167,26 @@ case's first search cost the same as a warm one.
   as a uniform 1% batch. Bucketing a batch's queries by rate, and widening the
   estimate for multi-column predicates, are the next things to measure.
 
+### Grouping a mixed batch by filtering rate
+
+`udfgroup` (throughput tool) and `udf_grouped` (probe) split a mixed batch into
+its window widths, laid out in contiguous query slots, and run one UDF search per
+width at that width's filtering rate, instead of one search at the batch's highest
+rate. k=500, FP32 graph, frontier 4096, 256 extra candidates:
+
+| Mixed 1–10% batch of 32 | Latency (1 GPU, 1 stream) | 8 GPUs, saturated | Recall (mean / lowest) |
+| --- | ---: | ---: | --- |
+| Bitsets cached per query, a search each | 26.0 ms | 22.0k q/s | 0.9998 / 0.998 |
+| One UDF search at the highest rate | 23.6 ms | 11.3k q/s | 0.9998 / 0.994 |
+| One UDF search per rate group | **16.8 ms** | **28.7k q/s** | 0.9997 / 0.994 |
+
+Grouping by rate is 2.5× the single-rate batch and 30% above per-query bitsets
+under load, at the same recall. It reverses the finding above that per-query
+bitsets beat the UDF under load: what cost throughput was searching every query at
+the most selective one's rate, not the UDF. Raw results:
+[`rategroup-probe.txt`](../benchmarks/ann/results/cagra-udf/rategroup-probe.txt),
+[`rategroup-throughput.txt`](../benchmarks/ann/results/cagra-udf/rategroup-throughput.txt).
+
 ## Next steps for routing
 
 1. Upload the attribute columns to each GPU at load, next to the dataset.
