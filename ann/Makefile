@@ -32,6 +32,9 @@ libannbatch.a: batching.o cpu.o indexfile.o filter.o
 ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
 	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c -lm -o $@
 
+ann-udf-tests: ../test/ann/udf_test.c udf.c udf.h filter.c filter.h
+	$(CC) $(CFLAGS) -I. ../test/ann/udf_test.c udf.c filter.c -lm -o $@
+
 ann-cost-tests: ../test/ann/cost_test.c cost.h
 	$(CC) $(CFLAGS) -I. ../test/ann/cost_test.c -lm -o $@
 
@@ -68,14 +71,26 @@ select_batch.o: select_batch.cpp select_batch.h
 	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
 	$(CXX) $(CXXFLAGS) -O2 -std=c++20 -I"$(CUVS_PREFIX)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_FALLBACK_DIRS)) $(CPPFLAGS) $(CUVS_CXXFLAGS) -c select_batch.cpp -o $@
 
+# JIT-LTO filter UDF search for FP32 CAGRA (experimental; see
+# docs/ann-cagra-filter-udf.md). pip SDKs need CUVS_CXXFLAGS with
+# -I$(CUVS_PREFIX)/../librmm/include/rapids -DRAFT_SYSTEM_LITTLE_ENDIAN=1.
+cagra_udf.o: cagra_udf.cpp cagra_udf.h udf.h
+	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
+	$(CXX) $(CXXFLAGS) -O2 -std=c++20 $(CUVS_CXXFLAGS) -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) $(CPPFLAGS) -c cagra_udf.cpp -o $@
+
+# Bitset versus filter UDF on one FP32 CAGRA shard: cagra-udf-probe INDEX_DIR [k itopk slack queries]
+cagra-udf-probe: ../benchmarks/ann/cagra_udf_probe.c cagra_udf.o udf.c udf.h filter.c filter.h
+	$(CC) -O3 -std=gnu11 -fopenmp -Wall -I. -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) ../benchmarks/ann/cagra_udf_probe.c udf.c filter.c cagra_udf.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lm -o $@
+
 # Requires cuVS 26.10 C/C++ SDKs, RAFT/RMM/CCCL, DLPack and CUDA runtime headers.
 # A different executable keeps the dependency-free CPU build reproducible.
 ann-worker-cuvs: $(WORKER_DEPS) cuvs.c replica.h nvrtc.c nvrtc.h blackwell.c blackwell.h select_batch.o select_batch.h
 	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
 	$(CC) $(CFLAGS) -pthread -DANN_USE_CUVS -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) $(WORKER_SRCS) cuvs.c nvrtc.c blackwell.c select_batch.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) $(WORKER_LIBS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lcuda -ldl -lm -o $@
 
-check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests
+check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests
 	./ann-cost-tests
+	./ann-udf-tests
 	./ann-replica-tests
 	python3 ../test/ann/test_worker.py
 	python3 ../test/ann/test_batching.py
@@ -108,13 +123,13 @@ check-postgres: ann-worker
 
 clean:
 	rm -f ann-worker
-	rm -f ann-replica-tests ann-cost-tests
-	rm -rf ann-replica-tests.dSYM ann-cost-tests.dSYM
+	rm -f ann-replica-tests ann-cost-tests ann-udf-tests
+	rm -rf ann-replica-tests.dSYM ann-cost-tests.dSYM ann-udf-tests.dSYM
 	rm -f batching.o cpu.o indexfile.o filter.o libannbatch.a ann-batch-tests
 	rm -f ann-batch-bench
 	rm -rf ann-batch-bench.dSYM
 	rm -rf ann-batch-tests.dSYM
-	rm -f ann-worker-cuvs select_batch.o
+	rm -f ann-worker-cuvs select_batch.o cagra_udf.o cagra-udf-probe
 	rm -rf ann-worker.dSYM
 	rm -rf ann-worker-cuvs.dSYM
 
