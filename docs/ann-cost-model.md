@@ -4,6 +4,8 @@ The optional cost profile connects PostgreSQL planning and worker route
 selection. It compares NVFP4 scanning and CAGRA, each with CPU or GPU FP32
 reranking. The current B200 calibration targets **95% recall@k** on its
 reference samples. This is a measured ANN target, not a per-query guarantee.
+See the [implementation audit](ann-cost-model-review.md) for routing cliffs,
+measurement boundaries, planner conversion and multi-vector limitations.
 
 PostgreSQL uses `ann.frozen_cost_profile = '/absolute/path/profile.tsv'`.
 The worker uses `--cost-profile /absolute/path/profile.tsv`. Both settings

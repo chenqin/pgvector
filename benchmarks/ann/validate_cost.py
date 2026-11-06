@@ -69,17 +69,27 @@ def main():
                     for k in [250,500,750]:
                         for batch in [1,4,8,16,32]:
                             packet=search_predicate_frame(2,'frozen_stress',vectors[0],k,program) if batch==1 else search_batch_frame(2,'frozen_stress',vectors[:batch],k,program)
-                            samples=[]
+                            samples=[]; client_samples=[]; decode_samples=[]
                             for rep in range(args.repeats+2):
-                                start=time.perf_counter_ns(); result=decode(request(conn,packet),batch)
-                                elapsed=(time.perf_counter_ns()-start)/1000
-                                if rep>=2:samples.append(elapsed)
+                                start=time.perf_counter_ns()
+                                payload=request(conn,packet)
+                                received=time.perf_counter_ns()
+                                result=decode(payload,batch)
+                                decoded=time.perf_counter_ns()
+                                if rep>=2:
+                                    samples.append((received-start)/1000)
+                                    decode_samples.append((decoded-received)/1000)
+                                    client_samples.append((decoded-start)/1000)
                             eligible=result[0][2]
                             recalls=[len(set(hits)&set(truth[predicate][j][:k]))/max(min(k,eligible),1) for j,(hits,_,_) in enumerate(result)] if truth else [len(set(result[0][0])&expected[ci,k])/max(len(expected[ci,k]),1)]
                             recall=statistics.mean(recalls)
                             cardinality=all(len(hits)==min(k,eligible) and len(set(hits))==len(hits) for hits,_,_ in result)
                             if calibrated and (not cardinality or recall<.95):raise RuntimeError(f'calibrated quality failed: {ci} {k} {batch} {recall}')
-                            row=dict(mode=label,predicate=predicate,k=k,batch=batch,matching=eligible,us=statistics.median(samples),samples_us=samples,recall=recall,min_recall=min(recalls),query_recalls=recalls,cardinality=cardinality,route=result[0][1])
+                            row=dict(mode=label,predicate=predicate,k=k,batch=batch,matching=eligible,
+                                     timing_scope='worker_roundtrip',us=statistics.median(samples),samples_us=samples,
+                                     decode_us=statistics.median(decode_samples),decode_samples_us=decode_samples,
+                                     client_us=statistics.median(client_samples),client_samples_us=client_samples,
+                                     recall=recall,min_recall=min(recalls),query_recalls=recalls,cardinality=cardinality,route=result[0][1])
                             rows.append(row)
                             print(json.dumps({x:row[x] for x in ['mode','matching','k','batch','us','recall','route']}),flush=True)
             stats=routing_stats(str(path),'frozen_stress')
@@ -90,7 +100,7 @@ def main():
                 db.execute("LOAD 'vector'")
                 db.execute("SELECT set_config('ann.worker_socket',%s,false)",(str(path),))
                 db.execute('SET max_parallel_workers_per_gather=0');db.execute('SET jit=off')
-                if calibrated:db.execute("SELECT set_config('ann.frozen_cost_profile',%s,false)",(str(args.profile),))
+                db.execute("SELECT set_config('ann.frozen_cost_profile',%s,false)",(str(args.profile) if calibrated else '',))
                 # Include empty/small correlated predicates and large matching sets.
                 for predicate in ['tenant=7 AND category=0']+[p for p,_ in cases]:
                     for k in [50,500]:
@@ -107,7 +117,7 @@ def main():
             except subprocess.TimeoutExpired:process.kill();process.wait()
         (args.output/'native.json').write_text(json.dumps(rows,indent=2)+'\n')
         (args.output/'plans.json').write_text(json.dumps(plans,indent=2)+'\n')
-    (args.output/'complete.json').write_text(json.dumps({'completed':time.time(),'query_start':args.query_start,'native_points':len(rows),'plan_points':len(plans)})+'\n')
+    (args.output/'complete.json').write_text(json.dumps({'completed':time.time(),'timing_version':2,'query_start':args.query_start,'native_points':len(rows),'plan_points':len(plans)})+'\n')
 
 
 if __name__=='__main__':main()

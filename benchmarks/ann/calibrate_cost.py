@@ -171,6 +171,8 @@ def main():
                 ('category BETWEEN 0 AND 19', range_program('category', 0, 19))]
     with psycopg.connect(args.dsn, autocommit=True, prepare_threshold=None) as db:
         db.execute("LOAD 'vector'")
+        # A deployed database may already enable the profile being replaced.
+        db.execute("SET ann.frozen_cost_profile = ''")
         db.execute('SET ann.enable_frozen_search = off')
         db.execute("SET ann.worker_socket = ''")
         db.execute('SET max_parallel_workers_per_gather = 0')
