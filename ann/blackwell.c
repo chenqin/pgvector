@@ -139,6 +139,21 @@ static const char *const BlackwellSource[] = {
 	"  float s = score4(data, scales, rowScales, rowBytes, blocks, i < n ? rows[i] : 0xffffffffu, query, dims, threadIdx.x % GROUP);\n"
 	"  if (threadIdx.x % GROUP == 0 && i < n) out[i] = s;\n"
 	"}\n"
+	"/*\n"
+	" * The same over several queries' row lists laid end to end: query q owns\n"
+	" * rows offsets[q] .. offsets[q + 1] - 1 (mixed-filter groups).\n"
+	" */\n"
+	"extern \"C\" __global__ void score_nvfp4_seg(const unsigned char *data, const unsigned char *scales,\n"
+	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
+	"    const unsigned *offsets, int nq, const float *queries, int dims, float *out)\n"
+	"{\n"
+	"  unsigned i = (blockIdx.x * blockDim.x + threadIdx.x) / GROUP;\n"
+	"  int lo = 0, hi = nq;\n"
+	"  if (i < n) while (hi - lo > 1) { int mid = (lo + hi) / 2; if (offsets[mid] <= i) lo = mid; else hi = mid; }\n"
+	"  float s = score4(data, scales, rowScales, rowBytes, blocks, i < n ? rows[i] : 0xffffffffu,\n"
+	"                   queries + (unsigned long long) lo * dims, dims, threadIdx.x % GROUP);\n"
+	"  if (threadIdx.x % GROUP == 0 && i < n) out[i] = s;\n"
+	"}\n"
 	"extern \"C\" __global__ void score_fp8(const unsigned char *data, const float *rowScales,\n"
 	"    unsigned rowBytes, const unsigned *rows, unsigned n, const float *query, int dims, float *out)\n"
 	"{\n"
@@ -555,6 +570,7 @@ typedef struct BlackwellModule
 	CUcontext	context;
 	CUmodule	module;
 	CUfunction	nvfp4;
+	CUfunction	nvfp4Segments;	/* score_nvfp4_seg */
 	CUfunction	fp8;
 	CUfunction	searchNvfp4;
 	CUfunction	searchFp8;
@@ -710,6 +726,7 @@ AnnBlackwellReady(int device)
 	else if ((result = cuModuleLoadData(&module->module, image)) != CUDA_SUCCESS)
 		failed = "module load";
 	else if (cuModuleGetFunction(&module->nvfp4, module->module, "score_nvfp4") != CUDA_SUCCESS ||
+			 cuModuleGetFunction(&module->nvfp4Segments, module->module, "score_nvfp4_seg") != CUDA_SUCCESS ||
 			 cuModuleGetFunction(&module->fp8, module->module, "score_fp8") != CUDA_SUCCESS ||
 			 cuModuleGetFunction(&module->searchNvfp4, module->module, "search_nvfp4") != CUDA_SUCCESS ||
 			 cuModuleGetFunction(&module->searchFp8, module->module, "search_fp8") != CUDA_SUCCESS)
@@ -934,6 +951,26 @@ AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32_t *ro
 		return cuLaunchKernel(module->fp8, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0,
 							  (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 	}
+}
+
+int
+AnnBlackwellScoreSegments(const AnnBlackwellShard *shard, int device, const uint32_t *rows, unsigned n,
+						  const uint32_t *offsets, int nq, const float *queries, int dims, float *out, void *stream)
+{
+	BlackwellModule *module = &modules[device];
+	unsigned	grid = (unsigned) (((uint64_t) n * ANN_BLACKWELL_GROUP + ANN_BLACKWELL_BLOCK - 1) / ANN_BLACKWELL_BLOCK);
+	unsigned	rowBytes = shard->rowBytes;
+	unsigned	blocks = shard->blocks;
+	void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+	&rowBytes, &blocks, (void *) &rows, &n, (void *) &offsets, &nq, (void *) &queries, &dims, &out};
+
+	if (n == 0)
+		return 1;
+	if (shard->quant != ANN_QUANT_NVFP4 || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
+		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
+		return 0;
+	return cuLaunchKernel(module->nvfp4Segments, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0,
+						  (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 }
 
 /* A thread's slot on the current device, sized for maxBlocks; allocated on first use. */

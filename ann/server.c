@@ -156,6 +156,7 @@ typedef struct FilterEntry
 } FilterEntry;
 
 #define ANN_FILTER_BUCKETS 4096
+#define ANN_MIXED_FILTERS 64	/* most other filters a mixed group adds */
 
 typedef struct Service
 {
@@ -1027,6 +1028,8 @@ Lane(void *argument)
 		uint64_t	deadline;
 		Job		   *job = NULL;
 		FilterEntry *owns = NULL;
+		FilterEntry *extras[ANN_MIXED_FILTERS]; /* --mixed-groups */
+		uint32_t	nextras = 0;
 
 		(void) pthread_mutex_lock(&service->mutex);
 		service->idle++;
@@ -1085,6 +1088,46 @@ Lane(void *argument)
 			{
 				service->groups++;
 				service->grouped_jobs += pulled + 1;
+			}
+
+			/*
+			 * --mixed-groups: a short group takes other filters' queued jobs
+			 * that no lane works on, and the backend serves them together
+			 * with one segmented gather. Their filters count as active until
+			 * the batch finishes, like this lane's own.
+			 */
+			if (AnnIndexConfig.mixed_groups && count < limit)
+			{
+				uint32_t	scanned = 0;
+
+				for (Job *other = service->head; other && count < limit && scanned < ANN_GROUP_SCAN; scanned++)
+				{
+					Job		   *next = other->next;
+					FilterEntry *entry = other->filter;
+
+					if (entry && entry != owns && other->kind == batch[0]->kind &&
+						bytes + JobBytes(other) <= service->options.max_batch_bytes)
+					{
+						uint32_t	e = 0;
+
+						while (e < nextras && extras[e] != entry)
+							e++;
+						if (e == nextras && (entry->active || nextras == ANN_MIXED_FILTERS))
+						{
+							other = next;
+							continue;
+						}
+						if (e == nextras)
+						{
+							extras[nextras++] = entry;
+							entry->active++;
+						}
+						Take(service, other);
+						batch[count++] = other;
+						bytes += JobBytes(other);
+					}
+					other = next;
+				}
 			}
 		}
 
@@ -1153,6 +1196,11 @@ Lane(void *argument)
 			owns->active--;
 			service->activeLanes--;
 			FilterDone(service, owns);
+			for (uint32_t e = 0; e < nextras; e++)
+			{
+				extras[e]->active--;
+				FilterDone(service, extras[e]);
+			}
 			if (service->blockedWaiters)
 				(void) pthread_cond_signal(&service->condition);
 			(void) pthread_mutex_unlock(&service->mutex);

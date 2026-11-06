@@ -61,6 +61,15 @@ int			AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32
 							  const float *query, int dims, float *out, void *stream);
 
 /*
+ * The same for nq queries at once, each over its own rows: query q's are
+ * rows[offsets[q]] .. rows[offsets[q + 1] - 1] (offsets on the device, nq + 1
+ * of them), scored into out at the same positions. NVFP4 copies only.
+ */
+int			AnnBlackwellScoreSegments(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
+									  unsigned n, const uint32_t *offsets, int nq, const float *queries,
+									  int dims, float *out, void *stream);
+
+/*
  * Squared L2 distances of the listed rows to nq FP32 device queries on the
  * tensor cores, written to out as a [nq][n] matrix for the caller's own
  * selection (large k); nq is at most AnnBlackwellGroupLimit(dims).

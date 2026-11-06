@@ -29,6 +29,7 @@ PREDICATES = {
     'rows2m': ('category', lambda v: (v * 20, v * 20 + 19), 'category BETWEEN {lo} AND {hi}', 5),
     'rows4m': ('category', lambda v: (v * 40, v * 40 + 39), 'category BETWEEN {lo} AND {hi}', 2),
     'mixed10': ('category', lambda v: (v, v + 9), 'category BETWEEN {lo} AND {hi}', 91),
+    'unique1': ('tenant', lambda v: (v, v + 9), 'tenant BETWEEN {lo} AND {hi}', 991),
 }
 
 

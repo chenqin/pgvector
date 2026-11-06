@@ -260,6 +260,9 @@ typedef struct AnnIndexOptions
 								 * off uses FP16 distances throughout */
 	int			matrix_prune;	/* matrix gathers select from scores under a
 								 * sampled cutoff instead of all of them */
+	int			mixed_groups;	/* lanes add other filters' queued jobs to a
+								 * short group; one segmented gather serves
+								 * them (--mixed-groups) */
 } AnnIndexOptions;
 
 /*

@@ -36,6 +36,8 @@ WORKLOADS = {
     'rows2m': 'category BETWEEN :g * 20 AND :g * 20 + 19',
     'rows4m': 'category BETWEEN :h * 40 AND :h * 40 + 39',
     'mixed10': 'category BETWEEN :a AND :a + 9',
+    # 991 distinct 1% windows: concurrent searches rarely share a predicate.
+    'unique1': 'tenant BETWEEN :u AND :u + 9',
 }
 
 
@@ -235,6 +237,7 @@ def main():
                         'rows2m': "format('category BETWEEN %s AND %s', :g * 20, :g * 20 + 19)",
                         'rows4m': "format('category BETWEEN %s AND %s', :h * 40, :h * 40 + 39)",
                         'mixed10': "format('category BETWEEN %s AND %s', :a::integer, :a + 9)",
+                        'unique1': "format('tenant BETWEEN %s AND %s', :u::integer, :u + 9)",
                     }[workload]
                     query = (f'SELECT id FROM ann_frozen_search_batch({index_name}, :batch::vector[], '
                              f'{args.k}, {predicate})')
@@ -248,7 +251,7 @@ def main():
                 script.write_text(f'\\set q random(1,{1001 - max(args.batch_queries, 1)})\n'
                                   '\\set t random(0,99)\n\\set c random(0,99)\n\\set d random(0,9)\n'
                                   '\\set e random(0,199)\n\\set f random(0,19)\n\\set g random(0,4)\n'
-                                  '\\set h random(0,1)\n\\set a random(0,90)\n'
+                                  '\\set h random(0,1)\n\\set a random(0,90)\n\\set u random(0,990)\n'
                                   + setup + query + ';\n')
                 env = dict(os.environ, PGAPPNAME=application,
                            PGOPTIONS=(f'-c ann.worker_socket={args.socket} -c ann.enable_frozen_search=on '

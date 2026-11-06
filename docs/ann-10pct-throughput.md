@@ -176,8 +176,9 @@ the graph: 171.6k, 490.5k and 766.3k for b1, b16 and b32, lowest recall 0.29–0
 
 At k=100 the crossover moves down, as the cost argument predicts (graph work grows
 with k / (1 − r)): single-vector SQL ties at 1M rows and the graph wins at 2M;
-batches tie at 2M (b16). The gather's 2M b32 point is below its b16 point and was
-not repeated. Below 1M rows the gather is 1.2× to 190× faster with every query at
+batches tie at 2M (b16). The gather's 2M b32 point is bimodal: two reruns from fresh
+workers gave 295.1k (the worker at 7 cores, GPUs 62% busy: a stall, not a limit) and
+490.7k, above the graph's 460.3k; b16 repeated at 449.0k. Below 1M rows the gather is 1.2× to 190× faster with every query at
 0.99 or better.
 
 ### Cost-profile routing against the limits
@@ -206,11 +207,32 @@ recall 0.996; the graph route gives 175.8k with 0.156). Single-vector SQL loses 
 (156.5k against 175.8k): same-filter groups shrink. That is the case a per-query
 predicate pipeline would address.
 
-**Not built:** the per-query-predicate device pipeline (candidate generation from
-GPU-resident postings for batches whose vectors each carry their own predicate,
-Phase 2 of the earlier plan). This workload's predicates repeat (10 ranges), so the
-worker's same-filter grouping already forms full 64-query groups; that pipeline
-targets batches of distinct predicates.
+### Mixed-filter groups (`--mixed-groups`)
+
+Phase 2 of the earlier plan, built in the worker without a protocol change: a lane
+whose same-filter group is short also takes queued searches over other cached
+filters, and those whose filter appears once in the batch share one segmented
+gather. Their device row lists are laid end to end, a segmented NVFP4 kernel scores
+each row against its own query, each query keeps its scores under its own sampled
+cutoff (every score for lists up to 16,384 rows) and sorts them in shared memory,
+and the candidates are reranked in FP32 on the GPU. Single-vector SQL, k=500, 512
+clients, 32 lanes, `ann.frozen_immutable = on`:
+
+| Workload | Off | On | Lowest recall |
+| --- | ---: | ---: | --- |
+| `unique1`: 991 distinct 1% tenant windows | 101.2k | **146.9k (+45%)** | 0.998 / 0.998 |
+| `mixed10`: 91 overlapping 10% windows | 158.4k | 119.0k (−25%) | 0.996 / 0.996 |
+| `10pct`: 10 ranges | 173.7k | 172.1k | 0.998 / 0.998 |
+
+When predicates rarely repeat, same-filter batches average 1.5 searches and the GPUs
+are busy with per-search launches (93%); mixed groups average 6 and leave them at
+69%. When predicates repeat, the same-filter matrix gather scores a shared row list
+once per group, while a segmented gather scores every search's rows separately, and
+pulling other filters into a lane splits the groups other lanes would form. Mixing
+every job, not only singletons, measured 80.9k on `mixed10`. The option stays off by
+default. Unlike Phase 2 as planned, candidates come from the cached predicates' row
+lists rather than from postings evaluated on the GPU, and predicates are not
+compiled per vector (operation 30 still shares one).
 
 ## Final configuration
 

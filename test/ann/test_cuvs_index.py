@@ -56,6 +56,11 @@ class CuvsIndexTests(unittest.TestCase):
                         '--vector', 'emb', '--out', os.path.join(cls.directory.name, 'float16_nvfp4'),
                         '--shards', '4', '--dtype', 'float16', '--quantize', 'nvfp4', '--attribute', 'tenant'],
                        check=True, capture_output=True)
+        # One shard with an NVFP4 copy, as mixed-filter groups require.
+        subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{cls.table}', '--key', 'id',
+                        '--vector', 'emb', '--out', os.path.join(cls.directory.name, 'nvfp4_1shard'),
+                        '--shards', '1', '--quantize', 'nvfp4', '--attribute', 'tenant'],
+                       check=True, capture_output=True)
         # Quantized copies for the Blackwell module's gather scan.
         for quant in ['nvfp4', 'fp8']:
             path = os.path.join(cls.directory.name, quant)
@@ -566,6 +571,84 @@ class CuvsIndexTests(unittest.TestCase):
                 stats = json.loads(receive(connection)[3])
             self.assertGreater(stats['groups'], 0, quant)
             self.psql(f"DELETE FROM ann_filter_bitmap WHERE index_name = '{index}' AND filter = 'tenant = 7'")
+
+    def test_mixed_filter_groups_match_sql(self):
+        """Searches over different cached filters share segmented gathers (--mixed-groups) and match SQL."""
+        import json
+        import threading
+        from test_index import search_cached_frame, decode_hits
+        server = Server('--backend', 'cuvs', '--lanes', '1', '--exact-limit', '0', '--gpu-rerank', 'on',
+                        '--group-gather-limit', '4000000', '--mixed-groups', 'on', '--delay-us', '2000',
+                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+        index = self.table + '_mixed'
+        try:
+            self.psql(f"SELECT ann_index_load('{index}', '{self.directory.name}/nvfp4_1shard')", server)
+            # 800-row filters keep every score; the 20k-row one prunes from a sampled cutoff.
+            filters = [f'tenant = {t}' for t in range(8)] + ['tenant < 25']
+            ids = {}
+            for text in filters:
+                self.psql(f"SELECT ann_filter_bitmap_build('{index}', '{text}')", server)
+                ids[text] = int(self.psql(f"SELECT id FROM ann_filter_bitmap WHERE index_name = '{index}' "
+                                          f"AND filter = '{text}'", server))
+            rows = self.psql(f"SELECT id, emb::text FROM {self.table} WHERE id % 997 = 0 ORDER BY id LIMIT 6").split('\n')
+            queries = [(int(line.split('|')[0]), [float(x) for x in line.split('|')[1].strip('[]').split(',')])
+                       for line in rows]
+            exact = {}
+            for text in filters:
+                for qid, _ in queries:
+                    exact[text, qid] = [int(x) for x in self.psql(f"""
+                        SELECT t.id FROM {self.table} t, {self.table} q WHERE q.id = {qid} AND t.{text}
+                        ORDER BY t.emb <-> q.emb, t.id LIMIT 10""").split()]
+            def check(text, qid, keys):
+                if text == 'tenant < 25':
+                    # Pruned from NVFP4 scores, as every NVFP4 route: a true neighbour
+                    # can rank past k + slack on these 32-dimension rows.
+                    self.assertEqual(len(keys), 10)
+                    self.assertGreaterEqual(len(set(keys) & set(exact[text, qid])), 9, (text, qid))
+                else:
+                    # Short lists keep every row for the FP32 re-score: exact.
+                    self.assertEqual(keys, exact[text, qid], (text, qid))
+
+            # Rounds of one search per filter: each batch holds every filter once,
+            # so the lane forms mixed groups.
+            with server.connect() as connection:
+                for round in range(4):
+                    plan = [(text, queries[(round + i) % len(queries)]) for i, text in enumerate(filters)]
+                    for request, (text, (_, vector)) in enumerate(plan, 1):
+                        connection.sendall(search_cached_frame(request, index, vector, 10, ids[text]))
+                    for _ in plan:
+                        _, got, status, payload = receive(connection)
+                        self.assertEqual(status, 0)
+                        text, (qid, _) = plan[got - 1]
+                        check(text, qid, [key for key, _ in decode_hits(payload)[1]])
+                connection.sendall(frame(31, 1, index.encode()))
+                stats = json.loads(receive(connection)[3])
+            self.assertGreater(stats['mixed_queries'], 0, stats)
+            # Concurrent clients with repeated filters: still SQL's results.
+            failures = []
+
+            def client(offset):
+                try:
+                    with server.connect() as connection:
+                        plan = [(filters[(offset + r) % len(filters)], queries[(offset + r) % len(queries)])
+                                for r in range(36)]
+                        for request, (text, (_, vector)) in enumerate(plan, 1):
+                            connection.sendall(search_cached_frame(request, index, vector, 10, ids[text]))
+                        for _ in plan:
+                            _, got, status, payload = receive(connection)
+                            self.assertEqual(status, 0)
+                            text, (qid, _) = plan[got - 1]
+                            check(text, qid, [key for key, _ in decode_hits(payload)[1]])
+                except Exception as error:  # noqa: BLE001
+                    failures.append(error)
+            threads = [threading.Thread(target=client, args=(i,)) for i in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            self.assertEqual(failures, [])
+        finally:
+            server.close()
 
     def test_ann_recall(self):
         for dtype in ['float32', 'float16']:

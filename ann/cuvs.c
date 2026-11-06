@@ -612,6 +612,7 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t matrix_peak_score_bytes;
 	atomic_uint_fast64_t matrix_pruned_queries; /* selected from sampled
 												 * cutoffs */
+	atomic_uint_fast64_t mixed_queries; /* served by mixed-filter groups */
 	atomic_uint_fast64_t matrix_prune_fallbacks;	/* tiles selected in full
 													 * instead */
 	atomic_uint_fast64_t gpu_rerank_candidates;
@@ -719,12 +720,13 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_pruned_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_prune_fallbacks, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->mixed_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp32_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp16_queries, memory_order_relaxed),
@@ -839,6 +841,13 @@ typedef struct AnnCuvsDevice
 				prunePositionCap,
 				pruneCountCap,
 				pruneHostCountCap;
+	/* mixed-filter groups: the queries' row lists end to end */
+	uint32_t   *mixedRows;
+	uint32_t   *mixedOffsets;
+	uint32_t   *mixedRanks;
+	size_t		mixedRowCap,
+				mixedOffsetCap,
+				mixedRankCap;
 } AnnCuvsDevice;
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
@@ -1386,6 +1395,7 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->matrix_peak_score_bytes, 0);
 	atomic_init(&state->matrix_pruned_queries, 0);
 	atomic_init(&state->matrix_prune_fallbacks, 0);
+	atomic_init(&state->mixed_queries, 0);
 	atomic_init(&state->gpu_rerank_candidates, 0);
 	atomic_init(&state->cagra_fp32_queries, 0);
 	atomic_init(&state->graph_cpu_rerank_candidates, 0);
@@ -2032,6 +2042,36 @@ static const char PruneSource[] =
 "  }\n"
 "}\n";
 
+/* Mixed-filter groups (SearchGatherMixed): the same per query's own list. */
+static const char SegmentSource[] =
+"/* Mixed-filter groups: query q's scores are scores[offsets[q] .. offsets[q + 1]). */\n"
+"extern \"C\" __global__ void segment_sample(const float *scores, const unsigned *offsets, unsigned q, unsigned s,\n"
+"    float *out)\n"
+"{\n"
+"  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (i >= q * s) return;\n"
+"  unsigned r = i / s, c = i - r * s, n = offsets[r + 1] - offsets[r];\n"
+"  out[i] = n ? scores[offsets[r] + (unsigned long long) c * n / s] : __int_as_float(0x7f800000);\n"
+"}\n"
+"/* Keep the scores under the query's cutoff (rank 0: all of them), with their positions. */\n"
+"extern \"C\" __global__ void segment_compact(const float *scores, const unsigned *offsets, const float *bounds,\n"
+"    const unsigned *ranks, unsigned stride, unsigned cap, float *d, long long *r, unsigned long long *counts)\n"
+"{\n"
+"  unsigned row = blockIdx.y, first = offsets[row], end = offsets[row + 1];\n"
+"  float bound = ranks[row] ? bounds[(unsigned long long) row * stride + ranks[row] - 1] : __int_as_float(0x7f800000);\n"
+"  for (unsigned i = first + blockIdx.x * blockDim.x + threadIdx.x; i - threadIdx.x < end; i += gridDim.x * blockDim.x)\n"
+"  {\n"
+"    bool keep = i < end && scores[i] <= bound;\n"
+"    unsigned mask = __ballot_sync(0xffffffffu, keep);\n"
+"    if (!mask) continue;\n"
+"    unsigned lane = threadIdx.x & 31, base = 0;\n"
+"    if (lane == 0) base = (unsigned) atomicAdd(&counts[row], (unsigned long long) __popc(mask));\n"
+"    base = __shfl_sync(0xffffffffu, base, 0);\n"
+"    unsigned slot = base + __popc(mask & ((1u << lane) - 1));\n"
+"    if (keep && slot < cap) { d[(unsigned long long) row * cap + slot] = scores[i]; r[(unsigned long long) row * cap + slot] = i; }\n"
+"  }\n"
+"}\n";
+
 #define ANN_PRUNE_SAMPLE 8192	/* sampled scores per query */
 #define ANN_PRUNE_RANK 32		/* the sample's least cutoff rank */
 #define ANN_PRUNE_MARGIN 4		/* expected kept / needed candidates */
@@ -2121,6 +2161,8 @@ typedef struct GatherModule
 	CUfunction	pruneFill;
 	CUfunction	pruneCompact;
 	CUfunction	pruneSort;
+	CUfunction	segmentSample;
+	CUfunction	segmentCompact;
 } GatherModule;
 
 static GatherModule gatherModules[ANN_CUVS_MAX_DEVICES];
@@ -2151,12 +2193,13 @@ GatherKernels(int device)
 		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
-	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + 1);
+	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + strlen(SegmentSource) + 1);
 	if (source == NULL)
 		goto fail;
 	strcpy(source, GatherSource);
 	strcat(source, RerankSource);
 	strcat(source, PruneSource);
+	strcat(source, SegmentSource);
 	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->lookup, module->module, "lookup") != CUDA_SUCCESS ||
@@ -2170,6 +2213,8 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneFill, module->module, "matrix_fill") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact, module->module, "matrix_compact") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->segmentCompact, module->module, "segment_compact") != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->pruneSort, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
 						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS)
 		goto fail;
@@ -3598,6 +3643,253 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 	return ok;
 }
 
+#define ANN_MIXED_MAX 64		/* most jobs one mixed-filter gather takes */
+
+/* Whether a filtered job can join a mixed-filter group (--mixed-groups). */
+static int
+MixedEligible(const AnnIndexFile *file, const AnnCuvsIndex *state, const AnnIndexJob *job)
+{
+	uint64_t	candidates = (uint64_t) job->k + AnnIndexConfig.quant_slack;
+
+	return AnnIndexConfig.mixed_groups && AnnIndexConfig.gpu_rerank && state->nshards == 1 && state->quantized &&
+		file->quant == ANN_QUANT_NVFP4 && job->filtered && job->ordinals != NULL && job->deviceRows != NULL &&
+		job->nfilter > AnnIndexConfig.exact_limit && job->nfilter <= AnnIndexConfig.group_gather_limit &&
+		job->nfilter >= candidates && candidates <= ANN_PRUNE_CAP / ANN_PRUNE_MARGIN;
+}
+
+/*
+ * The cutoff rank of a mixed group's query over n rows (as PrunedSelect's):
+ * 0 keeps every score of a list the sort can hold, UINT32_MAX when the
+ * cutoff could not keep enough.
+ */
+static uint32_t
+MixedRank(uint32_t n, uint32_t candidates)
+{
+	uint64_t	rank;
+
+	if (n <= ANN_PRUNE_CAP)
+		return 0;
+	rank = ((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n;
+	if (rank < ANN_PRUNE_RANK)
+		rank = ANN_PRUNE_RANK;
+	if (rank > ANN_PRUNE_SAMPLE / 4 || (uint64_t) n * rank / ANN_PRUNE_SAMPLE > ANN_PRUNE_CAP / 2)
+		return UINT32_MAX;
+	return (uint32_t) rank;
+}
+
+/*
+ * Mixed-filter group: m filtered jobs over different cached filters, each
+ * with its rows on the device, on a one-shard index with an NVFP4 copy.
+ * Their row lists are laid end to end; one launch scores every row against
+ * its own query, each query keeps its scores under a sampled cutoff (all of
+ * them for lists up to ANN_PRUNE_CAP), sorts them in one block's shared
+ * memory, and the candidates are re-scored in FP32 on the GPU. Returns 0,
+ * with no result written, when the group cannot take this path or a query
+ * keeps too few or too many candidates; the caller then searches job by job.
+ */
+static int
+SearchGatherMixed(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
+{
+	AnnCuvsShard *shard = &state->shards[(size_t) laneCopy * state->nshards];
+	uint32_t	dims = file->dimensions;
+	uint32_t	maxk = 0;
+	uint32_t	candidates;
+	uint32_t	maxRank = 0;
+	uint32_t	longest = 0;
+	uint32_t	offsets[ANN_MIXED_MAX + 1];
+	uint32_t	ranks[ANN_MIXED_MAX];
+	uint64_t	total = 0;
+	AnnCuvsDevice *lane;
+	cudaStream_t stream;
+	GatherModule *module;
+	float	   *hostQueries;
+	unsigned	sample = ANN_PRUNE_SAMPLE,
+				cap = ANN_PRUNE_CAP,
+				queries = m,
+				rows;
+	int64_t		most = 0;
+	unsigned	size = 1;
+	int			ok = 1;
+
+	if (m < 2 || m > ANN_MIXED_MAX || state->nshards != 1 || shard->rerank == NULL ||
+		shard->quant.quant != ANN_QUANT_NVFP4 || (module = GatherKernels(shard->device)) == NULL)
+		return 0;
+	for (uint32_t j = 0; j < m; j++)
+		if (jobs[j]->k > maxk)
+			maxk = jobs[j]->k;
+	candidates = maxk + AnnIndexConfig.quant_slack;
+	for (uint32_t j = 0; j < m; j++)
+	{
+		uint32_t	n = jobs[j]->nfilter;
+
+		if (jobs[j]->deviceRows == NULL || jobs[j]->deviceRows[laneCopy] == NULL || n < candidates ||
+			(ranks[j] = MixedRank(n, candidates)) == UINT32_MAX)
+			return 0;
+		if (ranks[j] > maxRank)
+			maxRank = ranks[j];
+		if (n > longest)
+			longest = n;
+		offsets[j] = (uint32_t) total;
+		total += n;
+		if (total * sizeof(float) > AnnIndexConfig.matrix_max_bytes || total >= UINT32_MAX)
+			return 0;
+	}
+	offsets[m] = (uint32_t) total;
+	rows = (unsigned) total;
+	if ((lane = LaneDevice(shard->device, (size_t) m * dims * sizeof(float), 1, 1)) == NULL ||
+		cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
+		!MatrixBuffers(lane, total, (size_t) m * candidates, (size_t) m * maxk, (size_t) m * maxk, stream) ||
+		!GrowDevice((void **) &lane->mixedRows, &lane->mixedRowCap, total, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->mixedOffsets, &lane->mixedOffsetCap, m + 1, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->mixedRanks, &lane->mixedRankCap, m, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneSample, &lane->pruneSampleCap, (size_t) m * sample, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneBounds, &lane->pruneBoundCap, (size_t) m * (maxRank ? maxRank : 1), sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneBoundRows, &lane->pruneBoundRowCap, (size_t) m * (maxRank ? maxRank : 1), sizeof(int64_t), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneScores, &lane->pruneScoreCap, (size_t) m * cap, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->prunePositions, &lane->prunePositionCap, (size_t) m * cap, sizeof(int64_t), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneCounts, &lane->pruneCountCap, m, sizeof(int64_t), 0, stream) ||
+		!GrowPinned((void **) &lane->pruneHostCounts, &lane->pruneHostCountCap, m, sizeof(int64_t), 0) ||
+		(hostQueries = malloc((size_t) m * dims * sizeof(float))) == NULL)
+		return 0;
+	for (uint32_t j = 0; j < m; j++)
+	{
+		memcpy(hostQueries + (size_t) j * dims, jobs[j]->query, dims * sizeof(float));
+		if (ok && cudaMemcpyAsync(lane->mixedRows + offsets[j], jobs[j]->deviceRows[laneCopy],
+								  (size_t) jobs[j]->nfilter * sizeof(uint32_t), cudaMemcpyDeviceToDevice,
+								  stream) != cudaSuccess)
+			ok = 0;
+	}
+	if (ok &&
+		(cudaMemcpyAsync(lane->queries, hostQueries, (size_t) m * dims * sizeof(float), cudaMemcpyHostToDevice,
+						 stream) != cudaSuccess ||
+		 cudaMemcpyAsync(lane->mixedOffsets, offsets, (m + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice,
+						 stream) != cudaSuccess ||
+		 cudaMemcpyAsync(lane->mixedRanks, ranks, m * sizeof(uint32_t), cudaMemcpyHostToDevice,
+						 stream) != cudaSuccess ||
+		 !AnnBlackwellScoreSegments(&shard->quant, shard->device, lane->mixedRows, rows, lane->mixedOffsets,
+									(int) m, lane->queries, (int) dims, lane->matrixScores, stream)))
+		ok = 0;
+	if (ok && maxRank)
+	{
+		void	   *sampleArgs[] = {&lane->matrixScores, &lane->mixedOffsets, &queries, &sample, &lane->pruneSample};
+
+		ok = cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->segmentSample, (unsigned) (((size_t) m * sample + 255) / 256), 1, 1, 256, 1, 1, 0,
+						   (CUstream) stream, sampleArgs, NULL) == CUDA_SUCCESS &&
+			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
+						   m, sample, maxRank, 1, NULL) == CUVS_SUCCESS;
+	}
+	if (ok)
+	{
+		unsigned	stride = maxRank ? maxRank : 1;
+		void	   *fillArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &queries, &cap};
+		void	   *compactArgs[] = {&lane->matrixScores, &lane->mixedOffsets, &lane->pruneBounds, &lane->mixedRanks,
+		&stride, &cap, &lane->pruneScores, &lane->prunePositions, &lane->pruneCounts};
+
+		ok = cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->pruneFill, (unsigned) (((size_t) m * cap + 255) / 256), 1, 1, 256, 1, 1, 0,
+						   (CUstream) stream, fillArgs, NULL) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->segmentCompact, (longest + 256 * 16 - 1) / (256 * 16), m, 1, 256, 1, 1, 0,
+						   (CUstream) stream, compactArgs, NULL) == CUDA_SUCCESS &&
+			cudaMemcpyAsync(lane->pruneHostCounts, lane->pruneCounts, (size_t) m * sizeof(int64_t),
+							cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+	}
+	if (cudaStreamSynchronize(stream) != cudaSuccess)
+		ok = 0;
+	free(hostQueries);
+	for (uint32_t j = 0; ok && j < m; j++)
+	{
+		if (lane->pruneHostCounts[j] < (int64_t) candidates || lane->pruneHostCounts[j] > (int64_t) cap)
+		{
+			(void) atomic_fetch_add_explicit(&state->matrix_prune_fallbacks, 1, memory_order_relaxed);
+			return 0;
+		}
+		if (lane->pruneHostCounts[j] > most)
+			most = lane->pruneHostCounts[j];
+	}
+	if (!ok)
+		return 0;
+	while (size < (unsigned) most)
+		size <<= 1;
+	{
+		unsigned	k = candidates;
+		void	   *sortArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &cap, &size, &k,
+		&lane->matrixCandidates, &lane->matrixIndices};
+
+		/* Positions index the end-to-end row list, which RerankDevice reads. */
+		if (cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->pruneSort, m, 1, 1, 1024, 1, 1, size * 8, (CUstream) stream,
+						   sortArgs, NULL) != CUDA_SUCCESS ||
+			!RerankDevice(shard, dims, lane->mixedRows, rows, file->shards[0].rows, lane->matrixIndices,
+						  candidates, m, lane->queries, lane->matrixCandidates, stream, 1) ||
+			AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices, lane->matrixValues,
+						   lane->matrixRows, m, candidates, maxk, 1, NULL) != CUVS_SUCCESS ||
+			cudaMemcpyAsync(lane->matrixHostRows, lane->matrixRows, (size_t) m * maxk * sizeof(int64_t),
+							cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+			cudaMemcpyAsync(lane->matrixHostValues, lane->matrixValues, (size_t) m * maxk * sizeof(float),
+							cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+			cudaStreamSynchronize(stream) != cudaSuccess)
+			return 0;
+	}
+	for (uint32_t j = 0; j < m; j++)
+	{
+		AnnIndexJob *job = jobs[j];
+		const int64_t *found = lane->matrixHostRows + (size_t) j * maxk;
+		const float *distances = lane->matrixHostValues + (size_t) j * maxk;
+		uint32_t	count = 0;
+
+		if (!AnnIndexPositionsDistinct(found, maxk))
+		{
+			AnnIndexExact(file, job, job->ordinals, job->nfilter);
+			job->route = ANN_ROUTE_EXACT;
+			continue;
+		}
+		for (uint32_t i = 0; i < maxk && count < job->k; i++)
+		{
+			AnnIndexHit *hit = &job->results[count];
+			uint64_t	row;
+
+			if (found[i] < 0 || (uint64_t) found[i] >= file->shards[0].rows)
+				continue;
+			row = file->shards[0].first + (uint64_t) found[i];
+			hit->key = file->keys[row];
+			hit->ordinal = row;
+			hit->distance = isnan(distances[i]) ? ExactDistance(file, row, job->query) : distances[i];
+			count++;
+		}
+		qsort(job->results, count, sizeof(AnnIndexHit), HitCompare);
+		job->nresults = count;
+		job->route = ANN_ROUTE_EXACT;
+	}
+	(void) atomic_fetch_add_explicit(&state->mixed_queries, m, memory_order_relaxed);
+	(void) atomic_fetch_add_explicit(&state->gpu_rerank_candidates, (uint64_t) m * candidates, memory_order_relaxed);
+	return 1;
+}
+
+/*
+ * Serve a tile of mixed-group jobs when it spans at least two filters; the
+ * jobs it answers leave filtered[] (their positions are where[]).
+ */
+static void
+MixedFlush(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **mixed, const uint32_t *where,
+		   uint32_t nm, AnnIndexJob **filtered)
+{
+	int			distinct = 0;
+	uint64_t	started;
+	uint32_t	copy;
+
+	for (uint32_t i = 1; i < nm && !distinct; i++)
+		distinct = mixed[i]->ordinals != mixed[0]->ordinals;
+	if (nm < 2 || !distinct)
+		return;
+	started = ReplicaNow();
+	copy = ReplicaAcquire(state, nm, started);
+	if (SearchGatherMixed(file, state, mixed, nm))
+		for (uint32_t i = 0; i < nm; i++)
+			filtered[where[i]] = NULL;
+	ReplicaRelease(state, copy, mixed, nm, started);
+}
+
 /*
  * Reorder (distance, row) pairs so the m smallest distances come first, in
  * any order (Hoare quickselect).
@@ -4372,6 +4664,43 @@ SearchIndex(AnnIndexJob *jobs, uint32_t count)
 				filtered[f++] = &jobs[j];
 			else
 				group[m++] = &jobs[j];
+		}
+
+		/*
+		 * Jobs over several different filters (a lane with --mixed-groups
+		 * filled its batch with them) share one segmented gather, in tiles
+		 * within the score-matrix bound; the rest search below.
+		 */
+		if (AnnIndexConfig.mixed_groups && state && f > 1)
+		{
+			AnnIndexJob *mixed[ANN_MIXED_MAX];
+			uint32_t	where[ANN_MIXED_MAX];
+			uint32_t	nm = 0;
+			uint64_t	rows = 0;
+
+			for (uint32_t a = 0; a < f; a++)
+			{
+				uint64_t	n = filtered[a] ? filtered[a]->nfilter : 0;
+
+				int			shared = 0;
+
+				/* Same-filter groups score rows once on the matrix path. */
+				for (uint32_t b = 0; filtered[a] && b < f && !shared; b++)
+					shared = b != a && filtered[b] && SameFilterJob(filtered[a], filtered[b]);
+				if (filtered[a] == NULL || shared || !MixedEligible(file, state, filtered[a]) ||
+					n * sizeof(float) > AnnIndexConfig.matrix_max_bytes)
+					continue;
+				if (nm == ANN_MIXED_MAX || (rows + n) * sizeof(float) > AnnIndexConfig.matrix_max_bytes)
+				{
+					MixedFlush(file, state, mixed, where, nm, filtered);
+					nm = 0;
+					rows = 0;
+				}
+				where[nm] = a;
+				mixed[nm++] = filtered[a];
+				rows += n;
+			}
+			MixedFlush(file, state, mixed, where, nm, filtered);
 		}
 
 		/* Same-filter jobs, as the lane queued them, share one search. */
