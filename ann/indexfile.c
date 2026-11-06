@@ -652,6 +652,12 @@ LoadMulti(AnnIndexFile *file, AnnIndexAttribute *attribute)
 		return 0;
 	ok = InvertMulti(file, attribute, row);
 	free(row);
+	/* Only the postings are read from here on; hits carry no element values. */
+	(void) munmap((void *) attribute->mapped, attribute->columnBytes);
+	(void) munmap((void *) attribute->rowOffsets, attribute->offsetsBytes);
+	attribute->elements = NULL;
+	attribute->mapped = NULL;
+	attribute->rowOffsets = NULL;
 	if (ok)
 		fprintf(stderr, "ann index %s: multivalued %s: %llu elements, %u values, %llu postings\n", file->name,
 				attribute->name, (unsigned long long) attribute->nelements, attribute->nvalues,
