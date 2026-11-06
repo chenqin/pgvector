@@ -311,6 +311,20 @@ class IndexWorkerTests(unittest.TestCase):
                                                                list(range(65))))[2], 1)
             self.assertEqual(self.call(connection, match_frame(23, 'other', [0] * 5, 3, 'color', [1]))[2], 3)
 
+    def test_attribute_limit(self):
+        # Up to 32 attributes load and the last one filters; a 33rd makes the manifest invalid.
+        columns = {f'a{i}': (lambda i: lambda keys, rng: [(key + i) % 5 for key in keys])(i) for i in range(32)}
+        path, keys, vectors, values = self.fixture(shards=2, attributes=columns)
+        too_many, _, _, _ = self.fixture('many', shards=2, attributes=dict(columns, a32=columns['a0']))
+        with self.server.connect() as connection:
+            self.assertEqual(self.call(connection, load_frame(1, 'docs', path))[2], 0)
+            _, _, status, payload = self.call(connection, match_frame(2, 'docs', [0] * 5, 10, 'a31', [2]))
+            self.assertEqual(status, 0)
+            _, hits = decode_hits(payload)
+            want = exact(keys, vectors, [0] * 5, 10, {key for key in keys if values['a31'][key] == 2})
+            self.assertEqual([key for key, _ in hits], [key for _, key in want])
+            self.assertNotEqual(self.call(connection, load_frame(3, 'many', too_many))[2], 0)
+
     def test_bitmap_build_and_search(self):
         path, keys, vectors = self.fixture(shards=7)
         rng = random.Random(6)

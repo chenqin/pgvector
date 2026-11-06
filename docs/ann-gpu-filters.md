@@ -70,7 +70,7 @@ JOIN docs d USING (id) ORDER BY s.distance;
 SELECT * FROM ann_attribute_search('docs', $1, 10, 'tenant', ARRAY[3, 7, 9]);
 ```
 
-- **Files.** Each `--attribute COLUMN` writes `attr-COLUMN.i32` (one little-endian int32 per row, in key order) and a manifest line `attribute COLUMN attr-COLUMN.i32`. NULL is stored as -2147483648 and never matches. Up to 8 attributes per index.
+- **Files.** Each `--attribute COLUMN` writes `attr-COLUMN.i32` (one little-endian int32 per row, in key order) and a manifest line `attribute COLUMN attr-COLUMN.i32`. NULL is stored as -2147483648 and never matches. Up to 32 attributes per index, as many as a PostgreSQL index has columns.
 - **Load.** The worker inverts each column into sorted per-value row lists (keys and ordinals). Loading the 10M-row index with two attributes took 6.5–7 s. Values with more than `--bitset-min` rows (default 4,000,000) also get one cuVS bitset per shard, built once.
 - **Search.** One value hands its row list to the existing routes with no copying: the exact CPU scan, the GPU gather scan, or filtered CAGRA with its prebuilt bitsets. Several values are merged per query.
 

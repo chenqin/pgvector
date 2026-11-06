@@ -21,7 +21,8 @@
 #define ANN_INDEX_MAX_SHARDS 64
 #define ANN_INDEX_NO_GRAPH "-"	/* shard file of an index served by quantized scans only */
 #define ANN_INDEX_NAME_MAX 63
-#define ANN_INDEX_MAX_ATTRIBUTES 8
+/* As many as a PostgreSQL index has columns (INDEX_MAX_KEYS): every frozen INCLUDE attribute. */
+#define ANN_INDEX_MAX_ATTRIBUTES 32
 #define ANN_INDEX_MAX_VALUES 64
 
 /*
