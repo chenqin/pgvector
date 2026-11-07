@@ -405,7 +405,7 @@ no two searches share a predicate), k=500, 64-vector arrays, 448 clients:
 | No candidate fill, no mid-batch sync in the pruned selection | e721afd | 890.7k | 724.6k |
 | Final top-k after reranking in shared memory | d4ee677 | 929.9k | 712.8k |
 | Immutable batch searches get keys from the worker; result arrays packed in place | 4a9e2c4 | 973.5k | 765.2k |
-| Radix select instead of a sort in the pruned selection; four-wide compaction | (this commit) | **1,042.6k** | **825.0k** |
+| Radix select instead of a sort in the pruned selection; four-wide compaction | 493ce12 | **1,042.6k** | **825.0k** |
 
 Single-vector SQL at 96 lanes and 256 clients: `10pct` 113.0k → 139.4k QPS,
 `distinct10` 4.55k → 98.6k QPS. The cached point's limit was found to be the lanes'
