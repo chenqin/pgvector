@@ -320,6 +320,23 @@ Vectors a second (arrays) and queries a second (SQL). Predicates that repeat are
 unaffected within run-to-run variation (about ±1.5%); the SQL points here use the
 arrays settings (96 lanes), not the 32 lanes single-vector SQL does best with.
 
+At k = 1500 (same settings; recall against the exact top 1500):
+
+| Workload | Arrays, off | Arrays, on | SQL, off | SQL, on | Recall (mean / lowest) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `10pct` | 254.6k | 234.6k | 62.6k | 62.7k | 0.996 / 0.983 |
+| `fresh10` | 61.2k | **93.0k** | 1.14k | **4.03k** | 0.996 / 0.983 |
+
+Every search took the pruned matrix gather (no fallbacks), reranking 1,756
+candidates a query (k plus the 256-row slack) on the GPU. Cached arrays drop by
+3.0× from k = 500 (775.6k), about the 3× more ids each call returns: PostgreSQL
+used 126 cores and the GPUs were 51% busy, with lanes filling 28.5 of 64 slots.
+The per-result host work (keys, TIDs, the id arrays' text output) is the limit,
+as at k = 500. `--gpu-predicates` still helps never-repeating predicates (1.5×
+through arrays, 3.5× through SQL); the 7% gap on cached arrays is within the
+variation of PostgreSQL-bound runs. p99 through arrays reaches 0.4–5.5 s at 448
+clients, so k = 1500 at this concurrency is a throughput setting only.
+
 Rate grouping (`udf_grouped` in the UDF benchmark) does not apply to the worker's
 graph route: a filtered CAGRA call there already carries one filter, hence one
 filtering rate.
