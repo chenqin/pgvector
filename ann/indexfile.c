@@ -1466,7 +1466,10 @@ AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const
 	if (blocks > 1)
 		qsort(all, total, sizeof(uint64_t), OrdinalCompare);
 
-	/* Keep the rows the base has, once each: one binary search a row. */
+	/*
+	 * Keep the rows the base has, once each: a bit test in its bitmap, or a
+	 * binary search of its ordinals when it keeps none.
+	 */
 	for (uint64_t i = 0; i < total; i++)
 	{
 		uint64_t	low = 0,
@@ -1474,6 +1477,12 @@ AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const
 
 		if (i > 0 && all[i] == all[i - 1])
 			continue;
+		if (base->words)
+		{
+			if ((base->words[all[i] / 32] >> (all[i] % 32)) & 1)
+				all[kept++] = all[i];
+			continue;
+		}
 		while (low < high)
 		{
 			uint64_t	middle = low + (high - low) / 2;

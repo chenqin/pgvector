@@ -317,6 +317,16 @@ Recall 0.9998 mean, 0.994-0.996 lowest. Together with P07, `distinct10` is 2.3x 
 
 From the start of this work, `distinct10` went 156.2k -> 546.5k vectors/s (3.5x) and 4.55k -> 35.8k QPS (7.9x). The falsifier's ceiling is 769.9k and 105.3k; the worker is the limit again (94 cores on arrays, 138 on SQL), most likely the per-search exclusion list (each search copies and binary-searches about 10,000 rows) and canonicalising the program twice.
 
+**Residual masks, cheaper exclusions.** Profiles of the `rm-*` runs put 78% of the worker's CPU (SQL) and 27% (arrays) in `AnnIndexExcludedRows`, which binary-searched each of a search's ~10,000 excluded rows in the 1M-row base, and 13% (arrays) in the per-hit exclusion check. Membership is now one bit test in the base entry's bitmap (binary search only for entries without one), and the per-hit check is one search instead of two:
+
+| Workload | `rm-*` | `rm2-*` | Falsifier ceiling | Recall (mean / lowest) |
+| --- | ---: | ---: | ---: | --- |
+| `distinct10` arrays | 546.5k vectors/s | 674.7k | 769.9k | 0.9998 / 0.996 |
+| `distinct10` SQL | 35.8k QPS | 96.6k | 105.3k | 0.9999 / 0.998 |
+| `mix10` arrays | 660.3k | 741.9k | — | 0.9998 / 0.996 |
+
+`distinct10` single-vector SQL is now GPU-bound (95.6% busy, as cached predicates are); the arrays point has PostgreSQL at 109 cores, its cached level, and the worker at 75 cores against 48 on cached work. Since the start of this work: `distinct10` 156.2k -> 674.7k vectors/s (4.3x) and 4.55k -> 96.6k QPS (21x).
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.

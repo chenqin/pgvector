@@ -1959,17 +1959,23 @@ MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t 
 	}
 }
 
-/* Whether ordinal is one of the job's excluded rows. */
+/* Whether ordinal is one of the job's excluded rows: one binary search. */
 static int
 IsExcluded(const AnnIndexJob *job, uint64_t ordinal)
 {
-	uint32_t	from,
-				to;
+	uint32_t	a = 0,
+				b = job->nexclude;
 
-	if (job->nexclude == 0)
-		return 0;
-	ExcludedRange(job, ordinal, ordinal + 1, &from, &to);
-	return to > from;
+	while (a < b)
+	{
+		uint32_t	mid = a + (b - a) / 2;
+
+		if (job->exclude[mid] < ordinal)
+			a = mid + 1;
+		else
+			b = mid;
+	}
+	return a < job->nexclude && job->exclude[a] == ordinal;
 }
 
 static AnnStatus
