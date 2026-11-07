@@ -299,7 +299,7 @@ LoadIndex(const char *name, const char *directory)
 static void
 SearchIndexJob(AnnIndexJob *job)
 {
-	AnnIndexFile *file = AnnIndexGet(job->name);
+	AnnIndexFile *file;
 	uint64_t   *ordinals = NULL;
 	const uint64_t *known = NULL;
 	uint64_t	nordinals = 0;
@@ -309,6 +309,9 @@ SearchIndexJob(AnnIndexJob *job)
 	uint32_t   *counts = NULL;
 
 	job->nresults = 0;
+	if (!AnnIndexJobDropExcluded(job))
+		return;
+	file = AnnIndexGet(job->name);
 	if (file == NULL)
 	{
 		job->status = ANN_STALE;

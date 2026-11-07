@@ -23,4 +23,28 @@
 int			AnnFilterCanonical(const AnnFilterSource *source, const unsigned char *program, size_t size,
 							   unsigned char **out, size_t *outSize);
 
+/*
+ * A canonical AND split into a base and exclusions: operands on one
+ * single-valued column that keep all but a few rows (such as "tenant <> 7")
+ * become exclusions, given as runs of the column's distinct-value indices
+ * whose rows are removed; the other operands form the base program. The
+ * program's rows are the base's rows minus every exclusion's rows. Returns 1
+ * with a malloc'd base when at least one exclusion and one base operand
+ * exist and the exclusions hold at most maxExcluded rows; otherwise 0.
+ */
+#define ANN_FILTER_MAX_EXCLUSIONS 4
+#define ANN_FILTER_EXCLUSION_RUNS 16
+
+typedef struct AnnFilterExclusion
+{
+	int			column;			/* the source's column index */
+	uint32_t	nruns;
+	uint64_t	lo[ANN_FILTER_EXCLUSION_RUNS];	/* value indices, half-open */
+	uint64_t	hi[ANN_FILTER_EXCLUSION_RUNS];
+} AnnFilterExclusion;
+
+int			AnnFilterCanonicalSplit(const AnnFilterSource *source, const unsigned char *program, size_t size,
+									uint64_t maxExcluded, unsigned char **base, size_t *baseSize,
+									AnnFilterExclusion *exclusions, uint32_t *nexclusions);
+
 #endif

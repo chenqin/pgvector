@@ -98,6 +98,16 @@ typedef struct AnnIndexJob
 	uint32_t	nresults;
 	uint32_t	route;
 	AnnStatus	status;
+
+	/*
+	 * --residual-masks: rows of the filter's ordinals the search must leave
+	 * out (sorted global ordinals, a subset of ordinals). Backends drop them
+	 * or turn the job into one over ordinals without them (ownedOrdinals,
+	 * which the server frees).
+	 */
+	const uint64_t *exclude;
+	uint32_t	nexclude;
+	uint64_t   *ownedOrdinals;
 } AnnIndexJob;
 
 /* Vendor-specific objects and precision/layout conversion stay behind this API. */

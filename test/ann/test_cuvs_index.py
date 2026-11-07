@@ -622,6 +622,89 @@ class CuvsIndexTests(unittest.TestCase):
                     10 * 800, 0, 0]
         self.assertEqual([eligible for eligible, _ in results['on']], expected * 2)
 
+    def test_residual_masks_match_full_evaluation(self):
+        """--residual-masks serves "range AND tenant <> v" from the range's entry with v's rows masked, row for row."""
+        import json
+        import struct
+        from test_predicate_cache import search_batch_frame, search_predicate_frame, values_program
+        table = self.table + '_two'
+        self.psql(f"""
+            CREATE TABLE {table} (id bigint PRIMARY KEY, category int, tenant int, emb vector(32));
+            SELECT setseed(0.3);
+            INSERT INTO {table} SELECT i, i % 20, (i / 20) % 100,
+                (SELECT array_agg(random()::real) FROM generate_series(1, 32) WHERE i > 0)::vector
+                FROM generate_series(1, 40000) i;""")
+        path = os.path.join(self.directory.name, 'two')
+        subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{table}', '--key', 'id',
+                        '--vector', 'emb', '--out', path, '--shards', '1', '--quantize', 'nvfp4',
+                        '--attribute', 'category', '--attribute', 'tenant'], check=True, capture_output=True)
+
+        def leaf_range(column, low, high):
+            return struct.pack('<BB', 2, len(column)) + column.encode() + struct.pack('<Bii', 0, low, high)
+
+        # Query vectors are rows of the excluded tenant: their nearest row is themselves.
+        cases = []
+        for low, high, tenant in [(2, 3, 7), (0, 1, 55), (10, 13, 99)]:
+            rows = self.psql(f"""SELECT id, emb::text FROM {table} WHERE category BETWEEN {low} AND {high}
+                                 AND tenant = {tenant} ORDER BY id LIMIT 3""").splitlines()
+            program = leaf_range('category', low, high) + values_program('tenant', [tenant], negate=True) + b'\x05'
+            eligible = int(self.psql(f"SELECT count(*) FROM {table} WHERE category BETWEEN {low} AND {high} "
+                                     f"AND tenant <> {tenant}"))
+            cases.append((program, [json.loads(r.split('|', 1)[1]) for r in rows], eligible, tenant))
+        results = {}
+        for mode in ('off', 'on'):
+            server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gpu-rerank', 'on',
+                            '--matrix-gather', 'on', '--group-gather-limit', '4000000', '--residual-masks', mode,
+                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+            name = f'{table}_{mode}'
+            try:
+                self.psql(f"SELECT ann_index_load('{name}', '{path}')", server)
+                answers = []
+                with server.connect() as connection:
+                    request = 1
+                    for program, vectors, eligible, tenant in cases:
+                        # Twice through operation 22 (the second finds the base cached), once batched.
+                        for vector in vectors[:2]:
+                            connection.sendall(search_predicate_frame(request, name, vector, 500, program))
+                            _, _, status, data = receive(connection)
+                            self.assertEqual(status, 0)
+                            count, _, got = struct.unpack_from('<IIQ', data)
+                            self.assertEqual(got, eligible)
+                            answers.append([struct.unpack_from('<qf', data, 16 + i * 12) for i in range(count)])
+                            request += 1
+                        connection.sendall(search_batch_frame(request, name, vectors, 500, program))
+                        _, _, status, data = receive(connection)
+                        self.assertEqual(status, 0)
+                        offset = 4
+                        for _ in vectors:
+                            count, _, got = struct.unpack_from('<IIQ', data, offset)
+                            self.assertEqual(got, eligible)
+                            answers.append([struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)])
+                            offset += 16 + count * 12
+                        request += 1
+                    connection.sendall(frame(31, 99, name.encode()))
+                    _, _, status, data = receive(connection)
+                    self.assertEqual(status, 0)
+                    masked = json.loads(data)['residual_masked']
+                    self.assertGreater(masked, 0) if mode == 'on' else self.assertEqual(masked, 0)
+                results[mode] = answers
+            finally:
+                server.close()
+        self.assertEqual(len(results['on']), len(results['off']))
+        for on, off in zip(results['on'], results['off']):
+            self.assertEqual(len(on), 500)
+            self.assertEqual([key for key, _ in on], [key for key, _ in off])
+            self.assertTrue(all(abs(a - b) < 1e-4 for (_, a), (_, b) in zip(on, off)))
+        # No hit carries an excluded tenant.
+        index = 0
+        for program, vectors, eligible, tenant in cases:
+            ids = {key for answer in results['on'][index:index + 2 + len(vectors)] for key, _ in answer}
+            index += 2 + len(vectors)
+            bad = self.psql(f"SELECT count(*) FROM {table} WHERE tenant = {tenant} AND id = ANY "
+                            f"(ARRAY[{','.join(map(str, ids))}]::bigint[])")
+            self.assertEqual(bad, '0')
+        self.psql(f'DROP TABLE {table}')
+
     def test_mixed_filter_groups_match_sql(self):
         """Searches over different cached filters share segmented gathers (--mixed-groups) and match SQL."""
         import json

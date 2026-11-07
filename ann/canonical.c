@@ -716,22 +716,15 @@ Serialize(Canon *c, Node *node)
 	return 1;
 }
 
-int
-AnnFilterCanonical(const AnnFilterSource *source, const unsigned char *program, size_t size,
-				   unsigned char **out, size_t *outSize)
+/* Parse and simplify a checked program; NULL (c->failed) when it can't. */
+static Node *
+Parse(Canon *c, const unsigned char *program, size_t size)
 {
-	Canon		c = {source, NULL, 0, 0, 0};
 	Node	   *stack[ANN_FILTER_MAX_DEPTH + 1];
 	int			depth = 0;
 	size_t		offset = 0;
-	int			ok = 0;
 
-	*out = NULL;
-	*outSize = 0;
-	if (!AnnFilterCheck(program, size) || source->column == NULL || source->count == NULL ||
-		source->value == NULL)
-		return 0;
-	while (offset < size && !c.failed)
+	while (offset < size && !c->failed)
 	{
 		int			op = program[offset];
 		size_t		step = 1;
@@ -741,48 +734,178 @@ AnnFilterCanonical(const AnnFilterSource *source, const unsigned char *program, 
 		{
 			case ANN_FILTER_AND:
 			case ANN_FILTER_OR:
-				node = Combine(&c, op == ANN_FILTER_AND ? K_AND : K_OR, stack[depth - 2], stack[depth - 1]);
+				node = Combine(c, op == ANN_FILTER_AND ? K_AND : K_OR, stack[depth - 2], stack[depth - 1]);
 				depth -= 2;
 				break;
 			case ANN_FILTER_NOT:
-				node = Not(&c, stack[--depth]);
+				node = Not(c, stack[--depth]);
 				break;
 			case ANN_FILTER_ALL:
 			case ANN_FILTER_NONE:
-				node = NewNode(&c, op == ANN_FILTER_ALL ? K_ALL : K_NONE);
+				node = NewNode(c, op == ANN_FILTER_ALL ? K_ALL : K_NONE);
 				break;
 			case ANN_FILTER_VALUES:
 			case ANN_FILTER_OVERLAP:
 				step = 7 + (size_t) program[offset + 1] + (size_t) Read32(program + offset + 3 + program[offset + 1]) * 4;
-				node = Leaf(&c, program + offset, step);
+				node = Leaf(c, program + offset, step);
 				break;
 			case ANN_FILTER_RANGE:
 				step = 11 + (size_t) program[offset + 1];
-				node = Leaf(&c, program + offset, step);
+				node = Leaf(c, program + offset, step);
 				break;
 			case ANN_FILTER_NULL:
 				step = 3 + (size_t) program[offset + 1];
-				node = Leaf(&c, program + offset, step);
+				node = Leaf(c, program + offset, step);
 				break;
 			default:			/* BITMAP: stored filters stay as written */
-				c.failed = 1;
+				c->failed = 1;
 				break;
 		}
 		if (node == NULL)
-			c.failed = 1;
+			c->failed = 1;
 		else
 			stack[depth++] = node;
 		offset += step;
 	}
-	if (!c.failed && depth == 1 && Serialize(&c, stack[0]) && stack[0]->nbytes <= ANN_FILTER_MAX_PROGRAM &&
-		AnnFilterCheck(stack[0]->bytes, stack[0]->nbytes) && (*out = malloc(stack[0]->nbytes)) != NULL)
+	return !c->failed && depth == 1 ? stack[0] : NULL;
+}
+
+static void
+Release(Canon *c)
+{
+	for (size_t i = 0; i < c->nowned; i++)
+		free(c->owned[i]);
+	free(c->owned);
+}
+
+/* A node's bytes copied out (malloc), if they form a valid program. */
+static int
+Emit(Canon *c, Node *node, unsigned char **out, size_t *outSize)
+{
+	if (node == NULL || !Serialize(c, node) || node->nbytes > ANN_FILTER_MAX_PROGRAM ||
+		!AnnFilterCheck(node->bytes, node->nbytes) || (*out = malloc(node->nbytes)) == NULL)
+		return 0;
+	memcpy(*out, node->bytes, node->nbytes);
+	*outSize = node->nbytes;
+	return 1;
+}
+
+int
+AnnFilterCanonical(const AnnFilterSource *source, const unsigned char *program, size_t size,
+				   unsigned char **out, size_t *outSize)
+{
+	Canon		c = {source, NULL, 0, 0, 0};
+	int			ok;
+
+	*out = NULL;
+	*outSize = 0;
+	if (!AnnFilterCheck(program, size) || source->column == NULL || source->count == NULL ||
+		source->value == NULL)
+		return 0;
+	ok = Emit(&c, Parse(&c, program, size), out, outSize);
+	Release(&c);
+	return ok;
+}
+
+/* Rows of value indices [lo, hi) of a column: its postings in between. */
+static uint64_t
+RunRows(Canon *c, int column, uint64_t lo, uint64_t hi)
+{
+	return c->source->start(c->source->arg, column, hi) - c->source->start(c->source->arg, column, lo);
+}
+
+int
+AnnFilterCanonicalSplit(const AnnFilterSource *source, const unsigned char *program, size_t size,
+						uint64_t maxExcluded, unsigned char **base, size_t *baseSize,
+						AnnFilterExclusion *exclusions, uint32_t *nexclusions)
+{
+	Canon		c = {source, NULL, 0, 0, 0};
+	Node	   *root;
+	Node	   *rest = NULL;
+	Node	  **kept;
+	uint32_t	nkept = 0;
+	uint64_t	excluded = 0;
+	int			ok = 0;
+
+	*base = NULL;
+	*baseSize = 0;
+	*nexclusions = 0;
+	if (!AnnFilterCheck(program, size) || source->column == NULL || source->count == NULL ||
+		source->value == NULL || source->start == NULL)
+		return 0;
+	root = Parse(&c, program, size);
+	if (root == NULL || root->kind != K_AND || (kept = Take(&c, sizeof(Node *) * root->nchildren)) == NULL)
+		goto done;
 	{
-		memcpy(*out, stack[0]->bytes, stack[0]->nbytes);
-		*outSize = stack[0]->nbytes;
-		ok = 1;
+		Run		  **gone = Take(&c, sizeof(Run *) * root->nchildren);
+		uint32_t   *ngone = Take(&c, sizeof(uint32_t) * root->nchildren);
+		uint64_t   *rows = Take(&c, sizeof(uint64_t) * root->nchildren);
+		uint32_t	widest = UINT32_MAX;
+
+		if (gone == NULL || ngone == NULL || rows == NULL)
+			goto done;
+
+		/*
+		 * A residual keeps all but a few rows: its complement is the
+		 * exclusion. The operand removing the most rows always stays in the
+		 * base, however small the table, so the base is never empty.
+		 */
+		for (uint32_t i = 0; i < root->nchildren; i++)
+		{
+			Node	   *child = root->children[i];
+
+			gone[i] = NULL;
+			rows[i] = UINT64_MAX;
+			if (child->kind != K_SET ||
+				(gone[i] = Complement(&c, child->runs, child->nruns, Count(&c, child->column), &ngone[i])) == NULL)
+				continue;
+			rows[i] = 0;
+			for (uint32_t r = 0; r < ngone[i]; r++)
+				rows[i] += RunRows(&c, child->column, gone[i][r].lo, gone[i][r].hi);
+		}
+		for (uint32_t i = 0; i < root->nchildren; i++)
+			if (widest == UINT32_MAX || rows[i] > rows[widest])
+				widest = i;
+		for (uint32_t i = 0; i < root->nchildren; i++)
+		{
+			Node	   *child = root->children[i];
+
+			if (i != widest && gone[i] && ngone[i] <= ANN_FILTER_EXCLUSION_RUNS &&
+				*nexclusions < ANN_FILTER_MAX_EXCLUSIONS && excluded + rows[i] <= maxExcluded)
+			{
+				AnnFilterExclusion *exclusion = &exclusions[(*nexclusions)++];
+
+				exclusion->column = child->column;
+				exclusion->nruns = ngone[i];
+				for (uint32_t r = 0; r < ngone[i]; r++)
+				{
+					exclusion->lo[r] = gone[i][r].lo;
+					exclusion->hi[r] = gone[i][r].hi;
+				}
+				excluded += rows[i];
+				continue;
+			}
+			kept[nkept++] = child;
+		}
 	}
-	for (size_t i = 0; i < c.nowned; i++)
-		free(c.owned[i]);
-	free(c.owned);
+	if (*nexclusions == 0 || nkept == 0)
+	{
+		*nexclusions = 0;
+		goto done;
+	}
+
+	/* The kept operands are canonical and ordered already: AND them as is. */
+	if (nkept == 1)
+		rest = kept[0];
+	else if ((rest = NewNode(&c, K_AND)) != NULL)
+	{
+		rest->children = kept;
+		rest->nchildren = nkept;
+	}
+	ok = Emit(&c, rest, base, baseSize);
+	if (!ok)
+		*nexclusions = 0;
+done:
+	Release(&c);
 	return ok;
 }

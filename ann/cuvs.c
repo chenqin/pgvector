@@ -625,6 +625,8 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t cost_queries[4];
 	atomic_uint_fast64_t gpu_predicates;	/* uncached predicates evaluated
 											 * on a device */
+	atomic_uint_fast64_t residual_masked;	/* searches whose excluded rows
+											 * were masked in the gather */
 	int32_t    *predicateColumns[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
 } AnnCuvsIndex;
 
@@ -725,7 +727,7 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"residual_masked\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
@@ -733,6 +735,7 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 					   (unsigned long long) atomic_load_explicit(&state->matrix_prune_fallbacks, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->mixed_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->gpu_predicates, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->residual_masked, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp32_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp16_queries, memory_order_relaxed),
@@ -859,6 +862,11 @@ typedef struct AnnCuvsDevice
 	uint32_t   *expandBlocks;
 	size_t		expandWordCap,
 				expandBlockCap;
+	/* --residual-masks: (query, shard row) pairs to mask, and their staging */
+	uint32_t   *maskPairs;
+	uint32_t   *hostMaskPairs;	/* pinned */
+	size_t		maskPairCap,
+				hostMaskPairCap;
 } AnnCuvsDevice;
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
@@ -1253,6 +1261,9 @@ FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
  * upload nothing per query. A failure frees what was copied and leaves
  * that form on the per-query path.
  */
+static int	MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t q, uint32_t n,
+						 uint32_t candidates, const uint32_t *rows, AnnCuvsDevice *lane, int device,
+						 cudaStream_t stream, float *scores);
 static int	ExpandLaneRows(const AnnIndexFile *file, uint32_t s, const uint32_t *bitset, uint64_t n,
 						   AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t *rows);
 static int	ExpandRows(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexBitmap *bitmap,
@@ -1459,6 +1470,22 @@ static const char ExpandKernelSource[] =
 "  while (bits) { out[at++] = (unsigned int) (w * 32 + __ffs(bits) - 1); bits &= bits - 1; }\n"
 "}\n";
 
+/*
+ * --residual-masks: excluded rows' scores set to +inf after scoring. Each
+ * pair is (query in the tile, shard row); rows is the shard's sorted row
+ * list the matrix was scored over (n of them).
+ */
+static const char MaskKernelSource[] =
+"extern \"C\" __global__ void mask_scores(float *scores, const unsigned int *rows, unsigned int n,\n"
+"                                        const unsigned int *pairs, unsigned int count)\n"
+"{\n"
+"  unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (t >= count) return;\n"
+"  unsigned int j = pairs[2 * t], r = pairs[2 * t + 1], lo = 0, hi = n;\n"
+"  while (lo < hi) { unsigned int mid = lo + (hi - lo) / 2; if (rows[mid] < r) lo = mid + 1; else hi = mid; }\n"
+"  if (lo < n && rows[lo] == r) scores[(unsigned long long) j * n + lo] = __int_as_float(0x7f800000);\n"
+"}\n";
+
 typedef struct PredicateModule
 {
 	atomic_int	state;			/* 0 unloaded, 1 ready, -1 unavailable */
@@ -1468,6 +1495,7 @@ typedef struct PredicateModule
 	CUfunction	expandCount;
 	CUfunction	expandScan;
 	CUfunction	expandWrite;
+	CUfunction	maskScores;
 } PredicateModule;
 
 static PredicateModule predicateModules[ANN_CUVS_MAX_DEVICES];
@@ -1498,17 +1526,20 @@ PredicateKernels(int device)
 		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
-	length = strlen(PredicateKernelSource) + strlen(AnnUdfDeviceSource()) + strlen(ExpandKernelSource) + 1;
+	length = strlen(PredicateKernelSource) + strlen(AnnUdfDeviceSource()) + strlen(ExpandKernelSource) +
+		strlen(MaskKernelSource) + 1;
 	if ((source = malloc(length)) == NULL)
 		goto fail;
 	snprintf(source, length, PredicateKernelSource, AnnUdfDeviceSource());
 	strcat(source, ExpandKernelSource);
+	strcat(source, MaskKernelSource);
 	if ((image = AnnNvrtcCompile(source, "predicate kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->words, module->module, "predicate_words") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->expandCount, module->module, "expand_count") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->expandScan, module->module, "expand_scan") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->expandWrite, module->module, "expand_write") != CUDA_SUCCESS)
+		cuModuleGetFunction(&module->expandWrite, module->module, "expand_write") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->maskScores, module->module, "mask_scores") != CUDA_SUCCESS)
 		goto fail;
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
@@ -1837,6 +1868,110 @@ ExpandLaneRows(const AnnIndexFile *file, uint32_t s, const uint32_t *bitset, uin
 	}
 }
 
+/* The excluded rows of a job that fall in [lo, hi): their index range in exclude. */
+static void
+ExcludedRange(const AnnIndexJob *job, uint64_t lo, uint64_t hi, uint32_t *from, uint32_t *to)
+{
+	uint32_t	a = 0,
+				b = job->nexclude;
+
+	while (a < b)
+	{
+		uint32_t	mid = a + (b - a) / 2;
+
+		if (job->exclude[mid] < lo)
+			a = mid + 1;
+		else
+			b = mid;
+	}
+	*from = a;
+	b = job->nexclude;
+	while (a < b)
+	{
+		uint32_t	mid = a + (b - a) / 2;
+
+		if (job->exclude[mid] < hi)
+			a = mid + 1;
+		else
+			b = mid;
+	}
+	*to = a;
+}
+
+/*
+ * --residual-masks: set the scores of each query's excluded rows in shard s
+ * to +inf on the lane's stream. Returns 1 when nothing needs masking, 0 on
+ * failure or when a query would keep fewer than candidates rows (the caller
+ * then searches each job over its own rows).
+ */
+static int
+MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t q, uint32_t n, uint32_t candidates,
+			 const uint32_t *rows, AnnCuvsDevice *lane, int device, cudaStream_t stream, float *scores)
+{
+	uint64_t	first = file->shards[s].first;
+	uint64_t	last = first + file->shards[s].rows;
+	uint64_t	pairs = 0;
+	unsigned	count;
+	PredicateModule *module;
+
+	for (uint32_t j = 0; j < q; j++)
+	{
+		uint32_t	from,
+					to;
+
+		if (jobs[j]->nexclude == 0)
+			continue;
+		ExcludedRange(jobs[j], first, last, &from, &to);
+		if (n < candidates || n - (to - from) < candidates)
+			return 0;
+		pairs += to - from;
+	}
+	if (pairs == 0)
+		return 1;
+	if (pairs > UINT32_MAX / 2 || (module = PredicateKernels(device)) == NULL ||
+		!GrowPinned((void **) &lane->hostMaskPairs, &lane->hostMaskPairCap, (size_t) pairs * 2, sizeof(uint32_t), 0) ||
+		!GrowDevice((void **) &lane->maskPairs, &lane->maskPairCap, (size_t) pairs * 2, sizeof(uint32_t), 0, stream))
+		return 0;
+	count = 0;
+	for (uint32_t j = 0; j < q; j++)
+	{
+		uint32_t	from,
+					to;
+
+		if (jobs[j]->nexclude == 0)
+			continue;
+		ExcludedRange(jobs[j], first, last, &from, &to);
+		for (uint32_t e = from; e < to; e++)
+		{
+			lane->hostMaskPairs[2 * count] = j;
+			lane->hostMaskPairs[2 * count + 1] = (uint32_t) (jobs[j]->exclude[e] - first);
+			count++;
+		}
+	}
+	{
+		void	   *args[] = {&scores, &rows, &n, &lane->maskPairs, &count};
+
+		return cudaMemcpyAsync(lane->maskPairs, lane->hostMaskPairs, (size_t) count * 2 * sizeof(uint32_t),
+							   cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+			cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->maskScores, (count + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   args, NULL) == CUDA_SUCCESS;
+	}
+}
+
+/* Whether ordinal is one of the job's excluded rows. */
+static int
+IsExcluded(const AnnIndexJob *job, uint64_t ordinal)
+{
+	uint32_t	from,
+				to;
+
+	if (job->nexclude == 0)
+		return 0;
+	ExcludedRange(job, ordinal, ordinal + 1, &from, &to);
+	return to > from;
+}
+
 static AnnStatus
 LoadIndex(const char *name, const char *directory)
 {
@@ -1889,6 +2024,7 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->matrix_prune_fallbacks, 0);
 	atomic_init(&state->mixed_queries, 0);
 	atomic_init(&state->gpu_predicates, 0);
+	atomic_init(&state->residual_masked, 0);
 	atomic_init(&state->gpu_rerank_candidates, 0);
 	atomic_init(&state->cagra_fp32_queries, 0);
 	atomic_init(&state->graph_cpu_rerank_candidates, 0);
@@ -4046,6 +4182,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			}
 			if (!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
 										 (int) dims, lane->matrixScores, stream) ||
+				!MaskExcluded(file, s, jobs + first, q, n, candidates, rows, lane, shard->device, stream,
+							  lane->matrixScores) ||
 				(!PrunedSelect(state, lane, shard->device, stream, q, n, candidates) &&
 				 AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
 								lane->matrixIndices, q, n, candidates, 0, NULL) != CUVS_SUCCESS))
@@ -4107,7 +4245,27 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 					AnnIndexJob part = *job;
 
 					part.results = hits;
-					AnnIndexExact(file, &part, ordinals + start[s], n);
+					part.ordinals = ordinals + start[s];
+					part.nfilter = n;
+					part.ownedOrdinals = NULL;
+					if (job->nexclude)
+					{
+						/* The shard's rows without this job's excluded ones. */
+						uint32_t	from,
+									to;
+
+						ExcludedRange(job, file->shards[s].first, file->shards[s].first + file->shards[s].rows,
+									  &from, &to);
+						part.exclude = job->exclude + from;
+						part.nexclude = to - from;
+						if (!AnnIndexJobDropExcluded(&part))
+						{
+							ok = 0;
+							break;
+						}
+					}
+					AnnIndexExact(file, &part, part.ordinals, part.nfilter);
+					free(part.ownedOrdinals);
 					*found = part.nresults;
 					continue;
 				}
@@ -4120,6 +4278,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 					if (pos < 0 || (uint64_t) pos >= (gpu[s] ? file->shards[s].rows : n))
 						continue;
 					row = gpu[s] ? file->shards[s].first + (uint64_t) pos : ordinals[start[s] + (uint64_t) pos];
+					if (IsExcluded(job, row))
+						continue;
 					hit.key = file->keys[row];
 					hit.ordinal = row;
 					hit.distance = gpu[s] ? distances[i] : ExactDistance(file, row, job->query);
@@ -4178,6 +4338,7 @@ MixedEligible(const AnnIndexFile *file, const AnnCuvsIndex *state, const AnnInde
 
 	return AnnIndexConfig.mixed_groups && AnnIndexConfig.gpu_rerank && state->nshards == 1 && state->quantized &&
 		file->quant == ANN_QUANT_NVFP4 && job->filtered && job->ordinals != NULL && job->deviceRows != NULL &&
+		job->nexclude == 0 &&
 		job->nfilter > AnnIndexConfig.exact_limit && job->nfilter <= AnnIndexConfig.group_gather_limit &&
 		job->nfilter >= candidates && candidates <= ANN_PRUNE_CAP / ANN_PRUNE_MARGIN;
 }
@@ -5115,6 +5276,28 @@ static void
 SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
 {
 	uint32_t	n = jobs[0]->nfilter;
+	int			excluding = 0;
+
+	/*
+	 * --residual-masks: jobs over a shared base with their own excluded rows
+	 * take the matrix gather, which masks them; any other route first gets
+	 * each job's own rows.
+	 */
+	for (uint32_t j = 0; j < m && !excluding; j++)
+		excluding = jobs[j]->nexclude != 0;
+	if (excluding)
+	{
+		if (!state->scanOnly && AnnIndexConfig.matrix_gather && n > AnnIndexConfig.exact_limit &&
+			n <= AnnIndexConfig.group_gather_limit && SearchGatherMatrix(file, state, jobs, m))
+		{
+			(void) atomic_fetch_add_explicit(&state->residual_masked, m, memory_order_relaxed);
+			return;
+		}
+		for (uint32_t j = 0; j < m; j++)
+			if (AnnIndexJobDropExcluded(jobs[j]))
+				SearchFiltered(file, state, jobs[j]);
+		return;
+	}
 
 	/* Scan-only indexes have no graph for a calibrated route to choose. */
 	if (!state->scanOnly && CalibratedFilteredGroup(file, state, jobs, m))
@@ -5174,6 +5357,8 @@ SearchIndex(AnnIndexJob *jobs, uint32_t count)
 				uint64_t   *ordinals = NULL;
 				uint64_t	n = 0;
 
+				if (!AnnIndexJobDropExcluded(&jobs[j]))
+					continue;
 				if (jobs[j].filtered && jobs[j].ordinals)
 					AnnIndexExact(file, &jobs[j], jobs[j].ordinals, jobs[j].nfilter);
 				else

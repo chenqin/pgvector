@@ -418,6 +418,84 @@ main(void)
 			assert(!AnnFilterCanonical(&source, x.b, x.n, &out, &size));
 		}
 	}
+	/*
+	 * Splits: the base's rows minus every exclusion's rows are the program's
+	 * rows, for random programs and for the shape "range AND c <> v".
+	 */
+	{
+		int			splits = 0;
+		static uint32_t base[(ROWS + 31) / 32];
+
+		srand(23);
+		for (int t = 0; t < 20000; t++)
+		{
+			Tree	   *tree = Build(1 + rand() % 4);
+			Program		p = {.n = 0};
+			unsigned char *out;
+			size_t		size;
+			AnnFilterExclusion exclusions[ANN_FILTER_MAX_EXCLUSIONS];
+			uint32_t	nexclusions;
+			uint64_t	count,
+						baseCount;
+
+			Emit(tree, &p, 0);
+			if (rand() % 2)
+			{
+				/* Often AND in an exclusion so that splits happen. */
+				int32_t		v = rand() % 5;
+
+				ValuesLeaf(&p, 'c', 1, &v, 1);
+				Put(&p, ANN_FILTER_AND, 1);
+			}
+			FreeTree(tree);
+			if (!AnnFilterCanonicalSplit(&source, p.b, p.n, 2500, &out, &size, exclusions, &nexclusions))
+				continue;
+			assert(nexclusions > 0 && nexclusions <= ANN_FILTER_MAX_EXCLUSIONS);
+			assert(AnnFilterCheck(out, size));
+			assert(AnnFilterEvaluate(&source, p.b, p.n, words, &count) == ANN_FILTER_OK);
+			assert(AnnFilterEvaluate(&source, out, size, base, &baseCount) == ANN_FILTER_OK);
+			free(out);
+			for (uint32_t e = 0; e < nexclusions; e++)
+				for (uint32_t r = 0; r < exclusions[e].nruns; r++)
+					for (uint64_t at = starts[exclusions[e].column][exclusions[e].lo[r]];
+						 at < starts[exclusions[e].column][exclusions[e].hi[r]]; at++)
+					{
+						uint32_t	row = postings[exclusions[e].column][at];
+
+						base[row / 32] &= ~(UINT32_C(1) << (row % 32));
+					}
+			if (memcmp(words, base, sizeof(base)) != 0)
+			{
+				fprintf(stderr, "split %d: base minus exclusions differs from the program\n", t);
+				return 1;
+			}
+			splits++;
+		}
+		assert(splits > 1000);
+		printf("canonical: %d splits keep their rows\n", splits);
+	}
+	{
+		Program		x = {.n = 0};
+		int32_t		v = 3;
+		unsigned char *out;
+		size_t		size;
+		AnnFilterExclusion exclusions[ANN_FILTER_MAX_EXCLUSIONS];
+		uint32_t	nexclusions;
+
+		/* b in -5..4 AND c <> 3: base is the range, one exclusion on c. */
+		RangeLeaf(&x, 'b', 0, -5, 4);
+		ValuesLeaf(&x, 'c', 1, &v, 1);
+		Put(&x, ANN_FILTER_AND, 1);
+		assert(AnnFilterCanonicalSplit(&source, x.b, x.n, 2500, &out, &size, exclusions, &nexclusions));
+		assert(nexclusions == 1 && exclusions[0].column == 2 && exclusions[0].nruns == 1);
+		assert(distinct[2][exclusions[0].lo[0]] == 3 && exclusions[0].hi[0] == exclusions[0].lo[0] + 1);
+		free(out);
+		/* Past the row bound, or with nothing left for the base: no split. */
+		assert(!AnnFilterCanonicalSplit(&source, x.b, x.n, 10, &out, &size, exclusions, &nexclusions));
+		x.n = 0;
+		ValuesLeaf(&x, 'c', 1, &v, 1);
+		assert(!AnnFilterCanonicalSplit(&source, x.b, x.n, 2500, &out, &size, exclusions, &nexclusions));
+	}
 	printf("canonical: %d programs keep their rows and one form per spelling; %d equivalences\n",
 		   programs, equal);
 	return 0;

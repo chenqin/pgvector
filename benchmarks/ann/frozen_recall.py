@@ -30,7 +30,13 @@ PREDICATES = {
     'rows4m': ('category', lambda v: (v * 40, v * 40 + 39), 'category BETWEEN {lo} AND {hi}', 2),
     'mixed10': ('category', lambda v: (v, v + 9), 'category BETWEEN {lo} AND {hi}', 91),
     'unique1': ('tenant', lambda v: (v, v + 9), 'tenant BETWEEN {lo} AND {hi}', 991),
+    # A 10% window minus one real tenant: v picks the window (v % 91) and the tenant (v // 91).
+    'distinct10': ('category', lambda v: (v % 91, v % 91 + 9), 'category BETWEEN {lo} AND {hi} AND tenant <> {t}',
+                   91000),
 }
+
+# Workloads that also exclude one value of a second column: (column, value of v).
+EXCLUDES = {'distinct10': ('tenant', lambda v: v // 91)}
 
 
 def truth(args, pairs, queries):
@@ -44,9 +50,14 @@ def truth(args, pairs, queries):
         vectors = np.memmap(directory / 'vectors.f32', dtype='<f4', mode='r').reshape(len(keys), -1)
         column, bounds, _, _ = PREDICATES[args.workload]
         values = np.fromfile(directory / f'attr-{column}.i32', dtype='<i4')
+        exclude = EXCLUDES.get(args.workload)
+        other = np.fromfile(directory / f'attr-{exclude[0]}.i32', dtype='<i4') if exclude else None
         for value in sorted({p[1] for p in missing}):
             lo, hi = bounds(value)
-            rows = np.flatnonzero((values >= lo) & (values <= hi))
+            keep = (values >= lo) & (values <= hi)
+            if exclude:
+                keep &= other != exclude[1](value)
+            rows = np.flatnonzero(keep)
             eligible = cp.asarray(vectors[rows], dtype=cp.float64)
             for q, v in [p for p in missing if p[1] == value]:
                 query = cp.asarray(np.asarray(queries[q], dtype=np.float64))
@@ -94,7 +105,8 @@ def main():
         started = time.monotonic()
         for q, v in pairs:
             lo, hi = bounds(v)
-            predicate = template.format(v=v, lo=lo, hi=hi)
+            predicate = template.format(v=v, lo=lo, hi=hi,
+                                        t=EXCLUDES[args.workload][1](v) if args.workload in EXCLUDES else '')
             if args.batch:
                 vectors = '{' + ','.join('"' + json.dumps(queries[q + i]) + '"' for i in range(width)) + '}'
                 found = {i: [] for i in range(width)}

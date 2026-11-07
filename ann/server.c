@@ -53,6 +53,7 @@ typedef struct Job
 	int64_t    *keys;			/* sorted filter keys owned by the job */
 	uint64_t   *ordinals;		/* their ordinals, when owned by the job */
 	uint32_t   *shardBitsets[ANN_INDEX_MAX_SHARDS]; /* bitmap route, per shard */
+	uint64_t   *exclude;		/* --residual-masks: rows to leave out */
 	uint32_t   *ownedBitsets[ANN_INDEX_MAX_SHARDS]; /* those this job
 													 * allocated */
 	AnnIndexFile *bitmapFile;	/* cached bitmap this job references */
@@ -124,6 +125,10 @@ static _Thread_local uint64_t frameArrived = 0;
 /* Hits to return when SubmitBitmapJob's caller over-fetches (else 0). */
 static _Thread_local uint32_t submittingWanted = 0;
 
+/* Rows SubmitBitmapJob's jobs leave out of their filter (--residual-masks). */
+static _Thread_local const uint64_t *submittingExclude = NULL;
+static _Thread_local uint32_t submittingNexclude = 0;
+
 /* Set while a reader or RDMA lane submits a composite's parts. */
 static _Thread_local Composite *submittingComposite = NULL;
 static _Thread_local uint32_t submittingPart = 0;
@@ -186,6 +191,8 @@ typedef struct Service
 	uint64_t	predicate_eval_us;	/* time spent evaluating them */
 	uint64_t	predicate_canonical;	/* lookups under a rewritten program */
 	uint64_t	predicate_transient;	/* first sightings served uncached */
+	uint64_t	predicate_residual; /* searches over a base entry with
+									 * masked rows (--residual-masks) */
 	uint32_t	blockedWaiters; /* lanes waiting for a filter to free up */
 	uint32_t	activeLanes;	/* lanes working on cached filters */
 	FilterEntry *filters[ANN_FILTER_BUCKETS];
@@ -681,7 +688,7 @@ Finish(Service *service, Job *job, Settlement *settle)
 	{
 		job->job.status = job->index.status;
 		CompositeAnswer(job->composite, job->compositePart, job->index.route, job->index.status, job->index.results, job->index.nresults,
-						job->bitmap ? job->bitmap->count : job->bitmapFile ? job->bitmapFile->rows : 0,
+						job->bitmap ? job->bitmap->count - job->index.nexclude : job->bitmapFile ? job->bitmapFile->rows : 0,
 						job->bitmapFile);
 	}
 	else if (job->kind == JOB_INDEX)
@@ -712,7 +719,7 @@ Finish(Service *service, Job *job, Settlement *settle)
 				Write(data, job->index.nresults, 4);
 				Write(data + 4, job->index.route, 4);
 				if (head == 16)
-					Write(data + 8, job->bitmap ? job->bitmap->count :
+					Write(data + 8, job->bitmap ? job->bitmap->count - job->index.nexclude :
 						  job->bitmapFile ? job->bitmapFile->rows : 0, 8);
 				for (uint32_t i = 0; i < job->index.nresults; i++)
 				{
@@ -794,6 +801,8 @@ Finish(Service *service, Job *job, Settlement *settle)
 	free(job->index.results);
 	free(job->keys);
 	free(job->ordinals);
+	free(job->exclude);
+	free(job->index.ownedOrdinals);
 	for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
 		free(job->ownedBitsets[s]);
 	if (!settled && job->bitmap)
@@ -2149,6 +2158,19 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 		AnnIndexBitmapRelease(file, bitmap);
 		return ANN_MISSING;
 	}
+	if (bitmap && submittingNexclude)
+	{
+		if ((job->exclude = malloc(sizeof(uint64_t) * submittingNexclude)) == NULL)
+		{
+			free(job->index.results);
+			free(job);
+			AnnIndexBitmapRelease(file, bitmap);
+			return ANN_NOMEM;
+		}
+		memcpy(job->exclude, submittingExclude, sizeof(uint64_t) * submittingNexclude);
+		job->index.exclude = job->exclude;
+		job->index.nexclude = submittingNexclude;
+	}
 	job->bitmapFile = file;
 	job->bitmap = bitmap;
 	job->connection = connection;
@@ -2174,6 +2196,7 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	if (file)
 		AnnIndexPut(file);
 	free(job->index.results);
+	free(job->exclude);
 	if (bitmap)
 		AnnIndexBitmapRelease(file, bitmap);
 	free(job);
@@ -2363,6 +2386,57 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
  * are cached under the program's hash, so repeated predicates share one
  * evaluation and are grouped like cached bitmaps.
  */
+/*
+ * A search's predicate: with --residual-masks an AND whose narrow operands
+ * remove few rows (such as "tenant <> 7") is served from the cached entry of
+ * its wide operands, with the removed rows returned in *exclude (sorted, a
+ * subset of the entry's ordinals; the caller frees them). The base must
+ * take the gather routes (known ordinals, within the group gather limit)
+ * and keep k plus the quantized slack once the rows go; otherwise the whole
+ * predicate is evaluated as usual.
+ */
+static AnnStatus
+PredicateSearchBitmap(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
+					  uint32_t k, int snapshot, AnnIndexBitmap **result, uint64_t **exclude, uint32_t *nexclude)
+{
+	*exclude = NULL;
+	*nexclude = 0;
+	if (AnnIndexConfig.residual_masks && AnnIndexConfig.canonical_predicates && file->device)
+	{
+		unsigned char *base;
+		size_t		baseSize;
+		AnnFilterExclusion exclusions[ANN_FILTER_MAX_EXCLUSIONS];
+		uint32_t	nexclusions;
+
+		if (AnnIndexCanonicalSplit(file, program, size, ANN_RESIDUAL_MAX_ROWS, &base, &baseSize, exclusions,
+								   &nexclusions))
+		{
+			AnnStatus	status = PredicateBitmap(service, file, 1, base, (uint32_t) baseSize, result, snapshot);
+
+			free(base);
+			if (status == ANN_OK)
+			{
+				const AnnIndexBitmap *entry = *result;
+
+				if (entry->ordinals && entry->count > AnnIndexConfig.exact_limit &&
+					entry->count <= AnnIndexConfig.group_gather_limit &&
+					AnnIndexExcludedRows(file, entry, exclusions, nexclusions, exclude, nexclude) == ANN_OK &&
+					entry->count - *nexclude >= (uint64_t) k + AnnIndexConfig.quant_slack)
+				{
+					(void) __atomic_fetch_add(&service->predicate_residual, 1, __ATOMIC_RELAXED);
+					return ANN_OK;
+				}
+				free(*exclude);
+				*exclude = NULL;
+				*nexclude = 0;
+				AnnIndexBitmapRelease(file, *result);
+				*result = NULL;
+			}
+		}
+	}
+	return PredicateBitmap(service, file, 1, program, size, result, snapshot);
+}
+
 static AnnStatus
 SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t request,
 				unsigned char *payload, uint32_t size)
@@ -2377,6 +2451,8 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 				programLength;
 	size_t		offset;
 	AnnStatus	status;
+	uint64_t   *exclude = NULL;
+	uint32_t	nexclude = 0;
 
 	if (service->backend->search_index == NULL)
 		return ANN_UNSUPPORTED;
@@ -2424,9 +2500,17 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 								 ANN_OP_INDEX_SEARCH_PREDICATE, flags);
 		submittingWanted = 0;
 	}
-	else if ((status = PredicateBitmap(service, file, 1, payload + offset, programLength, &bitmap, 0)) == ANN_OK)
+	else if ((status = PredicateSearchBitmap(service, file, payload + offset, programLength, k, 0, &bitmap,
+											 &exclude, &nexclude)) == ANN_OK)
+	{
+		submittingExclude = exclude;
+		submittingNexclude = nexclude;
 		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
 								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+		submittingExclude = NULL;
+		submittingNexclude = 0;
+		free(exclude);
+	}
 	/* The job took its own reference before this one goes. */
 	AnnIndexPut(file);
 	return status;
@@ -2544,6 +2628,8 @@ static AnnStatus
 SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request,
 			unsigned char *payload, uint32_t size, uint64_t generation)
 {
+	uint64_t   *exclude = NULL;
+	uint32_t	nexclude = 0;
 	uint32_t	nameLength,
 				dimensions,
 				k,
@@ -2600,8 +2686,9 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 		(uint64_t) k + deleted <=
 		(service->backend->max_k < 10000 ? service->backend->max_k : 10000))
 		searchK += (uint32_t) deleted;
-	else if ((status = PredicateBitmap(service, file, 1, payload + common + 20,
-									   programLength, &bitmap, (flags & ANN_PREDICATE_SNAPSHOT) != 0)) != ANN_OK)
+	else if ((status = PredicateSearchBitmap(service, file, payload + common + 20, programLength, k,
+											 (flags & ANN_PREDICATE_SNAPSHOT) != 0, &bitmap, &exclude,
+											 &nexclude)) != ANN_OK)
 	{
 		AnnIndexPut(file);
 		return status;
@@ -2659,9 +2746,13 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 			submittingWanted = searchK != k ? k : 0;
 			submittingComposite = composite;
 			submittingPart = p;
+			submittingExclude = exclude;
+			submittingNexclude = nexclude;
 			partStatus = SubmitBitmapJob(service, connection, rdma, request, part,
 										 (uint32_t) partSize, file, bitmap, name, dimensions, searchK,
 										 0, ANN_OP_INDEX_SEARCH_BATCH, flags);
+			submittingExclude = NULL;
+			submittingNexclude = 0;
 			submittingComposite = NULL;
 			submittingPart = 0;
 			submittingWanted = 0;
@@ -2692,6 +2783,7 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 				if (job->bitmapFile)
 					AnnIndexPut(job->bitmapFile);
 				free(job->index.results);
+				free(job->exclude);
 				if (job->bitmap)
 					AnnIndexBitmapRelease(job->bitmapFile, job->bitmap);
 				free(job->payload);
@@ -2701,6 +2793,7 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 	}
 	if (bitmap)
 		AnnIndexBitmapRelease(file, bitmap);
+	free(exclude);
 	AnnIndexPut(file);
 	free(payload);
 	return ANN_PENDING;
@@ -3206,7 +3299,7 @@ Reader(void *argument)
 								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
 								"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
 								"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
-								"\"predicate_canonical\":%llu,\"predicate_transient\":%llu}",
+								"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_residual\":%llu}",
 								(unsigned long long) service->jobs, (unsigned long long) service->batches,
 								(unsigned long long) service->max_batch, (unsigned long long) service->rows,
 								(unsigned long long) service->rejected, (unsigned long long) service->rejected_index,
@@ -3224,7 +3317,8 @@ Reader(void *argument)
 								(unsigned long long) predicateDeviceBytes,
 								(unsigned long long) predicateEvictions,
 								(unsigned long long) __atomic_load_n(&service->predicate_canonical, __ATOMIC_RELAXED),
-								(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED));
+								(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED),
+								(unsigned long long) __atomic_load_n(&service->predicate_residual, __ATOMIC_RELAXED));
 			(void) pthread_mutex_unlock(&service->mutex);
 			Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 				  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);

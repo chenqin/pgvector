@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 0, 1, ANN_ADMIT_ALL};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 0, 1, ANN_ADMIT_ALL, 0};
 int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;
@@ -1364,6 +1364,136 @@ AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.start = SourceStart;
 	source.multi = SourceMulti;
 	return AnnFilterCanonical(&source, program, size, out, outSize);
+}
+
+int
+AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, size_t size, uint64_t maxExcluded,
+					   unsigned char **base, size_t *baseSize, AnnFilterExclusion *exclusions, uint32_t *nexclusions)
+{
+	AnnFilterSource source;
+
+	memset(&source, 0, sizeof(source));
+	source.arg = file;
+	source.rows = file->rows;
+	source.column = SourceColumn;
+	source.count = SourceCount;
+	source.value = SourceValue;
+	source.start = SourceStart;
+	source.multi = SourceMulti;
+	return AnnFilterCanonicalSplit(&source, program, size, maxExcluded, base, baseSize, exclusions, nexclusions);
+}
+
+int
+AnnIndexJobDropExcluded(AnnIndexJob *job)
+{
+	uint64_t   *kept;
+	uint32_t	n = 0,
+				e = 0;
+
+	if (job->nexclude == 0)
+		return 1;
+	if (job->ordinals == NULL || (kept = malloc(sizeof(uint64_t) * (job->nfilter ? job->nfilter : 1))) == NULL)
+	{
+		job->status = ANN_NOMEM;
+		return 0;
+	}
+	/* Both lists are sorted, and the excluded rows are a subset. */
+	for (uint32_t i = 0; i < job->nfilter; i++)
+	{
+		while (e < job->nexclude && job->exclude[e] < job->ordinals[i])
+			e++;
+		if (e < job->nexclude && job->exclude[e] == job->ordinals[i])
+			continue;
+		kept[n++] = job->ordinals[i];
+	}
+	free(job->ownedOrdinals);
+	job->ownedOrdinals = kept;
+	job->ordinals = kept;
+	job->nfilter = n;
+	job->filter = NULL;
+	job->bitsets = NULL;
+	job->deviceBitsets = NULL;
+	job->deviceRows = NULL;
+	job->exclude = NULL;
+	job->nexclude = 0;
+	return 1;
+}
+
+AnnStatus
+AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const AnnFilterExclusion *exclusions,
+					 uint32_t nexclusions, uint64_t **rows, uint32_t *n)
+{
+	uint64_t	total = 0;
+	uint64_t	at = 0;
+	uint32_t	kept = 0;
+	uint32_t	blocks = 0;
+	uint64_t   *all;
+
+	*rows = NULL;
+	*n = 0;
+	if (base->ordinals == NULL)
+		return ANN_INVALID;
+	for (uint32_t e = 0; e < nexclusions; e++)
+	{
+		const AnnIndexAttribute *attribute = &file->attributes[exclusions[e].column];
+
+		if (attribute->multi)
+			return ANN_INVALID;
+		for (uint32_t r = 0; r < exclusions[e].nruns; r++)
+			for (uint64_t v = exclusions[e].lo[r]; v < exclusions[e].hi[r]; v++)
+			{
+				total += attribute->postings[v].count;
+				blocks++;
+			}
+	}
+	if (total == 0)
+		return ANN_OK;
+	if ((all = malloc(sizeof(uint64_t) * total)) == NULL)
+		return ANN_NOMEM;
+	for (uint32_t e = 0; e < nexclusions; e++)
+	{
+		const AnnIndexAttribute *attribute = &file->attributes[exclusions[e].column];
+
+		for (uint32_t r = 0; r < exclusions[e].nruns; r++)
+			for (uint64_t v = exclusions[e].lo[r]; v < exclusions[e].hi[r]; v++)
+			{
+				memcpy(all + at, attribute->ordinals + attribute->postings[v].offset,
+					   sizeof(uint64_t) * attribute->postings[v].count);
+				at += attribute->postings[v].count;
+			}
+	}
+	/* One value's rows are sorted already; several need sorting. */
+	if (blocks > 1)
+		qsort(all, total, sizeof(uint64_t), OrdinalCompare);
+
+	/* Keep the rows the base has, once each: one binary search a row. */
+	for (uint64_t i = 0; i < total; i++)
+	{
+		uint64_t	low = 0,
+					high = base->count;
+
+		if (i > 0 && all[i] == all[i - 1])
+			continue;
+		while (low < high)
+		{
+			uint64_t	middle = low + (high - low) / 2;
+
+			if (base->ordinals[middle] < all[i])
+				low = middle + 1;
+			else
+				high = middle;
+		}
+		if (low < base->count && base->ordinals[low] == all[i])
+			all[kept++] = all[i];
+	}
+	if (kept == 0)
+	{
+		free(all);
+		return ANN_OK;
+	}
+	*rows = all;
+	*n = kept;
+	return ANN_OK;
 }
 
 /* The host budget for predicate results: the option, else a quarter of RAM. */

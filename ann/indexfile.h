@@ -1,6 +1,7 @@
 #ifndef ANN_INDEXFILE_H
 #define ANN_INDEXFILE_H
 
+#include "canonical.h"
 #include "cost.h"
 
 #include "backend.h"
@@ -273,7 +274,13 @@ typedef struct AnnIndexOptions
 										 * default on */
 	int			predicate_admission;	/* ANN_ADMIT_*: which new predicate
 										 * results enter the cache */
+	int			residual_masks; /* cache AND predicates' wide operands, mask
+								 * the few rows their narrow ones remove
+								 * (--residual-masks) */
 } AnnIndexOptions;
+
+/* --residual-masks: most rows an AND's narrow operands may remove. */
+#define ANN_RESIDUAL_MAX_ROWS (UINT64_C(1) << 18)
 
 /*
  * --predicate-admission: every new predicate result enters the cache (all),
@@ -374,6 +381,24 @@ int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t 
  */
 int			AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,
 							  unsigned char **out, size_t *outSize);
+
+/*
+ * AnnFilterCanonicalSplit over this index's columns, and the rows of a base
+ * entry that its exclusions remove: sorted global ordinals, a subset of
+ * base->ordinals (malloc'd; NULL with *n = 0 when none).
+ */
+int			AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, size_t size, uint64_t maxExcluded,
+								   unsigned char **base, size_t *baseSize, AnnFilterExclusion *exclusions,
+								   uint32_t *nexclusions);
+/*
+ * A job with excluded rows turned into a plain one: its ordinals without
+ * them (job->ownedOrdinals), no bitsets, device copies or keys. Returns 0
+ * when out of memory (the job's status is then ANN_NOMEM).
+ */
+int			AnnIndexJobDropExcluded(AnnIndexJob *job);
+AnnStatus	AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base,
+								 const AnnFilterExclusion *exclusions, uint32_t nexclusions, uint64_t **rows,
+								 uint32_t *n);
 
 /*
  * Cache a predicate's result under its id like a pushed bitmap. Predicate

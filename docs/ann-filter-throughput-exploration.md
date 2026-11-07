@@ -306,6 +306,17 @@ Recall 0.9998 mean, 0.994-0.996 lowest. The gain is at the top of the reviewed r
 
 Recall 0.9998 mean, 0.994-0.996 lowest. Together with P07, `distinct10` is 2.3x its 156.2k start through arrays and 2.2x through SQL. `BuildBitmap` (building ordinals for every new entry) is now the largest worker cost on this workload; P01 removes it for decomposable predicates.
 
+**P01 built: `--residual-masks` (default off).** The canonicaliser splits an AND (`AnnFilterCanonicalSplit`): operands on one single-valued column whose complement holds at most 2^18 rows become exclusions, the operand removing the most rows always stays in the base, and the base is cached like any predicate. The server turns the exclusions into the base rows they remove (`AnnIndexExcludedRows`: the excluded values' postings, kept where the base has them), attaches them to each job and subtracts them from the eligible count. The matrix gather sets those rows' scores to +inf right after scoring (`mask_scores`: one thread per (query, row) pair, a binary search of the shard's sorted rows), after checking that every query keeps k plus the slack; every other route, and the gather's repair fallback, first turns the job into one over its own rows (`AnnIndexJobDropExcluded`). Searches sharing a base group by its rows, so single-vector SQL batches as on cached predicates. The base must take the gather routes (ordinals known, within the group gather limit); otherwise the whole predicate is evaluated as before. Tests: 20,000 random programs (about 3,700 splits) whose base minus exclusions equals the program's rows, under eleven seeds; a GPU test comparing ids, distances and eligible counts with masks on and off, with query vectors taken from the excluded tenant; recall measured against an exact `distinct10` reference (`frozen_recall.py --workload distinct10`).
+
+| Workload | Lane expansion | + residual masks (`rm-*`) | Change | Recall (mean / lowest) |
+| --- | ---: | ---: | ---: | --- |
+| `distinct10` arrays | 363.9k vectors/s | 546.5k | +50% | 0.9998 / 0.996 (exact `distinct10` reference) |
+| `distinct10` SQL | 10.15k QPS | 35.8k | 3.5x | 0.9999 / 0.998 |
+| `mix10` arrays | 507.8k | 660.3k | +30% | 0.9998 / 0.996 |
+| `10pct` arrays (cached, no AND) | 771.9k | 761.2k | -1.4% (within run spread) | 0.9998 / 0.994 |
+
+From the start of this work, `distinct10` went 156.2k -> 546.5k vectors/s (3.5x) and 4.55k -> 35.8k QPS (7.9x). The falsifier's ceiling is 769.9k and 105.3k; the worker is the limit again (94 cores on arrays, 138 on SQL), most likely the per-search exclusion list (each search copies and binary-searches about 10,000 rows) and canonicalising the program twice.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
