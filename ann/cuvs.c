@@ -875,6 +875,22 @@ typedef struct AnnCuvsDevice
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
 
+/*
+ * Wait for a lane's stream. cuvsStreamSync goes through RAFT's interruptible
+ * synchronize, which polls cudaStreamQuery and yields in a loop whatever the
+ * device's scheduling flag: under load the lanes spun there (about 35% of the
+ * worker's CPU at 800k vectors/s). cudaStreamSynchronize honours
+ * cudaDeviceScheduleBlockingSync, so a waiting lane sleeps.
+ */
+static int
+LaneSync(AnnCuvsDevice *device)
+{
+	cudaStream_t stream;
+
+	return cuvsStreamGet(device->resources, &stream) == CUVS_SUCCESS &&
+		cudaStreamSynchronize(stream) == cudaSuccess;
+}
+
 
 static int
 GrowDevice(void **pointer, size_t *capacity, size_t needed, size_t unit, size_t floor, cudaStream_t stream)
@@ -2508,7 +2524,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	}
 	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 		if (laneDevices[d].resources && perDevice[d] &&
-			(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+			(cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 			ok = 0;
 	for (uint32_t s = 0; ok && s < state->nshards; s++)
 		for (uint32_t j = 0; j < m; j++)
@@ -3282,7 +3298,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	}
 	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 		if (laneDevices[d].resources && perDeviceKeys[d] &&
-			(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+			(cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 		{
 			fprintf(stderr, "cuVS gather scan: device %d failed: %s\n", d, cudaGetErrorString(cudaGetLastError()));
 			ok = 0;
@@ -3872,7 +3888,7 @@ SearchGatherGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 		}
 		for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 			if (laneDevices[d].resources && uploaded[d] &&
-				(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+				(cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 				ok = 0;
 
 		/* Re-score each query's candidates in FP32; rows are known. */
@@ -4281,7 +4297,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 		 * is reused/freed.
 		 */
 		for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
-			if (used[d] && (cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+			if (used[d] && (cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 				ok = 0;
 		for (uint32_t s = 0; ok && s < state->nshards; s++)
 			for (uint32_t j = 0; selected[s] && j < q; j++)
@@ -5050,7 +5066,7 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 		}
 		for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 			if (laneDevices[d].resources && uploaded[d] &&
-				(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+				(cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 				ok = 0;
 
 		/*
@@ -5092,7 +5108,7 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 			}
 			for (int d = 0; ok && d < ANN_CUVS_MAX_DEVICES; d++)
 				if (laneDevices[d].resources && uploaded[d] &&
-					(cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+					(cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 					ok = 0;
 		}
 
@@ -5179,7 +5195,7 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 				used[shards[s].device] = 1;
 			}
 			for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
-				if (used[d] && (cudaSetDevice(d) != cudaSuccess || cuvsStreamSync(laneDevices[d].resources) != CUVS_SUCCESS))
+				if (used[d] && (cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 					ok = 0;
 		}
 

@@ -347,6 +347,17 @@ A worker profile at this point (none existed) put about 35% of its CPU in stream
 
 Worker CPU fell from about 50 to 45 cores and GPU busy rose from 78% to 83%, so the lanes' host work per batch is on the critical path (H2). Next on that path: the stream-synchronisation spin (35%), the remaining reply serialisation, and the duplicate-position check.
 
+**Lanes sleep while their GPU work runs.** The stream-synchronisation share in that profile was busy waiting: `cuvsStreamSync` goes through RAFT's `interruptible::synchronize`, which polls `cudaStreamQuery` and calls `std::this_thread::yield()` in a loop whatever the device's scheduling flag (the earlier spin and yield experiments changed only the flag, so they could not show this). Lanes now wait with `cudaStreamSynchronize` on their stream, which honours `cudaDeviceScheduleBlockingSync`:
+
+| Workload | `dk-*` | `ls-*` | Worker cores |
+| --- | ---: | ---: | --- |
+| `10pct` arrays (cached) | 806.2k vectors/s | 833.1k (+3.3%) | 45.0 -> 26.7 |
+| `10pct` SQL | 113.0k QPS | 119.6k (+5.9%) | 68.7 -> 35.4 |
+| `distinct10` arrays | 692.9k | 711.1k (+2.6%) | 71.4 -> 58.3 |
+| `distinct10` SQL | 96.6k | 98.6k | 74.9 -> 43.1 |
+
+Recall unchanged. The worker now uses about a quarter of the host's busy CPU at the cached point; PostgreSQL (104-112 cores) is again the largest consumer.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
