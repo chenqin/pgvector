@@ -44,8 +44,8 @@ ann-replica-tests: ../test/ann/replica_test.c replica.h
 ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
 	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c -lm -o $@
 
-WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c filter.c rdma.c
-WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h filter.h rdma.h cost.h
+WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c filter.c udf.c rdma.c
+WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h filter.h udf.h rdma.h cost.h
 
 # USE_RDMA=1 enables RDMA search frames over InfiniBand/RoCE verbs
 # (rdma-core); RDMA_PREFIX locates libibverbs if it is not in /usr.

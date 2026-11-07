@@ -572,6 +572,54 @@ class CuvsIndexTests(unittest.TestCase):
             self.assertGreater(stats['groups'], 0, quant)
             self.psql(f"DELETE FROM ann_filter_bitmap WHERE index_name = '{index}' AND filter = 'tenant = 7'")
 
+    def test_gpu_predicates_match_host(self):
+        """--gpu-predicates evaluates uncached programs on the GPU, row for row as the host does."""
+        import json
+        import struct
+        from test_predicate_cache import search_predicate_frame, values_program
+
+        def leaf_range(low, high, negate=0):
+            return struct.pack('<BB', 2, 6) + b'tenant' + struct.pack('<Bii', negate, low, high)
+
+        # Leaves, negation, NOT, AND/OR, ALL/NONE; the last ones match no row.
+        programs = [values_program('tenant', [7]), values_program('tenant', [3, 9, 41], negate=True),
+                    leaf_range(10, 14), leaf_range(5, 44, 1), leaf_range(0, 24) + b'\x07',
+                    leaf_range(0, 30) + values_program('tenant', [2, 4, 6, 8]) + b'\x05',
+                    values_program('tenant', [1]) + leaf_range(45, 49) + b'\x06' + b'\x07',
+                    leaf_range(0, 9) + b'\x09' + b'\x06',
+                    values_program('tenant', [77]), leaf_range(20, 10)]
+        query = json.loads(self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1'))
+        results = {}
+        for enabled in ('off', 'on'):
+            server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '500', '--gpu-predicates', enabled,
+                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+            name = f'{self.table}_gpu_predicates_{enabled}'
+            try:
+                self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float32')", server)
+                answers = []
+                with server.connect() as connection:
+                    # Twice: the first search stages the new result's rows from
+                    # the lane; the lookup again uploads them to every copy.
+                    for request, program in enumerate(programs * 2, 1):
+                        connection.sendall(search_predicate_frame(request, name, query, 50, program))
+                        _, _, status, data = receive(connection)
+                        self.assertEqual(status, 0)
+                        count, _, eligible = struct.unpack_from('<IIQ', data)
+                        answers.append((eligible, [struct.unpack_from('<qf', data, 16 + i * 12)[0]
+                                                   for i in range(count)]))
+                    connection.sendall(frame(31, 99, name.encode()))
+                    _, _, status, data = receive(connection)
+                    self.assertEqual(status, 0)
+                    self.assertEqual(json.loads(data)['gpu_predicates'], len(programs) if enabled == 'on' else 0)
+                results[enabled] = answers
+            finally:
+                server.close()
+        self.assertEqual(results['on'], results['off'])
+        self.assertEqual(results['on'][:len(programs)], results['on'][len(programs):])
+        expected = [800, 40000 - 2400, 4000, 40000 - 32000, 40000 - 20000, 4 * 800, 40000 - 6 * 800,
+                    10 * 800, 0, 0]
+        self.assertEqual([eligible for eligible, _ in results['on']], expected * 2)
+
     def test_mixed_filter_groups_match_sql(self):
         """Searches over different cached filters share segmented gathers (--mixed-groups) and match SQL."""
         import json

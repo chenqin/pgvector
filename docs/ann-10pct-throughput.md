@@ -258,9 +258,57 @@ are busy with per-search launches (93%); mixed groups average 6 and leave them a
 once per group, while a segmented gather scores every search's rows separately, and
 pulling other filters into a lane splits the groups other lanes would form. Mixing
 every job, not only singletons, measured 80.9k on `mixed10`. The option stays off by
-default. Unlike Phase 2 as planned, candidates come from the cached predicates' row
-lists rather than from postings evaluated on the GPU, and predicates are not
-compiled per vector (operation 30 still shares one).
+default. Candidates come from the cached predicates' row lists; evaluating
+predicates on the GPU is the next section.
+
+### GPU predicate evaluation (`--gpu-predicates`)
+
+The rest of Phase 2: a predicate the worker's cache misses is evaluated on a GPU
+instead of over the attribute columns on the host. The program compiles to the CAGRA
+UDF interpreter's steps (`ann/udf.h`; the interpreter source is now shared by both
+uses), one thread per row runs it over the single-valued columns (uploaded to a
+device the first time a predicate reads them there), and each warp writes its 32
+results as one bitmap word. Programs with stored-filter or multi-valued leaves stay
+on the host. The test `test_gpu_predicates_match_host` checks ten programs (leaves,
+negation, NOT, AND/OR, empty results) against host evaluation, on four shards that
+do not start on word boundaries.
+
+Measured on `fresh10`: `mixed10`'s rows under a predicate text that never repeats
+(`category BETWEEN a AND a + 9 AND tenant <> x`, x beyond any tenant), so every
+search misses the cache. k=500, same worker settings as the final configuration,
+`ann.frozen_immutable = on`:
+
+| Step | SQL, 256 clients | Arrays of 64, 448 clients |
+| --- | ---: | ---: |
+| Host evaluation (`--gpu-predicates off`) | 1.16k QPS | 67.1k vectors/s |
+| GPU evaluation only | 1.22k | 68.5k |
+| + rows expanded from bitsets on each GPU | 1.14k | 52.6k |
+| + a new result stays off the GPUs until looked up again | **3.8–4.4k** | **112.3k** |
+
+Recall is unchanged (0.9998 mean, lowest 0.996, against `mixed10`'s exact top 500;
+the recall queries' predicates are also uncached). Evaluation was not the
+bottleneck: profiles put 87% of the worker's CPU in caching the new result, mostly
+uploading its 1M rows to all eight index copies. Each of up to 448 reader threads
+waited on a CUDA driver lock of the eight shared upload streams while PostgreSQL
+backends sat in `poll` for the reply. With the option on, a new predicate result
+is not uploaded when it is cached; the lane that searches it copies its rows from
+the host on its own stream, as it already did for filters without device rows.
+The first repeated lookup uploads it to every copy, building the rows on each GPU
+from its bitsets (rows / 8 bytes a copy instead of 4 bytes a row). Precomputed
+filters follow the same rule: they go to the GPUs on their first search. On the
+cached `10pct` workload (64-vector arrays, 448 clients) the option measured 782.6k
+vectors/s against 775.2k off.
+
+Uncached predicates stay far slower than cached ones (780k vectors/s). The worker
+is now CPU-bound at 92–130 cores. Building the host key and ordinal arrays of each
+new result takes 58% of its CPU: at 4k predicates a second that streams the 80 MB
+key array, one cache line per matching row. A lane's host staging of the rows
+takes 27%. Removing both means routes that work from device rows and bitsets
+without host keys. The option is off by default.
+
+Rate grouping (`udf_grouped` in the UDF benchmark) does not apply to the worker's
+graph route: a filtered CAGRA call there already carries one filter, hence one
+filtering rate.
 
 ## Final configuration
 
@@ -306,6 +354,9 @@ Batch latency covers all 64 vectors of a call. Latency was not optimized.
   largest kernels.
 * **Ordinary SQL** remains PostgreSQL-bound at about 1 ms of backend CPU per
   search: the per-row executor path, not the GPU.
+* **Never-repeating predicates** reach 112k vectors/s with `--gpu-predicates on`
+  (67k off), against 780k cached: the host key and ordinal arrays of each new
+  result, and per-search row staging, are next.
 * `--matrix-prune` is opt-in. The GPU index tests cover it with exact-result checks;
   it should be validated on other datasets before it becomes the default.
 * The deployed worker and its cost profile were left unchanged. The test node's

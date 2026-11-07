@@ -2233,6 +2233,8 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 	{
 		if ((*result = AnnIndexBitmapGet(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE)) != NULL)
 		{
+			if (__atomic_load_n(&(*result)->uploadDeferred, __ATOMIC_ACQUIRE))
+				AnnIndexBitmapUploadDeferred(file, *result);
 			/* Not under service->mutex: every search would contend for it. */
 			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
 			return ANN_OK;

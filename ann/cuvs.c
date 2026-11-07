@@ -6,6 +6,8 @@
 #include "indexfile.h"
 #include "nvrtc.h"
 #include "blackwell.h"
+#include "filter.h"
+#include "udf.h"
 
 /* The driver API header has enumerators that are not strict ISO C. */
 #pragma GCC diagnostic push
@@ -621,6 +623,9 @@ typedef struct AnnCuvsIndex
 												 * without rescoring */
 	atomic_uint_fast64_t graph_cpu_rerank_candidates;
 	atomic_uint_fast64_t cost_queries[4];
+	atomic_uint_fast64_t gpu_predicates;	/* uncached predicates evaluated
+											 * on a device */
+	int32_t    *predicateColumns[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
 } AnnCuvsIndex;
 
 /* Keep the full lane ordinal: wrapping before modulo copies biases 3/6/7 GPUs. */
@@ -720,13 +725,14 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_pruned_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_prune_fallbacks, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->mixed_queries, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->gpu_predicates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->gpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp32_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp16_queries, memory_order_relaxed),
@@ -1126,6 +1132,13 @@ DestroyIndexState(AnnCuvsIndex *state)
 		if (shard->resources)
 			(void) cuvsResourcesDestroy(shard->resources);
 	}
+	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+		for (int a = 0; a < ANN_INDEX_MAX_ATTRIBUTES; a++)
+			if (state->predicateColumns[d][a])
+			{
+				(void) cudaSetDevice(d);
+				(void) cudaFree(state->predicateColumns[d][a]);
+			}
 	free(state->shards);
 	free(state);
 }
@@ -1235,6 +1248,9 @@ FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
  * upload nothing per query. A failure frees what was copied and leaves
  * that form on the per-query path.
  */
+static int	ExpandRows(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexBitmap *bitmap,
+					   const uint64_t *start, void ***result, uint64_t *bytes);
+
 static void
 UploadBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 {
@@ -1303,6 +1319,12 @@ UploadBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 		}
 		start[s] = low;
 	}
+	if (AnnIndexConfig.gpu_predicates && bitmap->words != NULL && ExpandRows(file, state, bitmap, start, &rows, &bytes))
+	{
+		bitmap->deviceRows = rows;
+		bitmap->deviceBytes = bytes;
+		return;
+	}
 	rows = calloc(n, sizeof(void *));
 	staged = malloc(bitmap->count * sizeof(uint32_t));
 	ok = rows != NULL && staged != NULL;
@@ -1346,6 +1368,402 @@ ReleaseBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 	bitmap->deviceBytes = 0;
 }
 
+/*
+ * --gpu-predicates: a predicate the cache misses is evaluated on a GPU, not
+ * by the host over the attribute columns. Its program compiles to the UDF
+ * interpreter's steps (ann/udf.h); one thread per row runs it and each warp
+ * writes its 32 results as one bitmap word. The index's single-valued
+ * columns go to a device the first time a predicate reads them there.
+ * Programs with BITMAP or OVERLAP leaves, or over multi-valued columns, stay
+ * on the host.
+ */
+static const char PredicateKernelSource[] =
+"typedef unsigned int uint32_t;\n"
+"typedef unsigned int source_index_t;\n"
+"%s\n"
+"extern \"C\" __global__ void predicate_words(const ann_udf_params *p, unsigned long long rows,\n"
+"                                            unsigned int *words, unsigned long long *count)\n"
+"{\n"
+"  unsigned long long row = (unsigned long long) blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  bool match = row < rows && ann_predicate_udf(0, (source_index_t) row, (void *) p);\n"
+"  unsigned int bits = __ballot_sync(0xffffffffu, match);\n"
+"  if ((threadIdx.x & 31) == 0 && row < rows) {\n"
+"    words[row / 32] = bits;\n"
+"    if (bits) atomicAdd(count, (unsigned long long) __popc(bits));\n"
+"  }\n"
+"}\n";
+
+/*
+ * A shard's bitset expanded into its sorted rows on the GPU (rows bits; the
+ * bits past them are ignored): per-block counts, one block's exclusive scan
+ * of them, then each block writes its rows from its offset.
+ */
+static const char ExpandKernelSource[] =
+"__device__ unsigned int expand_word(const unsigned int *words, unsigned long long rows, unsigned long long w)\n"
+"{\n"
+"  unsigned long long nwords = (rows + 31) / 32;\n"
+"  unsigned int bits = w < nwords ? words[w] : 0u;\n"
+"  if (w == nwords - 1 && rows % 32) bits &= (1u << (rows % 32)) - 1u;\n"
+"  return bits;\n"
+"}\n"
+"extern \"C\" __global__ void expand_count(const unsigned int *words, unsigned long long rows, unsigned int *blocks)\n"
+"{\n"
+"  __shared__ unsigned int total;\n"
+"  if (threadIdx.x == 0) total = 0;\n"
+"  __syncthreads();\n"
+"  unsigned int c = __popc(expand_word(words, rows, (unsigned long long) blockIdx.x * blockDim.x + threadIdx.x));\n"
+"  for (int o = 16; o > 0; o >>= 1) c += __shfl_down_sync(0xffffffffu, c, o);\n"
+"  if ((threadIdx.x & 31) == 0) atomicAdd(&total, c);\n"
+"  __syncthreads();\n"
+"  if (threadIdx.x == 0) blocks[blockIdx.x] = total;\n"
+"}\n"
+"extern \"C\" __global__ void expand_scan(unsigned int *blocks, unsigned int n)\n"
+"{\n"
+"  __shared__ unsigned int part[1024];\n"
+"  unsigned int per = (n + 1023) / 1024, begin = threadIdx.x * per;\n"
+"  unsigned int end = begin + per < n ? begin + per : n, sum = 0, run;\n"
+"  for (unsigned int i = begin; i < end; i++) sum += blocks[i];\n"
+"  part[threadIdx.x] = sum;\n"
+"  __syncthreads();\n"
+"  if (threadIdx.x == 0) {\n"
+"    run = 0;\n"
+"    for (int t = 0; t < 1024; t++) { unsigned int v = part[t]; part[t] = run; run += v; }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  run = part[threadIdx.x];\n"
+"  for (unsigned int i = begin; i < end; i++) { unsigned int v = blocks[i]; blocks[i] = run; run += v; }\n"
+"}\n"
+"extern \"C\" __global__ void expand_write(const unsigned int *words, unsigned long long rows,\n"
+"                                         const unsigned int *blocks, unsigned int *out)\n"
+"{\n"
+"  __shared__ unsigned int warps[32];\n"
+"  unsigned long long w = (unsigned long long) blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  unsigned int bits = expand_word(words, rows, w), c = __popc(bits), x = c;\n"
+"  unsigned int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;\n"
+"  for (int o = 1; o < 32; o <<= 1) { unsigned int y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }\n"
+"  if (lane == 31) warps[warp] = x;\n"
+"  __syncthreads();\n"
+"  if (threadIdx.x == 0) {\n"
+"    unsigned int run = 0;\n"
+"    for (unsigned int i = 0; i < blockDim.x / 32; i++) { unsigned int v = warps[i]; warps[i] = run; run += v; }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  unsigned int at = blocks[blockIdx.x] + warps[warp] + x - c;\n"
+"  while (bits) { out[at++] = (unsigned int) (w * 32 + __ffs(bits) - 1); bits &= bits - 1; }\n"
+"}\n";
+
+typedef struct PredicateModule
+{
+	atomic_int	state;			/* 0 unloaded, 1 ready, -1 unavailable */
+	CUcontext	context;
+	CUmodule	module;
+	CUfunction	words;
+	CUfunction	expandCount;
+	CUfunction	expandScan;
+	CUfunction	expandWrite;
+} PredicateModule;
+
+static PredicateModule predicateModules[ANN_CUVS_MAX_DEVICES];
+static pthread_mutex_t predicateMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static PredicateModule *
+PredicateKernels(int device)
+{
+	PredicateModule *module = &predicateModules[device];
+	char		arch[32];
+	char	   *image = NULL;
+	char	   *source = NULL;
+	size_t		size = 0;
+	size_t		length;
+	int			major = 0,
+				minor = 0;
+	CUdevice	handle;
+
+	if (atomic_load_explicit(&module->state, memory_order_acquire) != 0)
+		return atomic_load_explicit(&module->state, memory_order_acquire) > 0 ? module : NULL;
+	(void) pthread_mutex_lock(&predicateMutex);
+	if (atomic_load_explicit(&module->state, memory_order_relaxed) != 0)
+		goto unlock;
+	if (cuInit(0) != CUDA_SUCCESS || cuDeviceGet(&handle, device) != CUDA_SUCCESS ||
+		cuDevicePrimaryCtxRetain(&module->context, handle) != CUDA_SUCCESS ||
+		cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+		cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
+		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
+		goto fail;
+	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
+	length = strlen(PredicateKernelSource) + strlen(AnnUdfDeviceSource()) + strlen(ExpandKernelSource) + 1;
+	if ((source = malloc(length)) == NULL)
+		goto fail;
+	snprintf(source, length, PredicateKernelSource, AnnUdfDeviceSource());
+	strcat(source, ExpandKernelSource);
+	if ((image = AnnNvrtcCompile(source, "predicate kernel", arch, &size)) == NULL ||
+		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->words, module->module, "predicate_words") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->expandCount, module->module, "expand_count") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->expandScan, module->module, "expand_scan") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->expandWrite, module->module, "expand_write") != CUDA_SUCCESS)
+		goto fail;
+	atomic_store_explicit(&module->state, 1, memory_order_release);
+	goto unlock;
+fail:
+	atomic_store_explicit(&module->state, -1, memory_order_release);
+	fprintf(stderr, "cuVS: predicate kernel unavailable on device %d; predicates are evaluated on the host\n",
+			device);
+unlock:
+	free(source);
+	free(image);
+	(void) pthread_mutex_unlock(&predicateMutex);
+	return atomic_load_explicit(&module->state, memory_order_acquire) > 0 ? module : NULL;
+}
+
+/* A thread's predicate buffers on one device. */
+typedef struct PredicateBuffers
+{
+	cudaStream_t stream;
+	void	   *program;		/* params, steps, starts, values */
+	size_t		programCap;
+	uint32_t   *words;
+	size_t		wordCap;
+	unsigned long long *count;
+} PredicateBuffers;
+
+static _Thread_local PredicateBuffers predicateBuffers[ANN_CUVS_MAX_DEVICES];
+static atomic_uint nextPredicateCopy;
+
+typedef struct PredicateColumns
+{
+	const AnnIndexFile *file;
+	int			attributes[ANN_UDF_MAX_COLUMNS];
+	int			n;
+} PredicateColumns;
+
+/* AnnUdfCompile's column map: single-valued columns, in slots as first used. */
+static int
+PredicateColumn(void *arg, const char *name)
+{
+	PredicateColumns *columns = arg;
+
+	for (uint32_t a = 0; a < columns->file->nattributes; a++)
+	{
+		const AnnIndexAttribute *attribute = &columns->file->attributes[a];
+
+		if (strcmp(attribute->name, name) != 0)
+			continue;
+		if (attribute->multi || attribute->column == NULL)
+			return -1;
+		for (int c = 0; c < columns->n; c++)
+			if (columns->attributes[c] == (int) a)
+				return c;
+		if (columns->n == ANN_UDF_MAX_COLUMNS)
+			return -1;
+		columns->attributes[columns->n] = (int) a;
+		return columns->n++;
+	}
+	return -1;
+}
+
+/* An attribute column on a device, uploaded on first use; NULL on failure. */
+static const int32_t *
+PredicateDeviceColumn(const AnnIndexFile *file, AnnCuvsIndex *state, int device, int attribute)
+{
+	int32_t    *column;
+
+	(void) pthread_mutex_lock(&predicateMutex);
+	column = state->predicateColumns[device][attribute];
+	if (column == NULL &&
+		UploadArray(device, (void **) &state->predicateColumns[device][attribute],
+					file->attributes[attribute].column, (size_t) file->rows * sizeof(int32_t)))
+		column = state->predicateColumns[device][attribute];
+	else if (column == NULL && state->predicateColumns[device][attribute])
+	{
+		(void) cudaFree(state->predicateColumns[device][attribute]);
+		state->predicateColumns[device][attribute] = NULL;
+	}
+	(void) pthread_mutex_unlock(&predicateMutex);
+	return column;
+}
+
+static int
+DevicePredicate(AnnIndexFile *file, const unsigned char *program, size_t size, uint32_t *words, uint64_t *count)
+{
+	AnnCuvsIndex *state = file->device;
+	PredicateColumns columns = {file, {0}, 0};
+	AnnUdfStep *steps = NULL;
+	int32_t    *values = NULL;
+	uint32_t	nsteps = 0,
+				nvalues = 0;
+	uint32_t	starts[2];
+	size_t		nwords = ((size_t) file->rows + 31) / 32;
+	size_t		stepsAt = (sizeof(AnnUdfParams) + 15) / 16 * 16;
+	size_t		startsAt,
+				valuesAt,
+				bytes;
+	unsigned char *blob = NULL;
+	AnnUdfParams *params;
+	PredicateBuffers *buffers;
+	PredicateModule *module;
+	unsigned long long found = 0;
+	unsigned long long rows = file->rows;
+	int			device;
+	int			ok = 0;
+
+	if (state == NULL || state->nshards == 0 || file->rows == 0 || file->rows > UINT32_MAX)
+		return 0;
+	device = state->shards[(size_t) (atomic_fetch_add(&nextPredicateCopy, 1) % state->copies) * state->nshards].device;
+	if ((module = PredicateKernels(device)) == NULL ||
+		(steps = malloc(sizeof(AnnUdfStep) * ANN_FILTER_MAX_STEPS)) == NULL ||
+		(values = malloc(sizeof(int32_t) * ANN_FILTER_MAX_VALUES)) == NULL ||
+		AnnUdfCompile(program, size, PredicateColumn, &columns, steps, ANN_FILTER_MAX_STEPS, &nsteps,
+					  values, ANN_FILTER_MAX_VALUES, &nvalues) != ANN_FILTER_OK || nsteps == 0)
+		goto done;
+	starts[0] = 0;
+	starts[1] = nsteps;
+	startsAt = stepsAt + (size_t) nsteps * sizeof(AnnUdfStep);
+	valuesAt = startsAt + sizeof(starts);
+	bytes = valuesAt + (size_t) nvalues * sizeof(int32_t) + 4;
+	if ((blob = calloc(1, bytes)) == NULL)
+		goto done;
+	buffers = &predicateBuffers[device];
+	if (cudaSetDevice(device) != cudaSuccess ||
+		(buffers->stream == NULL && cudaStreamCreateWithFlags(&buffers->stream, cudaStreamNonBlocking) != cudaSuccess) ||
+		!GrowDevice(&buffers->program, &buffers->programCap, bytes, 1, 4096, buffers->stream) ||
+		!GrowDevice((void **) &buffers->words, &buffers->wordCap, nwords, sizeof(uint32_t), 0, buffers->stream) ||
+		(buffers->count == NULL && cudaMalloc((void **) &buffers->count, sizeof(*buffers->count)) != cudaSuccess))
+		goto done;
+	params = (AnnUdfParams *) (void *) blob;
+	for (int c = 0; c < columns.n; c++)
+		if ((params->columns[c] = PredicateDeviceColumn(file, state, device, columns.attributes[c])) == NULL)
+			goto done;
+	params->steps = (const AnnUdfStep *) ((const unsigned char *) buffers->program + stepsAt);
+	params->starts = (const uint32_t *) ((const unsigned char *) buffers->program + startsAt);
+	params->values = (const int32_t *) ((const unsigned char *) buffers->program + valuesAt);
+	params->rowBase = 0;
+	memcpy(blob + stepsAt, steps, (size_t) nsteps * sizeof(AnnUdfStep));
+	memcpy(blob + startsAt, starts, sizeof(starts));
+	memcpy(blob + valuesAt, values, (size_t) nvalues * sizeof(int32_t));
+	{
+		void	   *program = buffers->program;
+		void	   *args[] = {&program, &rows, &buffers->words, &buffers->count};
+
+		ok = cudaMemcpyAsync(buffers->program, blob, bytes, cudaMemcpyHostToDevice, buffers->stream) == cudaSuccess &&
+			cudaMemsetAsync(buffers->count, 0, sizeof(*buffers->count), buffers->stream) == cudaSuccess &&
+			cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->words, (unsigned) ((rows + 255) / 256), 1, 1, 256, 1, 1, 0,
+						   (CUstream) buffers->stream, args, NULL) == CUDA_SUCCESS &&
+			cudaMemcpyAsync(words, buffers->words, nwords * sizeof(uint32_t), cudaMemcpyDeviceToHost,
+							buffers->stream) == cudaSuccess &&
+			cudaMemcpyAsync(&found, buffers->count, sizeof(found), cudaMemcpyDeviceToHost,
+							buffers->stream) == cudaSuccess &&
+			cudaStreamSynchronize(buffers->stream) == cudaSuccess;
+	}
+	if (ok)
+	{
+		*count = found;
+		(void) atomic_fetch_add_explicit(&state->gpu_predicates, 1, memory_order_relaxed);
+	}
+done:
+	free(blob);
+	free(steps);
+	free(values);
+	return ok;
+}
+
+/*
+ * --gpu-predicates: a cached filter's rows made on each device from its
+ * shard bitsets (rows / 8 bytes a copy instead of 4 bytes a row, and no host
+ * staging). Every copy's work is queued before any device is waited on.
+ * Returns 0, with nothing kept, when a device can't; the caller uploads the
+ * rows from the host instead.
+ */
+static int
+ExpandRows(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexBitmap *bitmap, const uint64_t *start,
+		   void ***result, uint64_t *bytes)
+{
+	size_t		n = (size_t) state->copies * state->nshards;
+	void	  **rows = calloc(n, sizeof(void *));
+	void	  **scratch = calloc(n * 2, sizeof(void *));
+	int			synced[ANN_CUVS_MAX_DEVICES] = {0};
+	uint64_t	total = 0;
+	int			ok = rows != NULL && scratch != NULL;
+
+	for (size_t i = 0; ok && i < n; i++)
+	{
+		uint32_t	s = (uint32_t) (i % state->nshards);
+		uint64_t	count = start[s + 1] - start[s];
+		unsigned long long shardRows = file->shards[s].rows;
+		size_t		nwords = (size_t) ((shardRows + 31) / 32);
+		unsigned	nblocks = (unsigned) ((nwords + 255) / 256);
+		int			device = state->shards[i].device;
+		PredicateModule *module;
+		cudaStream_t stream;
+
+		if (count == 0)
+			continue;
+		if ((module = PredicateKernels(device)) == NULL || cudaSetDevice(device) != cudaSuccess ||
+			(stream = UploadStream(device)) == NULL)
+		{
+			ok = 0;
+			break;
+		}
+		if (cudaMallocAsync(&rows[i], count * sizeof(uint32_t), stream) != cudaSuccess)
+			rows[i] = NULL;
+		if (cudaMallocAsync(&scratch[2 * i], nwords * sizeof(uint32_t), stream) != cudaSuccess)
+			scratch[2 * i] = NULL;
+		if (cudaMallocAsync(&scratch[2 * i + 1], (size_t) nblocks * sizeof(uint32_t), stream) != cudaSuccess)
+			scratch[2 * i + 1] = NULL;
+		if (rows[i] == NULL || scratch[2 * i] == NULL || scratch[2 * i + 1] == NULL)
+		{
+			ok = 0;
+			break;
+		}
+		{
+			void	   *countArgs[] = {&scratch[2 * i], &shardRows, &scratch[2 * i + 1]};
+			void	   *scanArgs[] = {&scratch[2 * i + 1], &nblocks};
+			void	   *writeArgs[] = {&scratch[2 * i], &shardRows, &scratch[2 * i + 1], &rows[i]};
+
+			ok = cudaMemcpyAsync(scratch[2 * i], bitmap->bitsets[s], nwords * sizeof(uint32_t),
+								 cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+				cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+				cuLaunchKernel(module->expandCount, nblocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+							   countArgs, NULL) == CUDA_SUCCESS &&
+				cuLaunchKernel(module->expandScan, 1, 1, 1, 1024, 1, 1, 0, (CUstream) stream,
+							   scanArgs, NULL) == CUDA_SUCCESS &&
+				cuLaunchKernel(module->expandWrite, nblocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+							   writeArgs, NULL) == CUDA_SUCCESS;
+		}
+		total += count * sizeof(uint32_t);
+	}
+	for (size_t i = 0; scratch && i < 2 * n; i++)
+		if (scratch[i])
+		{
+			int			device = state->shards[i / 2].device;
+
+			(void) cudaSetDevice(device);
+			(void) cudaFreeAsync(scratch[i], UploadStream(device));
+		}
+	for (size_t i = 0; rows && i < n; i++)
+	{
+		int			device = state->shards[i].device;
+
+		if (synced[device])
+			continue;
+		synced[device] = 1;
+		if (cudaSetDevice(device) != cudaSuccess || UploadStream(device) == NULL ||
+			cudaStreamSynchronize(UploadStream(device)) != cudaSuccess)
+			ok = 0;
+	}
+	free(scratch);
+	if (!ok)
+	{
+		if (rows)
+			FreeDeviceArrays(state, rows);
+		return 0;
+	}
+	*result = rows;
+	*bytes += total;
+	return 1;
+}
+
 static AnnStatus
 LoadIndex(const char *name, const char *directory)
 {
@@ -1363,6 +1781,7 @@ LoadIndex(const char *name, const char *directory)
 	AnnIndexBitmapDevice.upload = UploadBitmap;
 	AnnIndexBitmapDevice.release = ReleaseBitmap;
 	AnnIndexDeviceDestroy = DestroyDevice;
+	AnnIndexDeviceEvaluate = DevicePredicate;
 	if (file->nshards == 0 || cudaGetDeviceCount(&devices) != cudaSuccess || devices <= 0)
 	{
 		/* No CAGRA shards or devices: serve exact results from the files. */
@@ -1396,6 +1815,7 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->matrix_pruned_queries, 0);
 	atomic_init(&state->matrix_prune_fallbacks, 0);
 	atomic_init(&state->mixed_queries, 0);
+	atomic_init(&state->gpu_predicates, 0);
 	atomic_init(&state->gpu_rerank_candidates, 0);
 	atomic_init(&state->cagra_fp32_queries, 0);
 	atomic_init(&state->graph_cpu_rerank_candidates, 0);

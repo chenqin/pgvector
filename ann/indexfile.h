@@ -130,6 +130,8 @@ typedef struct AnnIndexBitmap
 	uint64_t	used;			/* last use, for predicate eviction */
 	int			references;
 	struct AnnIndexBitmap *next;
+	int			uploadDeferred; /* --gpu-predicates: not on the devices until
+								 * looked up again (atomic) */
 } AnnIndexBitmap;
 
 /*
@@ -263,6 +265,8 @@ typedef struct AnnIndexOptions
 	int			mixed_groups;	/* lanes add other filters' queued jobs to a
 								 * short group; one segmented gather serves
 								 * them (--mixed-groups) */
+	int			gpu_predicates; /* evaluate uncached predicates on the GPU
+								 * (--gpu-predicates) */
 } AnnIndexOptions;
 
 /*
@@ -324,6 +328,22 @@ int			AnnIndexRemapped(const AnnIndexFile *file);
 
 /* Frees a loaded index's backend state (device memory) when it is unloaded. */
 extern void (*AnnIndexDeviceDestroy) (void *device);
+
+/*
+ * --gpu-predicates keeps a new predicate result off the devices until it is
+ * looked up again: a predicate searched once is served by its lane copying
+ * the rows itself, instead of every copy of the index receiving them. The
+ * lookup uploads it (once) before searching.
+ */
+void		AnnIndexBitmapUploadDeferred(AnnIndexFile *file, AnnIndexBitmap *bitmap);
+
+/*
+ * A backend's predicate evaluator (--gpu-predicates): fills words and *count
+ * as AnnFilterEvaluate would and returns 1, or returns 0 for programs it
+ * can't take (the host evaluates those). Tombstones are applied after it.
+ */
+extern int	(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
+									   uint32_t *words, uint64_t *count);
 
 /*
  * Evaluate a predicate program (ann/filter.h) over the index's attribute

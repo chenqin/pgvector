@@ -55,6 +55,7 @@ AnnUdfCompile(const unsigned char *program, size_t size,
 				offset++;
 				break;
 			case ANN_FILTER_BITMAP:
+			case ANN_FILTER_OVERLAP:
 				return ANN_UDF_UNSUPPORTED;
 			default:
 				{
@@ -243,4 +244,81 @@ AnnUdfEstimate(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
 		stack[depth++] = p < 0 ? 0 : p > 1 ? 1 : p;
 	}
 	return depth == 1 ? stack[0] * (double) total : 0;
+}
+
+/*
+ * The device twin of AnnUdfMatch: ann_predicate_udf(query, row, params)
+ * over an AnnUdfParams (declared again as ann_udf_params), for NVRTC. It
+ * needs uint32_t and source_index_t defined. Opcodes are ann/filter.h's.
+ */
+static const char deviceSource[] =
+"struct ann_udf_step {\n"
+"  unsigned char op, column, negate, pad;\n"
+"  int low, high;\n"
+"  unsigned int first, count;\n"
+"};\n"
+"struct ann_udf_params {\n"
+"  const int* columns[8];\n"
+"  const ann_udf_step* steps;\n"
+"  const int* values;\n"
+"  const unsigned int* starts;\n"
+"  unsigned long long row_base;\n"
+"};\n"
+"\n"
+"__device__ bool ann_udf_leaf(const ann_udf_step& s, const int* values, int v)\n"
+"{\n"
+"  const int null_value = (int)0x80000000;\n"
+"  bool match;\n"
+"  if (s.op == 3) {\n"
+"    match = v == null_value;\n"
+"  } else if (v == null_value) {\n"
+"    return false;\n"
+"  } else if (s.op == 2) {\n"
+"    match = s.low <= v && v <= s.high;\n"
+"  } else {\n"
+"    unsigned int lo = s.first, hi = s.first + s.count;\n"
+"    while (lo < hi) {\n"
+"      unsigned int mid = lo + (hi - lo) / 2;\n"
+"      if (values[mid] < v) lo = mid + 1; else hi = mid;\n"
+"    }\n"
+"    match = lo < s.first + s.count && values[lo] == v;\n"
+"  }\n"
+"  return s.negate ? !match : match;\n"
+"}\n"
+"\n"
+"__device__ bool ann_predicate_udf(uint32_t query_id, source_index_t source_id, void* filter_data)\n"
+"{\n"
+"  const ann_udf_params* p = static_cast<const ann_udf_params*>(filter_data);\n"
+"  const unsigned long long row = p->row_base + source_id;\n"
+"  const unsigned int end = p->starts[query_id + 1];\n"
+"  unsigned long long stack = 0;\n"
+"  int depth = 0;\n"
+"  for (unsigned int i = p->starts[query_id]; i < end; i++) {\n"
+"    const ann_udf_step s = p->steps[i];\n"
+"    unsigned long long bit;\n"
+"    if (s.op == 5 || s.op == 6) {\n"
+"      unsigned long long b = (stack >> (depth - 1)) & 1ull;\n"
+"      unsigned long long a = (stack >> (depth - 2)) & 1ull;\n"
+"      depth -= 2;\n"
+"      bit = s.op == 5 ? (a & b) : (a | b);\n"
+"    } else if (s.op == 7) {\n"
+"      bit = ((stack >> (depth - 1)) & 1ull) ^ 1ull;\n"
+"      depth--;\n"
+"    } else if (s.op == 8) {\n"
+"      bit = 1;\n"
+"    } else if (s.op == 9) {\n"
+"      bit = 0;\n"
+"    } else {\n"
+"      bit = ann_udf_leaf(s, p->values, p->columns[s.column][row]) ? 1ull : 0ull;\n"
+"    }\n"
+"    stack = (stack & ~(1ull << depth)) | (bit << depth);\n"
+"    depth++;\n"
+"  }\n"
+"  return depth == 1 && (stack & 1ull);\n"
+"}\n";
+
+const char *
+AnnUdfDeviceSource(void)
+{
+	return deviceSource;
 }

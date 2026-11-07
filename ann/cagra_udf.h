@@ -5,11 +5,11 @@
 #include <cuvs/neighbors/cagra.h>
 #include <stdint.h>
 
-#include "udf.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#include "udf.h"
 
 /*
  * Filtered FP32 CAGRA search whose eligibility is a JIT-LTO user-defined

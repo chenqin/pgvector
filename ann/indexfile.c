@@ -17,7 +17,9 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 0};
+int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
+									   uint32_t *words, uint64_t *count) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;
 size_t		(*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity) = NULL;
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
@@ -1049,7 +1051,12 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 	}
 
 	if (AnnIndexConfig.device_bitmaps && AnnIndexBitmapDevice.upload && file->device)
-		AnnIndexBitmapDevice.upload(file, bitmap);
+	{
+		if (AnnIndexConfig.gpu_predicates && kind != ANN_BITMAP_PUSHED)
+			bitmap->uploadDeferred = 1;
+		else
+			AnnIndexBitmapDevice.upload(file, bitmap);
+	}
 
 	bitmap->hostBytes = BitmapBytes(file, bitmap);
 	(void) pthread_mutex_lock(&file->bitmapMutex);
@@ -1071,6 +1078,42 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 	if (result)
 		*result = bitmap;
 	return ANN_OK;
+}
+
+void
+AnnIndexBitmapUploadDeferred(AnnIndexFile *file, AnnIndexBitmap *bitmap)
+{
+	AnnIndexBitmap copy;
+	int			linked = 0;
+
+	if (!__atomic_exchange_n(&bitmap->uploadDeferred, 0, __ATOMIC_ACQ_REL) || AnnIndexBitmapDevice.upload == NULL ||
+		file->device == NULL)
+		return;
+
+	/*
+	 * Upload outside the cache lock into a copy, then publish the copies and
+	 * account for them, unless the entry was evicted meanwhile (its release
+	 * still frees them). Searches read the pointers when they are submitted.
+	 */
+	copy = *bitmap;
+	copy.device = NULL;
+	copy.deviceRows = NULL;
+	copy.deviceBytes = 0;
+	AnnIndexBitmapDevice.upload(file, &copy);
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	for (AnnIndexBitmap *entry = file->bitmaps[bitmap->id % ANN_INDEX_BITMAP_BUCKETS]; entry && !linked;
+		 entry = entry->next)
+		linked = entry == bitmap;
+	__atomic_store_n(&bitmap->device, copy.device, __ATOMIC_RELEASE);
+	__atomic_store_n(&bitmap->deviceRows, copy.deviceRows, __ATOMIC_RELEASE);
+	bitmap->deviceBytes = copy.deviceBytes;
+	if (linked)
+	{
+		file->bitmapDeviceBytes += copy.deviceBytes;
+		if (bitmap->kind != ANN_BITMAP_PUSHED)
+			file->predicateDeviceBytes += copy.deviceBytes;
+	}
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
 }
 
 /* A cached entry's rows as a bitmap over ordinals, from its ordinals when it keeps no bitmap. */
@@ -1249,7 +1292,11 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.postings = SourcePostings;
 	source.bitmap = SourceBitmap;
 	source.multi = SourceMulti;
-	code = AnnFilterEvaluate(&source, program, size, words, count);
+	if (AnnIndexConfig.gpu_predicates && AnnIndexDeviceEvaluate &&
+		AnnIndexDeviceEvaluate(file, program, size, words, count))
+		code = ANN_FILTER_OK;
+	else
+		code = AnnFilterEvaluate(&source, program, size, words, count);
 	if (code == ANN_FILTER_OK && deleted && !snapshot)
 	{
 		/* Tombstoned rows never qualify. */

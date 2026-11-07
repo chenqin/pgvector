@@ -6,77 +6,11 @@
 #include <stdexcept>
 
 /*
- * The device twin of AnnUdfMatch (ann/udf.c). cuVS wraps this source in its
+ * cuVS wraps the device interpreter (AnnUdfDeviceSource, ann/udf.c) in its
  * JIT-LTO sample filter fragment and keys its compiled-fragment cache by the
  * whole source, so a constant source compiles once per process; queries vary
- * only the AnnUdfParams payload. Opcodes are ann/filter.h's.
+ * only the AnnUdfParams payload.
  */
-static const char interpreterSource[] = R"cuda(
-struct ann_udf_step {
-  unsigned char op, column, negate, pad;
-  int low, high;
-  unsigned int first, count;
-};
-struct ann_udf_params {
-  const int* columns[8];
-  const ann_udf_step* steps;
-  const int* values;
-  const unsigned int* starts;
-  unsigned long long row_base;
-};
-
-__device__ bool ann_udf_leaf(const ann_udf_step& s, const int* values, int v)
-{
-  const int null_value = (int)0x80000000;
-  bool match;
-  if (s.op == 3) {
-    match = v == null_value;
-  } else if (v == null_value) {
-    return false;
-  } else if (s.op == 2) {
-    match = s.low <= v && v <= s.high;
-  } else {
-    unsigned int lo = s.first, hi = s.first + s.count;
-    while (lo < hi) {
-      unsigned int mid = lo + (hi - lo) / 2;
-      if (values[mid] < v) lo = mid + 1; else hi = mid;
-    }
-    match = lo < s.first + s.count && values[lo] == v;
-  }
-  return s.negate ? !match : match;
-}
-
-__device__ bool ann_predicate_udf(uint32_t query_id, source_index_t source_id, void* filter_data)
-{
-  const ann_udf_params* p = static_cast<const ann_udf_params*>(filter_data);
-  const unsigned long long row = p->row_base + source_id;
-  const unsigned int end = p->starts[query_id + 1];
-  unsigned long long stack = 0;
-  int depth = 0;
-  for (unsigned int i = p->starts[query_id]; i < end; i++) {
-    const ann_udf_step s = p->steps[i];
-    unsigned long long bit;
-    if (s.op == 5 || s.op == 6) {
-      unsigned long long b = (stack >> (depth - 1)) & 1ull;
-      unsigned long long a = (stack >> (depth - 2)) & 1ull;
-      depth -= 2;
-      bit = s.op == 5 ? (a & b) : (a | b);
-    } else if (s.op == 7) {
-      bit = ((stack >> (depth - 1)) & 1ull) ^ 1ull;
-      depth--;
-    } else if (s.op == 8) {
-      bit = 1;
-    } else if (s.op == 9) {
-      bit = 0;
-    } else {
-      bit = ann_udf_leaf(s, p->values, p->columns[s.column][row]) ? 1ull : 0ull;
-    }
-    stack = (stack & ~(1ull << depth)) | (bit << depth);
-    depth++;
-  }
-  return depth == 1 && (stack & 1ull);
-}
-)cuda";
 
 /*
  * cuvsCagraIndex::addr points at cuVS 26.10's private index box, whose first
@@ -94,7 +28,7 @@ struct IndexBox {
 extern "C" const char *
 AnnCagraUdfSource(void)
 {
-	return interpreterSource;
+	return AnnUdfDeviceSource();
 }
 
 extern "C" cuvsError_t
@@ -143,7 +77,7 @@ AnnCagraUdfSearch(cuvsResources_t resources, cuvsCagraSearchParams_t params,
 		search.persistent_device_usage = params->persistent_device_usage;
 
 		cuvs::neighbors::filtering::udf_filter filter(
-			interpreterSource, const_cast<AnnUdfParams *>(deviceParams),
+			AnnUdfDeviceSource(), const_cast<AnnUdfParams *>(deviceParams),
 			filtering_rate >= 0.0f && filtering_rate < 1.0f ? filtering_rate : -1.0f,
 			"ann_predicate_udf");
 

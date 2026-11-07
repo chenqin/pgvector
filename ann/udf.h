@@ -12,9 +12,10 @@
  * starts[q] .. starts[q + 1] - 1 the steps of query q. Leaves follow
  * AnnFilterEvaluate: VALUES and RANGE never match NULL, a negated leaf
  * matches the non-NULL rows the leaf does not, and NOT complements over all
- * rows. BITMAP leaves (stored filters) are not compiled.
+ * rows. BITMAP leaves (stored filters) and OVERLAP leaves (multi-valued
+ * attributes) are not compiled.
  *
- * The device interpreter (ann/cagra_udf.cpp) declares these structures
+ * The device interpreter (AnnUdfDeviceSource) declares these structures
  * again; their layout is fixed: 20-byte steps, 8-byte pointers.
  */
 #define ANN_UDF_MAX_COLUMNS 8
@@ -41,7 +42,7 @@ typedef struct AnnUdfParams
 } AnnUdfParams;
 
 /* AnnUdfCompile results besides the ANN_FILTER_* codes. */
-#define ANN_UDF_UNSUPPORTED (-10)	/* a BITMAP leaf */
+#define ANN_UDF_UNSUPPORTED (-10)	/* a BITMAP or OVERLAP leaf */
 #define ANN_UDF_TOO_LARGE (-11)
 
 /*
@@ -66,5 +67,12 @@ int			AnnUdfMatch(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *value
 double		AnnUdfEstimate(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
 						   uint64_t (*rows) (void *arg, int column, int32_t low, int32_t high),
 						   void *arg, uint64_t total);
+
+/*
+ * CUDA source of the device interpreter, ann_predicate_udf(query_id,
+ * source_id, filter_data) over an ann_udf_params (AnnUdfParams); the
+ * includer defines uint32_t and source_index_t.
+ */
+const char *AnnUdfDeviceSource(void);
 
 #endif
