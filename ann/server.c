@@ -2134,10 +2134,11 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	if (bitmap && file->nshards && bitmap->words)
 	{
 		job->index.bitsets = bitmap->bitsets;
-		job->index.deviceBitsets = bitmap->device;
+		/* Published late by AnnIndexBitmapUploadDeferred; NULL is valid too. */
+		job->index.deviceBitsets = __atomic_load_n(&bitmap->device, __ATOMIC_ACQUIRE);
 	}
 	if (bitmap && file->nshards)
-		job->index.deviceRows = bitmap->deviceRows;
+		job->index.deviceRows = __atomic_load_n(&bitmap->deviceRows, __ATOMIC_ACQUIRE);
 	if (bitmap && job->index.filter == NULL && job->index.bitsets == NULL)
 	{
 		/* Neither form usable: the worker's limits changed under the entry. */

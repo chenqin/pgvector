@@ -1516,7 +1516,11 @@ unlock:
 	return atomic_load_explicit(&module->state, memory_order_acquire) > 0 ? module : NULL;
 }
 
-/* A thread's predicate buffers on one device. */
+/*
+ * Predicate buffers on one device, borrowed per evaluation from a free list:
+ * evaluations run on connection threads, which end with their connections,
+ * so thread-local buffers would leak.
+ */
 typedef struct PredicateBuffers
 {
 	cudaStream_t stream;
@@ -1525,9 +1529,33 @@ typedef struct PredicateBuffers
 	uint32_t   *words;
 	size_t		wordCap;
 	unsigned long long *count;
+	struct PredicateBuffers *next;
 } PredicateBuffers;
 
-static _Thread_local PredicateBuffers predicateBuffers[ANN_CUVS_MAX_DEVICES];
+static PredicateBuffers *predicateFree[ANN_CUVS_MAX_DEVICES];
+
+static PredicateBuffers *
+PredicateBuffersTake(int device)
+{
+	PredicateBuffers *buffers;
+
+	(void) pthread_mutex_lock(&predicateMutex);
+	if ((buffers = predicateFree[device]) != NULL)
+		predicateFree[device] = buffers->next;
+	(void) pthread_mutex_unlock(&predicateMutex);
+	return buffers ? buffers : calloc(1, sizeof(*buffers));
+}
+
+static void
+PredicateBuffersGive(int device, PredicateBuffers *buffers)
+{
+	if (buffers == NULL)
+		return;
+	(void) pthread_mutex_lock(&predicateMutex);
+	buffers->next = predicateFree[device];
+	predicateFree[device] = buffers;
+	(void) pthread_mutex_unlock(&predicateMutex);
+}
 static atomic_uint nextPredicateCopy;
 
 typedef struct PredicateColumns
@@ -1600,7 +1628,7 @@ DevicePredicate(AnnIndexFile *file, const unsigned char *program, size_t size, u
 				bytes;
 	unsigned char *blob = NULL;
 	AnnUdfParams *params;
-	PredicateBuffers *buffers;
+	PredicateBuffers *buffers = NULL;
 	PredicateModule *module;
 	unsigned long long found = 0;
 	unsigned long long rows = file->rows;
@@ -1623,8 +1651,7 @@ DevicePredicate(AnnIndexFile *file, const unsigned char *program, size_t size, u
 	bytes = valuesAt + (size_t) nvalues * sizeof(int32_t) + 4;
 	if ((blob = calloc(1, bytes)) == NULL)
 		goto done;
-	buffers = &predicateBuffers[device];
-	if (cudaSetDevice(device) != cudaSuccess ||
+	if ((buffers = PredicateBuffersTake(device)) == NULL || cudaSetDevice(device) != cudaSuccess ||
 		(buffers->stream == NULL && cudaStreamCreateWithFlags(&buffers->stream, cudaStreamNonBlocking) != cudaSuccess) ||
 		!GrowDevice(&buffers->program, &buffers->programCap, bytes, 1, 4096, buffers->stream) ||
 		!GrowDevice((void **) &buffers->words, &buffers->wordCap, nwords, sizeof(uint32_t), 0, buffers->stream) ||
@@ -1662,6 +1689,7 @@ DevicePredicate(AnnIndexFile *file, const unsigned char *program, size_t size, u
 		(void) atomic_fetch_add_explicit(&state->gpu_predicates, 1, memory_order_relaxed);
 	}
 done:
+	PredicateBuffersGive(device, buffers);
 	free(blob);
 	free(steps);
 	free(values);
