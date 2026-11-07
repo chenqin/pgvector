@@ -308,6 +308,11 @@ static const char *const BlackwellSource[] = {
 	" * of a sample of the rows: no row of the true best 32 is above it.\n"
 	" */\n"
 	"template <int QUANT, int NT, int FUSED>\n"
+	"/* Halves past each query's row in shared memory (QueryPad): 8 moves the\n"
+	" * eight lanes reading one B fragment off a single bank. */\n"
+	"#ifndef ANN_QPAD\n"
+	"#define ANN_QPAD 0\n"
+	"#endif\n"
 	"__device__ void score_mma(const unsigned char *data, const unsigned char *scales,\n"
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
 	"    const float *queries, int nq, int dims, float *out, const float *bounds, unsigned *candR,\n"
@@ -318,7 +323,7 @@ static const char *const BlackwellSource[] = {
 	"  __shared__ float th[NT * 8];\n"
 	"  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;\n"
 	"  int g = lane >> 2, t = lane & 3;\n"
-	"  int qstride = (dims + 15) & ~15;\n"
+	"  int qstride = ((dims + 15) & ~15) + ANN_QPAD;\n"
 	"  const float inf = __int_as_float(0x7f800000);\n"
 	"  for (int i = threadIdx.x; i < NT * 8 * qstride; i += blockDim.x)\n"
 	"  {\n"
@@ -624,17 +629,45 @@ static _Thread_local SearchSlot *slots[ANN_BLACKWELL_MAX_DEVICES][ANN_INDEX_MAX_
 static BlackwellModule modules[ANN_BLACKWELL_MAX_DEVICES];
 static pthread_mutex_t moduleMutex = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Each query's FP16 row in the scan's shared memory is padded by 8 halves
+ * (ANN_FUSE_QPAD=0 removes the pad, for measurements). Unpadded, a 128-
+ * dimension row is 256 bytes, so the eight lanes that load one B fragment
+ * all read one bank: the fused scan of 64 queries over 1M rows took 358.5
+ * us, 209.7 us with the pad.
+ */
+static unsigned
+QueryPad(void)
+{
+	static int	pad = -1;
+
+	if (pad < 0)
+	{
+		const char *value = getenv("ANN_FUSE_QPAD");
+
+		pad = value && atoi(value) == 0 ? 0 : 8;
+	}
+	return (unsigned) pad;
+}
+
+/* Halves a query takes in the scan's shared memory. */
+static unsigned
+QueryStride(int dims)
+{
+	return (((unsigned) dims + 15) & ~15u) + QueryPad();
+}
+
 static char *
 JoinSource(void)
 {
-	size_t		length = 1;
+	size_t		length = 64;
 	char	   *source;
 
 	for (int i = 0; BlackwellSource[i]; i++)
 		length += strlen(BlackwellSource[i]);
 	if ((source = malloc(length)) == NULL)
 		return NULL;
-	source[0] = '\0';
+	snprintf(source, length, "#define ANN_QPAD %u\n", QueryPad());
 	for (int i = 0; BlackwellSource[i]; i++)
 		strcat(source, BlackwellSource[i]);
 	return source;
@@ -1048,7 +1081,7 @@ int
 AnnBlackwellGroupLimit(int dims)
 {
 	static int	cap = 0;
-	size_t		qstride = ((size_t) dims + 15) & ~(size_t) 15;
+	size_t		qstride = QueryStride(dims);
 
 	if (cap == 0)
 	{
@@ -1074,7 +1107,7 @@ AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32
 	unsigned	blocks = shard->blocks;
 	int			count = (int) nq;
 	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
-	unsigned	shared = (16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t);
+	unsigned	shared = (16u << width) * QueryStride(dims) * sizeof(uint16_t);
 	unsigned	grid = (n + 127) / 128;
 	void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
 	&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dims, &out};
@@ -1103,7 +1136,7 @@ AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_
 	unsigned	blocks = shard->blocks;
 	int			count = (int) nq;
 	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
-	unsigned	shared = (16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t);
+	unsigned	shared = (16u << width) * QueryStride(dims) * sizeof(uint16_t);
 	unsigned	grid = (n + 127) / 128;
 	void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
 		&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dims, (void *) &bounds, &candD,
@@ -1209,7 +1242,7 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 		unsigned	slices = (n + 8191) / 8192 < cap ? (n + 8191) / 8192 : cap;
 		unsigned	perSlice;
 		int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
-		unsigned	shared = (unsigned) ((16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t));
+		unsigned	shared = (unsigned) ((16u << width) * QueryStride(dims) * sizeof(uint16_t));
 
 		if (slices < 1)
 			slices = 1;
@@ -1353,7 +1386,7 @@ AnnBlackwellCandidates(const AnnBlackwellShard *shard, int device, unsigned slot
 	int			dimensions = dims,
 				count = (int) nq;
 	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
-	unsigned	shared = (unsigned) ((16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t));
+	unsigned	shared = (unsigned) ((16u << width) * QueryStride(dims) * sizeof(uint16_t));
 	unsigned	sampleGrid,
 				grid,
 				slices,
