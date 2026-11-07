@@ -360,6 +360,15 @@ Recall unchanged. The worker now uses about a quarter of the host's busy CPU at 
 
 **Defaults.** `--gpu-predicates` and `--residual-masks` are now on by default (`off` restores the earlier behaviour). With neither flag given: `distinct10` arrays 699.3k vectors/s and cached `10pct` arrays 829.9k (`def-*`), within run-to-run variation of the explicit runs above.
 
+**P04, first half: no candidate fill, no mid-pipeline sync.** The pruned selection filled the whole q x cap candidate buffer with +inf before compacting (12.6 MB of writes a 64-query batch that the sort never reads; it reads each query's kept entries only), and synchronised the stream mid-batch so the host could check the kept counts and size the sort. The fill is now a memset of the counts; on one-shard indexes a sort kernel sizes itself from the count on the device (shared memory launched for the cap) and the counts are checked after the batch's final sync, a failure returning the group to the other routes. Both workloads pruned every matrix query with no fallback:
+
+| Workload | `ls-*` | `ns-*` | Change |
+| --- | ---: | ---: | ---: |
+| `10pct` arrays (cached) | 833.1k vectors/s | 890.7k | +6.9% |
+| `distinct10` arrays | 711.1k | 724.6k | +1.9% |
+
+Recall unchanged. GPU busy rose to 91.4% and PostgreSQL to 138 cores at the cached point. The second half of P04 (an in-module kernel for the final top-k after reranking) remains.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
