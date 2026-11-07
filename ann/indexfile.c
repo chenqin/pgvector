@@ -900,7 +900,7 @@ AnnIndexMatch(const AnnIndexFile *file, const char *name, const int32_t *values,
 static void
 FreeBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 {
-	if (bitmap->device && AnnIndexBitmapDevice.release)
+	if ((bitmap->device || bitmap->deviceRows) && AnnIndexBitmapDevice.release)
 		AnnIndexBitmapDevice.release(file, bitmap);
 	for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
 		free(bitmap->owned[s]);
