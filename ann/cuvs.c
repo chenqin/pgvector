@@ -821,6 +821,7 @@ typedef struct AnnCuvsDevice
 	cudaEvent_t matrixTiming[6];	/* ANN_KERNEL_TIMING: matrix gather stages */
 	cudaEvent_t pruneTiming[3];		/* the selection's cutoff, compact, sort ends */
 	int			pruneMarks;
+	int			pruneFused;		/* the marks are the fused path's */
 	int			matrixTimingReady;
 	int			matrixMarks;	/* marks recorded in the current batch */
 	int			timingReady;
@@ -4287,11 +4288,16 @@ MatrixBuffers(AnnCuvsDevice *lane, size_t scores, size_t candidates, size_t outp
  */
 static int	KernelTiming(void);
 
-/* ANN_KERNEL_TIMING: a selection sub-step's end, after MatrixMark's mark 2. */
+/*
+ * ANN_KERNEL_TIMING: a selection sub-step's end, after MatrixMark's mark 2
+ * (the matrix path) or mark 0 (the fused path, whose sub-steps are timed
+ * from the start of scoring).
+ */
 static int
 PruneMark(AnnCuvsDevice *lane, int mark, cudaStream_t stream)
 {
-	if (KernelTiming() && lane->matrixTimingReady && lane->matrixMarks == 3 && lane->pruneMarks == mark &&
+	if (KernelTiming() && lane->matrixTimingReady && (lane->matrixMarks == 3 || lane->matrixMarks == 1) &&
+		lane->pruneMarks == mark &&
 		cudaEventRecord(lane->pruneTiming[mark], stream) == cudaSuccess)
 		lane->pruneMarks = mark + 1;
 	return 1;
@@ -4538,6 +4544,7 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 									 (int) dims, lane->pruneSample, stream) ||
 			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
 						   q, sample, rank, 1, NULL) != CUVS_SUCCESS ||
+			!PruneMark(lane, 0, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->cutoff32, (q + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
 						   cutoffArgs, NULL) != CUDA_SUCCESS ||
@@ -4545,9 +4552,11 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 			!AnnBlackwellScoreBelow(&shard->quant, shard->device, rows, n, lane->queries, q, (int) dims,
 									lane->fuseBounds, lane->pruneScores, lane->fusePositions, lane->fuseCounts,
 									cap, stream) ||
+			!PruneMark(lane, 1, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->pruneSelect32, q, 1, 1, 1024, 1, 1, 0, (CUstream) stream, selectArgs,
 						   NULL) != CUDA_SUCCESS ||
+			!PruneMark(lane, 2, stream) ||
 			cudaMemcpyAsync(lane->hostFuseCounts, lane->fuseCounts, (size_t) q * sizeof(uint32_t),
 							cudaMemcpyDeviceToHost, stream) != cudaSuccess)
 			return 0;
@@ -4604,7 +4613,7 @@ MatrixMark(AnnCuvsDevice *lane, uint32_t s, int mark, cudaStream_t stream)
 		lane->matrixTimingReady = 1;
 	}
 	if (mark == 0)
-		lane->matrixMarks = lane->pruneMarks = 0;
+		lane->matrixMarks = lane->pruneMarks = lane->pruneFused = 0;
 	if (cudaEventRecord(lane->matrixTiming[mark], stream) == cudaSuccess && lane->matrixMarks == mark)
 		lane->matrixMarks = mark + 1;
 	return 1;
@@ -4627,7 +4636,7 @@ MatrixStagesAdd(AnnCuvsDevice *lane, uint32_t q)
 			return;
 	/* The selection runs from mark 2 to mark 3: its sub-steps in between. */
 	if (prune &&
-		(cudaEventElapsedTime(&pms[0], lane->matrixTiming[2], lane->pruneTiming[0]) != cudaSuccess ||
+		(cudaEventElapsedTime(&pms[0], lane->matrixTiming[lane->pruneFused ? 0 : 2], lane->pruneTiming[0]) != cudaSuccess ||
 		 cudaEventElapsedTime(&pms[1], lane->pruneTiming[0], lane->pruneTiming[1]) != cudaSuccess ||
 		 cudaEventElapsedTime(&pms[2], lane->pruneTiming[1], lane->pruneTiming[2]) != cudaSuccess))
 		prune = 0;
@@ -4766,6 +4775,9 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			const uint32_t *rows;
 			size_t		hostOffset = (size_t) s * limit * capacity;
 
+			/* Fused tiles write no score matrix, so none is allocated for them. */
+			int			fusedTile = n && FusedEligible(state, jobs + first, q, n, candidates, dims);
+
 			selected[s] = 0;
 			gpu[s] = 0;
 			keyed[s] = 0;
@@ -4775,7 +4787,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			lane = LaneDevice(shard->device, (size_t) q * dims * sizeof(float), 1, 1);
 			if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
 				!GatherBuffers(lane, jobs[0]->nfilter, 1) ||
-				!MatrixBuffers(lane, (size_t) q * n, (size_t) q * candidates,
+				!MatrixBuffers(lane, fusedTile ? 1 : (size_t) q * n, (size_t) q * candidates,
 							   (size_t) q * outk, (size_t) state->nshards * limit * capacity, stream))
 			{
 				ok = 0;
@@ -4819,10 +4831,14 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 																			  &peak, bytes, memory_order_relaxed, memory_order_relaxed))
 					;
 			}
-			if (FusedEligible(state, jobs + first, q, n, candidates, dims))
+			if (fusedTile)
 			{
-				/* Timed as scoring: the sample, cutoff, scan and select in one. */
-				if (!MatrixMark(lane, s, 0, stream) ||
+				/*
+				 * Timed as scoring: the sample, cutoff, scan and select in
+				 * one; the selection line splits it (cutoff from the start,
+				 * the fused scan, the radix select).
+				 */
+				if (!MatrixMark(lane, s, 0, stream) || !(lane->pruneFused = 1) ||
 					!FusedPrunedSelect(state, shard, lane, stream, rows, q, n, candidates, dims) ||
 					!MatrixMark(lane, s, 1, stream) || !MatrixMark(lane, s, 2, stream) ||
 					!MatrixMark(lane, s, 3, stream))

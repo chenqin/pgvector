@@ -422,6 +422,15 @@ Recall unchanged, no prune fallbacks. The compaction is still well below memory 
 
 Recall unchanged, no prune fallbacks. Throughput is flat: at the cached point the GPUs are no longer the limit (77.5% busy) and the host is (PostgreSQL 97-128 cores, the worker 34-44 and pgbench about 9 of 224). The fused path is kept for its GPU headroom; residual-masked tiles could use it once the mask applies to the candidate lists instead of a score matrix.
 
+**Per-GPU throughput (GPU-bound runs).** With two or four GPUs serving (12 lanes and 56 clients per GPU), the host has room and the GPUs set the pace (about 96% busy each). Cached `10pct` arrays:
+
+| GPUs | Fused selection | Matrix (`ANN_MATRIX_FUSE=off`) | Per GPU, fused |
+| --- | ---: | ---: | ---: |
+| 2 | 349.8k vectors/s | 273.3k | 174.9k |
+| 4 | 692.4k | 542.9k | 173.1k |
+
+The fused selection is worth 28% per GPU. Timed with one lane per GPU, a 64-query batch over 1M rows spends 42.5 us on the cutoff (sample rows, their scores, `select_k`), 359.8 us in the fused scan and 37.5 us in the radix select, then 20 us reranking and 22.5 us in the final top-k: the scan is about 80% of the GPU time. A 128-query pass (16 tiles of 8 queries per warp, `--max-batch 128`) was slower per GPU (289.5k against 350.0k on two GPUs, batches full at 127.7 queries), most likely from register pressure, and was not kept. The rows a 10% window selects are already mostly contiguous in this table (category changes about every 6 ids, so a window is runs of about 60 rows), so scattered loads are not the main cost either. Performance counters need administrator rights on this host, so the scan's bound (latency, issue or occupancy) is not measured yet.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
