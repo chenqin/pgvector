@@ -818,6 +818,9 @@ typedef struct AnnCuvsDevice
 	float	   *hostRescoreOut; /* pinned */
 	size_t		rescoreCapacity;
 	cudaEvent_t timing[4];		/* ANN_KERNEL_TIMING: candidate scan and copy marks */
+	cudaEvent_t matrixTiming[6];	/* ANN_KERNEL_TIMING: matrix gather stages */
+	int			matrixTimingReady;
+	int			matrixMarks;	/* marks recorded in the current batch */
 	int			timingReady;
 	float	   *matrixScores,
 			   *matrixCandidates,
@@ -4256,6 +4259,81 @@ PrunedChecked(AnnCuvsIndex *state, const AnnCuvsDevice *lane, uint32_t q, uint32
 	return 1;
 }
 
+static int	KernelTiming(void);
+static double MonotonicMs(void);
+
+/*
+ * ANN_KERNEL_TIMING for the matrix gather: six marks on the first shard's
+ * stream (before scoring, after scoring, masking, selection, reranking and
+ * the final top-k), read after the batch's sync and printed as averages per
+ * batch every 10 seconds. Returns 1 so it chains into the stage calls.
+ */
+typedef struct MatrixStages
+{
+	double		ms[5];
+	uint64_t	batches;
+	uint64_t	queries;
+} MatrixStages;
+
+static MatrixStages matrixStages;
+static double matrixStagesPrinted;
+static pthread_mutex_t matrixStagesMutex = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+MatrixMark(AnnCuvsDevice *lane, uint32_t s, int mark, cudaStream_t stream)
+{
+	if (s != 0 || !KernelTiming())
+		return 1;
+	if (!lane->matrixTimingReady)
+	{
+		for (int i = 0; i < 6; i++)
+			if (cudaEventCreate(&lane->matrixTiming[i]) != cudaSuccess)
+				return 1;
+		lane->matrixTimingReady = 1;
+	}
+	if (mark == 0)
+		lane->matrixMarks = 0;
+	if (cudaEventRecord(lane->matrixTiming[mark], stream) == cudaSuccess && lane->matrixMarks == mark)
+		lane->matrixMarks = mark + 1;
+	return 1;
+}
+
+/* After the batch's sync: add the first shard's stage times. */
+static void
+MatrixStagesAdd(AnnCuvsDevice *lane, uint32_t q)
+{
+	float		ms[5];
+	double		now;
+
+	if (!KernelTiming() || !lane->matrixTimingReady || lane->matrixMarks != 6)
+		return;
+	for (int i = 0; i < 5; i++)
+		if (cudaEventElapsedTime(&ms[i], lane->matrixTiming[i], lane->matrixTiming[i + 1]) != cudaSuccess)
+			return;
+	lane->matrixMarks = 0;
+	now = MonotonicMs();
+	(void) pthread_mutex_lock(&matrixStagesMutex);
+	for (int i = 0; i < 5; i++)
+		matrixStages.ms[i] += ms[i];
+	matrixStages.batches++;
+	matrixStages.queries += q;
+	if (matrixStagesPrinted == 0)
+		matrixStagesPrinted = now;
+	else if (now - matrixStagesPrinted >= 10000 && matrixStages.batches)
+	{
+		double		b = (double) matrixStages.batches;
+
+		fprintf(stderr, "matrix gather stages, us per batch (%llu batches, %.1f queries each): score %.1f, "
+				"mask %.1f, select %.1f, rerank %.1f, final top-k %.1f\n",
+				(unsigned long long) matrixStages.batches, (double) matrixStages.queries / b,
+				matrixStages.ms[0] * 1000 / b, matrixStages.ms[1] * 1000 / b, matrixStages.ms[2] * 1000 / b,
+				matrixStages.ms[3] * 1000 / b, matrixStages.ms[4] * 1000 / b);
+		memset(&matrixStages, 0, sizeof(matrixStages));
+		matrixStagesPrinted = now;
+	}
+	(void) pthread_mutex_unlock(&matrixStagesMutex);
+}
+
 /*
  * General top-k: score a matrix once, select k+slack for every query, then
  * rerank in FP32 on device when resident, otherwise with the host vectors.
@@ -4412,14 +4490,18 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 																			  &peak, bytes, memory_order_relaxed, memory_order_relaxed))
 					;
 			}
-			if (!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
+			if (!MatrixMark(lane, s, 0, stream) ||
+				!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
 										 (int) dims, lane->matrixScores, stream) ||
+				!MatrixMark(lane, s, 1, stream) ||
 				!MaskExcluded(file, s, jobs + first, q, n, candidates, rows, lane, shard->device, stream,
 							  lane->matrixScores) ||
+				!MatrixMark(lane, s, 2, stream) ||
 				(!(pruned[s] = PrunedSelect(state, lane, shard->device, stream, q, n, candidates,
 											state->nshards == 1)) &&
 				 AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
-								lane->matrixIndices, q, n, candidates, 0, NULL) != CUVS_SUCCESS))
+								lane->matrixIndices, q, n, candidates, 0, NULL) != CUVS_SUCCESS) ||
+				!MatrixMark(lane, s, 3, stream))
 			{
 				ok = 0;
 				break;
@@ -4428,7 +4510,9 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			{
 				if (!RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
 								  candidates, q, lane->queries, lane->matrixCandidates, stream, 1) ||
+					!MatrixMark(lane, s, 4, stream) ||
 					!FinalTopk(lane, shard->device, stream, q, candidates, outk) ||
+					!MatrixMark(lane, s, 5, stream) ||
 					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
 									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
 					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,
@@ -4464,6 +4548,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 		for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 			if (used[d] && (cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
 				ok = 0;
+		if (ok)
+			MatrixStagesAdd(&laneDevices[shards[0].device], q);
 		for (uint32_t s = 0; ok && state->nshards == 1 && s < state->nshards; s++)
 			if (pruned[s] && !PrunedChecked(state, &laneDevices[shards[s].device], q,
 											capacity < (uint32_t) (start[s + 1] - start[s]) ?

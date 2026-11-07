@@ -388,6 +388,18 @@ Recall unchanged. At the cached point PostgreSQL is at 146.5 cores, the worker a
 
 Recall unchanged. The GPUs are now 92% busy at the cached point, with PostgreSQL at 82.5 cores and the worker at 26.6.
 
+**Harness (prerequisites 1-2).** `frozen_stress.py` now records the worker's server statistics (operation 8: predicate hits, evaluations, residual masks) before and after each run, beside the routing statistics; per-role CPU including pgbench's was already in each run's JSON. With `ANN_KERNEL_TIMING=1` the matrix gather records six events on the first shard's stream and prints per-batch averages every 10 s. At 96 lanes (12 per GPU) those times include other lanes' kernels; with one lane per GPU (64 clients, 64-query batches over 1M rows) they are the stages' own GPU time:
+
+| Stage | us per batch | Share |
+| --- | ---: | ---: |
+| NVFP4 scoring | 319 | 45% |
+| Residual mask | 3 | 0.4% |
+| Selection (sample, cutoff, compact, sort) | 331-346 | 47% |
+| FP32 rerank | 20 | 3% |
+| Final top-k | 22.5 | 3% |
+
+The selection stage costs as much as scoring 64M rows; its bitonic sort runs one block per query (64 of 148 SMs) over about 4,096 kept scores, and the cutoff uses a cuVS `select_k` launch. That is the next GPU target.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.

@@ -144,34 +144,41 @@ class Monitor:
                     os_states=dict(self.states), gpu_samples=gpus, monitor_errors=self.errors)
 
 
-def routing_stats(path, index):
+def control(path, operation, payload):
     """A control request outside the timed workload; old workers may lack it."""
-    if not index:
-        return None
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
             connection.settimeout(2)
             connection.connect(path)
-            payload = index.encode()
-            connection.sendall(b'PVAN' + struct.pack('<HHQQII', 1, 31, 1, 0, len(payload), 0) + payload)
+            connection.sendall(b'PVAN' + struct.pack('<HHQQII', 1, operation, 1, 0, len(payload), 0) + payload)
 
             def receive(size):
                 data = b''
                 while len(data) < size:
                     chunk = connection.recv(size - len(data))
                     if not chunk:
-                        raise EOFError('routing stats connection closed')
+                        raise EOFError('control connection closed')
                     data += chunk
                 return data
 
             header = receive(32)
-            version, operation, request, generation, size, status = struct.unpack('<HHQQII', header[4:])
-            if header[:4] != b'PVAN' or version != 1 or operation != 31 or request != 1 or size > 65536:
-                raise ValueError('malformed routing stats header')
+            version, reply, request, generation, size, status = struct.unpack('<HHQQII', header[4:])
+            if header[:4] != b'PVAN' or version != 1 or reply != operation or request != 1 or size > 65536:
+                raise ValueError('malformed control reply header')
             data = receive(size)
             return json.loads(data) if status == 0 else {'status': status}
     except (OSError, EOFError, ValueError) as error:
         return {'error': str(error)}
+
+
+def routing_stats(path, index):
+    """The index's routing statistics (operation 31)."""
+    return control(path, 31, index.encode()) if index else None
+
+
+def server_stats(path):
+    """The worker's server statistics (operation 8): predicate cache hits, evaluations, residual masks."""
+    return control(path, 8, b'')
 
 
 def main():
@@ -287,6 +294,7 @@ def main():
                            '-j', str(min(clients, args.threads)), '-T', str(args.seconds), '-r',
                            '-f', str(script), '-l', '--sampling-rate=0.05', '--log-prefix', str(Path(directory) / 'latency')]
                 routing_before = routing_stats(args.socket, args.index_name)
+                server_before = server_stats(args.socket)
                 monitor = Monitor(args.dsn, application, args.worker_pid)
                 monitor.start()
                 started = time.monotonic()
@@ -323,6 +331,7 @@ def main():
                            batch_arrays=args.batch_arrays, immutable=args.immutable,
                            routing_stats_before=routing_before,
                            routing_stats_after=routing_stats(args.socket, args.index_name),
+                           server_stats_before=server_before, server_stats_after=server_stats(args.socket),
                            vector_qps=float(tps.group(1)) * max(args.batch_queries, 1) if tps else None,
                            mmap=args.mmap, local_cache_mb=args.local_cache_mb,
                            client_threads=min(clients,args.threads), table=args.table, query_table=args.queries,
