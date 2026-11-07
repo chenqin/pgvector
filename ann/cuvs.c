@@ -854,6 +854,11 @@ typedef struct AnnCuvsDevice
 	size_t		mixedRowCap,
 				mixedOffsetCap,
 				mixedRankCap;
+	/* --gpu-predicates: a filter's shard bitset, expanded into rows here */
+	uint32_t   *expandWords;
+	uint32_t   *expandBlocks;
+	size_t		expandWordCap,
+				expandBlockCap;
 } AnnCuvsDevice;
 
 static _Thread_local AnnCuvsDevice laneDevices[ANN_CUVS_MAX_DEVICES];
@@ -1248,6 +1253,8 @@ FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
  * upload nothing per query. A failure frees what was copied and leaves
  * that form on the per-query path.
  */
+static int	ExpandLaneRows(const AnnIndexFile *file, uint32_t s, const uint32_t *bitset, uint64_t n,
+						   AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t *rows);
 static int	ExpandRows(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexBitmap *bitmap,
 					   const uint64_t *start, void ***result, uint64_t *bytes);
 
@@ -1790,6 +1797,44 @@ ExpandRows(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexBitmap *
 	*result = rows;
 	*bytes += total;
 	return 1;
+}
+
+/*
+ * --gpu-predicates: a lane's rows for a filter that has none on this GPU,
+ * made from its shard bitset on the lane's own stream (rows / 8 bytes from
+ * the host instead of converting n ordinals there). Dense filters only: the
+ * bitset never outgrows the staging the ordinals would need (n u64).
+ * Returns 0 to stage from the ordinals instead.
+ */
+static int
+ExpandLaneRows(const AnnIndexFile *file, uint32_t s, const uint32_t *bitset, uint64_t n,
+			   AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t *rows)
+{
+	unsigned long long shardRows = file->shards[s].rows;
+	size_t		nwords = (size_t) ((shardRows + 31) / 32);
+	unsigned	nblocks = (unsigned) ((nwords + 255) / 256);
+	PredicateModule *module;
+
+	if (bitset == NULL || n == 0 || nwords * sizeof(uint32_t) > n * sizeof(int64_t) ||
+		(module = PredicateKernels(device)) == NULL ||
+		!GrowDevice((void **) &lane->expandWords, &lane->expandWordCap, nwords, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->expandBlocks, &lane->expandBlockCap, nblocks, sizeof(uint32_t), 0, stream))
+		return 0;
+	{
+		void	   *countArgs[] = {&lane->expandWords, &shardRows, &lane->expandBlocks};
+		void	   *scanArgs[] = {&lane->expandBlocks, &nblocks};
+		void	   *writeArgs[] = {&lane->expandWords, &shardRows, &lane->expandBlocks, &rows};
+
+		return cudaMemcpyAsync(lane->expandWords, bitset, nwords * sizeof(uint32_t), cudaMemcpyHostToDevice,
+							   stream) == cudaSuccess &&
+			cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->expandCount, nblocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   countArgs, NULL) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->expandScan, 1, 1, 1, 1024, 1, 1, 0, (CUstream) stream,
+						   scanArgs, NULL) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->expandWrite, nblocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   writeArgs, NULL) == CUDA_SUCCESS;
+	}
 }
 
 static AnnStatus
@@ -3973,6 +4018,10 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				uploaded[shard->device] = 1;
 			}
 			rows = jobs[0]->deviceRows ? jobs[0]->deviceRows[(size_t) laneCopy * state->nshards + s] : NULL;
+			if (rows == NULL && AnnIndexConfig.gpu_predicates && jobs[0]->bitsets &&
+				ExpandLaneRows(file, s, jobs[0]->bitsets[s], n, lane, shard->device, stream,
+							   lane->gatherRows + start[s]))
+				rows = lane->gatherRows + start[s];
 			if (rows == NULL)
 			{
 				uint32_t   *staged = (uint32_t *) (void *) (lane->hostKeys + start[s]);

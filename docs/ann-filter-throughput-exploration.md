@@ -295,6 +295,17 @@ So the ceiling P01 targets is real, and PostgreSQL's 16 ms per call on `distinct
 
 Recall 0.9998 mean, 0.994-0.996 lowest. The gain is at the top of the reviewed range (1.1-1.4x on `distinct10`) and larger on `mix10`, whose repeating half now evicts less: an entry is 9.25 MB instead of 17.25 MB. The worker is still CPU-bound on `distinct10` (110-136 cores).
 
+**Lane rows from the bitset on the GPU (P08 step 1).** A `distinct10` profile on the current build (gprofng, 30 s of 64-vector arrays) put 31% of the worker's CPU in `SearchGatherMatrix` turning an entry's ~1M 64-bit ordinals into 32-bit shard rows on the host for every search (`cuvs.c`, the `staged[i] = ordinals[...]` loop), 27% in `BuildBitmap`, and 9% in the per-hit `file->keys[row]` lookup. With `--gpu-predicates`, a lane that finds no device rows now copies the shard bitset (rows / 8 bytes) and expands it into rows on its own stream with the expand kernels (`ExpandLaneRows`); sparse entries without bitsets still stage from ordinals.
+
+| Workload | P07 | + lane expansion (`lex-*`) | Change |
+| --- | ---: | ---: | ---: |
+| `distinct10` arrays | 237.6k vectors/s | 363.9k | +53% |
+| `distinct10` SQL | 6.18k QPS | 10.15k | +64% |
+| `mix10` arrays | 435.3k | 507.8k | +17% |
+| `10pct` arrays (cached) | 776.8k | 771.9k | 0% (noise) |
+
+Recall 0.9998 mean, 0.994-0.996 lowest. Together with P07, `distinct10` is 2.3x its 156.2k start through arrays and 2.2x through SQL. `BuildBitmap` (building ordinals for every new entry) is now the largest worker cost on this workload; P01 removes it for decomposable predicates.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
