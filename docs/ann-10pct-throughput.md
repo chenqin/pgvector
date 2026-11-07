@@ -306,6 +306,20 @@ key array, one cache line per matching row. A lane's host staging of the rows
 takes 27%. Removing both means routes that work from device rows and bitsets
 without host keys. The option is off by default.
 
+Final build (7501378), 30 s a point, same settings; arrays of 64 with 448 clients,
+single-vector SQL with 256 clients:
+
+| Workload | Arrays, off | Arrays, on | SQL, off | SQL, on | Recall (mean / lowest) |
+| --- | ---: | ---: | ---: | ---: | --- |
+| `fresh10`: never-repeating 10% predicates | 66.1k | **143.9k** | 1.15k | **4.10k** | 0.9998 / 0.996 |
+| `10pct`: 10 cached ranges | 775.6k | 765.0k | 114.7k | 115.5k | 0.9998 / 0.994 |
+| `mixed10`: 91 overlapping 10% windows | 764.3k | 769.6k | 106.6k | 106.6k | 0.9998 / 0.996 |
+| `unique1`: 991 distinct 1% windows | 929.9k | 933.7k | 116.8k | 114.2k | 0.9998 / 0.996 |
+
+Vectors a second (arrays) and queries a second (SQL). Predicates that repeat are
+unaffected within run-to-run variation (about ±1.5%); the SQL points here use the
+arrays settings (96 lanes), not the 32 lanes single-vector SQL does best with.
+
 Rate grouping (`udf_grouped` in the UDF benchmark) does not apply to the worker's
 graph route: a filtered CAGRA call there already carries one filter, hence one
 filtering rate.
