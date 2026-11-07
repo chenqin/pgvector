@@ -819,6 +819,8 @@ typedef struct AnnCuvsDevice
 	size_t		rescoreCapacity;
 	cudaEvent_t timing[4];		/* ANN_KERNEL_TIMING: candidate scan and copy marks */
 	cudaEvent_t matrixTiming[6];	/* ANN_KERNEL_TIMING: matrix gather stages */
+	cudaEvent_t pruneTiming[3];		/* the selection's cutoff, compact, sort ends */
+	int			pruneMarks;
 	int			matrixTimingReady;
 	int			matrixMarks;	/* marks recorded in the current batch */
 	int			timingReady;
@@ -2823,6 +2825,99 @@ static const char FinalSource[] =
 "  }\n"
 "}\n";
 
+/*
+ * The pruned selection's linear steps. matrix_compact4 is matrix_compact
+ * reading four scores a thread (rows of n % 4 == 0 are 16-byte aligned): one
+ * atomic a warp. matrix_prune_select keeps each query's best k kept scores
+ * unordered (the rerank and the final top-k need no order): a radix select
+ * over the scores' order-preserving bits, four 8-bit passes, then one pass
+ * writing the keys below the k-th and enough of those equal to it.
+ */
+static const char SelectSource[] =
+"extern \"C\" __global__ void matrix_compact4(const float *scores, unsigned n, const float *bounds, unsigned rank,\n"
+"    unsigned cap, float *d, long long *r, unsigned long long *counts)\n"
+"{\n"
+"  unsigned row = blockIdx.y, lane = threadIdx.x & 31, quads = n / 4;\n"
+"  float bound = bounds[(unsigned long long) row * rank + rank - 1];\n"
+"  const float4 *v = (const float4 *) (scores + (unsigned long long) row * n);\n"
+"  for (unsigned i = blockIdx.x * blockDim.x + threadIdx.x; i - threadIdx.x < quads; i += gridDim.x * blockDim.x)\n"
+"  {\n"
+"    float4 x = i < quads ? v[i] : make_float4(__int_as_float(0x7f800000), __int_as_float(0x7f800000),\n"
+"                                              __int_as_float(0x7f800000), __int_as_float(0x7f800000));\n"
+"    unsigned keep = (x.x <= bound) | (x.y <= bound) << 1 | (x.z <= bound) << 2 | (x.w <= bound) << 3;\n"
+"    unsigned c = __popc(keep), scan = c;\n"
+"    if (!__any_sync(0xffffffffu, c)) continue;\n"
+"    for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, scan, o); if (lane >= o) scan += y; }\n"
+"    unsigned base = 0;\n"
+"    if (lane == 31) base = (unsigned) atomicAdd(&counts[row], (unsigned long long) scan);\n"
+"    base = __shfl_sync(0xffffffffu, base, 31);\n"
+"    unsigned slot = base + scan - c;\n"
+"    float xs[4] = {x.x, x.y, x.z, x.w};\n"
+"    for (int j = 0; j < 4; j++)\n"
+"      if ((keep >> j) & 1)\n"
+"      {\n"
+"        if (slot < cap) { d[(unsigned long long) row * cap + slot] = xs[j]; r[(unsigned long long) row * cap + slot] = 4 * i + j; }\n"
+"        slot++;\n"
+"      }\n"
+"  }\n"
+"}\n"
+"__device__ unsigned select_key(float f)\n"
+"{\n"
+"  unsigned b = __float_as_uint(f);\n"
+"  return (b & 0x80000000u) ? ~b : b | 0x80000000u;\n"
+"}\n"
+"extern \"C\" __global__ void matrix_prune_select(const float *d, const long long *r,\n"
+"    const unsigned long long *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  __shared__ unsigned hist[256];\n"
+"  __shared__ unsigned prefix, mask, want, below, ties;\n"
+"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
+"  const float *v = d + (unsigned long long) row * cap;\n"
+"  const long long *p = r + (unsigned long long) row * cap;\n"
+"  float *od = outD + (unsigned long long) row * k;\n"
+"  long long *orow = outR + (unsigned long long) row * k;\n"
+"  if (n <= k)\n"
+"  {\n"
+"    for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
+"    {\n"
+"      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
+"      orow[i] = i < n ? p[i] : -1;\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  if (threadIdx.x == 0) { prefix = 0; mask = 0; want = k; below = 0; ties = 0; }\n"
+"  for (int shift = 24; shift >= 0; shift -= 8)\n"
+"  {\n"
+"    for (unsigned b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;\n"
+"    __syncthreads();\n"
+"    for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
+"    {\n"
+"      unsigned u = select_key(v[i]);\n"
+"      if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255u], 1u);\n"
+"    }\n"
+"    __syncthreads();\n"
+"    if (threadIdx.x == 0)\n"
+"    {\n"
+"      unsigned cum = 0, b = 0;\n"
+"      while (cum + hist[b] < want) { cum += hist[b]; b++; }\n"
+"      prefix |= b << shift; mask |= 255u << shift; want -= cum;\n"
+"    }\n"
+"    __syncthreads();\n"
+"  }\n"
+"  for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
+"  {\n"
+"    unsigned u = select_key(v[i]);\n"
+"    if (u < prefix) { unsigned s = atomicAdd(&below, 1u); od[s] = v[i]; orow[s] = p[i]; }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
+"    if (select_key(v[i]) == prefix)\n"
+"    {\n"
+"      unsigned t = atomicAdd(&ties, 1u);\n"
+"      if (t < want) { unsigned s = k - want + t; od[s] = v[i]; orow[s] = p[i]; }\n"
+"    }\n"
+"}\n";
+
 /* Mixed-filter groups (SearchGatherMixed): the same per query's own list. */
 static const char SegmentSource[] =
 "/* Mixed-filter groups: query q's scores are scores[offsets[q] .. offsets[q + 1]). */\n"
@@ -2945,6 +3040,8 @@ typedef struct GatherModule
 	CUfunction	pruneSort;
 	CUfunction	pruneSortAuto;
 	CUfunction	finalTopk;
+	CUfunction	pruneCompact4;
+	CUfunction	pruneSelect;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
 } GatherModule;
@@ -2978,7 +3075,7 @@ GatherKernels(int device)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
 	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + strlen(PruneAutoSource) +
-					strlen(FinalSource) + strlen(SegmentSource) + 1);
+					strlen(FinalSource) + strlen(SelectSource) + strlen(SegmentSource) + 1);
 	if (source == NULL)
 		goto fail;
 	strcpy(source, GatherSource);
@@ -2986,6 +3083,7 @@ GatherKernels(int device)
 	strcat(source, PruneSource);
 	strcat(source, PruneAutoSource);
 	strcat(source, FinalSource);
+	strcat(source, SelectSource);
 	strcat(source, SegmentSource);
 	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
@@ -3002,6 +3100,8 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSortAuto, module->module, "matrix_prune_sort_auto") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->finalTopk, module->module, "final_topk") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneCompact4, module->module, "matrix_compact4") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneSelect, module->module, "matrix_prune_select") != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->finalTopk, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
 						   ANN_FINAL_MAX * 12) != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->pruneSortAuto, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -4106,6 +4206,18 @@ MatrixBuffers(AnnCuvsDevice *lane, size_t scores, size_t candidates, size_t outp
  * written, when a query keeps fewer than `candidates` or more than the
  * buffer holds (or a launch fails): the caller then selects in full.
  */
+static int	KernelTiming(void);
+
+/* ANN_KERNEL_TIMING: a selection sub-step's end, after MatrixMark's mark 2. */
+static int
+PruneMark(AnnCuvsDevice *lane, int mark, cudaStream_t stream)
+{
+	if (KernelTiming() && lane->matrixTimingReady && lane->matrixMarks == 3 && lane->pruneMarks == mark &&
+		cudaEventRecord(lane->pruneTiming[mark], stream) == cudaSuccess)
+		lane->pruneMarks = mark + 1;
+	return 1;
+}
+
 static int
 PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q,
 			 uint32_t n, uint32_t candidates, int deferred)
@@ -4140,7 +4252,7 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 		void	   *compactArgs[] = {&lane->matrixScores, &rows, &lane->pruneBounds, &rank, &cap,
 		&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts};
 		unsigned	k = candidates;
-		void	   *sortArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &cap, &k,
+		void	   *selectArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &cap, &k,
 		&lane->matrixCandidates, &lane->matrixIndices};
 
 		/*
@@ -4154,9 +4266,12 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 						   sampleArgs, NULL) != CUDA_SUCCESS ||
 			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
 						   q, sample, rank, 1, NULL) != CUVS_SUCCESS ||
+			!PruneMark(lane, 0, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
-			cuLaunchKernel(module->pruneCompact, compactBlocks, q, 1, 256, 1, 1, 0, (CUstream) stream,
-						   compactArgs, NULL) != CUDA_SUCCESS)
+			cuLaunchKernel(n % 4 == 0 ? module->pruneCompact4 : module->pruneCompact,
+						   n % 4 == 0 ? (n / 4 + 256 * 4 - 1) / (256 * 4) : compactBlocks, q, 1, 256, 1, 1, 0,
+						   (CUstream) stream, compactArgs, NULL) != CUDA_SUCCESS ||
+			!PruneMark(lane, 1, stream))
 			return 0;
 
 		/*
@@ -4166,8 +4281,9 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 		 */
 		if (deferred)
 		{
-			if (cuLaunchKernel(module->pruneSortAuto, q, 1, 1, 1024, 1, 1, ANN_PRUNE_CAP * 8, (CUstream) stream,
-							   sortArgs, NULL) != CUDA_SUCCESS ||
+			if (cuLaunchKernel(module->pruneSelect, q, 1, 1, 1024, 1, 1, 0, (CUstream) stream,
+							   selectArgs, NULL) != CUDA_SUCCESS ||
+				!PruneMark(lane, 2, stream) ||
 				cudaMemcpyAsync(lane->pruneHostCounts, lane->pruneCounts, (size_t) q * sizeof(int64_t),
 								cudaMemcpyDeviceToHost, stream) != cudaSuccess)
 				return 0;
@@ -4259,7 +4375,6 @@ PrunedChecked(AnnCuvsIndex *state, const AnnCuvsDevice *lane, uint32_t q, uint32
 	return 1;
 }
 
-static int	KernelTiming(void);
 static double MonotonicMs(void);
 
 /*
@@ -4271,6 +4386,8 @@ static double MonotonicMs(void);
 typedef struct MatrixStages
 {
 	double		ms[5];
+	double		pruneMs[3];		/* cutoff (sample + select_k), compact, sort */
+	uint64_t	pruneBatches;
 	uint64_t	batches;
 	uint64_t	queries;
 } MatrixStages;
@@ -4289,10 +4406,13 @@ MatrixMark(AnnCuvsDevice *lane, uint32_t s, int mark, cudaStream_t stream)
 		for (int i = 0; i < 6; i++)
 			if (cudaEventCreate(&lane->matrixTiming[i]) != cudaSuccess)
 				return 1;
+		for (int i = 0; i < 3; i++)
+			if (cudaEventCreate(&lane->pruneTiming[i]) != cudaSuccess)
+				return 1;
 		lane->matrixTimingReady = 1;
 	}
 	if (mark == 0)
-		lane->matrixMarks = 0;
+		lane->matrixMarks = lane->pruneMarks = 0;
 	if (cudaEventRecord(lane->matrixTiming[mark], stream) == cudaSuccess && lane->matrixMarks == mark)
 		lane->matrixMarks = mark + 1;
 	return 1;
@@ -4307,14 +4427,26 @@ MatrixStagesAdd(AnnCuvsDevice *lane, uint32_t q)
 
 	if (!KernelTiming() || !lane->matrixTimingReady || lane->matrixMarks != 6)
 		return;
+	float		pms[3] = {0, 0, 0};
+	int			prune = lane->pruneMarks == 3;
+
 	for (int i = 0; i < 5; i++)
 		if (cudaEventElapsedTime(&ms[i], lane->matrixTiming[i], lane->matrixTiming[i + 1]) != cudaSuccess)
 			return;
-	lane->matrixMarks = 0;
+	/* The selection runs from mark 2 to mark 3: its sub-steps in between. */
+	if (prune &&
+		(cudaEventElapsedTime(&pms[0], lane->matrixTiming[2], lane->pruneTiming[0]) != cudaSuccess ||
+		 cudaEventElapsedTime(&pms[1], lane->pruneTiming[0], lane->pruneTiming[1]) != cudaSuccess ||
+		 cudaEventElapsedTime(&pms[2], lane->pruneTiming[1], lane->pruneTiming[2]) != cudaSuccess))
+		prune = 0;
+	lane->matrixMarks = lane->pruneMarks = 0;
 	now = MonotonicMs();
 	(void) pthread_mutex_lock(&matrixStagesMutex);
 	for (int i = 0; i < 5; i++)
 		matrixStages.ms[i] += ms[i];
+	for (int i = 0; prune && i < 3; i++)
+		matrixStages.pruneMs[i] += pms[i];
+	matrixStages.pruneBatches += prune;
 	matrixStages.batches++;
 	matrixStages.queries += q;
 	if (matrixStagesPrinted == 0)
@@ -4328,6 +4460,11 @@ MatrixStagesAdd(AnnCuvsDevice *lane, uint32_t q)
 				(unsigned long long) matrixStages.batches, (double) matrixStages.queries / b,
 				matrixStages.ms[0] * 1000 / b, matrixStages.ms[1] * 1000 / b, matrixStages.ms[2] * 1000 / b,
 				matrixStages.ms[3] * 1000 / b, matrixStages.ms[4] * 1000 / b);
+		if (matrixStages.pruneBatches)
+			fprintf(stderr, "  selection, us per pruned batch: cutoff %.1f, compact %.1f, sort %.1f\n",
+					matrixStages.pruneMs[0] * 1000 / matrixStages.pruneBatches,
+					matrixStages.pruneMs[1] * 1000 / matrixStages.pruneBatches,
+					matrixStages.pruneMs[2] * 1000 / matrixStages.pruneBatches);
 		memset(&matrixStages, 0, sizeof(matrixStages));
 		matrixStagesPrinted = now;
 	}

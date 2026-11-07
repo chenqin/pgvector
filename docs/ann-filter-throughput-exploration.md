@@ -402,6 +402,16 @@ Recall unchanged. The GPUs are now 92% busy at the cached point, with PostgreSQL
 
 The selection stage costs as much as scoring 64M rows; its bitonic sort runs one block per query (64 of 148 SMs) over about 4,096 kept scores, and the cutoff uses a cuVS `select_k` launch. That is the next GPU target.
 
+**A faster selection.** Timed inside, the selection was 37 us for the cutoff (sampling plus `select_k`), 174 us compacting the scores under it (reading 256 MB a batch at about 1.5 TB/s) and 118.5 us sorting the kept scores. The rerank and the final top-k need the best candidates as a set, not in order, so a radix select replaces the sort (`matrix_prune_select`: four 8-bit histogram passes over the scores' order-preserving bits find the k-th smallest, then one pass writes the keys below it and enough of those equal to it), and the compaction reads four scores a thread with one atomic a warp (`matrix_compact4`, for rows of n % 4 == 0). One lane per GPU: sort 118.5 -> 38.8 us, compact 174.0 -> 157.6 us, selection 339 -> 243 us a batch.
+
+| Workload | `pk-*` | `rs-*` | Change |
+| --- | ---: | ---: | ---: |
+| `10pct` arrays (cached) | 973.5k vectors/s | 1,042.6k | +7.1% |
+| `10pct` SQL (two repeats) | 138.2k QPS | 139.4k | +0.9% |
+| `distinct10` arrays | 765.2k | 825.0k | +7.8% |
+
+Recall unchanged, no prune fallbacks. The compaction is still well below memory bandwidth and, with scoring (319 us), is the largest GPU cost left; fusing the cutoff test into the scoring kernel would remove the 256 MB written and read again per batch.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
