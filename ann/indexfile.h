@@ -268,7 +268,7 @@ typedef struct AnnIndexOptions
 								 * short group; one segmented gather serves
 								 * them (--mixed-groups) */
 	int			gpu_predicates; /* evaluate uncached predicates on the GPU
-								 * (--gpu-predicates) */
+								 * (--gpu-predicates); default on */
 	int			canonical_predicates;	/* cache predicates under their
 										 * canonical form (ann/canonical.h);
 										 * default on */
@@ -276,7 +276,7 @@ typedef struct AnnIndexOptions
 										 * results enter the cache */
 	int			residual_masks; /* cache AND predicates' wide operands, mask
 								 * the few rows their narrow ones remove
-								 * (--residual-masks) */
+								 * (--residual-masks); default on */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */

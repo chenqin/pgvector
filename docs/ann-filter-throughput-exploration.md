@@ -358,6 +358,8 @@ Worker CPU fell from about 50 to 45 cores and GPU busy rose from 78% to 83%, so 
 
 Recall unchanged. The worker now uses about a quarter of the host's busy CPU at the cached point; PostgreSQL (104-112 cores) is again the largest consumer.
 
+**Defaults.** `--gpu-predicates` and `--residual-masks` are now on by default (`off` restores the earlier behaviour). With neither flag given: `distinct10` arrays 699.3k vectors/s and cached `10pct` arrays 829.9k (`def-*`), within run-to-run variation of the explicit runs above.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
