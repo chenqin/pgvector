@@ -327,6 +327,26 @@ From the start of this work, `distinct10` went 156.2k -> 546.5k vectors/s (3.5x)
 
 `distinct10` single-vector SQL is now GPU-bound (95.6% busy, as cached predicates are); the arrays point has PostgreSQL at 109 cores, its cached level, and the worker at 75 cores against 48 on cached work. Since the start of this work: `distinct10` 156.2k -> 674.7k vectors/s (4.3x) and 4.55k -> 96.6k QPS (21x).
 
+**The limiter at the cached point (experiment 4): per-lane host work, not saturated cores.** On the cached `10pct` arrays point, 167 of 224 logical CPUs were busy (PostgreSQL 108.6, worker 50.0, pgbench 8.3; 112 physical cores). Three measurements on the same build:
+
+| Experiment | Vectors/s | Reading |
+| --- | ---: | --- |
+| Baseline (`h1-base-arrays`) | 760.8k | |
+| + 32 busy threads (`h1-burn32-arrays`) | 736.0k (-3.3%) | took most of the ~53 idle logical CPUs at little cost |
+| + 64 busy threads (`h1-burn64-arrays`) | 689.8k (-9.3%) | oversubscribed host |
+| Lanes spin-wait on the GPU (`h2-spin-arrays`) | 735.8k | +32 worker cores, no gain: completion wake-ups are not the limit |
+| Lanes yield-wait (`h2-yield-arrays`) | 736.8k | same |
+
+A worker profile at this point (none existed) put about 35% of its CPU in stream synchronisation, about 20% in the per-hit key lookup (`file->keys[row]`, ~32,000 random reads per 64-query batch), 18% in `BatchAnswer` serialising replies byte by byte, and 7% in the duplicate-position check. Two changes cut that host work: the matrix gather now fetches result keys on the GPU from the shard's device keys (`gather_keys`), and `Read`/`Write` copy fields on little-endian hosts:
+
+| Workload | Before | After (`dk-*`) | Change |
+| --- | ---: | ---: | ---: |
+| `10pct` arrays (cached) | 760.8-776.8k vectors/s | 806.2k | +4-6% (previous best 782.6k) |
+| `distinct10` arrays | 674.7k | 692.9k | +2.7% |
+| `10pct` single-vector SQL | 113.0k QPS | 113.0k | 0% |
+
+Worker CPU fell from about 50 to 45 cores and GPU busy rose from 78% to 83%, so the lanes' host work per batch is on the critical path (H2). Next on that path: the stream-synchronisation spin (35%), the remaining reply serialisation, and the duplicate-position check.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.

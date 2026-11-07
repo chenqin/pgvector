@@ -826,6 +826,10 @@ typedef struct AnnCuvsDevice
 			   *matrixRows;
 	float	   *matrixHostValues;
 	int64_t    *matrixHostRows;
+	int64_t    *matrixKeys;		/* keys of matrixRows, gathered on the GPU */
+	int64_t    *matrixHostKeys; /* pinned */
+	size_t		matrixKeyCap,
+				matrixHostKeyCap;
 	float	   *rerankQueries;
 	size_t		rerankQueryCap;
 	size_t		matrixScoreCap,
@@ -1261,6 +1265,8 @@ FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
  * upload nothing per query. A failure frees what was copied and leaves
  * that form on the per-query path.
  */
+static int	GatherKeys(const AnnCuvsShard *shard, uint64_t shardRows, AnnCuvsDevice *lane, int device,
+					   cudaStream_t stream, uint32_t count, int64_t *hostKeys);
 static int	MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t q, uint32_t n,
 						 uint32_t candidates, const uint32_t *rows, AnnCuvsDevice *lane, int device,
 						 cudaStream_t stream, float *scores);
@@ -1484,6 +1490,14 @@ static const char MaskKernelSource[] =
 "  unsigned int j = pairs[2 * t], r = pairs[2 * t + 1], lo = 0, hi = n;\n"
 "  while (lo < hi) { unsigned int mid = lo + (hi - lo) / 2; if (rows[mid] < r) lo = mid + 1; else hi = mid; }\n"
 "  if (lo < n && rows[lo] == r) scores[(unsigned long long) j * n + lo] = __int_as_float(0x7f800000);\n"
+"}\n"
+"extern \"C\" __global__ void gather_keys(const long long *keys, const long long *rows, long long *out,\n"
+"                                        unsigned int n, unsigned long long shardRows)\n"
+"{\n"
+"  unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (t >= n) return;\n"
+"  long long r = rows[t];\n"
+"  out[t] = r >= 0 && (unsigned long long) r < shardRows ? keys[r] : -1;\n"
 "}\n";
 
 typedef struct PredicateModule
@@ -1496,6 +1510,7 @@ typedef struct PredicateModule
 	CUfunction	expandScan;
 	CUfunction	expandWrite;
 	CUfunction	maskScores;
+	CUfunction	gatherKeys;
 } PredicateModule;
 
 static PredicateModule predicateModules[ANN_CUVS_MAX_DEVICES];
@@ -1539,7 +1554,8 @@ PredicateKernels(int device)
 		cuModuleGetFunction(&module->expandCount, module->module, "expand_count") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->expandScan, module->module, "expand_scan") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->expandWrite, module->module, "expand_write") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->maskScores, module->module, "mask_scores") != CUDA_SUCCESS)
+		cuModuleGetFunction(&module->maskScores, module->module, "mask_scores") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->gatherKeys, module->module, "gather_keys") != CUDA_SUCCESS)
 		goto fail;
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
@@ -1956,6 +1972,33 @@ MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t 
 			cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 			cuLaunchKernel(module->maskScores, (count + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
 						   args, NULL) == CUDA_SUCCESS;
+	}
+}
+
+/*
+ * The keys of the first count entries of lane->matrixRows (shard rows, -1
+ * for none), read from the shard's device keys and copied to hostKeys on
+ * the lane's stream: the host then reads no key per hit. Returns 0 when the
+ * kernel is unavailable (the host reads the keys itself).
+ */
+static int
+GatherKeys(const AnnCuvsShard *shard, uint64_t shardRows, AnnCuvsDevice *lane, int device, cudaStream_t stream,
+		   uint32_t count, int64_t *hostKeys)
+{
+	PredicateModule *module;
+	unsigned long long rows = shardRows;
+
+	if (shard->keys == NULL || count == 0 || (module = PredicateKernels(device)) == NULL ||
+		!GrowDevice((void **) &lane->matrixKeys, &lane->matrixKeyCap, count, sizeof(int64_t), 0, stream))
+		return 0;
+	{
+		void	   *args[] = {(void *) &shard->keys, &lane->matrixRows, &lane->matrixKeys, &count, &rows};
+
+		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->gatherKeys, (count + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   args, NULL) == CUDA_SUCCESS &&
+			cudaMemcpyAsync(hostKeys, lane->matrixKeys, (size_t) count * sizeof(int64_t), cudaMemcpyDeviceToHost,
+							stream) == cudaSuccess;
 	}
 }
 
@@ -4051,6 +4094,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 	uint64_t	start[ANN_INDEX_MAX_SHARDS + 1];
 	uint32_t	selected[ANN_INDEX_MAX_SHARDS];
 	int			gpu[ANN_INDEX_MAX_SHARDS];
+	int			keyed[ANN_INDEX_MAX_SHARDS] = {0};
 	const uint64_t *ordinals = jobs[0]->ordinals;
 	AnnCuvsShard *shards = state->shards + (size_t) laneCopy * state->nshards;
 	AnnIndexHit *lists;
@@ -4137,6 +4181,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 
 			selected[s] = 0;
 			gpu[s] = 0;
+			keyed[s] = 0;
 			if (n == 0)
 				continue;
 			lane = LaneDevice(shard->device, (size_t) q * dims * sizeof(float), 1, 1);
@@ -4211,6 +4256,10 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 					ok = 0;
 					break;
 				}
+				keyed[s] = GrowPinned((void **) &lane->matrixHostKeys, &lane->matrixHostKeyCap,
+									  (size_t) state->nshards * limit * capacity, sizeof(int64_t), 0) &&
+					GatherKeys(shard, file->shards[s].rows, lane, shard->device, stream, q * outk,
+							   lane->matrixHostKeys + hostOffset);
 				selected[s] = outk;
 				gpu[s] = 1;
 				reranked += (uint64_t) q * candidates;
@@ -4243,6 +4292,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				AnnCuvsDevice *lane = &laneDevices[shards[s].device];
 				const int64_t *positions = lane->matrixHostRows + (size_t) s * limit * capacity + (size_t) j * selected[s];
 				const float *distances = lane->matrixHostValues + (size_t) s * limit * capacity + (size_t) j * selected[s];
+				const int64_t *gathered = keyed[s] ?
+					lane->matrixHostKeys + (size_t) s * limit * capacity + (size_t) j * selected[s] : NULL;
 				uint32_t	n = (uint32_t) (start[s + 1] - start[s]);
 				int			ordered = 1;
 
@@ -4286,7 +4337,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 					row = gpu[s] ? file->shards[s].first + (uint64_t) pos : ordinals[start[s] + (uint64_t) pos];
 					if (IsExcluded(job, row))
 						continue;
-					hit.key = file->keys[row];
+					hit.key = gathered && gathered[i] >= 0 ? gathered[i] : file->keys[row];
 					hit.ordinal = row;
 					hit.distance = gpu[s] ? distances[i] : ExactDistance(file, row, job->query);
 					if (gpu[s] && isnan(hit.distance))
