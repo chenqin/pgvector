@@ -2128,11 +2128,11 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	 */
 	if (bitmap)
 		job->index.nfilter = (uint32_t) (bitmap->count < UINT32_MAX ? bitmap->count : UINT32_MAX - 1);
-	if (bitmap && bitmap->keys)
-	{
-		job->index.filter = bitmap->keys;
+	/* Predicate results keep ordinals only; pushed bitmaps keys as well. */
+	if (bitmap && bitmap->ordinals)
 		job->index.ordinals = bitmap->ordinals;
-	}
+	if (bitmap && bitmap->keys)
+		job->index.filter = bitmap->keys;
 	if (bitmap && file->nshards && bitmap->words)
 	{
 		job->index.bitsets = bitmap->bitsets;
@@ -2141,7 +2141,7 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	}
 	if (bitmap && file->nshards)
 		job->index.deviceRows = __atomic_load_n(&bitmap->deviceRows, __ATOMIC_ACQUIRE);
-	if (bitmap && job->index.filter == NULL && job->index.bitsets == NULL)
+	if (bitmap && job->index.filter == NULL && job->index.ordinals == NULL && job->index.bitsets == NULL)
 	{
 		/* Neither form usable: the worker's limits changed under the entry. */
 		free(job->index.results);

@@ -233,7 +233,8 @@ class PredicateCacheTests(unittest.TestCase):
             sparse = [3, 7, 11]   # 120 rows, under ROWS / 64
             self.evaluate(1, sparse)
             added = self.stats()['predicate_bytes'] - before
-            self.assertEqual(added, len(self.rows(sparse)) * 16)
+            # Ordinals only (8 bytes a row): predicate results keep no host keys.
+            self.assertEqual(added, len(self.rows(sparse)) * 8)
             self.assertLess(added, bitmap)
             rng = random.Random(9)
             for i in range(5):

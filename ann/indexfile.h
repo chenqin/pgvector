@@ -120,8 +120,9 @@ typedef struct AnnIndexBitmap
 								 * ordinals are the only form kept */
 	uint32_t   *bitsets[ANN_INDEX_MAX_SHARDS];
 	uint32_t   *owned[ANN_INDEX_MAX_SHARDS];
-	int64_t    *keys;			/* NULL for filters only the graph route takes */
-	uint64_t   *ordinals;
+	int64_t    *keys;			/* pushed bitmaps only, with ordinals */
+	uint64_t   *ordinals;		/* sorted; NULL for filters only the graph
+								 * route takes */
 	void	  **device;			/* backend copies of the bitsets, or NULL */
 	void	  **deviceRows;		/* backend copies of each shard's rows, or
 								 * NULL */

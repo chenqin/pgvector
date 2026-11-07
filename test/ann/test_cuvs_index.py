@@ -591,7 +591,9 @@ class CuvsIndexTests(unittest.TestCase):
         query = json.loads(self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1'))
         results = {}
         for enabled in ('off', 'on'):
+            # Canonical forms would merge the two empty programs into one entry.
             server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '500', '--gpu-predicates', enabled,
+                            '--canonical-predicates', 'off',
                             executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
             name = f'{self.table}_gpu_predicates_{enabled}'
             try:

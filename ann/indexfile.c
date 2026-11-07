@@ -919,8 +919,10 @@ BitmapBytes(const AnnIndexFile *file, const AnnIndexBitmap *bitmap)
 	for (uint32_t s = 0; s < ANN_INDEX_MAX_SHARDS; s++)
 		if (bitmap->owned[s])
 			bytes += ((size_t) file->shards[s].rows + 31) / 32 * 4;
+	if (bitmap->ordinals)
+		bytes += bitmap->count * 8;
 	if (bitmap->keys)
-		bytes += bitmap->count * 16;
+		bytes += bitmap->count * 8;
 	return bytes;
 }
 
@@ -1014,23 +1016,26 @@ BuildBitmap(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, si
 	}
 	if (bitmap->count <= expandLimit)
 	{
+		/*
+		 * Every route takes a result's rows as ordinals; only pushed bitmaps
+		 * keep keys as well. Reading file->keys for each row of a new result
+		 * was the worker's costliest line under never-repeating predicates.
+		 */
+		int			withKeys = kind == ANN_BITMAP_PUSHED;
 		uint64_t	i = 0;
 
-		bitmap->keys = malloc(sizeof(int64_t) * (bitmap->count ? bitmap->count : 1));
+		bitmap->keys = withKeys ? malloc(sizeof(int64_t) * (bitmap->count ? bitmap->count : 1)) : NULL;
 		bitmap->ordinals = malloc(sizeof(uint64_t) * (bitmap->count ? bitmap->count : 1));
-		if (bitmap->keys == NULL || bitmap->ordinals == NULL)
+		if ((withKeys && bitmap->keys == NULL) || bitmap->ordinals == NULL)
 		{
 			FreeBitmap(file, bitmap);
 			return ANN_NOMEM;
 		}
 		for (size_t w = 0; w < nwords; w++)
 			for (uint32_t bits = bitmap->words[w]; bits; bits &= bits - 1)
-			{
-				uint64_t	ordinal = (uint64_t) w * 32 + (uint64_t) __builtin_ctz(bits);
-
-				bitmap->ordinals[i] = ordinal;
-				bitmap->keys[i++] = file->keys[ordinal];
-			}
+				bitmap->ordinals[i++] = (uint64_t) w * 32 + (uint64_t) __builtin_ctz(bits);
+		for (uint64_t j = 0; withKeys && j < bitmap->count; j++)
+			bitmap->keys[j] = file->keys[bitmap->ordinals[j]];
 	}
 
 	/*

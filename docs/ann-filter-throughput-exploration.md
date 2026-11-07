@@ -272,6 +272,29 @@ G3a validation note: `matrix_prune_fallbacks` cannot detect the 4M disablement. 
 - **G4b: fused FP16 exact route for ≤16,384-row segments.** Lists under `ANN_PRUNE_MIN_ROWS` = 65536 already skip pruning (`cuvs.c:2527, 3755`), so the kernel chain it replaces does not run there. `s-0.1pct-gather-b32` already reaches 949.5k, PostgreSQL-bound at GPU 66.6%, which is the outcome the proposal predicts. The benchmark table has 1,000 tenants, not 10,000 (`docs/ann-frozen-index.md:290`). Sparse entries are about 160 KB, not 17 MB.
 - **G4c: host exact route for tiny tenant x category conjunctions.** The exact route already exists for ≤`exact_limit` filters (`cuvs.c:3315-3317, 5101-5109`), with no device rows (`cuvs.c:1276`). Host evaluation already intersects sorted lists (`filter.c:408`). A transient mode exists (`AnnIndexBitmapTransient`, `indexfile.c:1068`). Tiny entries do not trigger the eviction qsort (`indexfile.c:1415-1416`). The simpler fixes are to return short lists without filling the 1.25 MB words and to raise `ANN_INDEX_BITMAP_BUCKETS` (`indexfile.h:152`). 0 on the benchmark.
 
+## Results so far
+
+**P01 falsifier (experiment 1): passed.** A throwaway build dropped the `tenant` operand from the canonical AND, so `distinct10` was served from its category window alone (wrong answers by design; the recall check uses `mixed10` predicates and cannot see the difference). Same settings as the final configuration with `--gpu-predicates on`, 30 s:
+
+| Run | Arrays, vectors/s | SQL, QPS | PostgreSQL cores | Worker cores | GPU busy |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `distinct10` (`hit-distinct10-all`) | 156.2k | 4.55k | 39.4 | 91.4 | 39% |
+| `distinct10`, residual ignored (`p01f3-*`) | 769.9k | 105.3k | 107.0 | 48.2 | 78% |
+| `mixed10`, same build (`p01f3-mixed10-arrays`) | 773.8k | — | 105.5 | 48.0 | 78% |
+
+So the ceiling P01 targets is real, and PostgreSQL's 16 ms per call on `distinct10` is not caused by the predicate: with the worker doing cached work it returns to 8.9 ms per call. The real P01 still pays for the residual mask, and through single-vector SQL each query carries its own residual, so batches would not group the way they do here (1.52 queries per batch). A first attempt that split the AND on the raw program kept only `category >= a` for right-nested programs and sent most searches to the graph route (`p01f2-*`, 220k); splitting after canonicalisation fixed that.
+
+**P07 built: predicate entries keep ordinals only.** `BuildBitmap` no longer reads `file->keys` for each row of a new predicate result (pushed bitmaps still keep keys), `SearchGather` splits, stages and maps results from ordinals, and the route gates accept ordinals as known rows. Same settings, 30 s:
+
+| Workload | Before | After (`p07-*`) | Change |
+| --- | ---: | ---: | ---: |
+| `distinct10` arrays | 156.2k vectors/s | 237.6k | +52% |
+| `distinct10` SQL | 4.55k QPS | 6.18k | +36% |
+| `mix10` arrays | 248.8k | 435.3k | +75% |
+| `10pct` arrays (cached) | 775.6k | 776.8k | 0% |
+
+Recall 0.9998 mean, 0.994-0.996 lowest. The gain is at the top of the reviewed range (1.1-1.4x on `distinct10`) and larger on `mix10`, whose repeating half now evicts less: an entry is 9.25 MB instead of 17.25 MB. The worker is still CPU-bound on `distinct10` (110-136 cores).
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.

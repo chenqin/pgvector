@@ -2856,7 +2856,12 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	copy = laneCopy;
 	shards = state->shards + (size_t) copy * state->nshards;
 
-	/* Split the keys at each shard's first key. */
+	/*
+	 * Split the rows at each shard's first ordinal, or the keys at its first
+	 * key. Predicate results carry ordinals only (no host key array).
+	 */
+	if (keys == NULL && job->ordinals == NULL)
+		return 0;
 	start[0] = 0;
 	start[state->nshards] = job->nfilter;
 	for (uint32_t s = 1; s < state->nshards; s++)
@@ -2869,7 +2874,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		{
 			uint64_t	middle = low + (high - low) / 2;
 
-			if (keys[middle] < boundary)
+			if (job->ordinals ? job->ordinals[middle] < file->shards[s].first : keys[middle] < boundary)
 				low = middle + 1;
 			else
 				high = middle;
@@ -3009,11 +3014,28 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			}
 			continue;
 		}
-		memcpy(lane->hostKeys + keySlot[s], keys + start[s], eligible[s] * sizeof(int64_t));
-		if (cudaMemcpyAsync(wantedKeys, lane->hostKeys + keySlot[s], eligible[s] * sizeof(int64_t),
-							cudaMemcpyHostToDevice, stream) != cudaSuccess ||
-			cuLaunchKernel(module->lookup, lookupBlocks, 1, 1, ANN_GATHER_BLOCK, 1, 1, 0,
-						   (CUstream) stream, lookup, NULL) != CUDA_SUCCESS ||
+		if (job->ordinals)
+		{
+			/* Known ordinals are shard rows already: no key lookup. */
+			uint32_t   *staged = (uint32_t *) (void *) (lane->hostKeys + keySlot[s]);
+			uint64_t	first = file->shards[s].first;
+
+			for (uint64_t i = 0; i < eligible[s]; i++)
+				staged[i] = (uint32_t) (job->ordinals[start[s] + i] - first);
+			if (cudaMemcpyAsync(rows, staged, eligible[s] * sizeof(uint32_t), cudaMemcpyHostToDevice,
+								stream) != cudaSuccess)
+				ok = 0;
+		}
+		else
+		{
+			memcpy(lane->hostKeys + keySlot[s], keys + start[s], eligible[s] * sizeof(int64_t));
+			if (cudaMemcpyAsync(wantedKeys, lane->hostKeys + keySlot[s], eligible[s] * sizeof(int64_t),
+								cudaMemcpyHostToDevice, stream) != cudaSuccess ||
+				cuLaunchKernel(module->lookup, lookupBlocks, 1, 1, ANN_GATHER_BLOCK, 1, 1, 0,
+							   (CUstream) stream, lookup, NULL) != CUDA_SUCCESS)
+				ok = 0;
+		}
+		if (!ok ||
 			(state->quantized ?
 			 !AnnBlackwellScore(&shard->quant, shard->device, rows, count, queries, dimensions, out, stream) :
 			 cuLaunchKernel(state->fp16 ? module->f16 : module->f32, gatherBlocks, 1, 1,
@@ -3077,8 +3099,11 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			}
 			part.results = hits;
 			part.k = k;
-			AnnIndexExact(file, &part, ordinals,
-						  AnnIndexOrdinals(file, keys + start[s], (uint32_t) eligible[s], ordinals));
+			if (job->ordinals)
+				AnnIndexExact(file, &part, job->ordinals + start[s], eligible[s]);
+			else
+				AnnIndexExact(file, &part, ordinals,
+							  AnnIndexOrdinals(file, keys + start[s], (uint32_t) eligible[s], ordinals));
 			counts[s] = part.nresults;
 			free(ordinals);
 			continue;
@@ -3100,15 +3125,17 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 
 			if (found[i] < 0 || (uint64_t) found[i] >= eligible[s])
 				continue;
-			key = keys[start[s] + (uint64_t) found[i]];
 			if (job->ordinals)
 			{
-				/* Cached filters already pair each key with its ordinal. */
+				/* Cached filters carry ordinals: the key is the index's. */
 				low = job->ordinals[start[s] + (uint64_t) found[i]];
 				if (low < first || low >= high)
 					continue;
+				key = file->keys[low];
 			}
 			else
+			{
+				key = keys[start[s] + (uint64_t) found[i]];
 				while (low < high)
 				{
 					uint64_t	middle = low + (high - low) / 2;
@@ -3118,6 +3145,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 					else
 						high = middle;
 				}
+			}
 			if (low == first + file->shards[s].rows || file->keys[low] != key)
 				continue;
 			hits[counts[s]].key = key;
@@ -3228,7 +3256,7 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	 * A broad filter with prebuilt bitsets runs filtered CAGRA on every
 	 * shard, with no per-row work here, whether or not its rows are known.
 	 */
-	scan = job->filter != NULL && ScanPreferred(state, k, job->nfilter);
+	scan = (job->filter != NULL || job->ordinals != NULL) && ScanPreferred(state, k, job->nfilter);
 	if (state->scanOnly)
 	{
 		if (job->filter == NULL && job->ordinals == NULL)
@@ -5053,7 +5081,7 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 	if (n > AnnIndexConfig.exact_limit && SearchGatherGroupLarge(file, state, jobs, m))
 		return;
 	if (m > 1 && jobs[0]->bitsets != NULL && n > AnnIndexConfig.bitset_gather_limit && !state->scanOnly &&
-		!(jobs[0]->filter != NULL && ScanPreferred(state, jobs[0]->k, n)))
+		!((jobs[0]->filter != NULL || jobs[0]->ordinals != NULL) && ScanPreferred(state, jobs[0]->k, n)))
 	{
 		SearchFilteredGroupGraph(file, state, jobs, m);
 		return;
