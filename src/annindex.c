@@ -1723,6 +1723,45 @@ TombstoneTable(FunctionCallInfo fcinfo)
 	return psprintf("%s.ann_frozen_tombstone", quote_identifier(schema));
 }
 
+/*
+ * A one-dimensional bigint[] or real[] of n values, written in place: no
+ * per-element pass through construct_array's generic copy (at 64 vectors
+ * by 500 hits a call, that copy and its zeroed allocation were about a
+ * fifth of the backend's CPU outside waits).
+ */
+static ArrayType *
+PackArray(const Datum *values, int n, Oid type)
+{
+	int			width = type == INT8OID ? sizeof(int64) : sizeof(float4);
+	Size		bytes = ARR_OVERHEAD_NONULLS(1) + (Size) n * width;
+	ArrayType  *array;
+
+	if (n == 0)
+		return construct_empty_array(type);
+	array = (ArrayType *) palloc(bytes);
+	SET_VARSIZE(array, bytes);
+	array->ndim = 1;
+	array->dataoffset = 0;
+	array->elemtype = type;
+	ARR_DIMS(array)[0] = n;
+	ARR_LBOUND(array)[0] = 1;
+	if (type == INT8OID)
+	{
+		int64	   *out = (int64 *) ARR_DATA_PTR(array);
+
+		for (int i = 0; i < n; i++)
+			out[i] = DatumGetInt64(values[i]);
+	}
+	else
+	{
+		float4	   *out = (float4 *) ARR_DATA_PTR(array);
+
+		for (int i = 0; i < n; i++)
+			out[i] = DatumGetFloat4(values[i]);
+	}
+	return array;
+}
+
 /* One result row per query: (query_no, ids bigint[], distances real[]). */
 static void
 StoreQueryArrays(Tuplestorestate *store, TupleDesc tupdesc, int q, Datum *ids, Datum *distances, int n)
@@ -1731,8 +1770,8 @@ StoreQueryArrays(Tuplestorestate *store, TupleDesc tupdesc, int q, Datum *ids, D
 	bool		nulls[3] = {false, false, false};
 
 	row[0] = Int32GetDatum(q + 1);
-	row[1] = PointerGetDatum(construct_array(ids, n, INT8OID, sizeof(int64), FLOAT8PASSBYVAL, TYPALIGN_DOUBLE));
-	row[2] = PointerGetDatum(construct_array(distances, n, FLOAT4OID, sizeof(float4), true, TYPALIGN_INT));
+	row[1] = PointerGetDatum(PackArray(ids, n, INT8OID));
+	row[2] = PointerGetDatum(PackArray(distances, n, FLOAT4OID));
 	tuplestore_putvalues(store, tupdesc, row, nulls);
 }
 
@@ -1884,7 +1923,11 @@ FrozenSearchBatch(FunctionCallInfo fcinfo, bool arrays)
 	appendBinaryStringInfo(&payload, name, strlen(name));
 	Put32(&payload, dimensions);
 	Put32(&payload, k);
-	Put32(&payload, ANN_PREDICATE_ORDINALS | ANN_PREDICATE_SNAPSHOT);
+	/*
+	 * An immutable table needs no TIDs, so the worker returns keys: no read
+	 * of the index's key array per hit here.
+	 */
+	Put32(&payload, (immutable ? 0 : ANN_PREDICATE_ORDINALS) | ANN_PREDICATE_SNAPSHOT);
 	Put32(&payload, program.len);
 	Put32(&payload, nqueries);
 	appendBinaryStringInfo(&payload, program.data, program.len);
@@ -1955,9 +1998,14 @@ FrozenSearchBatch(FunctionCallInfo fcinfo, bool arrays)
 			memcpy(&ordinal, reply + offset, 8);
 			memcpy(&distance, reply + offset + 8, 4);
 			offset += 12;
-			if (ordinal >= meta->rows)
-				elog(ERROR, "ann worker returned an invalid batch ordinal");
-			AnnArrayRead(&keys, ordinal, &key);
+			if (immutable)
+				key = (int64) ordinal;	/* requested as keys */
+			else
+			{
+				if (ordinal >= meta->rows)
+					elog(ERROR, "ann worker returned an invalid batch ordinal");
+				AnnArrayRead(&keys, ordinal, &key);
+			}
 			if (ndeleted && bsearch(&key, deleted, ndeleted, sizeof(int64), KeyCompare))
 				continue;
 			if (immutable || (mapped && visible[i]))

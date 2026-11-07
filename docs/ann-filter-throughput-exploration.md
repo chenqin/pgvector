@@ -379,6 +379,15 @@ Recall unchanged. GPU busy rose to 91.4% and PostgreSQL to 138 cores at the cach
 
 Recall unchanged. At the cached point PostgreSQL is at 146.5 cores, the worker at 32.8 and the GPUs at 90%.
 
+**PostgreSQL per-result work (P02 and in-place arrays).** With the worker at 33 cores, PostgreSQL became the largest consumer at the cached point (146.5 cores at 929.9k). Backend stack samples at that point (gdb, 120 samples) spent 61% waiting for the worker and, of the rest, about 12% writing the id arrays as text, 9% reading each hit's key from the index's mapped key array (`AnnArrayReadRange`), 8% building the result arrays (`palloc0`, `construct_md_array`) and 4% parsing the `vector[]` argument. Two changes in `ann_frozen_search_batch_arrays` and `ann_frozen_search_batch`: under `ann.frozen_immutable` the request asks the worker for keys instead of ordinals (no TIDs are needed, and the worker reads keys on the GPU), and the result arrays are written in place instead of through `construct_array`:
+
+| Workload | `ft-*` | `pk-*` | PostgreSQL cores |
+| --- | ---: | ---: | --- |
+| `10pct` arrays (cached) | 929.9k vectors/s | 973.5k (+4.7%) | 146.5 -> 82.5 |
+| `distinct10` arrays | 712.8k | 765.2k (+7.4%) | 124.8 -> 84.6 |
+
+Recall unchanged. The GPUs are now 92% busy at the cached point, with PostgreSQL at 82.5 cores and the worker at 26.6.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
