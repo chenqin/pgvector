@@ -1094,6 +1094,49 @@ AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32
 }
 
 int
+AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_t *rows, unsigned n,
+					   const float *queries, unsigned nq, int dims, const float *bounds, float *candD,
+					   uint32_t *candR, uint32_t *counts, unsigned cap, void *stream)
+{
+	BlackwellModule *module = &modules[device];
+	unsigned	rowBytes = shard->rowBytes;
+	unsigned	blocks = shard->blocks;
+	int			count = (int) nq;
+	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
+	unsigned	shared = (16u << width) * (((unsigned) dims + 15) & ~15u) * sizeof(uint16_t);
+	unsigned	grid = (n + 127) / 128;
+	void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+		&rowBytes, &blocks, (void *) &rows, &n, (void *) &queries, &count, &dims, (void *) &bounds, &candD,
+	&candR, &counts, &cap};
+
+	if (n == 0 || nq == 0 || nq > (unsigned) AnnBlackwellGroupLimit(dims) ||
+		shard->quant == ANN_QUANT_NONE || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
+		module->fuse[shard->quant - 1][width] == NULL || cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
+		return 0;
+	if (grid > (unsigned) module->sms * 4)
+		grid = (unsigned) module->sms * 4;
+	if (shard->quant == ANN_QUANT_FP8)
+		blocks = rowBytes / 16;
+	else if (shard->quant >= ANN_BLACKWELL_HALF)
+		blocks = ((unsigned) dims + 15) / 16;
+	return cuLaunchKernel(module->fuse[shard->quant - 1][width], grid, 1, 1,
+						  ANN_BLACKWELL_BLOCK, 1, 1, shared, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
+}
+
+int
+AnnBlackwellStrideRows(int device, const uint32_t *rows, unsigned n, unsigned s, uint32_t *out, void *stream)
+{
+	BlackwellModule *module = &modules[device];
+	void	   *args[] = {(void *) &rows, &n, &s, &out};
+
+	if (atomic_load_explicit(&module->state, memory_order_acquire) <= 0 || s == 0 ||
+		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
+		return 0;
+	return cuLaunchKernel(module->strideRows, (s + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream, args,
+						  NULL) == CUDA_SUCCESS;
+}
+
+int
 AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, const uint32_t *rows, unsigned n,
 				   const float *queries, unsigned nq, int dims, void *stream)
 {

@@ -457,12 +457,13 @@ Batch latency covers all 64 vectors of a call. Latency was not optimized.
 
 As of 2026-11-07, at the cached 1,042.6k point:
 
-* **The GPUs are the limit**: 93% busy. Timed with one lane per GPU
-  (`ANN_KERNEL_TIMING=1`), a 64-query batch over 1M rows spends 318 µs scoring in
-  NVFP4 and 243 µs in the pruned selection (37 µs cutoff, 158 µs compacting the
-  scores under it, 39 µs radix select), then 20 µs reranking and 22.5 µs in the final
-  top-k. The compaction reads the 256 MB score matrix at about 1.6 TB/s; fusing the
-  cutoff test into the scoring kernel would avoid writing and reading it.
+* **The host is the limit again**, not the GPUs. After the radix select
+  (493ce12) a 64-query batch over 1M rows spent 318 µs scoring in NVFP4 and 243 µs
+  in the pruned selection, timed with one lane per GPU (`ANN_KERNEL_TIMING=1`). The
+  fused selection then removed the score matrix (sample, cutoff and a fused scan
+  keeping only rows under the cutoff: 564 → 441 µs for both stages). With it the
+  GPUs are 77.5% busy at 1,033k vectors/s, while PostgreSQL, the worker and pgbench
+  share the host's 224 logical CPUs.
 * **PostgreSQL** uses about 100 cores and the worker 32. PostgreSQL's remaining work per
   call is mostly text output of the id arrays (about 12% of backend samples) and
   parsing the text `vector[]` argument (about 4%); a client reading binary results

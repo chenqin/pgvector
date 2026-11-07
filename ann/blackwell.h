@@ -79,6 +79,21 @@ int			AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const 
 									float *out, void *stream);
 
 /*
+ * Score the listed rows for nq queries as AnnBlackwellScoreMatrix does, but
+ * keep only distances at or under each query's bound (bounds[q * 32 + 31]):
+ * they are appended, with their positions in rows, to candD and candR
+ * (cap per query, counts[q] counting every kept row, also past the cap;
+ * the caller zeroes counts). No score matrix is written.
+ */
+int			AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
+								   unsigned n, const float *queries, unsigned nq, int dims, const float *bounds,
+								   float *candD, uint32_t *candR, uint32_t *counts, unsigned cap, void *stream);
+
+/* rows[c * n / s] for c < s into out (a spread sample of a row list). */
+int			AnnBlackwellStrideRows(int device, const uint32_t *rows, unsigned n, unsigned s, uint32_t *out,
+								   void *stream);
+
+/*
  * Large-k candidates for nq queries over the listed rows: a sample of the
  * rows bounds about four times `wanted` candidates per query, which the
  * tensor-core scan keeps (up to the returned capacity per query, counting

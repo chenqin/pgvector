@@ -871,6 +871,17 @@ typedef struct AnnCuvsDevice
 	uint32_t   *expandBlocks;
 	size_t		expandWordCap,
 				expandBlockCap;
+	/* fused pruned selection: sampled rows, cutoffs, u32 candidates and counts */
+	uint32_t   *fuseSampleRows;
+	float	   *fuseBounds;
+	uint32_t   *fusePositions;
+	uint32_t   *fuseCounts;
+	uint32_t   *hostFuseCounts;	/* pinned */
+	size_t		fuseSampleRowCap,
+				fuseBoundCap,
+				fusePositionCap,
+				fuseCountCap,
+				hostFuseCountCap;
 	/* --residual-masks: (query, shard row) pairs to mask, and their staging */
 	uint32_t   *maskPairs;
 	uint32_t   *hostMaskPairs;	/* pinned */
@@ -2918,6 +2929,69 @@ static const char SelectSource[] =
 "    }\n"
 "}\n";
 
+/*
+ * The fused pruned selection's own steps: each query's cutoff laid out as
+ * AnnBlackwellScoreBelow reads it, and matrix_prune_select over its u32
+ * candidate lists.
+ */
+static const char FusedSelectSource[] =
+"extern \"C\" __global__ void cutoff32(const float *bounds, unsigned rank, unsigned q, float *out)\n"
+"{\n"
+"  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (i < q) out[i * 32 + 31] = bounds[(unsigned long long) i * rank + rank - 1];\n"
+"}\n"
+"extern \"C\" __global__ void matrix_prune_select32(const float *d, const unsigned *r,\n"
+"    const unsigned *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  __shared__ unsigned hist[256];\n"
+"  __shared__ unsigned prefix, mask, want, below, ties;\n"
+"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
+"  const float *v = d + (unsigned long long) row * cap;\n"
+"  const unsigned *p = r + (unsigned long long) row * cap;\n"
+"  float *od = outD + (unsigned long long) row * k;\n"
+"  long long *orow = outR + (unsigned long long) row * k;\n"
+"  if (n <= k)\n"
+"  {\n"
+"    for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
+"    {\n"
+"      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
+"      orow[i] = i < n ? (long long) p[i] : -1;\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  if (threadIdx.x == 0) { prefix = 0; mask = 0; want = k; below = 0; ties = 0; }\n"
+"  for (int shift = 24; shift >= 0; shift -= 8)\n"
+"  {\n"
+"    for (unsigned b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;\n"
+"    __syncthreads();\n"
+"    for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
+"    {\n"
+"      unsigned u = select_key(v[i]);\n"
+"      if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255u], 1u);\n"
+"    }\n"
+"    __syncthreads();\n"
+"    if (threadIdx.x == 0)\n"
+"    {\n"
+"      unsigned cum = 0, b = 0;\n"
+"      while (cum + hist[b] < want) { cum += hist[b]; b++; }\n"
+"      prefix |= b << shift; mask |= 255u << shift; want -= cum;\n"
+"    }\n"
+"    __syncthreads();\n"
+"  }\n"
+"  for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
+"  {\n"
+"    unsigned u = select_key(v[i]);\n"
+"    if (u < prefix) { unsigned s = atomicAdd(&below, 1u); od[s] = v[i]; orow[s] = (long long) p[i]; }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
+"    if (select_key(v[i]) == prefix)\n"
+"    {\n"
+"      unsigned t = atomicAdd(&ties, 1u);\n"
+"      if (t < want) { unsigned s = k - want + t; od[s] = v[i]; orow[s] = (long long) p[i]; }\n"
+"    }\n"
+"}\n";
+
 /* Mixed-filter groups (SearchGatherMixed): the same per query's own list. */
 static const char SegmentSource[] =
 "/* Mixed-filter groups: query q's scores are scores[offsets[q] .. offsets[q + 1]). */\n"
@@ -3042,6 +3116,8 @@ typedef struct GatherModule
 	CUfunction	finalTopk;
 	CUfunction	pruneCompact4;
 	CUfunction	pruneSelect;
+	CUfunction	pruneSelect32;
+	CUfunction	cutoff32;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
 } GatherModule;
@@ -3075,7 +3151,7 @@ GatherKernels(int device)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
 	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + strlen(PruneAutoSource) +
-					strlen(FinalSource) + strlen(SelectSource) + strlen(SegmentSource) + 1);
+					strlen(FinalSource) + strlen(SelectSource) + strlen(FusedSelectSource) + strlen(SegmentSource) + 1);
 	if (source == NULL)
 		goto fail;
 	strcpy(source, GatherSource);
@@ -3084,6 +3160,7 @@ GatherKernels(int device)
 	strcat(source, PruneAutoSource);
 	strcat(source, FinalSource);
 	strcat(source, SelectSource);
+	strcat(source, FusedSelectSource);
 	strcat(source, SegmentSource);
 	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
@@ -3102,6 +3179,8 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->finalTopk, module->module, "final_topk") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact4, module->module, "matrix_compact4") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSelect, module->module, "matrix_prune_select") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->pruneSelect32, module->module, "matrix_prune_select32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->cutoff32, module->module, "cutoff32") != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->finalTopk, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
 						   ANN_FINAL_MAX * 12) != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->pruneSortAuto, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
@@ -4377,6 +4456,119 @@ PrunedChecked(AnnCuvsIndex *state, const AnnCuvsDevice *lane, uint32_t q, uint32
 
 static double MonotonicMs(void);
 
+/* The fused pruned selection unless ANN_MATRIX_FUSE=off (for measurements). */
+static int
+FuseMatrixEnabled(void)
+{
+	static int	enabled = -1;
+
+	if (enabled < 0)
+	{
+		const char *value = getenv("ANN_MATRIX_FUSE");
+
+		enabled = !(value && strcmp(value, "off") == 0);
+	}
+	return enabled;
+}
+
+/*
+ * Whether a tile can take the fused pruned selection: the pruned
+ * selection's own bounds, one shard, and no residual masks (they mask a
+ * score matrix the fused scan does not write).
+ */
+static int
+FusedEligible(const AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t q, uint32_t n, uint32_t candidates,
+			  uint32_t dims)
+{
+	uint64_t	rank;
+
+	if (!FuseMatrixEnabled() || !AnnIndexConfig.matrix_prune || state->nshards != 1 || n < PruneMinRows() ||
+		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || dims > ANN_BLACKWELL_FUSE_DIMS)
+		return 0;
+	rank = ((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n;
+	if (rank < ANN_PRUNE_RANK)
+		rank = ANN_PRUNE_RANK;
+	if (rank > ANN_PRUNE_SAMPLE / 4 || (uint64_t) n * rank / ANN_PRUNE_SAMPLE > ANN_PRUNE_CAP / 2)
+		return 0;
+	for (uint32_t j = 0; j < q; j++)
+		if (jobs[j]->nexclude)
+			return 0;
+	return 1;
+}
+
+/*
+ * The pruned selection without a score matrix: score the same spread
+ * sample of rows the matrix path samples, take each query's cutoff from
+ * it, then score every row once more keeping only distances at or under
+ * the cutoff (AnnBlackwellScoreBelow), and radix-select the candidates. The
+ * candidates equal those the matrix path compacts. The counts are checked
+ * after the batch's sync (FusedChecked).
+ */
+static int
+FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane, cudaStream_t stream,
+				  const uint32_t *rows, uint32_t q, uint32_t n, uint32_t candidates, uint32_t dims)
+{
+	GatherModule *module = GatherKernels(shard->device);
+	unsigned	sample = ANN_PRUNE_SAMPLE,
+				cap = ANN_PRUNE_CAP,
+				k = candidates,
+				queries = q,
+				rank = (unsigned) (((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n);
+
+	if (rank < ANN_PRUNE_RANK)
+		rank = ANN_PRUNE_RANK;
+	if (module == NULL ||
+		!GrowDevice((void **) &lane->fuseSampleRows, &lane->fuseSampleRowCap, sample, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneSample, &lane->pruneSampleCap, (size_t) q * sample, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneBounds, &lane->pruneBoundCap, (size_t) q * rank, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneBoundRows, &lane->pruneBoundRowCap, (size_t) q * rank, sizeof(int64_t), 0, stream) ||
+		!GrowDevice((void **) &lane->fuseBounds, &lane->fuseBoundCap, (size_t) q * 32, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->pruneScores, &lane->pruneScoreCap, (size_t) q * cap, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->fusePositions, &lane->fusePositionCap, (size_t) q * cap, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->fuseCounts, &lane->fuseCountCap, q, sizeof(uint32_t), 0, stream) ||
+		!GrowPinned((void **) &lane->hostFuseCounts, &lane->hostFuseCountCap, q, sizeof(uint32_t), 0))
+		return 0;
+	{
+		void	   *cutoffArgs[] = {&lane->pruneBounds, &rank, &queries, &lane->fuseBounds};
+		void	   *selectArgs[] = {&lane->pruneScores, &lane->fusePositions, &lane->fuseCounts, &cap, &k,
+		&lane->matrixCandidates, &lane->matrixIndices};
+
+		if (!AnnBlackwellStrideRows(shard->device, rows, n, sample, lane->fuseSampleRows, stream) ||
+			!AnnBlackwellScoreMatrix(&shard->quant, shard->device, lane->fuseSampleRows, sample, lane->queries, q,
+									 (int) dims, lane->pruneSample, stream) ||
+			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
+						   q, sample, rank, 1, NULL) != CUVS_SUCCESS ||
+			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->cutoff32, (q + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   cutoffArgs, NULL) != CUDA_SUCCESS ||
+			cudaMemsetAsync(lane->fuseCounts, 0, (size_t) q * sizeof(uint32_t), stream) != cudaSuccess ||
+			!AnnBlackwellScoreBelow(&shard->quant, shard->device, rows, n, lane->queries, q, (int) dims,
+									lane->fuseBounds, lane->pruneScores, lane->fusePositions, lane->fuseCounts,
+									cap, stream) ||
+			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->pruneSelect32, q, 1, 1, 1024, 1, 1, 0, (CUstream) stream, selectArgs,
+						   NULL) != CUDA_SUCCESS ||
+			cudaMemcpyAsync(lane->hostFuseCounts, lane->fuseCounts, (size_t) q * sizeof(uint32_t),
+							cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+			return 0;
+	}
+	(void) atomic_fetch_add_explicit(&state->matrix_pruned_queries, q, memory_order_relaxed);
+	return 1;
+}
+
+/* After a fused selection's batch has finished: PrunedChecked for its counts. */
+static int
+FusedChecked(AnnCuvsIndex *state, const AnnCuvsDevice *lane, uint32_t q, uint32_t candidates)
+{
+	for (uint32_t j = 0; j < q; j++)
+		if (lane->hostFuseCounts[j] < candidates || lane->hostFuseCounts[j] > ANN_PRUNE_CAP)
+		{
+			(void) atomic_fetch_add_explicit(&state->matrix_prune_fallbacks, 1, memory_order_relaxed);
+			return 0;
+		}
+	return 1;
+}
+
 /*
  * ANN_KERNEL_TIMING for the matrix gather: six marks on the first shard's
  * stream (before scoring, after scoring, masking, selection, reranking and
@@ -4627,7 +4819,20 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 																			  &peak, bytes, memory_order_relaxed, memory_order_relaxed))
 					;
 			}
-			if (!MatrixMark(lane, s, 0, stream) ||
+			if (FusedEligible(state, jobs + first, q, n, candidates, dims))
+			{
+				/* Timed as scoring: the sample, cutoff, scan and select in one. */
+				if (!MatrixMark(lane, s, 0, stream) ||
+					!FusedPrunedSelect(state, shard, lane, stream, rows, q, n, candidates, dims) ||
+					!MatrixMark(lane, s, 1, stream) || !MatrixMark(lane, s, 2, stream) ||
+					!MatrixMark(lane, s, 3, stream))
+				{
+					ok = 0;
+					break;
+				}
+				pruned[s] = 2;
+			}
+			else if (!MatrixMark(lane, s, 0, stream) ||
 				!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
 										 (int) dims, lane->matrixScores, stream) ||
 				!MatrixMark(lane, s, 1, stream) ||
@@ -4688,10 +4893,14 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 		if (ok)
 			MatrixStagesAdd(&laneDevices[shards[0].device], q);
 		for (uint32_t s = 0; ok && state->nshards == 1 && s < state->nshards; s++)
-			if (pruned[s] && !PrunedChecked(state, &laneDevices[shards[s].device], q,
-											capacity < (uint32_t) (start[s + 1] - start[s]) ?
-											capacity : (uint32_t) (start[s + 1] - start[s])))
+		{
+			uint32_t	got = capacity < (uint32_t) (start[s + 1] - start[s]) ?
+				capacity : (uint32_t) (start[s + 1] - start[s]);
+
+			if (pruned[s] == 2 ? !FusedChecked(state, &laneDevices[shards[s].device], q, got) :
+				pruned[s] && !PrunedChecked(state, &laneDevices[shards[s].device], q, got))
 				ok = 0;
+		}
 		for (uint32_t s = 0; ok && s < state->nshards; s++)
 			for (uint32_t j = 0; selected[s] && j < q; j++)
 			{

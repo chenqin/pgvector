@@ -412,6 +412,16 @@ The selection stage costs as much as scoring 64M rows; its bitonic sort runs one
 
 Recall unchanged, no prune fallbacks. The compaction is still well below memory bandwidth and, with scoring (319 us), is the largest GPU cost left; fusing the cutoff test into the scoring kernel would remove the 256 MB written and read again per batch.
 
+**Fused selection: no score matrix.** For tiles without residual masks on one-shard indexes, the matrix gather now scores the same spread sample of rows the matrix path samples (8,192 rows), takes each query's cutoff from it, then scores every row with the module's fused kernel, which keeps only distances at or under the cutoff (`AnnBlackwellScoreBelow`), and radix-selects them; the candidates equal those the matrix path compacts. `ANN_MATRIX_FUSE=off` restores the matrix. One lane per GPU: scoring plus selection 564 -> 441 us a batch (-22%).
+
+| Workload | `rs-*` | `fu-*` | GPU busy |
+| --- | ---: | ---: | --- |
+| `10pct` arrays (cached) | 1,042.6k vectors/s | 1,033.3k | 93.1% -> 77.5% |
+| `10pct` SQL | 139.4k QPS | 140.5k | 95.4% -> 95.7% |
+| `distinct10` arrays (masked tiles keep the matrix) | 825.0k | 814.9k | 77.5% -> 73.7% |
+
+Recall unchanged, no prune fallbacks. Throughput is flat: at the cached point the GPUs are no longer the limit (77.5% busy) and the host is (PostgreSQL 97-128 cores, the worker 34-44 and pgbench about 9 of 224). The fused path is kept for its GPU headroom; residual-masked tiles could use it once the mask applies to the candidate lists instead of a score matrix.
+
 ## 6. Suggested order
 
 **Harness and test prerequisites.** The first four are needed to read the experiments; items 5-6 gate the P01 and P07 builds.
