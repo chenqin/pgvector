@@ -2779,6 +2779,47 @@ static const char PruneAutoSource[] =
 "  }\n"
 "}\n";
 
+/*
+ * The final top-k after reranking: one block per query sorts its n reranked
+ * candidates (padded to size, a power of two) with their rows in shared
+ * memory and writes the best k, in place of a cuVS select_k launch.
+ */
+static const char FinalSource[] =
+"extern \"C\" __global__ void final_topk(const float *d, const long long *r, unsigned n, unsigned size,\n"
+"    unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  extern __shared__ float key[];\n"
+"  long long *val = (long long *) (key + size);\n"
+"  unsigned row = blockIdx.x;\n"
+"  for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
+"  {\n"
+"    bool live = i < n;\n"
+"    key[i] = live ? d[(unsigned long long) row * n + i] : __int_as_float(0x7f800000);\n"
+"    val[i] = live ? r[(unsigned long long) row * n + i] : -1;\n"
+"  }\n"
+"  __syncthreads();\n"
+"  for (unsigned len = 2; len <= size; len <<= 1)\n"
+"    for (unsigned stride = len >> 1; stride > 0; stride >>= 1)\n"
+"    {\n"
+"      for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
+"      {\n"
+"        unsigned j = i ^ stride;\n"
+"        if (j > i)\n"
+"        {\n"
+"          float a = key[i], b = key[j];\n"
+"          bool up = (i & len) == 0;\n"
+"          if ((a > b) == up) { key[i] = b; key[j] = a; long long t = val[i]; val[i] = val[j]; val[j] = t; }\n"
+"        }\n"
+"      }\n"
+"      __syncthreads();\n"
+"    }\n"
+"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
+"  {\n"
+"    outD[(unsigned long long) row * k + i] = key[i];\n"
+"    outR[(unsigned long long) row * k + i] = val[i];\n"
+"  }\n"
+"}\n";
+
 /* Mixed-filter groups (SearchGatherMixed): the same per query's own list. */
 static const char SegmentSource[] =
 "/* Mixed-filter groups: query q's scores are scores[offsets[q] .. offsets[q + 1]). */\n"
@@ -2809,6 +2850,7 @@ static const char SegmentSource[] =
 "  }\n"
 "}\n";
 
+#define ANN_FINAL_MAX 4096		/* most reranked candidates final_topk sorts */
 #define ANN_PRUNE_SAMPLE 8192	/* sampled scores per query */
 #define ANN_PRUNE_RANK 32		/* the sample's least cutoff rank */
 #define ANN_PRUNE_MARGIN 4		/* expected kept / needed candidates */
@@ -2899,6 +2941,7 @@ typedef struct GatherModule
 	CUfunction	pruneCompact;
 	CUfunction	pruneSort;
 	CUfunction	pruneSortAuto;
+	CUfunction	finalTopk;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
 } GatherModule;
@@ -2932,13 +2975,14 @@ GatherKernels(int device)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
 	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + strlen(PruneAutoSource) +
-					strlen(SegmentSource) + 1);
+					strlen(FinalSource) + strlen(SegmentSource) + 1);
 	if (source == NULL)
 		goto fail;
 	strcpy(source, GatherSource);
 	strcat(source, RerankSource);
 	strcat(source, PruneSource);
 	strcat(source, PruneAutoSource);
+	strcat(source, FinalSource);
 	strcat(source, SegmentSource);
 	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
@@ -2954,6 +2998,9 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneCompact, module->module, "matrix_compact") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSortAuto, module->module, "matrix_prune_sort_auto") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->finalTopk, module->module, "final_topk") != CUDA_SUCCESS ||
+		cuFuncSetAttribute(module->finalTopk, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+						   ANN_FINAL_MAX * 12) != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->pruneSortAuto, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
 						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
@@ -4165,6 +4212,34 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 }
 
 /*
+ * The best outk of each query's reranked candidates (matrixCandidates and
+ * matrixIndices, q rows of candidates) into matrixValues and matrixRows,
+ * sorted: a shared-memory sort for lists up to ANN_FINAL_MAX, else cuVS.
+ */
+static int
+FinalTopk(AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q, uint32_t candidates, uint32_t outk)
+{
+	GatherModule *module;
+	unsigned	size = 2,
+				n = candidates,
+				k = outk;
+
+	while (size < candidates)
+		size <<= 1;
+	if (candidates > ANN_FINAL_MAX || (module = GatherKernels(device)) == NULL)
+		return AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices, lane->matrixValues,
+							  lane->matrixRows, q, candidates, outk, 1, NULL) == CUVS_SUCCESS;
+	{
+		void	   *args[] = {&lane->matrixCandidates, &lane->matrixIndices, &n, &size, &k, &lane->matrixValues,
+		&lane->matrixRows};
+
+		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->finalTopk, q, 1, 1, 1024, 1, 1, size * 12, (CUstream) stream, args, NULL) ==
+			CUDA_SUCCESS;
+	}
+}
+
+/*
  * After a deferred PrunedSelect's batch has finished: whether every query
  * kept at least candidates scores and no more than the cap. A failure means
  * the batch's candidates are short, and it is searched another way.
@@ -4353,8 +4428,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			{
 				if (!RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
 								  candidates, q, lane->queries, lane->matrixCandidates, stream, 1) ||
-					AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices,
-								   lane->matrixValues, lane->matrixRows, q, candidates, outk, 1, NULL) != CUVS_SUCCESS ||
+					!FinalTopk(lane, shard->device, stream, q, candidates, outk) ||
 					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
 									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
 					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,

@@ -367,7 +367,17 @@ Recall unchanged. The worker now uses about a quarter of the host's busy CPU at 
 | `10pct` arrays (cached) | 833.1k vectors/s | 890.7k | +6.9% |
 | `distinct10` arrays | 711.1k | 724.6k | +1.9% |
 
-Recall unchanged. GPU busy rose to 91.4% and PostgreSQL to 138 cores at the cached point. The second half of P04 (an in-module kernel for the final top-k after reranking) remains.
+Recall unchanged. GPU busy rose to 91.4% and PostgreSQL to 138 cores at the cached point.
+
+**P04, second half: the final top-k in shared memory.** After reranking, each query's k plus slack candidates (756 at k=500) went through a cuVS `select_k` launch. One block per query now sorts them, padded to the next power of two, in shared memory (`final_topk`; cuVS still takes lists over 4,096):
+
+| Workload | `ns-*` | `ft-*` | Change |
+| --- | ---: | ---: | ---: |
+| `10pct` arrays (cached) | 890.7k vectors/s | 929.9k | +4.4% |
+| `10pct` SQL | 119.6k QPS | 138.2k | +15.5% |
+| `distinct10` arrays | 724.6k | 712.8k | -1.6% (within run spread; worker-bound) |
+
+Recall unchanged. At the cached point PostgreSQL is at 146.5 cores, the worker at 32.8 and the GPUs at 90%.
 
 ## 6. Suggested order
 
