@@ -301,6 +301,64 @@ class PredicateCacheTests(unittest.TestCase):
         finally:
             self.stop()
 
+    def search_program(self, request, program, allowed, query, k=10):
+        """Operation 22 over any program whose rows are allowed, checked against an exact scan."""
+        _, _, status, payload = self.call(search_predicate_frame(request, 'docs', query, k, program))
+        self.assertEqual(status, 0)
+        count, _, eligible = struct.unpack_from('<IIQ', payload)
+        self.assertEqual(eligible, len(allowed))
+        hits = [struct.unpack_from('<qf', payload, 16 + i * 12)[0] for i in range(count)]
+        self.assertEqual(hits, [key for _, key in exact(self.keys, self.vectors, query, k, set(allowed))])
+
+    def test_canonical_predicates_share_entries(self):
+        def range_program(low, high, negate=False):
+            return struct.pack('<BB', 2, 1) + b'a' + struct.pack('<Bii', 1 if negate else 0, low, high)
+
+        rng = random.Random(3)
+        query = [rng.uniform(-3, 3) for _ in range(DIMENSIONS)]
+        rows = self.rows([3, 4, 5])
+        # One row set, five spellings: one evaluation, four hits.
+        spellings = [values_program('a', [5, 3, 4]), range_program(3, 5), values_program('a', [3, 4, 5, 5, 4]),
+                     range_program(3, 5) + values_program('a', [GROUPS + 7], negate=True) + b'\x05',
+                     values_program('a', [3]) + range_program(4, 5) + b'\x06']
+        for mode, evaluations in [('off', len(spellings)), ('on', 1)]:
+            self.start('--canonical-predicates', mode)
+            try:
+                before = self.stats()
+                for request, program in enumerate(spellings, 2):
+                    self.search_program(request, program, rows, query)
+                after = self.stats()
+                self.assertEqual(after['predicate_evaluations'] - before['predicate_evaluations'], evaluations)
+                self.assertEqual(after['predicate_canonical'] - before['predicate_canonical'],
+                                 len(spellings) if mode == 'on' else 0)
+                # Values the column lacks match nothing; every value is every row.
+                self.search_program(20, values_program('a', [GROUPS + 1, -5]), [], query)
+                self.search_program(21, range_program(0, GROUPS - 1), list(range(ROWS)), query)
+            finally:
+                self.stop()
+
+    def test_second_sighting_admission(self):
+        rng = random.Random(4)
+        query = [rng.uniform(-3, 3) for _ in range(DIMENSIONS)]
+        groups = self.window(0)
+        self.start('--predicate-admission', 'second')
+        try:
+            # First sighting: served, not cached.
+            self.search(2, groups, query)
+            stats = self.stats()
+            self.assertEqual((stats['predicate_transient'], stats['predicate_entries']), (1, 0))
+            # Second: evaluated again and cached; third: a hit.
+            self.search(3, groups, query)
+            stats = self.stats()
+            self.assertEqual((stats['predicate_evaluations'], stats['predicate_entries']), (2, 1))
+            self.search(4, groups, query)
+            self.assertEqual(self.stats()['predicate_hits'], stats['predicate_hits'] + 1)
+            # Precomputed predicates (operation 23) are cached at once.
+            self.evaluate(5, self.window(WINDOW))
+            self.assertEqual(self.stats()['predicate_entries'], 2)
+        finally:
+            self.stop()
+
     def test_entry_cap(self):
         self.start('--predicate-cache', '3')
         try:

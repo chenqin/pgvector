@@ -41,6 +41,10 @@ WORKLOADS = {
     # mixed10's rows under a predicate that never repeats (no tenant is that
     # large): every search misses the worker's predicate cache.
     'fresh10': 'category BETWEEN :a AND :a + 9 AND tenant <> :x',
+    # One real tenant excluded: 91,000 distinct predicates no rewrite folds.
+    'distinct10': 'category BETWEEN :a AND :a + 9 AND tenant <> :w',
+    # Half distinct10, half fresh10 (tenants 1000..1999 do not exist).
+    'mix10': 'category BETWEEN :a AND :a + 9 AND tenant <> :y',
 }
 
 
@@ -243,6 +247,10 @@ def main():
                         'unique1': "format('tenant BETWEEN %s AND %s', :u::integer, :u + 9)",
                         'fresh10': "format('category BETWEEN %s AND %s AND tenant <> %s', :a::integer, :a + 9, "
                                    ":x::integer)",
+                        'distinct10': "format('category BETWEEN %s AND %s AND tenant <> %s', :a::integer, :a + 9, "
+                                      ":w::integer)",
+                        'mix10': "format('category BETWEEN %s AND %s AND tenant <> %s', :a::integer, :a + 9, "
+                                 ":y::integer)",
                     }[workload]
                     query = (f'SELECT id FROM ann_frozen_search_batch({index_name}, :batch::vector[], '
                              f'{args.k}, {predicate})')
@@ -257,7 +265,8 @@ def main():
                                   '\\set t random(0,99)\n\\set c random(0,99)\n\\set d random(0,9)\n'
                                   '\\set e random(0,199)\n\\set f random(0,19)\n\\set g random(0,4)\n'
                                   '\\set h random(0,1)\n\\set a random(0,90)\n\\set u random(0,990)\n'
-                                  '\\set x random(1000000,2000000000)\n'
+                                  '\\set x random(1000000,2000000000)\n\\set w random(0,999)\n'
+                                  '\\set y random(0,1999)\n'
                                   + setup + query + ';\n')
                 env = dict(os.environ, PGAPPNAME=application,
                            PGOPTIONS=(f'-c ann.worker_socket={args.socket} -c ann.enable_frozen_search=on '

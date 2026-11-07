@@ -20,20 +20,26 @@ batching.o: batching.c batching.h backend.h
 cpu.o: cpu.c backend.h indexfile.h
 	$(CC) $(CFLAGS) -c cpu.c -o $@
 
-indexfile.o: indexfile.c indexfile.h backend.h filter.h
+indexfile.o: indexfile.c indexfile.h backend.h filter.h canonical.h
 	$(CC) $(CFLAGS) -pthread -c indexfile.c -o $@
+
+canonical.o: canonical.c canonical.h filter.h
+	$(CC) $(CFLAGS) -c canonical.c -o $@
 
 filter.o: filter.c filter.h
 	$(CC) $(CFLAGS) -c filter.c -o $@
 
-libannbatch.a: batching.o cpu.o indexfile.o filter.o
-	$(AR) rcs $@ batching.o cpu.o indexfile.o filter.o
+libannbatch.a: batching.o cpu.o indexfile.o filter.o canonical.o
+	$(AR) rcs $@ batching.o cpu.o indexfile.o filter.o canonical.o
 
-ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
-	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c -lm -o $@
+ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c canonical.c batching.h backend.h
+	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c canonical.c -lm -o $@
 
 ann-udf-tests: ../test/ann/udf_test.c udf.c udf.h filter.c filter.h
 	$(CC) $(CFLAGS) -I. ../test/ann/udf_test.c udf.c filter.c -lm -o $@
+
+ann-canonical-tests: ../test/ann/canonical_test.c canonical.c canonical.h filter.c filter.h
+	$(CC) $(CFLAGS) -I. ../test/ann/canonical_test.c canonical.c filter.c -lm -o $@
 
 ann-cost-tests: ../test/ann/cost_test.c cost.h
 	$(CC) $(CFLAGS) -I. ../test/ann/cost_test.c -lm -o $@
@@ -41,11 +47,11 @@ ann-cost-tests: ../test/ann/cost_test.c cost.h
 ann-replica-tests: ../test/ann/replica_test.c replica.h
 	$(CC) $(CFLAGS) -pthread -I. ../test/ann/replica_test.c -o $@
 
-ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c batching.h backend.h
-	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c -lm -o $@
+ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c canonical.c batching.h backend.h
+	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c canonical.c -lm -o $@
 
-WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c filter.c udf.c rdma.c
-WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h filter.h udf.h rdma.h cost.h
+WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c filter.c canonical.c udf.c rdma.c
+WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h filter.h canonical.h udf.h rdma.h cost.h
 
 # USE_RDMA=1 enables RDMA search frames over InfiniBand/RoCE verbs
 # (rdma-core); RDMA_PREFIX locates libibverbs if it is not in /usr.
@@ -88,9 +94,10 @@ ann-worker-cuvs: $(WORKER_DEPS) cuvs.c replica.h nvrtc.c nvrtc.h blackwell.c bla
 	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
 	$(CC) $(CFLAGS) -pthread -DANN_USE_CUVS -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) $(WORKER_SRCS) cuvs.c nvrtc.c blackwell.c select_batch.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) $(WORKER_LIBS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lcuda -ldl -lm -o $@
 
-check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests
+check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests ann-canonical-tests
 	./ann-cost-tests
 	./ann-udf-tests
+	./ann-canonical-tests
 	./ann-replica-tests
 	python3 ../test/ann/test_worker.py
 	python3 ../test/ann/test_batching.py
@@ -125,11 +132,11 @@ clean:
 	rm -f ann-worker
 	rm -f ann-replica-tests ann-cost-tests ann-udf-tests
 	rm -rf ann-replica-tests.dSYM ann-cost-tests.dSYM ann-udf-tests.dSYM
-	rm -f batching.o cpu.o indexfile.o filter.o libannbatch.a ann-batch-tests
+	rm -f batching.o cpu.o indexfile.o filter.o canonical.o libannbatch.a ann-batch-tests
 	rm -f ann-batch-bench
 	rm -rf ann-batch-bench.dSYM
 	rm -rf ann-batch-tests.dSYM
-	rm -f ann-worker-cuvs select_batch.o cagra_udf.o cagra-udf-probe
+	rm -f ann-canonical-tests ann-worker-cuvs select_batch.o cagra_udf.o cagra-udf-probe
 	rm -rf ann-worker.dSYM
 	rm -rf ann-worker-cuvs.dSYM
 

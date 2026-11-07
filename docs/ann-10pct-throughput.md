@@ -337,6 +337,44 @@ through arrays, 3.5× through SQL); the 7% gap on cached arrays is within the
 variation of PostgreSQL-bound runs. p99 through arrays reaches 0.4–5.5 s at 448
 clients, so k = 1500 at this concurrency is a throughput setting only.
 
+### Canonical predicates and cache admission
+
+The cache is keyed by the predicate's text, so `fresh10`'s searches missed although
+each selected one of 91 row sets: `tenant <> x` with an `x` no row has matches every
+row. `--canonical-predicates` (default on) rewrites a program before the lookup: on a
+single-valued column every row has exactly one value, so a leaf is a set of the
+column's distinct values; values the column lacks drop out, ranges snap to the
+values they hold, negation and NOT complement the set, AND/OR of leaves on one
+column merge, empty and full sets fold to NONE and ALL, and operands are flattened
+and ordered. `--predicate-admission second` (default `all`) serves a predicate's
+first sighting from a transient result and caches it on its second, so one-off
+predicates do not evict entries that repeat.
+
+Measured with `--gpu-predicates on`, k=500; `distinct10` excludes one real tenant
+per search (91,000 distinct predicates, nothing folds); `mix10` is half `distinct10`
+and half `fresh10`; the 1 GB cache holds about 60 of `mix10`'s 91 hot windows:
+
+| Workload | Cache | Canonical | Admission | Arrays, vectors/s | SQL, QPS | Hit rate |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| `fresh10` | 8 GB | off | all | 143.9k | 4.10k | 0% |
+| `fresh10` | 8 GB | on | all | **773.7k** | **105.5k** | 99.98% |
+| `distinct10` | 8 GB | on | all | 156.2k | 4.55k | 0.7% |
+| `distinct10` | 8 GB | on | second | 126.2k | 3.70k | 0.5% |
+| `mix10` | 8 GB | off | all | 150.4k | 4.42k | 0.3% |
+| `mix10` | 8 GB | on | all | **248.8k** | **7.66k** | 49% |
+| `mix10` | 8 GB | on | second | 219.3k | 6.85k | 50% |
+| `mix10` | 1 GB | on | all | 120.4k | 3.69k | 25% |
+| `mix10` | 1 GB | on | second | **133.1k** | 3.78k | 34% |
+
+Recall 0.9998 mean and 0.996 lowest throughout. Canonical predicates cost nothing
+measurable (`fresh10` reaches the cached `10pct` rate) and cannot help predicates
+that really differ. Second-sighting admission helps only when the hot predicates
+outgrow the cache; with room for them it costs 11–19%, as a repeating predicate is
+evaluated twice before it is kept, so it stays off. A separate fix went in with this
+work: evicted entries that kept only rows on the GPUs never freed them, so under
+predicate churn the GPUs filled and later entries were uploaded per query (1,592
+failed uploads in one 30 s `fresh10` run).
+
 Rate grouping (`udf_grouped` in the UDF benchmark) does not apply to the worker's
 graph route: a filtered CAGRA call there already carries one filter, hence one
 filtering rate.

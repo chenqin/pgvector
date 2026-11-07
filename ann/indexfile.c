@@ -5,6 +5,7 @@
 
 #include "indexfile.h"
 #include "filter.h"
+#include "canonical.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -17,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 0, 1, ANN_ADMIT_ALL};
 int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;
@@ -956,13 +957,16 @@ Account(AnnIndexFile *file, const AnnIndexBitmap *bitmap, int sign)
 	}
 }
 
-AnnStatus
-AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
-				  uint64_t expandLimit, AnnIndexBitmap **result)
+/*
+ * A cache entry's forms built from words, not yet in the cache: rows,
+ * per-shard bitsets, device copies (none for a transient result, which a
+ * single search's lane copies itself).
+ */
+static AnnStatus
+BuildBitmap(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
+			uint64_t expandLimit, int transient, AnnIndexBitmap **out)
 {
 	AnnIndexBitmap *bitmap;
-	AnnIndexBitmap **link;
-	AnnIndexBitmap *old = NULL;
 	size_t		expected = ((size_t) file->rows + 31) / 32;
 
 	if (nwords != expected)
@@ -973,11 +977,8 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 		free(bitmap);
 		return ANN_NOMEM;
 	}
-	if (result)
-		*result = NULL;
 	bitmap->id = id;
 	bitmap->kind = kind;
-	bitmap->references = result ? 2 : 1;	/* the cache's, and the caller's */
 	memcpy(bitmap->words, words, nwords * 4);
 	if (file->rows % 32)
 		bitmap->words[nwords - 1] &= (UINT32_C(1) << (file->rows % 32)) - 1;
@@ -1050,7 +1051,7 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 		bitmap->words = NULL;
 	}
 
-	if (AnnIndexConfig.device_bitmaps && AnnIndexBitmapDevice.upload && file->device)
+	if (AnnIndexConfig.device_bitmaps && AnnIndexBitmapDevice.upload && file->device && !transient)
 	{
 		if (AnnIndexConfig.gpu_predicates && kind != ANN_BITMAP_PUSHED)
 			bitmap->uploadDeferred = 1;
@@ -1059,6 +1060,35 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 	}
 
 	bitmap->hostBytes = BitmapBytes(file, bitmap);
+	*out = bitmap;
+	return ANN_OK;
+}
+
+AnnStatus
+AnnIndexBitmapTransient(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
+						uint64_t expandLimit, AnnIndexBitmap **result)
+{
+	AnnStatus	status = BuildBitmap(file, id, kind, words, nwords, expandLimit, 1, result);
+
+	if (status == ANN_OK)
+		(*result)->references = 1;
+	return status;
+}
+
+AnnStatus
+AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
+				  uint64_t expandLimit, AnnIndexBitmap **result)
+{
+	AnnIndexBitmap *bitmap;
+	AnnIndexBitmap **link;
+	AnnIndexBitmap *old = NULL;
+	AnnStatus	status;
+
+	if (result)
+		*result = NULL;
+	if ((status = BuildBitmap(file, id, kind, words, nwords, expandLimit, 0, &bitmap)) != ANN_OK)
+		return status;
+	bitmap->references = result ? 2 : 1;	/* the cache's, and the caller's */
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	for (link = &file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
 		if ((*link)->id == id && (*link)->kind == kind)
@@ -1312,6 +1342,23 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 		*count -= removed;
 	}
 	return code;
+}
+
+int
+AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,
+				  unsigned char **out, size_t *outSize)
+{
+	AnnFilterSource source;
+
+	memset(&source, 0, sizeof(source));
+	source.arg = file;
+	source.rows = file->rows;
+	source.column = SourceColumn;
+	source.count = SourceCount;
+	source.value = SourceValue;
+	source.start = SourceStart;
+	source.multi = SourceMulti;
+	return AnnFilterCanonical(&source, program, size, out, outSize);
 }
 
 /* The host budget for predicate results: the option, else a quarter of RAM. */

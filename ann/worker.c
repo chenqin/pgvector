@@ -408,6 +408,24 @@ main(int argc, char **argv)
 			free(AnnIndexCostProfile);
 			AnnIndexCostProfile = profile;
 		}
+		else if (strcmp(argv[i], "--canonical-predicates") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--canonical-predicates takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.canonical_predicates = strcmp(value, "on") == 0;
+		}
+		else if (strcmp(argv[i], "--predicate-admission") == 0)
+		{
+			if (strcmp(value, "all") && strcmp(value, "second"))
+			{
+				fprintf(stderr, "--predicate-admission takes all or second\n");
+				return 2;
+			}
+			AnnIndexConfig.predicate_admission = strcmp(value, "second") == 0 ? ANN_ADMIT_SECOND : ANN_ADMIT_ALL;
+		}
 		else if (strcmp(argv[i], "--gpu-predicates") == 0)
 		{
 			if (strcmp(value, "on") && strcmp(value, "off"))
@@ -702,7 +720,8 @@ usage:
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
-			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off] [--quantized-scan on|off] [--quant-slack N]\n"
+			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off]\n"
+			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--quantized-scan on|off] [--quant-slack N]\n"
 			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--scan-routes on|off] [--scan-max-k N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"

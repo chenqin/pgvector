@@ -184,6 +184,8 @@ typedef struct Service
 	uint64_t	predicate_hits; /* operation 22 programs found cached */
 	uint64_t	predicate_evaluations;
 	uint64_t	predicate_eval_us;	/* time spent evaluating them */
+	uint64_t	predicate_canonical;	/* lookups under a rewritten program */
+	uint64_t	predicate_transient;	/* first sightings served uncached */
 	uint32_t	blockedWaiters; /* lanes waiting for a filter to free up */
 	uint32_t	activeLanes;	/* lanes working on cached filters */
 	FilterEntry *filters[ANN_FILTER_BUCKETS];
@@ -1486,7 +1488,7 @@ static AnnStatus SubmitBitmapJob(Service *service, Connection *connection, int r
 								 unsigned char *payload, uint32_t size, AnnIndexFile *file,
 								 AnnIndexBitmap *bitmap, const char *name, uint32_t dimensions,
 								 uint32_t k, size_t offset, uint16_t operation, uint32_t flags);
-static AnnStatus PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program,
+static AnnStatus PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned char *program,
 								 uint32_t size, AnnIndexBitmap **result, int snapshot);
 
 static AnnStatus
@@ -1539,7 +1541,7 @@ SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operati
 			return ANN_STALE;
 		/* Legacy searches must honor the same tombstones as operation 22. */
 		if (__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) > 0)
-			status = PredicateBitmap(service, file, &all, 1, &bitmap, 0);
+			status = PredicateBitmap(service, file, 0, &all, 1, &bitmap, 0);
 		if (status == ANN_OK)
 			status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap,
 									 name, dimensions, k, offset, operation, 0);
@@ -2195,7 +2197,8 @@ MicrosecondsSince(const struct timespec *start)
  * --predicate-cache). Returns a referenced bitmap.
  */
 static AnnStatus PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program,
-								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot);
+								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot,
+								   int transient);
 
 /*
  * Programs being evaluated: a search that misses the cache while another
@@ -2221,15 +2224,51 @@ Evaluating(const AnnIndexFile *file, uint64_t id)
 	return -1;
 }
 
+/*
+ * --predicate-admission second: predicate ids seen recently, one per slot
+ * (a collision only delays an admission). Keyed by index too.
+ */
+#define ANN_SEEN_SLOTS (1U << 17)
+static uint64_t predicateSeen[ANN_SEEN_SLOTS];
+
+static int
+SeenBefore(const AnnIndexFile *file, uint64_t id)
+{
+	uint64_t	key = (id ^ ((uint64_t) (uintptr_t) file * UINT64_C(0x9E3779B97F4A7C15))) | 1;
+	uint64_t   *slot = &predicateSeen[key % ANN_SEEN_SLOTS];
+
+	if (__atomic_load_n(slot, __ATOMIC_RELAXED) == key)
+		return 1;
+	__atomic_store_n(slot, key, __ATOMIC_RELAXED);
+	return 0;
+}
+
+/*
+ * admit: searches follow --predicate-admission; precomputed and internal
+ * programs are always cached. With --canonical-predicates the program is
+ * looked up and evaluated in its canonical form, so equivalent predicates
+ * share one entry.
+ */
 static AnnStatus
-PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
+PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned char *program, uint32_t size,
 				AnnIndexBitmap **result, int snapshot)
 {
-	uint64_t	id = AnnFilterHash(program, size);
+	unsigned char *canonical = NULL;
+	size_t		canonicalSize = 0;
+	uint64_t	id;
 	size_t		nwords = ((size_t) file->rows + 31) / 32;
 	int			slot = -1;
+	int			transient;
 	AnnStatus	status;
 
+	if (AnnIndexConfig.canonical_predicates &&
+		AnnIndexCanonical(file, program, size, &canonical, &canonicalSize))
+	{
+		program = canonical;
+		size = (uint32_t) canonicalSize;
+		(void) __atomic_fetch_add(&service->predicate_canonical, 1, __ATOMIC_RELAXED);
+	}
+	id = AnnFilterHash(program, size);
 	for (;;)
 	{
 		if ((*result = AnnIndexBitmapGet(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE)) != NULL)
@@ -2238,6 +2277,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 				AnnIndexBitmapUploadDeferred(file, *result);
 			/* Not under service->mutex: every search would contend for it. */
 			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
+			free(canonical);
 			return ANN_OK;
 		}
 		(void) pthread_mutex_lock(&evaluatingMutex);
@@ -2259,7 +2299,8 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 		(void) pthread_mutex_unlock(&evaluatingMutex);
 		break;					/* evaluate (unclaimed if every slot is busy) */
 	}
-	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot);
+	transient = admit && AnnIndexConfig.predicate_admission == ANN_ADMIT_SECOND && !SeenBefore(file, id);
+	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot, transient);
 	if (slot >= 0)
 	{
 		(void) pthread_mutex_lock(&evaluatingMutex);
@@ -2267,12 +2308,13 @@ PredicateBitmap(Service *service, AnnIndexFile *file, const unsigned char *progr
 		(void) pthread_cond_broadcast(&evaluatingDone);
 		(void) pthread_mutex_unlock(&evaluatingMutex);
 	}
+	free(canonical);
 	return status;
 }
 
 static AnnStatus
 PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
-				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot)
+				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot, int transient)
 {
 	uint32_t   *words;
 	uint64_t	count;
@@ -2296,9 +2338,17 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	 * without graphs scans every filter, however broad.
 	 */
 	/* The entry comes back referenced: an eviction meanwhile can't lose it. */
-	status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words, nwords,
-								  file->device == NULL || file->scanOnly ? UINT64_MAX : PredicateGatherLimit(file),
-								  result);
+	if (transient)
+	{
+		status = AnnIndexBitmapTransient(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words,
+										 nwords, file->device == NULL || file->scanOnly ? UINT64_MAX :
+										 PredicateGatherLimit(file), result);
+		(void) __atomic_fetch_add(&service->predicate_transient, 1, __ATOMIC_RELAXED);
+	}
+	else
+		status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words,
+									  nwords, file->device == NULL || file->scanOnly ? UINT64_MAX :
+									  PredicateGatherLimit(file), result);
 	free(words);
 	(void) __atomic_fetch_add(&service->predicate_evaluations, 1, __ATOMIC_RELAXED);
 	(void) __atomic_fetch_add(&service->predicate_eval_us, MicrosecondsSince(&start), __ATOMIC_RELAXED);
@@ -2374,7 +2424,7 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 								 ANN_OP_INDEX_SEARCH_PREDICATE, flags);
 		submittingWanted = 0;
 	}
-	else if ((status = PredicateBitmap(service, file, payload + offset, programLength, &bitmap, 0)) == ANN_OK)
+	else if ((status = PredicateBitmap(service, file, 1, payload + offset, programLength, &bitmap, 0)) == ANN_OK)
 		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap, name,
 								 dimensions, k, offset + programLength, ANN_OP_INDEX_SEARCH_PREDICATE, flags);
 	/* The job took its own reference before this one goes. */
@@ -2550,7 +2600,7 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 		(uint64_t) k + deleted <=
 		(service->backend->max_k < 10000 ? service->backend->max_k : 10000))
 		searchK += (uint32_t) deleted;
-	else if ((status = PredicateBitmap(service, file, payload + common + 20,
+	else if ((status = PredicateBitmap(service, file, 1, payload + common + 20,
 									   programLength, &bitmap, (flags & ANN_PREDICATE_SNAPSHOT) != 0)) != ANN_OK)
 	{
 		AnnIndexPut(file);
@@ -2683,7 +2733,7 @@ EvaluatePredicate(Service *service, const unsigned char *payload, uint32_t size,
 	name[nameLength] = '\0';
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
-	status = PredicateBitmap(service, file, payload + 4 + nameLength, size - 4 - nameLength, &bitmap, 0);
+	status = PredicateBitmap(service, file, 0, payload + 4 + nameLength, size - 4 - nameLength, &bitmap, 0);
 	if (status == ANN_OK)
 	{
 		nwords = ((size_t) file->rows + 31) / 32;
@@ -3155,7 +3205,8 @@ Reader(void *argument)
 								"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu,\"predicate_hits\":%llu,"
 								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
 								"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
-								"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu}",
+								"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
+								"\"predicate_canonical\":%llu,\"predicate_transient\":%llu}",
 								(unsigned long long) service->jobs, (unsigned long long) service->batches,
 								(unsigned long long) service->max_batch, (unsigned long long) service->rows,
 								(unsigned long long) service->rejected, (unsigned long long) service->rejected_index,
@@ -3171,7 +3222,9 @@ Reader(void *argument)
 								(unsigned long long) service->predicate_eval_us,
 								(unsigned long long) predicateEntries, (unsigned long long) predicateBytes,
 								(unsigned long long) predicateDeviceBytes,
-								(unsigned long long) predicateEvictions);
+								(unsigned long long) predicateEvictions,
+								(unsigned long long) __atomic_load_n(&service->predicate_canonical, __ATOMIC_RELAXED),
+								(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED));
 			(void) pthread_mutex_unlock(&service->mutex);
 			Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 				  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);

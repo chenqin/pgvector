@@ -267,7 +267,20 @@ typedef struct AnnIndexOptions
 								 * them (--mixed-groups) */
 	int			gpu_predicates; /* evaluate uncached predicates on the GPU
 								 * (--gpu-predicates) */
+	int			canonical_predicates;	/* cache predicates under their
+										 * canonical form (ann/canonical.h);
+										 * default on */
+	int			predicate_admission;	/* ANN_ADMIT_*: which new predicate
+										 * results enter the cache */
 } AnnIndexOptions;
+
+/*
+ * --predicate-admission: every new predicate result enters the cache (all),
+ * or only one seen before (second): a first sighting is served once and
+ * dropped, so one-off predicates do not evict entries that repeat.
+ */
+#define ANN_ADMIT_ALL 0
+#define ANN_ADMIT_SECOND 1
 
 /*
  * Re-scoring of a quantized scan's candidates at k > 24: from the FP32 rows in
@@ -355,6 +368,13 @@ int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t 
 							 uint32_t *words, uint64_t *count, int snapshot);
 
 /*
+ * The program's canonical form over this index's columns (ann/canonical.h):
+ * 1 and a malloc'd program, or 0 to use the program as written.
+ */
+int			AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,
+							  unsigned char **out, size_t *outSize);
+
+/*
  * Cache a predicate's result under its id like a pushed bitmap. Predicate
  * results share a memory budget per index (predicate_cache_bytes of host
  * memory, predicate_device_bytes of device memory, and optionally at most
@@ -399,6 +419,13 @@ AnnStatus	AnnIndexMatch(const AnnIndexFile *file, const char *attribute, const i
 #define ANN_BITMAP_PUSHED 0
 #define ANN_BITMAP_PREDICATE 1
 #define ANN_BITMAP_SNAPSHOT 2
+/*
+ * A predicate result built as a cache entry would be but kept out of the
+ * cache (--predicate-admission second): one reference, the caller's; no
+ * device copies.
+ */
+AnnStatus	AnnIndexBitmapTransient(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words,
+									size_t nwords, uint64_t expandLimit, AnnIndexBitmap **result);
 AnnStatus	AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
 							  uint64_t expandLimit, AnnIndexBitmap **result);
 
