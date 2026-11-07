@@ -1,6 +1,8 @@
 # Filtered ANN throughput: exploration roadmap
 
-Status: this roadmap comes from a read-only review of commit 4f18cfe (branch `matcha-patches`). Every number comes from `docs/ann-10pct-throughput.md`, from `benchmarks/ann/results/frozen-10pct-throughput/runs.jsonl`, or from the code citations given. A number marked *estimate* was worked out during the review and was not measured.
+Status: this roadmap comes from a read-only review of commit 4f18cfe (branch `matcha-patches`). Every number comes from `docs/ann-10pct-throughput.md`, from `benchmarks/ann/results/frozen-10pct-throughput/runs.jsonl`, or from the code citations given. A number marked *estimate* was worked out during the review and was not measured. Sections 1 to 6 describe the state at 4f18cfe; what was built afterwards, and what it measured, is under [Results so far](#results-so-far).
+
+**Built as of 2026-11-07 (4a9e2c4):** P01 as `--residual-masks` (default on), P07 (ordinals-only entries), P08 step 1 (lane rows expanded from bitsets), P03's key half (result keys gathered on the GPU), P04 (no candidate fill, no mid-batch sync, final top-k in shared memory), P02 (keys for immutable batch searches, with result arrays packed in place), experiment 4 (the cached point was bound by the lanes' host work, including RAFT's yield-polling stream sync), and harness prerequisites 1-2. The cached `10pct` arrays point went from 775.6k to 973.5k vectors/s, and `distinct10` from 156.2k to 765.2k vectors/s and from 4.55k to 98.6k QPS. Not built: G1a, G4a, G3a, P14 and the rest of P03; the selection stage (47% of GPU time) is the next target.
 
 Benchmark case: 10M rows x 128 dims, a predicate keeping 10% of rows, k=500, 8 B200 GPUs, recall floor 0.90. Recall is 0.99 or better at every measured point today.
 

@@ -7,11 +7,16 @@ on all eight GPUs). The workload is the 10% filter, `category BETWEEN d*10 AND
 d*10+9` with ten values of `d`, so 90% of rows are rejected. Every search returns
 500 keys. pgbench runs on the same host as PostgreSQL and the worker.
 
-The result: **780.4k vectors/s through PostgreSQL** with the multi-vector SQL
-batch function on an immutable table, against 86.2k for the deployed
-configuration's ordinary SQL scan (9.1×), and **177.3k QPS** for ordinary
+The result on 2026-11-06: **780.4k vectors/s through PostgreSQL** with the
+multi-vector SQL batch function on an immutable table, against 86.2k for the
+deployed configuration's ordinary SQL scan (9.1×), and **177.3k QPS** for ordinary
 single-vector SQL (2.1×). Mean recall@500 stayed at 0.9998 (lowest single query
 0.994). The goal was at least 90%.
+
+Updated 2026-11-07: **973.5k vectors/s** through the batch function (11.3× the
+deployed configuration) and 138.2k QPS for single-vector SQL at 96 lanes, with
+predicates that never repeat at 765.2k vectors/s and 98.6k QPS (they started at
+156.2k and 4.55k). Recall is unchanged. See [Since 2026-11-06](#since-2026-11-06).
 
 ## Method
 
@@ -379,6 +384,36 @@ Rate grouping (`udf_grouped` in the UDF benchmark) does not apply to the worker'
 graph route: a filtered CAGRA call there already carries one filter, hence one
 filtering rate.
 
+## Since 2026-11-06
+
+A second round, planned with the [exploration roadmap](ann-filter-throughput-exploration.md)
+(which has every measurement and its run labels), took the cached point from 775.6k to
+973.5k vectors/s and never-repeating predicates from 156.2k to 765.2k. Each step on the
+cached `10pct` arrays point and on `distinct10` (a 10% window minus one real tenant, so
+no two searches share a predicate), k=500, 64-vector arrays, 448 clients:
+
+| Step | Commit | `10pct` | `distinct10` |
+| --- | --- | ---: | ---: |
+| Start of the round | 4f18cfe | 775.6k | 156.2k |
+| Predicate entries keep ordinals only, no host keys | 53cc686 | 776.8k | 237.6k |
+| A first search expands its rows from the bitset on its own GPU | 8fe2777 | 771.9k | 363.9k |
+| Residual masks: cache the wide operand, mask the narrow one's rows (`--residual-masks`) | 6f45aed | 761.2k | 546.5k |
+| Excluded rows tested against the base entry's bitmap | ec84e86 | — | 674.7k |
+| Result keys fetched on the GPU; reply fields copied | 2845d85 | 806.2k | 692.9k |
+| Lanes sleep in `cudaStreamSynchronize` instead of RAFT's yield loop | 1a5213b | 833.1k | 711.1k |
+| `--gpu-predicates` and `--residual-masks` on by default | e05ccf2 | 829.9k | 699.3k |
+| No candidate fill, no mid-batch sync in the pruned selection | e721afd | 890.7k | 724.6k |
+| Final top-k after reranking in shared memory | d4ee677 | 929.9k | 712.8k |
+| Immutable batch searches get keys from the worker; result arrays packed in place | 4a9e2c4 | **973.5k** | **765.2k** |
+
+Single-vector SQL at 96 lanes and 256 clients: `10pct` 113.0k → 138.2k QPS,
+`distinct10` 4.55k → 98.6k QPS. The cached point's limit was found to be the lanes'
+host work per batch, not saturated cores: 32 and 64 extra busy threads cost 3.3% and
+9.3%, while each cut in per-batch host work raised throughput and GPU use. Earlier in
+the round, canonical predicates (`--canonical-predicates`, default on) took predicates
+whose unique part matches every row (`fresh10`) to the cached rate, and a device-memory
+leak on evicted entries was fixed (a0d4a81).
+
 ## Final configuration
 
 ```sh
@@ -396,9 +431,12 @@ python benchmarks/ann/frozen_stress.py --socket "$SOCKET" --worker-pid "$WORKER_
   --immutable --plan-cache-mode force_generic_plan
 ```
 
-No cost profile is loaded: limits route 1M-row groups to the matrix gather. For
-ordinary single-vector SQL, 32 lanes and 512 clients did best (161.3k QPS, p99 6.2
-ms; PostgreSQL used 151 cores, the worker 25, GPUs 70% busy).
+No cost profile is loaded: limits route 1M-row groups to the matrix gather.
+`--gpu-predicates`, `--residual-masks` and `--canonical-predicates` are on by default
+since 2026-11-07, so the command is unchanged. For ordinary single-vector SQL on the
+2026-11-06 build, 32 lanes and 512 clients did best (161.3k QPS, p99 6.2 ms;
+PostgreSQL used 151 cores, the worker 25, GPUs 70% busy); that setting was not
+remeasured on the current build.
 
 | Path | vectors/s | Mean / lowest recall@500 | p99 |
 | --- | ---: | --- | ---: |
@@ -408,27 +446,32 @@ ms; PostgreSQL used 151 cores, the worker 25, GPUs 70% busy).
 | Final worker, `ann_frozen_search_batch_arrays`, 64 vectors | 745,766 | 0.9998 / 0.994 | 52 ms per call |
 | Merged tree, ordinary SQL, `ann.frozen_immutable = on` | 177,261 | 0.9999 / 0.998 | 5.3 ms |
 | Merged tree, arrays, 64 vectors, `ann.frozen_immutable = on` | 780,404 | 0.9998 / 0.994 | 46 ms per call |
+| 2026-11-07 (4a9e2c4), ordinary SQL, 96 lanes, 256 clients, immutable | 138,183 | 0.9999 / 0.998 | 2.8 ms |
+| 2026-11-07 (4a9e2c4), arrays, 64 vectors, immutable | 973,521 | 0.9998 / 0.994 | 34 ms per call |
 
 Batch latency covers all 64 vectors of a call. Latency was not optimized.
 
 ## Limits and next steps
 
-* **The host CPU is the limit.** PostgreSQL, the worker and pgbench share 224
-  cores. PostgreSQL's remaining work per call is reading keys and TIDs and checking
-  visibility (about 15% of backend samples), text output of the id arrays (about
-  11%), and parsing the text `vector[]` argument (about 4%). Clients on other hosts,
-  binary result format, and binary query vectors would each reduce it.
-* **The GPUs have headroom**: 79% busy at the final point. NVFP4 scoring of the
-  1M eligible rows per group and the final top-500 after reranking are now the
-  largest kernels.
-* **Ordinary SQL** remains PostgreSQL-bound at about 1 ms of backend CPU per
-  search: the per-row executor path, not the GPU.
-* **Never-repeating predicates** reach 112k vectors/s with `--gpu-predicates on`
-  (67k off), against 780k cached: the host key and ordinal arrays of each new
-  result, and per-search row staging, are next.
+As of 2026-11-07 (4a9e2c4), at the cached 973.5k point:
+
+* **The GPUs are the limit**: 92% busy. Timed with one lane per GPU
+  (`ANN_KERNEL_TIMING=1`), a 64-query batch over 1M rows spends 319 µs scoring in
+  NVFP4 and 331-346 µs in the pruned selection (sample, cutoff, compact, sort), then
+  20 µs reranking and 22.5 µs in the final top-k. The selection's sort runs one block
+  per query, so a batch uses 64 of the 148 SMs; it is the next GPU target.
+* **PostgreSQL** uses 82.5 cores and the worker 26.6. PostgreSQL's remaining work per
+  call is mostly text output of the id arrays (about 12% of backend samples) and
+  parsing the text `vector[]` argument (about 4%); a client reading binary results
+  would remove most of it.
+* **Ordinary SQL** reached 138.2k QPS at 96 lanes with the GPUs 96% busy; the
+  32-lane, 512-client setting that did best before was not remeasured.
+* **Never-repeating predicates** reach 765.2k vectors/s when they split into a
+  cached operand and narrow exclusions (`--residual-masks`); predicates that cannot
+  be split still build a cache entry per search and are bounded by the worker.
 * `--matrix-prune` is opt-in. The GPU index tests cover it with exact-result checks;
   it should be validated on other datasets before it becomes the default.
 * The deployed worker and its cost profile were left unchanged. The test node's
-  PostgreSQL now runs this branch's `vector.so`, with
+  PostgreSQL runs this branch's `vector.so` (4a9e2c4), with
   `ann_frozen_search_batch_arrays` created by hand in `gpu_ann`; the previous
-  library is kept beside the experiment files.
+  libraries are kept beside the experiment files.
