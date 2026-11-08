@@ -469,6 +469,8 @@ As of 2026-11-07, at the cached 1,042.6k point:
   cached point from 175.0k to 292.3k vectors/s per GPU. Staging hits per block, 2
   blocks per SM, and then per-lane hit lists, a lane-contiguous NVFP4 copy and stored
   row norms at 3 blocks per SM brought the scan to 122 µs and the point to 430.5k
+  per GPU. A 128-dimension scan kernel, a shared-memory radix select, a fused rerank and
+  final top-k and vectorized query staging then brought one GPU to 542k and two to 486.6k
   per GPU (see [the exploration notes](ann-filter-throughput-exploration.md)).
 * **PostgreSQL** uses about 100 cores and the worker 32. PostgreSQL's remaining work per
   call is mostly text output of the id arrays (about 12% of backend samples) and

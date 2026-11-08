@@ -3023,6 +3023,499 @@ static const char SegmentSource[] =
 "  }\n"
 "}\n";
 
+/*
+ * ANN_POST variants of the post-scan stages (default: none, today's
+ * kernels). prune_select_reg: matrix_prune_select32 with the candidates'
+ * keys held in registers, the passes starting at the first bit where the
+ * least and greatest key differ, a parallel scan for each pass's bucket and
+ * an early stop once the bucket is taken whole. final_rank: the final top-k
+ * by counting each reranked candidate's rank (no bitonic stages). rerank8:
+ * the rerank with eight threads a row and 16-byte loads. copy_first32 and
+ * copy_first64 are the probes (ANN_POST=probe-*): no selection at all.
+ */
+static const char PostSource[] =
+"#define PS_ITEMS 16\n"
+"__device__ __forceinline__ float select_float(unsigned u)\n"
+"{ return __uint_as_float((u & 0x80000000u) ? u & 0x7fffffffu : ~u); }\n"
+"extern \"C\" __global__ void __launch_bounds__(1024) prune_select_reg(const float *d, const unsigned *r,\n"
+"    const unsigned *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  __shared__ unsigned hist[256], wsum[8];\n"
+"  __shared__ unsigned s_lo, s_hi, s_prefix, s_want, s_done, below, ties;\n"
+"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
+"  unsigned tid = threadIdx.x, lane = tid & 31, nt = blockDim.x;\n"
+"  const float *v = d + (unsigned long long) row * cap;\n"
+"  const unsigned *p = r + (unsigned long long) row * cap;\n"
+"  float *od = outD + (unsigned long long) row * k;\n"
+"  long long *orow = outR + (unsigned long long) row * k;\n"
+"  if (n <= k)\n"
+"  {\n"
+"    for (unsigned i = tid; i < k; i += nt)\n"
+"    {\n"
+"      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
+"      orow[i] = i < n ? (long long) p[i] : -1;\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  unsigned u[PS_ITEMS], lo = 0xffffffffu, hi = 0;\n"
+"#pragma unroll\n"
+"  for (int j = 0; j < PS_ITEMS; j++)\n"
+"  {\n"
+"    unsigned i = tid + j * nt;\n"
+"    u[j] = i < n ? select_key(v[i]) : 0u;\n"
+"    if (i < n) { lo = min(lo, u[j]); hi = max(hi, u[j]); }\n"
+"  }\n"
+"  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; below = 0; ties = 0; s_done = 0; }\n"
+"  __syncthreads();\n"
+"  lo = __reduce_min_sync(0xffffffffu, lo); hi = __reduce_max_sync(0xffffffffu, hi);\n"
+"  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
+"  __syncthreads();\n"
+"  lo = s_lo; hi = s_hi;\n"
+"  unsigned diff = lo ^ hi, want = k, prefix, mask;\n"
+"  int top;\n"
+"  if (diff == 0) { prefix = lo; mask = 0xffffffffu; top = -1; }\n"
+"  else { top = 31 - __clz(diff); mask = top == 31 ? 0u : 0xffffffffu << (top + 1); prefix = lo & mask; }\n"
+"  while (top >= 0)\n"
+"  {\n"
+"    int w = top + 1 < 8 ? top + 1 : 8, shift = top - w + 1;\n"
+"    unsigned bins = 1u << w;\n"
+"    if (tid < 256) hist[tid] = 0;\n"
+"    __syncthreads();\n"
+"#pragma unroll\n"
+"    for (int j = 0; j < PS_ITEMS; j++)\n"
+"    {\n"
+"      unsigned i = tid + j * nt;\n"
+"      if (i < n && (u[j] & mask) == prefix) atomicAdd(&hist[(u[j] >> shift) & (bins - 1)], 1u);\n"
+"    }\n"
+"    __syncthreads();\n"
+"    unsigned h = 0, c = 0;\n"
+"    if (tid < 256)\n"
+"    {\n"
+"      h = hist[tid]; c = h;\n"
+"      for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, c, o); if (lane >= o) c += y; }\n"
+"      if (lane == 31) wsum[tid >> 5] = c;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    if (tid < 256)\n"
+"    {\n"
+"      for (unsigned w2 = 0; w2 < (tid >> 5); w2++) c += wsum[w2];\n"
+"      unsigned ex = c - h;\n"
+"      if (ex < want && want <= c) { s_prefix = prefix | (tid << shift); s_want = want - ex; s_done = h == want - ex; }\n"
+"    }\n"
+"    __syncthreads();\n"
+"    prefix = s_prefix; want = s_want; mask |= (bins - 1) << shift; top = shift - 1;\n"
+"    if (s_done) break;\n"
+"  }\n"
+"#pragma unroll\n"
+"  for (int j = 0; j < PS_ITEMS; j++)\n"
+"    if (j * nt < n)\n"
+"    {\n"
+"      unsigned i = tid + j * nt, m = u[j] & mask;\n"
+"      bool b = i < n && m < prefix;\n"
+"      unsigned bal = __ballot_sync(0xffffffffu, b), base = 0;\n"
+"      if (lane == 0 && bal) base = atomicAdd(&below, __popc(bal));\n"
+"      base = __shfl_sync(0xffffffffu, base, 0);\n"
+"      if (b) { unsigned s = base + __popc(bal & ((1u << lane) - 1)); od[s] = select_float(u[j]); orow[s] = (long long) p[i]; }\n"
+"      if (i < n && m == prefix)\n"
+"      {\n"
+"        unsigned t = atomicAdd(&ties, 1u);\n"
+"        if (t < want) { unsigned s = k - want + t; od[s] = select_float(u[j]); orow[s] = (long long) p[i]; }\n"
+"      }\n"
+"    }\n"
+"}\n";
+
+static const char PostSource1[] =
+"extern \"C\" __global__ void __launch_bounds__(1024) final_rank(const float *d, const long long *r, unsigned n,\n"
+"    unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  extern __shared__ unsigned skey[];\n"
+"  unsigned n4 = (n + 3) & ~3u, row = blockIdx.x, tid = threadIdx.x, nt = blockDim.x;\n"
+"  unsigned *tie = skey + n4;\n"
+"  const float *v = d + (unsigned long long) row * n;\n"
+"  const long long *p = r + (unsigned long long) row * n;\n"
+"  for (unsigned i = tid; i < n4; i += nt) { skey[i] = i < n ? select_key(v[i]) : 0xffffffffu; tie[i] = 0; }\n"
+"  for (unsigned i = n + tid; i < k; i += nt)\n"
+"  {\n"
+"    outD[(unsigned long long) row * k + i] = __int_as_float(0x7f800000);\n"
+"    outR[(unsigned long long) row * k + i] = -1;\n"
+"  }\n"
+"  __syncthreads();\n"
+"  const uint4 *s4 = (const uint4 *) skey;\n"
+"  for (unsigned i = tid; i < n; i += nt)\n"
+"  {\n"
+"    unsigned ki = skey[i], c = 0;\n"
+"    for (unsigned j = 0; j < n4 / 4; j++)\n"
+"    {\n"
+"      uint4 x = s4[j];\n"
+"      c += (x.x < ki) + (x.y < ki) + (x.z < ki) + (x.w < ki);\n"
+"    }\n"
+"    c += atomicAdd(&tie[c], 1u);\n"
+"    if (c < k) { outD[(unsigned long long) row * k + c] = v[i]; outR[(unsigned long long) row * k + c] = p[i]; }\n"
+"  }\n"
+"}\n";
+
+static const char PostSource2[] =
+"__device__ __forceinline__ double sq8(const unsigned short *v, const float *q)\n"
+"{\n"
+"  uint4 x = *(const uint4 *) v; float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
+"  unsigned w[4] = {x.x, x.y, x.z, x.w}; float qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  double s = 0.;\n"
+"#pragma unroll\n"
+"  for (int e = 0; e < 8; e++)\n"
+"  {\n"
+"    float f; unsigned short h = (unsigned short) (w[e >> 1] >> ((e & 1) * 16));\n"
+"    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h));\n"
+"    double t = (double) f - qq[e]; s += t * t;\n"
+"  }\n"
+"  return s;\n"
+"}\n"
+"__device__ __forceinline__ double sq8(const float *v, const float *q)\n"
+"{\n"
+"  float4 x0 = *(const float4 *) v, x1 = *(const float4 *) (v + 4);\n"
+"  float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
+"  float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w}, qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  double s = 0.;\n"
+"#pragma unroll\n"
+"  for (int e = 0; e < 8; e++) { double t = (double) xs[e] - qq[e]; s += t * t; }\n"
+"  return s;\n"
+"}\n"
+"/* Eight threads a row, eight dimensions a step (dims % 8 == 0, 16-byte aligned rows). */\n"
+"template <typename D> __device__ void rerank8(const D *data, long long stride, const unsigned *rows,\n"
+"    unsigned eligible, unsigned nr, long long *positions, unsigned top, unsigned nq, const float *queries,\n"
+"    int dims, float *out)\n"
+"{\n"
+"  unsigned g = (blockIdx.x * blockDim.x + threadIdx.x) >> 3;\n"
+"  int sub = threadIdx.x & 7;\n"
+"  bool live = g < top * nq;\n"
+"  long long pos = live ? positions[g] : -1;\n"
+"  unsigned row = pos < 0 || (unsigned long long) pos >= eligible ? 0xffffffffu : rows ? rows[pos] : (unsigned) pos;\n"
+"  bool ok = live && row < nr;\n"
+"  double sum = 0.;\n"
+"  if (ok)\n"
+"  {\n"
+"    const D *v = data + (long long) row * stride;\n"
+"    const float *q = queries + (unsigned long long) (g / top) * dims;\n"
+"    for (int e = sub * 8; e < dims; e += 64) sum += sq8(v + e, q + e);\n"
+"  }\n"
+"  for (int o = 4; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);\n"
+"  if (live && sub == 0)\n"
+"  {\n"
+"    positions[g] = ok ? (long long) row : -1;\n"
+"    out[g] = ok ? (float) sqrt(sum) : __int_as_float(0x7f800000);\n"
+"  }\n"
+"}\n"
+"extern \"C\" __global__ void rerank8_i64(const float *v, long long st, const unsigned *r, unsigned ne, unsigned nr,\n"
+"  long long *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank8(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
+"extern \"C\" __global__ void rerank8_h_i64(const unsigned short *v, long long st, const unsigned *r, unsigned ne,\n"
+"  unsigned nr, long long *p, unsigned top, unsigned nq, const float *q, int d, float *o)\n"
+"  { rerank8(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
+"extern \"C\" __global__ void copy_first32(const float *d, const unsigned *r, const unsigned *counts, unsigned cap,\n"
+"    unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : counts[row];\n"
+"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
+"  {\n"
+"    outD[(unsigned long long) row * k + i] = i < n ? d[(unsigned long long) row * cap + i] : __int_as_float(0x7f800000);\n"
+"    outR[(unsigned long long) row * k + i] = i < n ? (long long) r[(unsigned long long) row * cap + i] : -1;\n"
+"  }\n"
+"}\n"
+"extern \"C\" __global__ void copy_first64(const float *d, const long long *r, unsigned n, unsigned k,\n"
+"    float *outD, long long *outR)\n"
+"{\n"
+"  unsigned row = blockIdx.x;\n"
+"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
+"  {\n"
+"    outD[(unsigned long long) row * k + i] = i < n ? d[(unsigned long long) row * n + i] : __int_as_float(0x7f800000);\n"
+"    outR[(unsigned long long) row * k + i] = i < n ? r[(unsigned long long) row * n + i] : -1;\n"
+"  }\n"
+"}\n";
+
+/*
+ * prune_select_s (ANN_POST bit 64): prune_select_reg with the keys in
+ * shared memory (compact loops: the block runs once per SM, so code size
+ * costs instruction fetches), 11-bit digits, and a stop once the bucket
+ * holding the k-th key has at most 256 keys, which are then ranked among
+ * themselves (ties by row, then position, so the result does not depend on
+ * the order the scan appended them). Positions are gathered once at the end.
+ */
+static const char PostSource3[] =
+"extern \"C\" __global__ void __launch_bounds__(1024) prune_select_s(const float *d, const unsigned *r,\n"
+"    const unsigned *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  extern __shared__ unsigned keys[];\n"
+"  __shared__ unsigned hist[2048], wsum[32], bu[256], bi[256], bp[256], sel[4096];\n"
+"  __shared__ unsigned s_lo, s_hi, s_prefix, s_want, s_m, below, ties, nb;\n"
+"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
+"  unsigned tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nt = blockDim.x;\n"
+"  const float *v = d + (unsigned long long) row * cap;\n"
+"  const unsigned *p = r + (unsigned long long) row * cap;\n"
+"  float *od = outD + (unsigned long long) row * k;\n"
+"  long long *orow = outR + (unsigned long long) row * k;\n"
+"  if (n <= k)\n"
+"  {\n"
+"    for (unsigned i = tid; i < k; i += nt)\n"
+"    {\n"
+"      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
+"      orow[i] = i < n ? (long long) p[i] : -1;\n"
+"    }\n"
+"    return;\n"
+"  }\n"
+"  unsigned lo = 0xffffffffu, hi = 0;\n"
+"  for (unsigned i = tid; i < n; i += nt) { unsigned x = select_key(v[i]); keys[i] = x; lo = min(lo, x); hi = max(hi, x); }\n"
+"  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; below = 0; ties = 0; nb = 0; }\n"
+"  __syncthreads();\n"
+"  lo = __reduce_min_sync(0xffffffffu, lo); hi = __reduce_max_sync(0xffffffffu, hi);\n"
+"  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
+"  __syncthreads();\n"
+"  lo = s_lo; hi = s_hi;\n"
+"  unsigned diff = lo ^ hi, want = k, prefix, mask, m = n;\n"
+"  int top;\n"
+"  if (diff == 0) { prefix = lo; mask = 0xffffffffu; top = -1; }\n"
+"  else { top = 31 - __clz(diff); mask = top == 31 ? 0u : 0xffffffffu << (top + 1); prefix = lo & mask; }\n"
+"  while (top >= 0 && m > 256)\n"
+"  {\n"
+"    int w = top + 1 < 11 ? top + 1 : 11, shift = top - w + 1;\n"
+"    unsigned bins = 1u << w;\n"
+"    hist[tid] = 0; hist[tid + 1024] = 0;\n"
+"    __syncthreads();\n"
+"    for (unsigned i = tid; i < n; i += nt)\n"
+"    { unsigned x = keys[i]; if ((x & mask) == prefix) atomicAdd(&hist[(x >> shift) & (bins - 1)], 1u); }\n"
+"    __syncthreads();\n"
+"    unsigned h0 = hist[2 * tid], h1 = hist[2 * tid + 1], c = h0 + h1;\n"
+"    for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, c, o); if (lane >= o) c += y; }\n"
+"    if (lane == 31) wsum[warp] = c;\n"
+"    __syncthreads();\n"
+"    if (warp == 0)\n"
+"    {\n"
+"      unsigned x = wsum[lane];\n"
+"      for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }\n"
+"      wsum[lane] = x;\n"
+"    }\n"
+"    __syncthreads();\n"
+"    unsigned e0 = (warp ? wsum[warp - 1] : 0) + c - h0 - h1;\n"
+"    if (e0 < want && want <= e0 + h0) { s_prefix = prefix | ((2 * tid) << shift); s_want = want - e0; s_m = h0; }\n"
+"    else if (e0 + h0 < want && want <= e0 + h0 + h1)\n"
+"    { s_prefix = prefix | ((2 * tid + 1) << shift); s_want = want - e0 - h0; s_m = h1; }\n"
+"    __syncthreads();\n"
+"    prefix = s_prefix; want = s_want; m = s_m; mask |= (bins - 1) << shift; top = shift - 1;\n"
+"  }\n";
+
+static const char PostSource3b[] =
+"  bool small = m <= 256 && m != want;\n"
+"  for (unsigned b0 = 0; b0 < n; b0 += nt)\n"
+"  {\n"
+"    unsigned i = b0 + tid, x = i < n ? keys[i] : 0xffffffffu, mk = x & mask;\n"
+"    bool b = i < n && mk < prefix;\n"
+"    unsigned bal = __ballot_sync(0xffffffffu, b), base = 0;\n"
+"    if (lane == 0 && bal) base = atomicAdd(&below, __popc(bal));\n"
+"    base = __shfl_sync(0xffffffffu, base, 0);\n"
+"    if (b) { unsigned s = base + __popc(bal & ((1u << lane) - 1)); od[s] = select_float(x); sel[s] = i; }\n"
+"    if (i < n && mk == prefix)\n"
+"    {\n"
+"      if (small) { unsigned s = atomicAdd(&nb, 1u); bu[s] = x; bi[s] = i; bp[s] = p[i]; }\n"
+"      else\n"
+"      {\n"
+"        unsigned t = atomicAdd(&ties, 1u);\n"
+"        if (t < want) { unsigned s = k - want + t; od[s] = select_float(x); sel[s] = i; }\n"
+"      }\n"
+"    }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  if (small && tid < m)\n"
+"  {\n"
+"    unsigned uk = bu[tid], ik = bi[tid], pk = bp[tid], rk = 0;\n"
+"    for (unsigned j = 0; j < m; j++) { unsigned x = bu[j]; rk += x < uk || (x == uk && (bp[j] < pk || (bp[j] == pk && bi[j] < ik))); }\n"
+"    if (rk < want) { unsigned s = k - want + rk; od[s] = select_float(uk); sel[s] = ik; }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  for (unsigned i = tid; i < k; i += nt) orow[i] = (long long) p[sel[i]];\n"
+"}\n";
+
+/*
+ * final_bucket (ANN_POST bit 128, n <= 1024): a counting sort of the
+ * reranked candidates into 2048 buckets spanning their least to greatest
+ * key; each candidate's rank is its bucket's start plus its rank among the
+ * bucket's keys (ties by position).
+ */
+static const char PostSource4[] =
+"/* Thread tid < n holds candidate tid (f, pv); one block a query (blockIdx.x), 1024 threads. */\n"
+"__device__ __forceinline__ void bucket_topk(float f, long long pv, unsigned n, unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  __shared__ unsigned hist[2048], start[2048], skey[1024], sidx[1024], wsum[32], s_lo, s_hi;\n"
+"  unsigned row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;\n"
+"  bool live = tid < n;\n"
+"  for (unsigned i = n + tid; i < k; i += blockDim.x)\n"
+"  {\n"
+"    outD[(unsigned long long) row * k + i] = __int_as_float(0x7f800000);\n"
+"    outR[(unsigned long long) row * k + i] = -1;\n"
+"  }\n"
+"  unsigned key = select_key(f), lo = live ? key : 0xffffffffu, hi = live ? key : 0u;\n"
+"  hist[2 * tid] = 0; hist[2 * tid + 1] = 0;\n"
+"  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; }\n"
+"  __syncthreads();\n"
+"  lo = __reduce_min_sync(0xffffffffu, lo); hi = __reduce_max_sync(0xffffffffu, hi);\n"
+"  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
+"  __syncthreads();\n"
+"  lo = s_lo; hi = s_hi;\n"
+"  unsigned range = hi - lo, shift = range < 2048 ? 0 : 21 - __clz(range);\n"
+"  unsigned b = live ? (key - lo) >> shift : 0, slot = live ? atomicAdd(&hist[b], 1u) : 0;\n"
+"  __syncthreads();\n"
+"  unsigned h0 = hist[2 * tid], h1 = hist[2 * tid + 1], c = h0 + h1;\n"
+"  for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, c, o); if (lane >= o) c += y; }\n"
+"  if (lane == 31) wsum[warp] = c;\n"
+"  __syncthreads();\n"
+"  if (warp == 0)\n"
+"  {\n"
+"    unsigned x = lane < (blockDim.x >> 5) ? wsum[lane] : 0;\n"
+"    for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, x, o); if (lane >= o) x += y; }\n"
+"    wsum[lane] = x;\n"
+"  }\n"
+"  __syncthreads();\n"
+"  unsigned e0 = (warp ? wsum[warp - 1] : 0) + c - h0 - h1;\n"
+"  start[2 * tid] = e0; start[2 * tid + 1] = e0 + h0;\n"
+"  __syncthreads();\n"
+"  unsigned base = start[b], cnt = hist[b];\n"
+"  if (live) { skey[base + slot] = key; sidx[base + slot] = tid; }\n"
+"  __syncthreads();\n"
+"  if (!live) return;\n"
+"  unsigned rank = base;\n"
+"  for (unsigned j = base; j < base + cnt; j++) { unsigned x = skey[j]; rank += x < key || (x == key && sidx[j] < tid); }\n"
+"  if (rank < k) { outD[(unsigned long long) row * k + rank] = f; outR[(unsigned long long) row * k + rank] = pv; }\n"
+"}\n"
+"extern \"C\" __global__ void __launch_bounds__(1024) final_bucket(const float *d, const long long *r, unsigned n,\n"
+"    unsigned k, float *outD, long long *outR)\n"
+"{\n"
+"  bool live = threadIdx.x < n;\n"
+"  unsigned long long at = (unsigned long long) blockIdx.x * n + threadIdx.x;\n"
+"  bucket_topk(live ? d[at] : 0.f, live ? r[at] : -1, n, k, outD, outR);\n"
+"}\n";
+
+/*
+ * rerank_final (ANN_POST bit 256, n <= 1024): the rerank and the final
+ * top-k in one block a query. Four threads rerank a candidate (16-byte
+ * loads, every candidate's row read first), keeping its distance and row in
+ * shared memory for bucket_topk.
+ */
+static const char PostSource5[] =
+"__device__ __forceinline__ void ld8(const unsigned short *v, uint4 &a, uint4 &b) { a = *(const uint4 *) v; }\n"
+"__device__ __forceinline__ void ld8(const float *v, uint4 &a, uint4 &b) { a = *(const uint4 *) v; b = *(const uint4 *) (v + 4); }\n"
+"__device__ __forceinline__ double sq8r(const unsigned short *, uint4 x, uint4, const float *q)\n"
+"{\n"
+"  float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
+"  unsigned w[4] = {x.x, x.y, x.z, x.w}; float qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  double s = 0.;\n"
+"#pragma unroll\n"
+"  for (int e = 0; e < 8; e++)\n"
+"  {\n"
+"    float f; unsigned short h = (unsigned short) (w[e >> 1] >> ((e & 1) * 16));\n"
+"    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h));\n"
+"    double t = (double) f - qq[e]; s += t * t;\n"
+"  }\n"
+"  return s;\n"
+"}\n"
+"__device__ __forceinline__ double sq8r(const float *, uint4 x0, uint4 x1, const float *q)\n"
+"{\n"
+"  float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
+"  float xs[8] = {__uint_as_float(x0.x), __uint_as_float(x0.y), __uint_as_float(x0.z), __uint_as_float(x0.w),\n"
+"                 __uint_as_float(x1.x), __uint_as_float(x1.y), __uint_as_float(x1.z), __uint_as_float(x1.w)};\n"
+"  float qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  double s = 0.;\n"
+"#pragma unroll\n"
+"  for (int e = 0; e < 8; e++) { double t = (double) xs[e] - qq[e]; s += t * t; }\n"
+"  return s;\n"
+"}\n"
+"template <typename D> __device__ __forceinline__ void rerank_final(const D *data, long long stride,\n"
+"    const unsigned *rows, unsigned eligible, unsigned nr, const long long *positions, unsigned n, unsigned k,\n"
+"    const float *queries, int dims, float *outD, long long *outR)\n"
+"{\n"
+"  __shared__ float sf[1024];\n"
+"  __shared__ long long sp[1024];\n"
+"  unsigned row = blockIdx.x, tid = threadIdx.x, sub = tid & 3, per = blockDim.x >> 2;\n"
+"  const float *qv = queries + (unsigned long long) row * dims;\n"
+"  const long long *pp = positions + (unsigned long long) row * n;\n"
+"  long long pos[4];\n"
+"  unsigned rr[4];\n"
+"#pragma unroll\n"
+"  for (int t = 0; t < 4; t++) { unsigned g = t * per + (tid >> 2); pos[t] = g < n ? pp[g] : -1; }\n"
+"#pragma unroll\n"
+"  for (int t = 0; t < 4; t++)\n"
+"    rr[t] = pos[t] < 0 || (unsigned long long) pos[t] >= eligible ? 0xffffffffu : rows ? rows[pos[t]] : (unsigned) pos[t];\n"
+"#pragma unroll 1\n"
+"  for (int t = 0; t < 4; t++)\n"
+"  {\n"
+"    unsigned g = t * per + (tid >> 2);\n"
+"    if (t * per >= n) break;\n"
+"    bool ok = g < n && rr[t] < nr;\n"
+"    double sum = 0.;\n"
+"    const D *v = data + (long long) (ok ? rr[t] : 0) * stride;\n"
+"    for (int e0 = 0; e0 < dims; e0 += 128)\n"
+"    {\n"
+"      uint4 xa[4], xb[4];\n"
+"#pragma unroll\n"
+"      for (int c = 0; c < 4; c++) { int e = e0 + c * 32 + sub * 8; if (ok && e < dims) ld8(v + e, xa[c], xb[c]); }\n"
+"#pragma unroll\n"
+"      for (int c = 0; c < 4; c++) { int e = e0 + c * 32 + sub * 8; if (ok && e < dims) sum += sq8r(v, xa[c], xb[c], qv + e); }\n"
+"    }\n"
+"    sum += __shfl_xor_sync(0xffffffffu, sum, 1);\n"
+"    sum += __shfl_xor_sync(0xffffffffu, sum, 2);\n"
+"    if (g < n && sub == 0) { sf[g] = ok ? (float) sqrt(sum) : __int_as_float(0x7f800000); sp[g] = ok ? (long long) rr[t] : -1; }\n"
+"  }\n"
+"  __syncthreads();\n"
+"  bool live = tid < n;\n"
+"  bucket_topk(live ? sf[tid] : 0.f, live ? sp[tid] : -1, n, k, outD, outR);\n"
+"}\n"
+"extern \"C\" __global__ void __launch_bounds__(1024) rerank_final_f(const float *v, long long st, const unsigned *r,\n"
+"    unsigned ne, unsigned nr, const long long *p, unsigned n, unsigned k, const float *q, int d, float *oD,\n"
+"    long long *oR) { rerank_final(v, st, r, ne, nr, p, n, k, q, d, oD, oR); }\n"
+"extern \"C\" __global__ void __launch_bounds__(1024) rerank_final_h(const unsigned short *v, long long st,\n"
+"    const unsigned *r, unsigned ne, unsigned nr, const long long *p, unsigned n, unsigned k, const float *q, int d,\n"
+"    float *oD, long long *oR) { rerank_final(v, st, r, ne, nr, p, n, k, q, d, oD, oR); }\n";
+
+#define ANN_POST_SELECT 1		/* prune_select_reg for the fused sort */
+#define ANN_POST_FINAL 2		/* final_rank for the final top-k */
+#define ANN_POST_RERANK 4		/* rerank8 */
+#define ANN_POST_PROBE_SORT 8	/* probe: no sort (copy the first kept) */
+#define ANN_POST_PROBE_FINAL 16 /* probe: no final top-k */
+#define ANN_POST_PROBE_RERANK 32	/* probe: no rerank */
+#define ANN_POST_SELECT11 64	/* prune_select_s for the fused sort */
+#define ANN_POST_CHUNK 128		/* final_bucket for the final top-k */
+#define ANN_POST_FUSED 256		/* rerank_final: rerank and final top-k in one */
+
+/*
+ * ANN_POST: the post-scan variants, a number (the bits above) or a list of
+ * select, final, rerank, probe-sort, probe-final, probe-rerank. Unset: 452
+ * (rerank8, prune_select_s, final_bucket and rerank_final); 0 restores the
+ * earlier kernels.
+ */
+static int
+PostVariant(void)
+{
+	static _Atomic int variant = -1;
+	int			value = atomic_load_explicit(&variant, memory_order_relaxed);
+
+	if (value < 0)
+	{
+		const char *setting = getenv("ANN_POST");
+
+		value = setting ? 0 : ANN_POST_RERANK | ANN_POST_SELECT11 | ANN_POST_CHUNK | ANN_POST_FUSED;
+		if (setting && setting[0] >= '0' && setting[0] <= '9')
+			value = (int) strtol(setting, NULL, 0);
+		else if (setting)
+		{
+			value |= strstr(setting, "probe-sort") ? ANN_POST_PROBE_SORT : 0;
+			value |= strstr(setting, "probe-final") ? ANN_POST_PROBE_FINAL : 0;
+			value |= strstr(setting, "probe-rerank") ? ANN_POST_PROBE_RERANK : 0;
+			value |= strstr(setting, "select") && !strstr(setting, "probe-select") ? ANN_POST_SELECT : 0;
+			value |= (strstr(setting, "final,") ||
+					  (strlen(setting) >= 5 && strcmp(setting + strlen(setting) - 5, "final") == 0 &&
+					   (strlen(setting) == 5 || setting[strlen(setting) - 6] == ','))) ? ANN_POST_FINAL : 0;
+			value |= (strncmp(setting, "rerank", 6) == 0 || strstr(setting, ",rerank")) ? ANN_POST_RERANK : 0;
+		}
+		atomic_store_explicit(&variant, value, memory_order_relaxed);
+	}
+	return value;
+}
+
 #define ANN_FINAL_MAX 4096		/* most reranked candidates final_topk sorts */
 #define ANN_PRUNE_SAMPLE 8192	/* sampled scores per query */
 #define ANN_PRUNE_RANK 32		/* the sample's least cutoff rank */
@@ -3121,6 +3614,16 @@ typedef struct GatherModule
 	CUfunction	cutoff32;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
+	CUfunction	postSelect;		/* ANN_POST kernels */
+	CUfunction	postFinal;
+	CUfunction	postRerank;
+	CUfunction	postRerankHalf;
+	CUfunction	postCopy32;
+	CUfunction	postCopy64;
+	CUfunction	postSelect11;
+	CUfunction	postChunk;
+	CUfunction	postFusedF;
+	CUfunction	postFusedH;
 } GatherModule;
 
 static GatherModule gatherModules[ANN_CUVS_MAX_DEVICES];
@@ -3152,7 +3655,9 @@ GatherKernels(int device)
 		goto fail;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
 	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + strlen(PruneAutoSource) +
-					strlen(FinalSource) + strlen(SelectSource) + strlen(FusedSelectSource) + strlen(SegmentSource) + 1);
+					strlen(FinalSource) + strlen(SelectSource) + strlen(FusedSelectSource) + strlen(SegmentSource) +
+					strlen(PostSource) + strlen(PostSource1) + strlen(PostSource2) +
+					strlen(PostSource3) + strlen(PostSource3b) + strlen(PostSource4) + strlen(PostSource5) + 1);
 	if (source == NULL)
 		goto fail;
 	strcpy(source, GatherSource);
@@ -3163,6 +3668,13 @@ GatherKernels(int device)
 	strcat(source, SelectSource);
 	strcat(source, FusedSelectSource);
 	strcat(source, SegmentSource);
+	strcat(source, PostSource);
+	strcat(source, PostSource1);
+	strcat(source, PostSource2);
+	strcat(source, PostSource3);
+	strcat(source, PostSource3b);
+	strcat(source, PostSource4);
+	strcat(source, PostSource5);
 	if ((image = AnnNvrtcCompile(source, "cuVS gather kernel", arch, &size)) == NULL ||
 		cuModuleLoadData(&module->module, image) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->lookup, module->module, "lookup") != CUDA_SUCCESS ||
@@ -3188,6 +3700,18 @@ GatherKernels(int device)
 						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentCompact, module->module, "segment_compact") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postSelect, module->module, "prune_select_reg") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postFinal, module->module, "final_rank") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postRerank, module->module, "rerank8_i64") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postRerankHalf, module->module, "rerank8_h_i64") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postCopy32, module->module, "copy_first32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postCopy64, module->module, "copy_first64") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postSelect11, module->module, "prune_select_s") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postChunk, module->module, "final_bucket") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postFusedF, module->module, "rerank_final_f") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->postFusedH, module->module, "rerank_final_h") != CUDA_SUCCESS ||
+		cuFuncSetAttribute(module->postSelect11, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+						   ANN_PRUNE_CAP * 4) != CUDA_SUCCESS ||
 		cuFuncSetAttribute(module->pruneSort, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
 						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS)
 		goto fail;
@@ -3284,6 +3808,22 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 	void	   *args[] = {(void *) &shard->rerank, &stride, (void *) &rows, &eligible, &nrows,
 	&positions, &top, &nq, (void *) &queries, &dimensions, &out};
 
+	if (module && wide && (PostVariant() & (ANN_POST_RERANK | ANN_POST_PROBE_RERANK)))
+	{
+		size_t		element = shard->rerankHalf ? 2 : 4;
+
+		if (PostVariant() & ANN_POST_PROBE_RERANK)
+			return 1;
+		if (dims % 8 == 0 && stride % 8 == 0 && ((uintptr_t) shard->rerank) % 16 == 0 &&
+			((uintptr_t) queries) % 16 == 0 && element * 8 >= 16)
+		{
+			unsigned	blocks8 = (unsigned) (((uint64_t) nq * top * 8 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
+
+			return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+				cuLaunchKernel(shard->rerankHalf ? module->postRerankHalf : module->postRerank, blocks8, 1, 1,
+							   ANN_GATHER_BLOCK, 1, 1, 0, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
+		}
+	}
 	return module && cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 		cuLaunchKernel(shard->rerankHalf ? (wide ? module->rerankHalf64 : module->rerankHalf32) :
 					   (wide ? module->rerank64 : module->rerank32), blocks, 1, 1,
@@ -4436,10 +4976,52 @@ FinalTopk(AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q, uint
 	{
 		void	   *args[] = {&lane->matrixCandidates, &lane->matrixIndices, &n, &size, &k, &lane->matrixValues,
 		&lane->matrixRows};
+		void	   *postArgs[] = {&lane->matrixCandidates, &lane->matrixIndices, &n, &k, &lane->matrixValues,
+		&lane->matrixRows};
 
+		if ((PostVariant() & ANN_POST_CHUNK) && !(PostVariant() & ANN_POST_PROBE_FINAL) && n <= 1024)
+			return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+				cuLaunchKernel(module->postChunk, q, 1, 1, 1024, 1, 1, 0, (CUstream) stream, postArgs,
+							   NULL) == CUDA_SUCCESS;
+		if (PostVariant() & (ANN_POST_FINAL | ANN_POST_CHUNK | ANN_POST_PROBE_FINAL))
+			return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+				cuLaunchKernel((PostVariant() & ANN_POST_PROBE_FINAL) ? module->postCopy64 : module->postFinal,
+							   q, 1, 1, (PostVariant() & ANN_POST_PROBE_FINAL) ? 256 : 1024, 1, 1,
+							   (PostVariant() & ANN_POST_PROBE_FINAL) ? 0 : (((n + 3) & ~3u) + n) * 4,
+							   (CUstream) stream, postArgs, NULL) == CUDA_SUCCESS;
 		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 			cuLaunchKernel(module->finalTopk, q, 1, 1, 1024, 1, 1, size * 12, (CUstream) stream, args, NULL) ==
 			CUDA_SUCCESS;
+	}
+}
+
+/*
+ * ANN_POST bit 256: the rerank and the final top-k of the matrix gather in
+ * one launch (rerank_final), when each query has at most 1024 candidates and
+ * the rerank rows allow 16-byte loads. Returns -1 when it does not apply
+ * (the caller runs RerankDevice and FinalTopk), else whether it launched.
+ */
+static int
+RerankFinal(const AnnCuvsShard *shard, AnnCuvsDevice *lane, uint32_t dims, const uint32_t *rows,
+			uint32_t eligible, uint32_t nrows, uint32_t q, uint32_t candidates, uint32_t outk, cudaStream_t stream)
+{
+	GatherModule *module;
+	int			dimensions = (int) dims;
+	long long	stride = shard->rerankStride;
+	unsigned	n = candidates,
+				k = outk;
+
+	if (!(PostVariant() & ANN_POST_FUSED) || candidates > 1024 || outk > candidates || dims % 8 != 0 ||
+		stride % 8 != 0 || ((uintptr_t) shard->rerank) % 16 != 0 || ((uintptr_t) lane->queries) % 16 != 0 ||
+		(module = GatherKernels(shard->device)) == NULL)
+		return -1;
+	{
+		void	   *args[] = {(void *) &shard->rerank, &stride, (void *) &rows, &eligible, &nrows,
+		&lane->matrixIndices, &n, &k, &lane->queries, &dimensions, &lane->matrixValues, &lane->matrixRows};
+
+		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(shard->rerankHalf ? module->postFusedH : module->postFusedF, q, 1, 1, 1024, 1, 1, 0,
+						   (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 	}
 }
 
@@ -4554,8 +5136,12 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 									cap, stream) ||
 			!PruneMark(lane, 1, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
-			cuLaunchKernel(module->pruneSelect32, q, 1, 1, 1024, 1, 1, 0, (CUstream) stream, selectArgs,
-						   NULL) != CUDA_SUCCESS ||
+			cuLaunchKernel((PostVariant() & ANN_POST_PROBE_SORT) ? module->postCopy32 :
+						   (PostVariant() & ANN_POST_SELECT11) ? module->postSelect11 :
+						   (PostVariant() & ANN_POST_SELECT) ? module->postSelect : module->pruneSelect32,
+						   q, 1, 1, 1024, 1, 1,
+						   (PostVariant() & (ANN_POST_SELECT11 | ANN_POST_PROBE_SORT)) == ANN_POST_SELECT11 ?
+						   ANN_PRUNE_CAP * 4 : 0, (CUstream) stream, selectArgs, NULL) != CUDA_SUCCESS ||
 			!PruneMark(lane, 2, stream) ||
 			cudaMemcpyAsync(lane->hostFuseCounts, lane->fuseCounts, (size_t) q * sizeof(uint32_t),
 							cudaMemcpyDeviceToHost, stream) != cudaSuccess)
@@ -4565,10 +5151,40 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 	return 1;
 }
 
+/* ANN_KERNEL_TIMING: the fused selection's kept counts (sum, queries, least, fallbacks). */
+static _Atomic uint64_t fusedKeptSum,
+			fusedKeptQueries,
+			fusedKeptFallbacks;
+static _Atomic uint32_t fusedKeptMin = UINT32_MAX;
+
+static int	KernelTiming(void);
+
 /* After a fused selection's batch has finished: PrunedChecked for its counts. */
 static int
 FusedChecked(AnnCuvsIndex *state, const AnnCuvsDevice *lane, uint32_t q, uint32_t candidates)
 {
+	if (KernelTiming())
+	{
+		uint64_t	sum = 0;
+		uint32_t	least = UINT32_MAX,
+					seen;
+		int			fell = 0;
+
+		for (uint32_t j = 0; j < q; j++)
+		{
+			sum += lane->hostFuseCounts[j];
+			if (lane->hostFuseCounts[j] < least)
+				least = lane->hostFuseCounts[j];
+			if (lane->hostFuseCounts[j] < candidates || lane->hostFuseCounts[j] > ANN_PRUNE_CAP)
+				fell = 1;
+		}
+		(void) atomic_fetch_add(&fusedKeptSum, sum);
+		(void) atomic_fetch_add(&fusedKeptQueries, q);
+		(void) atomic_fetch_add(&fusedKeptFallbacks, (uint64_t) fell);
+		seen = atomic_load(&fusedKeptMin);
+		while (least < seen && !atomic_compare_exchange_weak(&fusedKeptMin, &seen, least))
+			;
+	}
 	for (uint32_t j = 0; j < q; j++)
 		if (lane->hostFuseCounts[j] < candidates || lane->hostFuseCounts[j] > ANN_PRUNE_CAP)
 		{
@@ -4666,6 +5282,10 @@ MatrixStagesAdd(AnnCuvsDevice *lane, uint32_t q)
 					matrixStages.pruneMs[0] * 1000 / matrixStages.pruneBatches,
 					matrixStages.pruneMs[1] * 1000 / matrixStages.pruneBatches,
 					matrixStages.pruneMs[2] * 1000 / matrixStages.pruneBatches);
+		if (atomic_load(&fusedKeptQueries))
+			fprintf(stderr, "  fused kept per query: mean %.0f, least %u, fallback batches %llu\n",
+					(double) atomic_load(&fusedKeptSum) / (double) atomic_load(&fusedKeptQueries),
+					(unsigned) atomic_load(&fusedKeptMin), (unsigned long long) atomic_load(&fusedKeptFallbacks));
 		memset(&matrixStages, 0, sizeof(matrixStages));
 		matrixStagesPrinted = now;
 	}
@@ -4866,10 +5486,15 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			}
 			if (shard->rerank && laneRerank != 0)
 			{
-				if (!RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
-								  candidates, q, lane->queries, lane->matrixCandidates, stream, 1) ||
+				int			fusedPost = RerankFinal(shard, lane, dims, rows, n, file->shards[s].rows, q, candidates,
+													outk, stream);
+
+				if (fusedPost == 0 ||
+					(fusedPost < 0 &&
+					 !RerankDevice(shard, dims, rows, n, file->shards[s].rows, lane->matrixIndices,
+								   candidates, q, lane->queries, lane->matrixCandidates, stream, 1)) ||
 					!MatrixMark(lane, s, 4, stream) ||
-					!FinalTopk(lane, shard->device, stream, q, candidates, outk) ||
+					(fusedPost < 0 && !FinalTopk(lane, shard->device, stream, q, candidates, outk)) ||
 					!MatrixMark(lane, s, 5, stream) ||
 					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
 									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||

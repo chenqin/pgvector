@@ -450,6 +450,38 @@ Rows read from a hot 1,024-row set are no faster, so the scan is not bound by me
 
 GPU-bound on two GPUs, cached `10pct` arrays (same session): 657.2k vectors/s with the three flags off, 860.9k and 853.9k with the defaults, **328.6k -> 430.5k per GPU (+31%)**, p99 12.4 -> 10.0 ms. Each change alone, short runs: copy 740.6k, row norms 672.5k, lists 751.5k (bit 1 only 684.5k). Recall went from 0.9998 (lowest 0.994) to 1.0 (lowest 0.998), and only bit 4 moves it: the candidates under each cutoff are the same set (a query with more than the cap falls back, and none did), so the difference is most likely which of several equal NVFP4 distances the radix select keeps at its boundary, which depends on append order. The copy and the norms cost about 72 bytes a row on each GPU (720 MB per 10M rows at 128 dimensions). About 21 us of append cost remains above the no-append floor (99.9 us).
 
+**Round 3: five more paths, one GPU each (2026-11-07).** Same method: own source copy, worker and socket per agent, a one-lane latency harness and a one-GPU throughput harness (12 lanes, 56 clients, cached `10pct` arrays, recall on 10 x 64 queries). Single-GPU baseline 444-447k vectors/s.
+
+| Path (flag) | Result | Kept |
+| --- | --- | --- |
+| Fused scan (`ANN_FUSE_TUNE`) | 440.6k -> 521.7k (+18%); compact 121 -> 90 us | yes, bits 2, 8, 32 |
+| Post-scan stages (`ANN_POST=452`) | 442.1k -> 476.2k (+8-14%); sort 37 -> 13 us, rerank plus final top-k 42 -> 24 us | yes |
+| Query staging (`ANN_FUSE_QVEC=3`) | 422k -> 436k (+3-5%); sample scoring 16.7 -> 9.6 us | yes |
+| Cutoff stage (`ANN_FUSE_CUTOFF`) | cutoff 49.9 -> 38.5 us one lane, no throughput gain | no |
+| Native FP4 math (`ANN_FUSE_MMA`) | about 2 us, no throughput gain | no |
+| 64-dimension rotated copy (`ANN_SCAN_DIMS=64`) | 443.3k -> 524.4k (+18%), recall 0.9998 here but 0.9934 (lowest 0.962) on a SIFT1M simulation at 1,000 candidates | flag only, not merged |
+
+What each does. The fused scan gets a kernel compiled for 128 dimensions (constant loop bounds: 121 -> 106.5 us), a one-`prmt` block-scale broadcast, and each hit stored at its output's list slot (one predicated shared store, no list pointer); 80 registers, no spill, 3 blocks per SM. A looser hit test with an exact recheck at flush (bit 16) took another 4% but moved a few candidates at the cutoff (recall 0.9998, lowest 0.994) and is off by default. The post-scan stages get a shared-memory radix select (11-bit digits, ranking the last at most 256 tied keys by row, then position, so the result no longer depends on the order the scan appended them) and one kernel per query for the FP32 rerank and the final top-k; these 64-block kernels run one block per SM with cold code, so they are limited by instruction fetch and compact loops beat unrolled ones (one lane they are slower fused, under 12 lanes they win). Query staging loads four floats at a time instead of one, in both the sample scoring and the scan.
+
+The block-scaled FP4 instructions (`mma.sync ... kind::mxf4nvf4.block_scale`, `kind::f8f6f4` with e2m1) assemble for `sm_120a` but are rejected for `sm_100a`; on B200 only `tcgen05.mma` runs them. Decode costs about 12 us and the MMA about 12 us of the 122 us scan, so a `tcgen05` scan could save at most 20-25 us (8% of a batch) at the risk of FP4 queries, and was not built. FP8 `m16n8k32` is 1.8x faster per instruction in isolation and saved nothing in the kernel. A pre-scaled FP8 scan copy doubles the copy for a ceiling of about 10 us.
+
+Merged defaults (`ANN_FUSE_TUNE=42`, `ANN_POST=452`, `ANN_FUSE_QVEC=3`; set each to 0 for the earlier kernels). One GPU, 12 lanes: 443.7k with the three off, 542.2k with the defaults (+22%), recall 1.0 / 0.998, p99 9.6 -> 8.1 ms. Two GPUs, cached `10pct` arrays: 855.8k with them off, 973.1k and 955.3k on (+12-14%; 427.9k -> 486.6k per GPU), no prune fallbacks; the host is closer to its limit at two GPUs (PostgreSQL 67 cores, worker 20). With bit 16 on, one GPU reached 566-576k, at recall 0.9998 / 0.994.
+
+**Realistic single-GPU workloads** (current build before the round-3 defaults, GPU 5, k=500):
+
+| Workload | Vectors/s | Recall (mean / lowest) | GPU busy | Queries per GPU batch |
+| --- | ---: | ---: | ---: | ---: |
+| Cached `10pct`, 64-query arrays | 445.8k | 1.0 / 0.998 | 95% | 64 |
+| `fresh10` arrays (a new predicate every query) | 406.8k | 1.0 / 1.0 | 93% | 64 |
+| `mix10` arrays (half `distinct10`, half `fresh10`) | 243.0k | 0.9999 / 0.996 | 84% | 64 |
+| `distinct10` arrays (a real tenant excluded) | 180.2k | 0.9999 / 0.996 | 82% | 64 |
+| `fresh10` / `distinct10`, canonicalization and residual masks off | 117.0k / 125.1k | 1.0 | 89% | 58 |
+| `distinct10`, one query per call (SQL) | 44.9k | 0.9998 / 0.998 | 94% | 4.1 |
+| `mix10`, one query per call (SQL) | 28.8k | 0.9998 / 0.998 | 94% | 4.3 |
+| Cached `10pct`, one query per call (SQL) | 13.8k | 1.0 / 1.0 | 93% | 14.8 |
+
+Fresh predicates reach 91% of the cached rate because canonicalization folds the nonexistent tenant away and they take the fused scan. `distinct10` runs at 40% because a batch with excluded rows cannot use the fused scan (`FusedEligible`) and takes the score-matrix path (todo: masked fused tiles). One query per call leaves the GPU 93-94% busy on batches of 4-15 queries, as a batch costs about the same at any fill; the worker only merges concurrent calls with the same filter, so a new filter on most calls stays near 4 (todo: batch calls across filters on the server). With a predicate of three or more columns the same rules apply: the combination must repeat to be cached, or split into a cached base and at most four small exclusions (16 value runs each, 262,144 rows in all); the benchmark table has two columns, so wider predicates are not measured (todo).
+
 **Per-GPU options measured offline.** A reduced-dimension scan copy cannot be judged on this table: its vectors are synthetic and nearly low-rank (32 of 128 dimensions hold 99.96% of the variance; recall stayed 1.0 at every D). On SIFT1M (1M x 128, a 10% random filter, k=500), candidates from a PCA copy, reranked in full dimension, kept recall 0.9999-1.0 (lowest 0.998) at D=64 with 1,500 candidates, 0.999 at D=48 with 1,500 and D=32 with 3,000. But the scan barely scales with dimensions (`blackwell_bench.py time`, 64 queries over 1M rows: 672 us at 128, 554 at 64, 470 at 32), so a reduced copy would save roughly 15-25% of the scan. Probing k-means clusters (1,024 on SIFT1M) needed 128 of them for recall 0.987 (lowest 0.912), 13% of the eligible rows per query, while a 64-query batch's probed clusters covered 98% of the rows, so the shared-row scan would have to become per-query. Neither is built yet. `blackwell_bench.py check` and `time --fused` fail on this host with the committed kernel source too (a launch returns `CUDA_ERROR_INVALID_VALUE`), so the offline gates need fixing before they can vouch for kernel changes; the GPU index tests and recall runs cover this one.
 
 ## 6. Suggested order

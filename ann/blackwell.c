@@ -307,7 +307,16 @@ static const char *const BlackwellSource[] = {
 	" * only when the distance is at most bounds[q * 32 + 31], the 32nd best\n"
 	" * of a sample of the rows: no row of the true best 32 is above it.\n"
 	" */\n"
-	"template <int QUANT, int NT, int FUSED>\n"
+	"template <int QUANT, int NT, int FUSED, int CD = 0>\n"
+	"/* ANN_TUNE (ANN_FUSE_TUNE, fused scan only): bit 1 tests hits as fma(-2 rs, x.q, rs^2 |x|^2) against\n"
+	" * cutoff - |q|^2 (slightly loose), voting per output so only warps with a candidate take the\n"
+	" * exact test and stage append; bit 2 a 128-dimension NVFP4 kernel with constant loop bounds;\n"
+	" * bit 4 B fragments by ldmatrix.x4; bit 8 block scales broadcast with one prmt; bit 32 (with 16)\n"
+	" * keeps output j's x.q in list slot j (one predicated store, no list pointer); bit 64 (check, slow)\n"
+	" * prints any hit the loose test of bit 16 would miss. */\n"
+	"#ifndef ANN_TUNE\n"
+	"#define ANN_TUNE 0\n"
+	"#endif\n"
 	"/* Halves past each query's row in shared memory (QueryPad): 8 moves the\n"
 	" * eight lanes reading one B fragment off a single bank. */\n"
 	"#ifndef ANN_QPAD\n"
@@ -349,14 +358,18 @@ static const char *const BlackwellSource[] = {
 	"/* ANN_APPEND_MODE bit 4: each lane keeps the tile's hits in its own ANN_BCAP-entry shared list\n"
 	" * (2 stores, no atomics in the row loop; a hit past it appends directly; assumes 256 threads)\n"
 	" * and stages them per query after the tile. */\n"
+	"#ifndef ANN_QVEC\n"
+	"#define ANN_QVEC 0\n"
+	"#endif\n"
 	"#ifndef ANN_BCAP\n"
 	"#define ANN_BCAP 32\n"
 	"#endif\n"
 	"__device__ void score_mma(const unsigned char *data, const unsigned char *scales,\n"
-	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
-	"    const float *queries, int nq, int dims, float *out, const float *bounds, unsigned *candR,\n"
+	"    const float *rowScales, unsigned rowBytes, unsigned blocks_, const unsigned *rows, unsigned n,\n"
+	"    const float *queries, int nq, int dims_, float *out, const float *bounds, unsigned *candR,\n"
 	"    unsigned *counts, unsigned cap, const float2 *rowNorm)\n"
 	"{\n"
+	"  const unsigned blocks = CD ? CD / 16 : blocks_; const int dims = CD ? CD : dims_;\n"
 	"  constexpr bool PRE = FUSED == 1 && (ANN_ROWNORM == 1 || ANN_ROWNORM == 3) && QUANT == 1;\n"
 	"  constexpr bool EARLY = PRE && ANN_ROWNORM == 3; /* issue the pair load before the row's k loop */\n"
 	"  constexpr bool PK = FUSED == 1 && (ANN_APPEND_MODE & 1);\n"
@@ -364,9 +377,14 @@ static const char *const BlackwellSource[] = {
 	"  __shared__ float qn[NT * 8];\n"
 	"  __shared__ float th[NT * 8];\n"
 	"  __shared__ float2 qt[PK ? NT * 8 : 1];\n"
-	"  constexpr bool PB = FUSED == 1 && (ANN_APPEND_MODE & 4);\n"
+	"  constexpr bool TV = FUSED == 1 && (ANN_TUNE & 1) && PK, TL = FUSED == 1 && (ANN_TUNE & 4) && !(ANN_ABLATE & 8);\n"
+	"  constexpr bool PB = FUSED == 1 && (ANN_APPEND_MODE & 4) && !TV;\n"
+	"  /* bit 16 (with the per-lane lists): the loose test above; a hit stores x.q alone and sets\n"
+	"   * bit j of hm, and the flush recomputes the exact distance and test. */\n"
+	"  constexpr bool TC = PB && PK && (ANN_TUNE & 16) && ANN_BCAP >= NT * 4;\n"
+	"  __shared__ __align__(8) float qc[TV || TC ? NT * 8 : 1];\n"
 	"  __shared__ float bD[PB ? ANN_BCAP * 256 : 1];\n"
-	"  __shared__ unsigned char bJ[PB ? ANN_BCAP * 256 : 1];\n"
+	"  __shared__ unsigned char bJ[PB && !TC ? ANN_BCAP * 256 : 1];\n"
 	"  unsigned bcnt = 0;\n"
 	"  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;\n"
 	"  int g = lane >> 2, t = lane & 3;\n"
@@ -386,6 +404,23 @@ static const char *const BlackwellSource[] = {
 	"      if (at < cap) { out[(unsigned long long) q * cap + at] = d; candR[(unsigned long long) q * cap + at] = r; }\n"
 	"    }\n"
 	"  };\n",
+	"  /* ANN_QVEC (ANN_FUSE_QVEC, default 3; 0 turns it off) bit 1: score matrices (FUSED 0), bit 2: the fused scan stage their\n"
+	"   * half queries four floats per load, the loads of a thread unrolled, instead of one. */\n"
+	"  if ((ANN_QVEC & (FUSED == 0 ? 1 : FUSED == 1 ? 2 : 0)) && (dims & 3) == 0 && (qstride & 3) == 0)\n"
+	"  {\n"
+	"    int q4 = qstride >> 2;\n"
+	"#pragma unroll 4\n"
+	"    for (int i = threadIdx.x; i < NT * 8 * q4; i += blockDim.x)\n"
+	"    {\n"
+	"      int q = i / q4, d = (i - q * q4) << 2;\n"
+	"      float4 v = (q < nq && d < dims) ? *(const float4 *) (queries + q * dims + d) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);\n"
+	"      unsigned short h0, h1, h2, h3;\n"
+	"      asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h0) : \"f\"(v.x)); asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h1) : \"f\"(v.y));\n"
+	"      asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h2) : \"f\"(v.z)); asm(\"cvt.rn.f16.f32 %0, %1;\" : \"=h\"(h3) : \"f\"(v.w));\n"
+	"      *(uint2 *) (qh + 4 * i) = make_uint2((unsigned) h0 | ((unsigned) h1 << 16), (unsigned) h2 | ((unsigned) h3 << 16));\n"
+	"    }\n"
+	"  }\n"
+	"  else\n",
 	"  for (int i = threadIdx.x; i < NT * 8 * qstride; i += blockDim.x)\n"
 	"  {\n"
 	"    int q = i / qstride, d = i - q * qstride;\n"
@@ -400,6 +435,11 @@ static const char *const BlackwellSource[] = {
 	"    qn[threadIdx.x] = s;\n"
 	"    if (FUSED) th[threadIdx.x] = threadIdx.x < nq ? bounds[threadIdx.x * 32 + 31] : 0.0f;\n"
 	"    if (PK) qt[threadIdx.x] = make_float2(s, threadIdx.x < nq ? bounds[threadIdx.x * 32 + 31] : -inf);\n"
+	"    if (TV || TC)\n"
+	"    {\n"
+	"      float c = threadIdx.x < nq ? bounds[threadIdx.x * 32 + 31] : -inf;\n"
+	"      qc[threadIdx.x] = c == -inf ? -inf : c - s + 1e-5f * (fabsf(c) + s);\n"
+	"    }\n"
 	"  }\n"
 	"  __syncthreads();\n"
 	"  unsigned stride = gridDim.x * warps * 16, first = (blockIdx.x * warps + warp) * 16;\n"
@@ -520,6 +560,11 @@ static const char *const BlackwellSource[] = {
 	"        if (QUANT == 1)\n"
 	"        {\n"
 	"          unsigned sc0 = scale2((k < 4 ? e0.x : e0.y) >> (8 * (k & 3))), sc1 = scale2((k < 4 ? e1.x : e1.y) >> (8 * (k & 3)));\n"
+	"          if (FUSED == 1 && (ANN_TUNE & 8))\n"
+	"          {\n"
+	"            unsigned h0 = e4m3pair((k < 4 ? e0.x : e0.y) >> (8 * (k & 3))), h1 = e4m3pair((k < 4 ? e1.x : e1.y) >> (8 * (k & 3)));\n"
+	"            asm(\"prmt.b32 %0, %1, %1, 0x1010;\" : \"=r\"(sc0) : \"r\"(h0)); asm(\"prmt.b32 %0, %1, %1, 0x1010;\" : \"=r\"(sc1) : \"r\"(h1));\n"
+	"          }\n"
 	"          int sh = ((ANN_LAYOUT & 1) && FUSED == 1) ? 0 : 8 * t;\n"
 	"          a0 = hmul2(e2m1pair(w0[k].x >> sh), sc0); a2 = hmul2(e2m1pair(w0[k].y >> sh), sc0);\n"
 	"          a1 = hmul2(e2m1pair(w1[k].x >> sh), sc1); a3 = hmul2(e2m1pair(w1[k].y >> sh), sc1);\n"
@@ -541,6 +586,23 @@ static const char *const BlackwellSource[] = {
 	"        }\n"
 	"        if (!PRE) { nx0 += sumsq2(a0) + sumsq2(a2); nx1 += sumsq2(a1) + sumsq2(a3); }\n"
 	"        const unsigned short *qk = qh + (seg + k) * 16 + 2 * t;\n"
+	"        if (TL)\n"
+	"        {\n"
+	"          /* x4: matrices (tile np, k 0-7), (np, k 8-15), (np + 1, 0-7), (np + 1, 8-15); lane l\n"
+	"           * addresses row l & 7 of matrix l >> 3. */\n"
+	"          const unsigned short *ql = qh + (seg + k) * 16 + ((lane >> 4) * 8 + (lane & 7)) * qstride + ((lane >> 3) & 1) * 8;\n"
+	"          unsigned qa; asm(\"{ .reg .u64 a; cvta.to.shared.u64 a, %1; cvt.u32.u64 %0, a; }\" : \"=r\"(qa) : \"l\"(ql));\n"
+	"#pragma unroll\n"
+	"          for (int np = 0; np < NT; np += 2)\n"
+	"          {\n"
+	"            unsigned b0, b1, b2, b3;\n"
+	"            asm volatile(\"ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\"\n"
+	"                : \"=r\"(b0), \"=r\"(b1), \"=r\"(b2), \"=r\"(b3) : \"r\"(qa + np * 16 * qstride));\n"
+	"            mma16816(acc + np * 4, a0, a1, a2, a3, b0, b1);\n"
+	"            if (np + 1 < NT) mma16816(acc + np * 4 + 4, a0, a1, a2, a3, b2, b3);\n"
+	"          }\n"
+	"          continue;\n"
+	"        }\n"
 	"#pragma unroll\n"
 	"        for (int nt = 0; nt < (FUSED == 2 ? 0 : NT); nt++)\n"
 	"        {\n"
@@ -572,14 +634,44 @@ static const char *const BlackwellSource[] = {
 	"      float2 p0 = rowNorm[r0], p1 = rowNorm[r1];\n"
 	"      if ((v0 && (p0.x != rs0 || p0.y != nx0)) || (v1 && (p1.x != rs1 || p1.y != nx1)))\n"
 	"        printf(\"rownorm mismatch rows %u %u: %.9g/%.9g %.9g/%.9g\\n\", r0, r1, p0.y, nx0, p1.y, nx1);\n"
-	"    }\n"
+	"    }\n",
+	"    const float nan = __int_as_float(0x7fffffff);\n"
+	"    float A0 = v0 ? rs0 * rs0 * nx0 * 0.99999f : nan, A1 = v1 ? rs1 * rs1 * nx1 * 0.99999f : nan;\n"
+	"    float m0 = -2.0f * rs0, m1 = -2.0f * rs1;\n"
+	"    unsigned hm = 0, sp = threadIdx.x;\n"
 	"    /* acc[nt * 4 + c]: c0 (row g, query nt*8 + 2t), c1 (g, +1), c2 (row g + 8, 2t), c3 (g + 8, +1) */\n"
 	"#pragma unroll\n"
 	"    for (int j = 0; j < NT * 4; j++)\n"
 	"    {\n"
 	"      int nn = (j >> 2) * 8 + 2 * t + (j & 1);\n"
 	"      unsigned i = (j & 2) ? i1 : i0; bool vr = (j & 2) ? v1 : v0;\n"
-	"      float nx = (j & 2) ? nx1 : nx0; float rs = (j & 2) ? rs1 : rs0;\n"
+	"      float nx = (j & 2) ? nx1 : nx0; float rs = (j & 2) ? rs1 : rs0;\n",
+	"      if (TV)\n"
+	"      {\n"
+	"        float2 cc = *(const float2 *) (qc + (j >> 2) * 8 + 2 * t);\n"
+	"        bool pre = fmaf((j & 2) ? m1 : m0, acc[j], (j & 2) ? A1 : A0) <= ((j & 1) ? cc.y : cc.x);\n"
+	"        if (__any_sync(0xffffffffu, pre) && pre)\n"
+	"        {\n"
+	"          float2 qv2 = qt[nn];\n"
+	"          float dist = fmaxf(rs * rs * nx + qv2.x - 2.0f * rs * acc[j], 0.0f);\n"
+	"          if (dist <= qv2.y) append(nn, dist, i);\n"
+	"        }\n"
+	"        continue;\n"
+	"      }\n"
+	"      if (TC)\n"
+	"      {\n"
+	"        float2 cc = *(const float2 *) (qc + (j >> 2) * 8 + 2 * t);\n"
+	"        if (ANN_TUNE & 64)\n"
+	"        {\n"
+	"          if (blockIdx.x == 0 && threadIdx.x == 0 && j == 0 && base == first) printf(\"tc alive n %u\\n\", n);\n"
+	"          float2 qd = qt[nn]; float dd = fmaxf(rs * rs * nx + qd.x - 2.0f * rs * acc[j], 0.0f);\n"
+	"          float pp = fmaf((j & 2) ? m1 : m0, acc[j], (j & 2) ? A1 : A0), pc = (j & 1) ? cc.y : cc.x;\n"
+	"          if (vr && dd <= qd.y && !(pp <= pc)) printf(\"tc miss q %d i %u d %.9g c %.9g p %.9g pc %.9g qn %.9g\\n\", nn, i, dd, qd.y, pp, pc, qd.x);\n"
+	"        }\n"
+	"        if (fmaf((j & 2) ? m1 : m0, acc[j], (j & 2) ? A1 : A0) <= ((j & 1) ? cc.y : cc.x))\n"
+	"        { if (ANN_TUNE & 32) bD[j * 256 + threadIdx.x] = acc[j]; else { bD[sp] = acc[j]; sp += 256; } hm |= 1u << j; }\n"
+	"        continue;\n"
+	"      }\n"
 	"      float2 qv = PK ? qt[nn] : make_float2(qn[nn], 0.0f);\n"
 	"      float dist = fmaxf(rs * rs * nx + qv.x - 2.0f * rs * acc[j], 0.0f);\n"
 	"      if (FUSED && (ANN_ABLATE & 1))\n"
@@ -603,7 +695,21 @@ static const char *const BlackwellSource[] = {
 	"      }\n"
 	"      else if (nn < nq && i < n) out[(unsigned long long) nn * n + i] = vr ? dist : inf;\n"
 	"    }\n"
-	"    if (PB)\n"
+	"    if (TC)\n"
+	"      for (unsigned e = 0; hm; e++)\n"
+	"      {\n"
+	"        int jj = __ffs(hm) - 1; hm &= hm - 1;\n"
+	"        float a = bD[((ANN_TUNE & 32) ? jj : e) * 256 + threadIdx.x], rs = (jj & 2) ? rs1 : rs0, nx = (jj & 2) ? nx1 : nx0;\n"
+	"        unsigned nn = (jj >> 2) * 8 + 2 * t + (jj & 1); float2 qv = qt[nn];\n"
+	"        /* The main loop's rounding exactly: no contraction of rs^2 |x|^2 + |q|^2. */\n"
+	"        float ax, tx, dist;\n"
+	"        asm(\"mul.rn.f32 %0, %1, %1;\" : \"=f\"(ax) : \"f\"(rs)); asm(\"mul.rn.f32 %0, %0, %1;\" : \"+f\"(ax) : \"f\"(nx));\n"
+	"        asm(\"add.rn.f32 %0, %1, %2;\" : \"=f\"(tx) : \"f\"(ax), \"f\"(qv.x));\n"
+	"        asm(\"fma.rn.f32 %0, %1, %2, %3;\" : \"=f\"(dist) : \"f\"(-2.0f * rs), \"f\"(a), \"f\"(tx));\n"
+	"        dist = fmaxf(dist, 0.0f);\n"
+	"        if (dist <= qv.y) append(nn, dist, base + g + (jj & 2) * 4);\n"
+	"      }\n"
+	"    else if (PB)\n"
 	"    {\n"
 	"      for (unsigned e = 0; e < bcnt; e++)\n"
 	"      {\n"
@@ -619,8 +725,8 @@ static const char *const BlackwellSource[] = {
 	"    __syncthreads();\n"
 	"    for (int q = threadIdx.x; q < NT * 8; q += blockDim.x)\n"
 	"    {\n"
-	"      unsigned c = sCount[q] < ANN_STAGE ? sCount[q] : ANN_STAGE;\n"
-	"      if (c == 0 || q >= nq) continue;\n"
+	"      unsigned c = sCount[q] < ANN_STAGE ? sCount[q] : ANN_STAGE;\n",
+	"      if (c == 0 || q >= nq) continue;\n",
 	"      unsigned base = atomicAdd(counts + q, c);\n"
 	"      for (unsigned j = 0; j < c && base + j < cap; j++)\n"
 	"      { out[(unsigned long long) q * cap + base + j] = sD[q * ANN_STAGE + j]; candR[(unsigned long long) q * cap + base + j] = sR[q * ANN_STAGE + j]; }\n"
@@ -658,6 +764,14 @@ static const char *const BlackwellSource[] = {
 	"MMA(score_mma_float, 4, 2) MMA(score_mma_float_32, 4, 4) MMA(score_mma_float_64, 4, 8)\n"
 	"FUSE(fuse_mma_nvfp4, 1, 2, FUSE_BOUNDS) FUSE(fuse_mma_nvfp4_32, 1, 4, FUSE_BOUNDS)\n"
 	"FUSE(fuse_mma_nvfp4_64, 1, 8, FUSE_BOUNDS)\n"
+	"#if ANN_TUNE & 2\n"
+	"extern \"C\" __global__ void FUSE_BOUNDS fuse_mma_nvfp4_64_d128(const unsigned char *data,\n"
+	"    const unsigned char *scales, const float *rowScales, unsigned rowBytes, unsigned blocks,\n"
+	"    const unsigned *rows, unsigned n, const float *queries, int nq, int dims, const float *bounds,\n"
+	"    float *candD, unsigned *candR, unsigned *counts, unsigned cap ROWNORM_PARAM)\n"
+	"{ score_mma<1, 8, 1, 128>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, candD, bounds,\n"
+	"    candR, counts, cap, ROWNORM_ARG); }\n"
+	"#endif\n"
 	"FUSE(fuse_mma_fp8, 2, 2, ) FUSE(fuse_mma_fp8_32, 2, 4, ) FUSE(fuse_mma_fp8_64, 2, 8, )\n"
 	"FUSE(fuse_mma_half, 3, 2, ) FUSE(fuse_mma_half_32, 3, 4, ) FUSE(fuse_mma_half_64, 3, 8, )\n"
 	"FUSE(fuse_mma_float, 4, 2, ) FUSE(fuse_mma_float_32, 4, 4, ) FUSE(fuse_mma_float_64, 4, 8, )\n"
@@ -755,6 +869,8 @@ typedef struct BlackwellModule
 	CUfunction	mma[4][3];		/* [format - 1][tiles]: score matrix of up to
 								 * 16, 32 or 64 queries from NVFP4, FP8, FP16
 								 * or FP32 rows */
+	CUfunction	fuse128;		/* fuse_mma_nvfp4_64 at 128 dimensions
+								 * (ANN_FUSE_TUNE bit 2) */
 	CUfunction	fuse[4][3];		/* the same, appending only rows under a bound
 								 * to candidate lists */
 	CUfunction	select32;		/* batched top-32 over a score matrix */
@@ -825,6 +941,29 @@ QueryPad(void)
 }
 
 /*
+ * ANN_FUSE_TUNE (default 42; 0 restores the generic scan): bits of
+ * fused-scan variants, see ANN_TUNE in the kernel source. 42 is bits 2, 8
+ * and 32: a kernel compiled for 128 dimensions, one-prmt scale broadcast and
+ * hits stored at their output's list slot. Bit 16 (58) adds a looser hit
+ * test rechecked at flush, about 4% faster, but its rounding moves a few
+ * candidates at the cutoff (recall@500 0.9998, lowest 0.994, against 1.0 and
+ * 0.998), so it is off by default.
+ */
+static int
+FuseTune(void)
+{
+	static int	tune = -1;
+
+	if (tune < 0)
+	{
+		const char *value = getenv("ANN_FUSE_TUNE");
+
+		tune = value ? atoi(value) & 0xffff : 42;
+	}
+	return tune;
+}
+
+/*
  * ANN_FUSE_LAYOUT (default 3; 0 turns it off): bit 1 has the fused NVFP4
  * scan read a second, lane-contiguous copy of each shard's rows, built at
  * upload: rows padded to whole 64-byte chunks of 8 blocks, and in each chunk
@@ -835,6 +974,7 @@ QueryPad(void)
  * 3 blocks fit a multiprocessor (4 or 5 bound it to 4, which spills). It
  * costs a second copy of the rows (64 bytes a row at 128 dimensions).
  */
+
 static int
 FuseLayout(void)
 {
@@ -945,7 +1085,7 @@ FuseInputs(const AnnBlackwellShard *shard, uint8_t **data, unsigned *rowBytes, f
 static char *
 JoinSource(void)
 {
-	size_t		length = 512;
+	size_t		length = 1024;
 	char	   *source;
 
 	for (int i = 0; BlackwellSource[i]; i++)
@@ -963,12 +1103,15 @@ JoinSource(void)
 		 * first: 210.4 -> 185.2 us a batch.
 		 */
 		snprintf(source, length, "#define ANN_QPAD %u\n#define ANN_ABLATE %d\n#define ANN_STAGE %d\n#define ANN_LAYOUT %d\n"
-				 "#define ANN_ROWNORM %d\n#define ANN_APPEND_MODE %d\n#define ANN_PREFETCH %d\n#define ANN_BCAP %d\n",
+				 "#define ANN_ROWNORM %d\n#define ANN_APPEND_MODE %d\n#define ANN_PREFETCH %d\n#define ANN_BCAP %d\n"
+				 "#define ANN_QVEC %d\n",
 				 QueryPad(), ablate ? atoi(ablate) : 0, append && strcmp(append, "global") == 0 ? 0 :
 				 getenv("ANN_FUSE_STAGE") ? atoi(getenv("ANN_FUSE_STAGE")) : 32, FuseLayout(),
 				 RowNormMode(), getenv("ANN_FUSE_APPEND_MODE") ? atoi(getenv("ANN_FUSE_APPEND_MODE")) : 5,
 				 getenv("ANN_FUSE_PREFETCH") ? atoi(getenv("ANN_FUSE_PREFETCH")) : 0,
-				 getenv("ANN_FUSE_BCAP") && atoi(getenv("ANN_FUSE_BCAP")) > 0 ? atoi(getenv("ANN_FUSE_BCAP")) : 32);
+				 getenv("ANN_FUSE_BCAP") && atoi(getenv("ANN_FUSE_BCAP")) > 0 ? atoi(getenv("ANN_FUSE_BCAP")) : 32,
+				 getenv("ANN_FUSE_QVEC") ? atoi(getenv("ANN_FUSE_QVEC")) : 3);
+		snprintf(source + strlen(source), length - strlen(source), "#define ANN_TUNE %d\n", FuseTune());
 	}
 	for (int i = 0; BlackwellSource[i]; i++)
 		strcat(source, BlackwellSource[i]);
@@ -1076,6 +1219,16 @@ AnnBlackwellReady(int device)
 		failed = "selection kernels";
 	else if (RowNormMode() && cuModuleGetFunction(&module->rowNorm, module->module, "row_norm_nvfp4") != CUDA_SUCCESS)
 		failed = "row norm kernel";
+	else if (FuseTune() & 2)
+	{
+		int			fixed = 0;
+
+		if (cuModuleGetFunction(&module->fuse128, module->module, "fuse_mma_nvfp4_64_d128") != CUDA_SUCCESS ||
+			cuFuncGetAttribute(&fixed, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, module->fuse128) != CUDA_SUCCESS ||
+			cuFuncSetAttribute(module->fuse128, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+							   (int) (optin > fixed ? optin - fixed : 0)) != CUDA_SUCCESS)
+			failed = "128-dimension fused kernel";
+	}
 	if (failed)
 	{
 		fprintf(stderr, "Blackwell module: unavailable on device %d (%s failed for %s, CUDA error %d, "
@@ -1086,12 +1239,14 @@ AnnBlackwellReady(int device)
 	{
 		/* Register arrays indexed by an unrolled loop must not spill. */
 		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_fp8", "score_mma_nvfp4_64",
-		"fuse_mma_nvfp4_64"};
+		"fuse_mma_nvfp4_64", "fuse_mma_nvfp4_64_d128"};
 		CUfunction	functions[] = {module->searchNvfp4, module->mma[0][0], module->mma[1][0], module->mma[0][2],
-		module->fuse[0][2]};
+		module->fuse[0][2], module->fuse128};
 
 		for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
 		{
+			if (functions[i] == NULL)
+				continue;
 			int			registers = 0,
 						local = 0;
 
@@ -1600,7 +1755,8 @@ AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_
 		blocks = rowBytes / 16;
 	else if (shard->quant >= ANN_BLACKWELL_HALF)
 		blocks = ((unsigned) dims + 15) / 16;
-	return cuLaunchKernel(module->fuse[shard->quant - 1][width], grid, 1, 1,
+	return cuLaunchKernel(module->fuse128 && shard->quant == ANN_QUANT_NVFP4 && width == 2 && dims == 128 &&
+						  blocks == 8 ? module->fuse128 : module->fuse[shard->quant - 1][width], grid, 1, 1,
 						  ANN_BLACKWELL_BLOCK, 1, 1, shared, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 }
 
