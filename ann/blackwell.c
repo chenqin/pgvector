@@ -1178,6 +1178,27 @@ AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32
 						  ANN_BLACKWELL_BLOCK, 1, 1, shared, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 }
 
+/*
+ * Blocks per SM of the fused scan's grid: ANN_FUSE_GRID, default 2. With
+ * hits staged per block, fewer, longer blocks flush less: 64 queries over
+ * 1M rows took 175.4 us at 2, 185.2 at 4, 243.4 at 16, 281.4 at 1, and two
+ * loaded GPUs served 5% more at 2 than at 4.
+ */
+static unsigned
+FuseGridPerSm(void)
+{
+	static int	blocks = -1;
+
+	if (blocks < 0)
+	{
+		const char *value = getenv("ANN_FUSE_GRID");
+		int			parsed = value ? atoi(value) : 0;
+
+		blocks = parsed >= 1 && parsed <= 64 ? parsed : 2;
+	}
+	return (unsigned) blocks;
+}
+
 int
 AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_t *rows, unsigned n,
 					   const float *queries, unsigned nq, int dims, const float *bounds, float *candD,
@@ -1198,8 +1219,8 @@ AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_
 		shard->quant == ANN_QUANT_NONE || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
 		module->fuse[shard->quant - 1][width] == NULL || cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
 		return 0;
-	if (grid > (unsigned) module->sms * 4)
-		grid = (unsigned) module->sms * 4;
+	if (grid > (unsigned) module->sms * FuseGridPerSm())
+		grid = (unsigned) module->sms * FuseGridPerSm();
 	if (shard->quant == ANN_QUANT_FP8)
 		blocks = rowBytes / 16;
 	else if (shard->quant >= ANN_BLACKWELL_HALF)
