@@ -466,7 +466,10 @@ As of 2026-11-07, at the cached 1,042.6k point:
   share the host's 224 logical CPUs.
   Per GPU (two GPUs serving, GPU-bound), padding the queries' shared-memory rows to
   remove an 8-way bank conflict took the scan from 358.5 to 209.7 µs a batch and the
-  cached point from 175.0k to 292.3k vectors/s per GPU.
+  cached point from 175.0k to 292.3k vectors/s per GPU. Staging hits per block, 2
+  blocks per SM, and then per-lane hit lists, a lane-contiguous NVFP4 copy and stored
+  row norms at 3 blocks per SM brought the scan to 122 µs and the point to 430.5k
+  per GPU (see [the exploration notes](ann-filter-throughput-exploration.md)).
 * **PostgreSQL** uses about 100 cores and the worker 32. PostgreSQL's remaining work per
   call is mostly text output of the id arrays (about 12% of backend samples) and
   parsing the text `vector[]` argument (about 4%); a client reading binary results
