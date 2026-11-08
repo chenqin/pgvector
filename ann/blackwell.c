@@ -313,6 +313,17 @@ static const char *const BlackwellSource[] = {
 	"#ifndef ANN_QPAD\n"
 	"#define ANN_QPAD 0\n"
 	"#endif\n"
+	"/* ANN_FUSE_ABLATE (timing only; results are wrong): 1 no appends, 2 no MMA,\n"
+	" * 4 rows from a hot 1,024-row set, 8 constant B fragments. */\n"
+	"#ifndef ANN_ABLATE\n"
+	"#define ANN_ABLATE 0\n"
+	"#endif\n"
+	"/* ANN_STAGE (default 32; ANN_FUSE_APPEND=global sets 0): the fused scan stages each block's hits per query in\n"
+	" * shared memory (ANN_STAGE of them) and appends them with one global atomic\n"
+	" * per query per block; a hit past the stage takes the global path. */\n"
+	"#ifndef ANN_STAGE\n"
+	"#define ANN_STAGE 0\n"
+	"#endif\n"
 	"__device__ void score_mma(const unsigned char *data, const unsigned char *scales,\n"
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
 	"    const float *queries, int nq, int dims, float *out, const float *bounds, unsigned *candR,\n"
@@ -324,7 +335,12 @@ static const char *const BlackwellSource[] = {
 	"  int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;\n"
 	"  int g = lane >> 2, t = lane & 3;\n"
 	"  int qstride = ((dims + 15) & ~15) + ANN_QPAD;\n"
+	"  float sink = 0.0f;\n"
 	"  const float inf = __int_as_float(0x7f800000);\n"
+	"  __shared__ float sD[FUSED && ANN_STAGE ? NT * 8 * ANN_STAGE : 1];\n"
+	"  __shared__ unsigned sR[FUSED && ANN_STAGE ? NT * 8 * ANN_STAGE : 1];\n"
+	"  __shared__ unsigned sCount[NT * 8];\n"
+	"  if (threadIdx.x < NT * 8) sCount[threadIdx.x] = 0;\n"
 	"  for (int i = threadIdx.x; i < NT * 8 * qstride; i += blockDim.x)\n"
 	"  {\n"
 	"    int q = i / qstride, d = i - q * qstride;\n"
@@ -346,6 +362,7 @@ static const char *const BlackwellSource[] = {
 	"    unsigned row0 = i0 < n ? rows[i0] : 0xffffffffu, row1 = i1 < n ? rows[i1] : 0xffffffffu;\n"
 	"    bool v0 = row0 != 0xffffffffu, v1 = row1 != 0xffffffffu;\n"
 	"    unsigned r0 = v0 ? row0 : 0u, r1 = v1 ? row1 : 0u;\n"
+	"    if (ANN_ABLATE & 4) { r0 = i0 & 1023u; r1 = i1 & 1023u; }\n"
 	"    float acc[NT * 4]; float nx0 = 0.0f, nx1 = 0.0f;\n"
 	"#pragma unroll\n"
 	"    for (int j = 0; j < NT * 4; j++) acc[j] = 0.0f;\n"
@@ -448,7 +465,10 @@ static const char *const BlackwellSource[] = {
 	"        for (int nt = 0; nt < NT; nt++)\n"
 	"        {\n"
 	"          const unsigned short *qq = qk + (nt * 8 + g) * qstride;\n"
-	"          mma16816(acc + nt * 4, a0, a1, a2, a3, *(const unsigned *) qq, *(const unsigned *) (qq + 8));\n"
+	"          unsigned b0 = (ANN_ABLATE & 8) ? lane * 0x3c003c00u : *(const unsigned *) qq;\n"
+	"          unsigned b1 = (ANN_ABLATE & 8) ? b0 ^ (unsigned) k : *(const unsigned *) (qq + 8);\n"
+	"          if (ANN_ABLATE & 2) acc[nt * 4] += __int_as_float((a0 ^ a1 ^ a2 ^ a3 ^ b0 ^ b1) & 0x3fffffffu);\n"
+	"          else mma16816(acc + nt * 4, a0, a1, a2, a3, b0, b1);\n"
 	"        }\n"
 	"      }\n"
 	"    }\n",
@@ -463,15 +483,35 @@ static const char *const BlackwellSource[] = {
 	"      unsigned i = (j & 2) ? i1 : i0; bool vr = (j & 2) ? v1 : v0;\n"
 	"      float nx = (j & 2) ? nx1 : nx0; float rs = (j & 2) ? rs1 : rs0;\n"
 	"      float dist = fmaxf(rs * rs * nx + qn[nn] - 2.0f * rs * acc[j], 0.0f);\n"
-	"      if (FUSED)\n"
+	"      if (FUSED && (ANN_ABLATE & 1))\n"
+	"        sink += dist;\n"
+	"      else if (FUSED)\n"
 	"      {\n"
 	"        if (nn < nq && i < n && vr && dist <= th[nn])\n"
 	"        {\n"
-	"          unsigned at = atomicAdd(counts + nn, 1u);\n"
-	"          if (at < cap) { out[(unsigned long long) nn * cap + at] = dist; candR[(unsigned long long) nn * cap + at] = i; }\n"
+	"          unsigned at = ANN_STAGE ? atomicAdd(sCount + nn, 1u) : ANN_STAGE;\n"
+	"          if (ANN_STAGE && at < ANN_STAGE) { sD[nn * ANN_STAGE + at] = dist; sR[nn * ANN_STAGE + at] = i; }\n"
+	"          else\n"
+	"          {\n"
+	"            at = atomicAdd(counts + nn, 1u);\n"
+	"            if (at < cap) { out[(unsigned long long) nn * cap + at] = dist; candR[(unsigned long long) nn * cap + at] = i; }\n"
+	"          }\n"
 	"        }\n"
 	"      }\n"
 	"      else if (nn < nq && i < n) out[(unsigned long long) nn * n + i] = vr ? dist : inf;\n"
+	"    }\n"
+	"  }\n"
+	"  if (FUSED && (ANN_ABLATE & 1) && sink == 1234.5f) counts[0] = 0;\n"
+	"  if (FUSED && ANN_STAGE)\n"
+	"  {\n"
+	"    __syncthreads();\n"
+	"    for (int q = threadIdx.x; q < NT * 8; q += blockDim.x)\n"
+	"    {\n"
+	"      unsigned c = sCount[q] < ANN_STAGE ? sCount[q] : ANN_STAGE;\n"
+	"      if (c == 0 || q >= nq) continue;\n"
+	"      unsigned base = atomicAdd(counts + q, c);\n"
+	"      for (unsigned j = 0; j < c && base + j < cap; j++)\n"
+	"      { out[(unsigned long long) q * cap + base + j] = sD[q * ANN_STAGE + j]; candR[(unsigned long long) q * cap + base + j] = sR[q * ANN_STAGE + j]; }\n"
 	"    }\n"
 	"  }\n"
 	"}\n",
@@ -667,7 +707,19 @@ JoinSource(void)
 		length += strlen(BlackwellSource[i]);
 	if ((source = malloc(length)) == NULL)
 		return NULL;
-	snprintf(source, length, "#define ANN_QPAD %u\n", QueryPad());
+	{
+		const char *ablate = getenv("ANN_FUSE_ABLATE");
+		const char *append = getenv("ANN_FUSE_APPEND");
+
+		/*
+		 * ANN_FUSE_APPEND=global puts every fused hit straight into its
+		 * global list (about 250,000 atomics a 64-query batch on 64
+		 * counters); the default stages them per block in shared memory
+		 * first: 210.4 -> 185.2 us a batch.
+		 */
+		snprintf(source, length, "#define ANN_QPAD %u\n#define ANN_ABLATE %d\n#define ANN_STAGE %d\n", QueryPad(),
+				 ablate ? atoi(ablate) : 0, append && strcmp(append, "global") == 0 ? 0 : 32);
+	}
 	for (int i = 0; BlackwellSource[i]; i++)
 		strcat(source, BlackwellSource[i]);
 	return source;
