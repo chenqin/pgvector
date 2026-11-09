@@ -2641,8 +2641,30 @@ WidenShortJob(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job, u
  * size, so it beats a mostly-masked graph walk for selective filters (an
  * inverted posting list scanned on the GPU). The kernel is compiled with
  * NVRTC on first use, so building the worker needs no CUDA compiler.
+ *
+ * This module carries the baseline scan every cuVS GPU runs, so it uses no
+ * instruction past what cuVS itself needs: warp_umin and warp_umax take
+ * __reduce_*_sync (sm_80) only where it exists and shuffle elsewhere.
  */
 static const char GatherSource[] =
+"__device__ __forceinline__ unsigned warp_umin(unsigned v)\n"
+"{\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"  return __reduce_min_sync(0xffffffffu, v);\n"
+"#else\n"
+"  for (int o = 16; o; o >>= 1) v = min(v, __shfl_xor_sync(0xffffffffu, v, o));\n"
+"  return v;\n"
+"#endif\n"
+"}\n"
+"__device__ __forceinline__ unsigned warp_umax(unsigned v)\n"
+"{\n"
+"#if __CUDA_ARCH__ >= 800\n"
+"  return __reduce_max_sync(0xffffffffu, v);\n"
+"#else\n"
+"  for (int o = 16; o; o >>= 1) v = max(v, __shfl_xor_sync(0xffffffffu, v, o));\n"
+"  return v;\n"
+"#endif\n"
+"}\n"
 "__device__ __forceinline__ float load(const float *p) { return *p; }\n"
 "__device__ __forceinline__ float load(const unsigned short *p)\n"
 "{ float f; unsigned short h = *p; asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h)); return f; }\n"
@@ -2723,49 +2745,6 @@ static const char PruneSource[] =
 "  unsigned *val = (unsigned *) (key + size);\n"
 "  unsigned row = blockIdx.x, n = (unsigned) counts[row];\n"
 "  if (n > cap) n = cap;\n"
-"  for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
-"  {\n"
-"    bool live = i < n;\n"
-"    key[i] = live ? d[(unsigned long long) row * cap + i] : __int_as_float(0x7f800000);\n"
-"    val[i] = live ? (unsigned) r[(unsigned long long) row * cap + i] : 0xffffffffu;\n"
-"  }\n"
-"  __syncthreads();\n"
-"  for (unsigned len = 2; len <= size; len <<= 1)\n"
-"    for (unsigned stride = len >> 1; stride > 0; stride >>= 1)\n"
-"    {\n"
-"      for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
-"      {\n"
-"        unsigned j = i ^ stride;\n"
-"        if (j > i)\n"
-"        {\n"
-"          float a = key[i], b = key[j];\n"
-"          bool up = (i & len) == 0;\n"
-"          if ((a > b) == up) { key[i] = b; key[j] = a; unsigned t = val[i]; val[i] = val[j]; val[j] = t; }\n"
-"        }\n"
-"      }\n"
-"      __syncthreads();\n"
-"    }\n"
-"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
-"  {\n"
-"    bool live = i < n;\n"
-"    outD[(unsigned long long) row * k + i] = live ? key[i] : __int_as_float(0x7f800000);\n"
-"    outR[(unsigned long long) row * k + i] = live && val[i] != 0xffffffffu ? (long long) val[i] : -1;\n"
-"  }\n"
-"}\n";
-
-/*
- * matrix_prune_sort sized on the device: each block sorts the next power of
- * two of its own kept count (shared memory is launched for the cap), so the
- * host needs no counts before the sort and no mid-pipeline sync.
- */
-static const char PruneAutoSource[] =
-"extern \"C\" __global__ void matrix_prune_sort_auto(const float *d, const long long *r,\n"
-"    const unsigned long long *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
-"{\n"
-"  extern __shared__ float key[];\n"
-"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row], size = 2;\n"
-"  while (size < n) size <<= 1;\n"
-"  unsigned *val = (unsigned *) (key + size);\n"
 "  for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
 "  {\n"
 "    bool live = i < n;\n"
@@ -3067,7 +3046,7 @@ static const char PostSource[] =
 "  }\n"
 "  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; below = 0; ties = 0; s_done = 0; }\n"
 "  __syncthreads();\n"
-"  lo = __reduce_min_sync(0xffffffffu, lo); hi = __reduce_max_sync(0xffffffffu, hi);\n"
+"  lo = warp_umin(lo); hi = warp_umax(hi);\n"
 "  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
 "  __syncthreads();\n"
 "  lo = s_lo; hi = s_hi;\n"
@@ -3264,7 +3243,7 @@ static const char PostSource3[] =
 "  for (unsigned i = tid; i < n; i += nt) { unsigned x = select_key(v[i]); keys[i] = x; lo = min(lo, x); hi = max(hi, x); }\n"
 "  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; below = 0; ties = 0; nb = 0; }\n"
 "  __syncthreads();\n"
-"  lo = __reduce_min_sync(0xffffffffu, lo); hi = __reduce_max_sync(0xffffffffu, hi);\n"
+"  lo = warp_umin(lo); hi = warp_umax(hi);\n"
 "  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
 "  __syncthreads();\n"
 "  lo = s_lo; hi = s_hi;\n"
@@ -3353,7 +3332,7 @@ static const char PostSource4[] =
 "  hist[2 * tid] = 0; hist[2 * tid + 1] = 0;\n"
 "  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; }\n"
 "  __syncthreads();\n"
-"  lo = __reduce_min_sync(0xffffffffu, lo); hi = __reduce_max_sync(0xffffffffu, hi);\n"
+"  lo = warp_umin(lo); hi = warp_umax(hi);\n"
 "  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
 "  __syncthreads();\n"
 "  lo = s_lo; hi = s_hi;\n"
@@ -3606,7 +3585,6 @@ typedef struct GatherModule
 	CUfunction	pruneFill;
 	CUfunction	pruneCompact;
 	CUfunction	pruneSort;
-	CUfunction	pruneSortAuto;
 	CUfunction	finalTopk;
 	CUfunction	pruneCompact4;
 	CUfunction	pruneSelect;
@@ -3624,10 +3602,39 @@ typedef struct GatherModule
 	CUfunction	postChunk;
 	CUfunction	postFusedF;
 	CUfunction	postFusedH;
+
+	/*
+	 * Dynamic shared memory each sort may take on this device: what it asks
+	 * for, or less where the device's opt-in limit is lower (about 99 KB on
+	 * 8.6, 8.9 and 12.x, 64 KB on 7.5). A launch that would need more takes
+	 * the select_k path instead.
+	 */
+	int			sortShared;		/* matrix_prune_sort */
+	int			finalShared;	/* final_topk */
+	int			select11Shared; /* prune_select_s */
 } GatherModule;
 
 static GatherModule gatherModules[ANN_CUVS_MAX_DEVICES];
 static pthread_mutex_t gatherMutex = PTHREAD_MUTEX_INITIALIZER;
+
+/*
+ * Let a kernel take up to want bytes of dynamic shared memory, or what the
+ * device's opt-in limit leaves after its static shared memory if that is
+ * less. Returns the bytes granted, -1 on a driver error.
+ */
+static int
+OptInShared(CUfunction function, int optin, int want)
+{
+	int			fixed = 0;
+	int			dynamic = want;
+
+	if (cuFuncGetAttribute(&fixed, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, function) != CUDA_SUCCESS)
+		return -1;
+	if (optin > 0 && optin - fixed < dynamic)
+		dynamic = optin - fixed > 0 ? optin - fixed : 0;
+	return cuFuncSetAttribute(function, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, dynamic) ==
+		CUDA_SUCCESS ? dynamic : -1;
+}
 
 /* Compile and load the gather kernels on a device once; NULL if unavailable. */
 static GatherModule *
@@ -3639,7 +3646,8 @@ GatherKernels(int device)
 	char	   *source = NULL;
 	size_t		size = 0;
 	int			major = 0,
-				minor = 0;
+				minor = 0,
+				optin = 0;
 	CUdevice	handle;
 
 	if (atomic_load_explicit(&module->state, memory_order_acquire) != 0)
@@ -3653,8 +3661,10 @@ GatherKernels(int device)
 		cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
 		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess)
 		goto fail;
+	if (cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, device) != cudaSuccess)
+		optin = 0;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
-	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) + strlen(PruneAutoSource) +
+	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) +
 					strlen(FinalSource) + strlen(SelectSource) + strlen(FusedSelectSource) + strlen(SegmentSource) +
 					strlen(PostSource) + strlen(PostSource1) + strlen(PostSource2) +
 					strlen(PostSource3) + strlen(PostSource3b) + strlen(PostSource4) + strlen(PostSource5) + 1);
@@ -3663,7 +3673,6 @@ GatherKernels(int device)
 	strcpy(source, GatherSource);
 	strcat(source, RerankSource);
 	strcat(source, PruneSource);
-	strcat(source, PruneAutoSource);
 	strcat(source, FinalSource);
 	strcat(source, SelectSource);
 	strcat(source, FusedSelectSource);
@@ -3688,16 +3697,12 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneFill, module->module, "matrix_fill") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact, module->module, "matrix_compact") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->pruneSortAuto, module->module, "matrix_prune_sort_auto") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->finalTopk, module->module, "final_topk") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact4, module->module, "matrix_compact4") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSelect, module->module, "matrix_prune_select") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSelect32, module->module, "matrix_prune_select32") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->cutoff32, module->module, "cutoff32") != CUDA_SUCCESS ||
-		cuFuncSetAttribute(module->finalTopk, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-						   ANN_FINAL_MAX * 12) != CUDA_SUCCESS ||
-		cuFuncSetAttribute(module->pruneSortAuto, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS ||
+		(module->finalShared = OptInShared(module->finalTopk, optin, ANN_FINAL_MAX * 12)) < 0 ||
 		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentCompact, module->module, "segment_compact") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postSelect, module->module, "prune_select_reg") != CUDA_SUCCESS ||
@@ -3710,11 +3715,15 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->postChunk, module->module, "final_bucket") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFusedF, module->module, "rerank_final_f") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFusedH, module->module, "rerank_final_h") != CUDA_SUCCESS ||
-		cuFuncSetAttribute(module->postSelect11, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-						   ANN_PRUNE_CAP * 4) != CUDA_SUCCESS ||
-		cuFuncSetAttribute(module->pruneSort, CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
-						   ANN_PRUNE_CAP * 8) != CUDA_SUCCESS)
+		(module->select11Shared = OptInShared(module->postSelect11, optin, ANN_PRUNE_CAP * 4)) < 0 ||
+		(module->sortShared = OptInShared(module->pruneSort, optin, ANN_PRUNE_CAP * 8)) < 0)
 		goto fail;
+	if (module->sortShared < ANN_PRUNE_CAP * 8 || module->finalShared < ANN_FINAL_MAX * 12 ||
+		module->select11Shared < ANN_PRUNE_CAP * 4)
+		fprintf(stderr, "cuVS: device %d (compute capability %d.%d) opts in %d KB of shared memory a block; "
+				"pruned sorts past %d scores, final top-k past %d candidates and the fused radix select past "
+				"%d scores use select_k\n", device, major, minor, optin / 1024, module->sortShared / 8,
+				module->finalShared / 12, module->select11Shared / 4);
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
 fail:
@@ -4945,6 +4954,15 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 			void	   *sortArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &cap, &size, &k,
 			&lane->matrixCandidates, &lane->matrixIndices};
 
+			if (size * 8 > (unsigned) module->sortShared)
+			{
+				/*
+				 * The scores are untouched: the caller selects them with
+				 * select_k.
+				 */
+				(void) atomic_fetch_add_explicit(&state->matrix_prune_fallbacks, 1, memory_order_relaxed);
+				return 0;
+			}
 			if (cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 				cuLaunchKernel(module->pruneSort, q, 1, 1, 1024, 1, 1, size * 8, (CUstream) stream,
 							   sortArgs, NULL) != CUDA_SUCCESS)
@@ -4989,6 +5007,9 @@ FinalTopk(AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q, uint
 							   q, 1, 1, (PostVariant() & ANN_POST_PROBE_FINAL) ? 256 : 1024, 1, 1,
 							   (PostVariant() & ANN_POST_PROBE_FINAL) ? 0 : (((n + 3) & ~3u) + n) * 4,
 							   (CUstream) stream, postArgs, NULL) == CUDA_SUCCESS;
+		if (size * 12 > (unsigned) module->finalShared)
+			return AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices, lane->matrixValues,
+								  lane->matrixRows, q, candidates, outk, 1, NULL) == CUVS_SUCCESS;
 		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 			cuLaunchKernel(module->finalTopk, q, 1, 1, 1024, 1, 1, size * 12, (CUstream) stream, args, NULL) ==
 			CUDA_SUCCESS;
@@ -5069,9 +5090,19 @@ FusedEligible(const AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t q, uint32_
 			  uint32_t dims)
 {
 	uint64_t	rank;
+	GatherModule *module;
 
 	if (!FuseMatrixEnabled() || !AnnIndexConfig.matrix_prune || state->nshards != 1 || n < PruneMinRows() ||
-		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || dims > ANN_BLACKWELL_FUSE_DIMS)
+		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || dims > ANN_BLACKWELL_FUSE_DIMS ||
+		(module = GatherKernels(state->shards[0].device)) == NULL)
+		return 0;
+
+	/*
+	 * prune_select_s keeps up to ANN_PRUNE_CAP keys in shared memory; a
+	 * failed fused tile fails its batch.
+	 */
+	if ((PostVariant() & (ANN_POST_SELECT11 | ANN_POST_PROBE_SORT)) == ANN_POST_SELECT11 &&
+		module->select11Shared < ANN_PRUNE_CAP * 4)
 		return 0;
 	rank = ((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n;
 	if (rank < ANN_PRUNE_RANK)
@@ -5813,6 +5844,11 @@ SearchGatherMixed(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 		return 0;
 	while (size < (unsigned) most)
 		size <<= 1;
+	if (size * 8 > (unsigned) module->sortShared)
+	{
+		(void) atomic_fetch_add_explicit(&state->matrix_prune_fallbacks, 1, memory_order_relaxed);
+		return 0;
+	}
 	{
 		unsigned	k = candidates;
 		void	   *sortArgs[] = {&lane->pruneScores, &lane->prunePositions, &lane->pruneCounts, &cap, &size, &k,

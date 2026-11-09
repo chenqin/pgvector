@@ -1183,6 +1183,15 @@ AnnBlackwellReady(int device)
 	(void) pthread_mutex_lock(&moduleMutex);
 	if (atomic_load_explicit(&module->state, memory_order_relaxed) != 0)
 		goto unlock;
+
+	/*
+	 * One module, one gate, set by its newest instruction:
+	 * cvt.rn.f16x2.e2m1x2 (FP4 decode) needs an arch-specific Blackwell
+	 * target (sm_100a, sm_120a). The rest would run earlier:
+	 * cvt.rn.f16x2.e4m3x2 from 8.9, mma.sync m16n8k16 and cvt.rn.f16x2.f32
+	 * from 8.0, ldmatrix from 7.5. Elsewhere the worker keeps the cuVS
+	 * baseline: CAGRA, and the gather scan in cuvs.c.
+	 */
 	if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, device) != cudaSuccess ||
 		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, device) != cudaSuccess ||
 		(major != 10 && major != 12))
@@ -1236,6 +1245,25 @@ AnnBlackwellReady(int device)
 		goto unlock;
 	}
 	atomic_store_explicit(&module->state, 1, memory_order_release);
+	{
+		/*
+		 * Experiment settings that change what searches return, said once so
+		 * a timing run's results are not read as recall.
+		 */
+		static int	warned = 0;
+		const char *ablate = getenv("ANN_FUSE_ABLATE");
+
+		if (!warned && ablate && atoi(ablate) != 0)
+			fprintf(stderr, "Blackwell module: WARNING ANN_FUSE_ABLATE=%s is for timing only; fused scans "
+					"return wrong results\n", ablate);
+		if (!warned && (FuseTune() & 16))
+			fprintf(stderr, "Blackwell module: WARNING ANN_FUSE_TUNE bit 16 tests fused hits loosely; "
+					"candidates at the cutoff can be missed (lower recall)\n");
+		if (!warned && ((FuseTune() & 64) || RowNormMode() == 2))
+			fprintf(stderr, "Blackwell module: ANN_FUSE_TUNE bit 64 or ANN_FUSE_ROWNORM=check is set; "
+					"fused scans run checks and are slower\n");
+		warned = 1;
+	}
 	{
 		/* Register arrays indexed by an unrolled loop must not spill. */
 		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_fp8", "score_mma_nvfp4_64",
