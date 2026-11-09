@@ -32,7 +32,7 @@ The worker must run on the database host as a user that can create sockets where
 | `--backend` | `cpu-exact` | `cpu-exact` or `mock-gpu` (`cuvs` in the separate cuVS build). |
 | `--lanes` | online CPUs | Concurrent backend submissions. |
 | `--max-batch` | 64 | Jobs per submission. Lanes leave queued work for idle lanes. |
-| `--delay-us` | 0 | Optional wait to fill a partial batch while no lane is idle. |
+| `--delay-us` | 0 | Optional wait to fill a partial batch while no lane is idle, counted from the oldest job's arrival, so a job that already queued that long is not held again. |
 | `--max-pending-mb` | 512 | Admission budget for queued and running work across all connections. |
 | `--index-pending-share PERCENT` | 100 | The share of that budget one loaded index's searches may hold, so a flood on one index can't starve the others; refusals count in `rejected` and `rejected_index`. Use 25–50 on workers serving several indexes or collection parts. |
 | `--trace FILE`, `--trace-sample N` | off, 64 | Append arrival, queued, started, finished and replied times of requests whose ID is a multiple of N ([tracing](ann-networked.md#rdma-infiniband-roce)). |

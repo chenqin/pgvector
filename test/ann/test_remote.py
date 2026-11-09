@@ -37,14 +37,14 @@ def free_port():
 
 
 class Node:
-    def __init__(self, directory):
+    def __init__(self, directory, *extra):
         self.port = free_port()
         token = os.path.join(directory, f'token-{self.port}')
         with open(token, 'w') as out:
             out.write(TOKEN + '\n')
         rdma = ['--rdma', RDMA, '--rdma-lanes', RDMA_LANES] if RDMA else []
         self.server = Server('--backend', IndexWorkerTests.backend, '--listen-tcp', f'127.0.0.1:{self.port}',
-                             '--auth-token-file', token, *rdma, executable=IndexWorkerTests.worker)
+                             '--auth-token-file', token, *rdma, *extra, executable=IndexWorkerTests.worker)
         deadline = time.monotonic() + 5
         while True:
             try:
@@ -275,6 +275,23 @@ class RemoteSqlTests(unittest.TestCase):
             self.assertLess(time.monotonic() - started, 5)
         finally:
             spare.close()
+
+    def test_overloaded_node_moves_searches_to_another(self):
+        # A node with no admission budget refuses every search as overloaded.
+        tight = Node(self.directory.name, '--max-pending-mb', '0')
+        try:
+            name = f'{self.name}_tight'
+            for node in (tight, self.nodes[0]):
+                self.psql(f"SELECT ann_index_load('{name}', '{self.path}')", nodes=[node])
+            query = ("SET ann.worker_overload_wait_ms = 0;\n"
+                     f"SELECT count(*) FROM ann_index_search('{name}', '[1,1,1,1]', 3);\n" * 2)
+            # Backends start on a node by process ID, so about half start on the tight one.
+            for _ in range(8):
+                self.assertEqual(self.psql(query, nodes=[tight, self.nodes[0]]).split(), ['3', '3'])
+            output = self.psql(query, check=False, nodes=[tight])
+            self.assertIn('overloaded', output)
+        finally:
+            tight.close()
 
     def test_all_nodes_down_is_unavailable(self):
         output = self.psql("SET ann.worker_address = '127.0.0.1:1';\n"

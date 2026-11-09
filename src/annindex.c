@@ -91,6 +91,8 @@ AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs
 {
 	instr_time	start;
 	long		delayUs = 500;
+	int			refused = 0;
+	int			nodes = AnnRemoteNodeCount();
 
 	INSTR_TIME_SET_CURRENT(start);
 	for (;;)
@@ -111,6 +113,19 @@ AnnIndexCall(uint16 operation, const char *payload, size_t length, int timeoutMs
 		 */
 		if (!ok || *status != ANN_STATUS_OVERLOADED)
 			return ok;
+
+		/*
+		 * Another node may have room: try each once, at once, and stay on
+		 * the one that accepts. Once every node has refused, back off on
+		 * the current one rather than reconnecting every round.
+		 */
+		if (refused + 1 < nodes)
+		{
+			AnnRemoteNextNode();
+			refused++;
+			CHECK_FOR_INTERRUPTS();
+			continue;
+		}
 		INSTR_TIME_SET_CURRENT(now);
 		INSTR_TIME_SUBTRACT(now, start);
 		if (INSTR_TIME_GET_MILLISEC(now) + delayUs / 1000.0 >= ann_worker_overload_wait_ms)

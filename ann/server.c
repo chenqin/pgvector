@@ -78,6 +78,7 @@ typedef struct Job
 	uint64_t	arrived;		/* --trace: frame read (ns, realtime) */
 	uint64_t	queued;			/* decoded and queued */
 	uint64_t	started;		/* taken by a lane */
+	uint64_t	enqueued;		/* --delay-us: queued (ns, realtime) */
 } Job;
 
 /*
@@ -959,6 +960,8 @@ Append		(Service *service, Job *job)
 		service->head = job;
 	service->tail = job;
 	service->queued++;
+	if (service->options.delay_us)
+		job->enqueued = Now();
 	job->filter = Shareable(job) ? FilterFor(service, job) : NULL;
 	if (job->filter)
 	{
@@ -1075,7 +1078,12 @@ Lane(void *argument)
 			(void) pthread_mutex_unlock(&service->mutex);
 			break;
 		}
-		deadline = Now() + service->options.delay_us * 1000;
+
+		/*
+		 * The fill window counts from the job's arrival, so a job that
+		 * already waited in the queue is not held again.
+		 */
+		deadline = service->options.delay_us ? job->enqueued + service->options.delay_us * 1000 : 0;
 
 		/*
 		 * Leave a share of the queue for idle lanes instead of serializing

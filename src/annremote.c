@@ -619,6 +619,30 @@ AnnRemoteConfigured(void)
 }
 
 /* Split ann.worker_address into host and port strings; returns the count. */
+static int	ParseNodes(const char *nodes, char **hosts, char **ports);
+
+/* The number of nodes in ann.worker_address. */
+int
+AnnRemoteNodeCount(void)
+{
+	char	   *hosts[ANN_MAX_NODES];
+	char	   *ports[ANN_MAX_NODES];
+
+	return AnnRemoteConfigured() ? ParseNodes(ann_worker_address, hosts, ports) : 0;
+}
+
+/*
+ * Move this backend to the next node of ann.worker_address for its next
+ * request, without marking the current one down: used when a node refuses
+ * a search as overloaded while others may have room.
+ */
+void
+AnnRemoteNextNode(void)
+{
+	if (!remoteBusy)
+		CloseRemote();
+}
+
 static int
 ParseNodes(const char *nodes, char **hosts, char **ports)
 {
