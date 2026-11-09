@@ -169,7 +169,7 @@ The matching implementation is in [cost.h](../ann/common/cost.h),
 [annfrozenscan.c](../src/annfrozenscan.c), and [cuvs.c](../ann/server/cuvs.c).
 
 ```sh
-cc -O2 -std=c11 -Iann benchmarks/ann/cost_predict.c -lm -o /tmp/cost-predict
+cc -O2 -std=c11 -Iann/common benchmarks/ann/cost_predict.c -lm -o /tmp/cost-predict
 printf '10000000 500 32\n10000000 501 32\n' | /tmp/cost-predict \
   benchmarks/ann/results/frozen-cost-b200-95/profile.tsv
 ```

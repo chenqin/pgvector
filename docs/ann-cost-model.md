@@ -58,7 +58,7 @@ python benchmarks/ann/calibrate_cost.py --index-dir "$INDEX_DIR" \
   --graph-itopk 4096 --graph-slack 256 \
   --truth-training calibration/training-truth.json \
   --truth-holdout calibration/holdout-truth.json
-cc -O2 -std=c11 -Iann benchmarks/ann/cost_predict.c -lm -o /tmp/cost-predict
+cc -O2 -std=c11 -Iann/common benchmarks/ann/cost_predict.c -lm -o /tmp/cost-predict
 printf '100000 500 16\n' | /tmp/cost-predict calibration/profile.tsv
 python benchmarks/ann/validate_cost.py --index-dir "$INDEX_DIR" \
   --profile "$PWD/calibration/profile.tsv" --truth calibration/holdout-truth.json \
