@@ -63,14 +63,14 @@ Items 1-3 target the uncached regime. Item 4 targets a workload the benchmark do
 ### P01: base conjunct plus residual mask on the GPU
 
 **Mechanism.**
-- After `AnnIndexCanonical` in `PredicateBitmap` (`ann/server.c:2253-2313`), split a top-level AND into a BASE and a RESIDUAL:
+- After `AnnIndexCanonical` in `PredicateBitmap` (`ann/server/server.c:2253-2313`), split a top-level AND into a BASE and a RESIDUAL:
   - BASE: one single-column run, which is today's cached entry, or a postings slice.
   - RESIDUAL: the remaining leaves.
 - Only the BASE is looked up and cached. The job carries the residual program and its hash.
 - The lane masks residual-rejected rows on the GPU in one of two ways:
   - (a) copy the base's device rows into `lane->gatherRows` (a 4 MB D2D) and overwrite rejected entries with `0xffffffff`;
   - (b) test the residual inside `matrix_compact`.
-- Rows set to `0xffffffff` already score +inf in three places: `score_mma` (`ann/blackwell.c:338-343, 468`), the gather kernel (`cuvs.c:2392`) and rerank (`cuvs.c:2555`).
+- Rows set to `0xffffffff` already score +inf in three places: `score_mma` (`ann/server/blackwell.c:338-343, 468`), the gather kernel (`cuvs.c:2392`) and rerank (`cuvs.c:2555`).
 - `matrix_compact` keeps only scores at or under the sampled bound (`cuvs.c:2436-2452`), so masked rows never reach the candidate set.
 - The residual itself can run on the existing UDF interpreter (`DevicePredicate`, `cuvs.c:1615-1697`) over device-resident columns (`PredicateDeviceColumn`, `cuvs.c:1594-1612`).
 - Masked predicates create no cache entry.
@@ -118,7 +118,7 @@ Items 1-3 target the uncached regime. Item 4 targets a workload the benchmark do
 ### P07: drop host `keys[]` from predicate entries
 
 **Mechanism.**
-- `BuildBitmap` (`ann/indexfile.c:1015-1034`) reads `file->keys[ordinal]` for every set bit, the 33.8% line of the fresh10 profile.
+- `BuildBitmap` (`ann/server/indexfile.c:1015-1034`) reads `file->keys[ordinal]` for every set bit, the 33.8% line of the fresh10 profile.
 - No matrix-route consumer reads an entry's `keys[]`. `SearchGatherMatrix` uses ordinals and `deviceRows`, and hits come from `file->keys[row]` (`cuvs.c:4046`).
 - Build only `ordinals[]` for computed predicates. Keep `keys[]` for key-list filters that arrive through `SubmitIndex`.
 
@@ -146,7 +146,7 @@ Items 1-3 target the uncached regime. Item 4 targets a workload the benchmark do
 ### G1a: clustered worker export with range-form predicate jobs
 
 **Mechanism.**
-1. **Export permutation.** Write the worker files (vectors, NVFP4 codes and scales, keys, attribute columns) in argsort order of a declared cluster key, for example `(category, tenant, key)`. This goes in `src/annexport.c` (`:147-175, 241, 250`) or in `scripts/ann/build_cuvs_index.py` before quantization; NVFP4 is per row, so quantizing the permuted rows gives byte-identical rows. The PostgreSQL frozen index stays key-ordered. Side files:
+1. **Export permutation.** Write the worker files (vectors, NVFP4 codes and scales, keys, attribute columns) in argsort order of a declared cluster key, for example `(category, tenant, key)`. This goes in `src/annexport.c` (`:147-175, 241, 250`) or in `ann/builder/build_cuvs_index.py` before quantization; NVFP4 is per row, so quantizing the permuted rows gives byte-identical rows. The PostgreSQL frozen index stays key-ordered. Side files:
    - `ordinal.u32`: the original ordinal of each row;
    - `keyorder.u32`: rows sorted by key;
    - a (category, tenant) cell directory;
@@ -266,7 +266,7 @@ G3a validation note: `matrix_prune_fallbacks` cannot detect the 4M disablement. 
 - **G1b: range-input `score_mma` streaming contiguous clustered rows.** 0 throughput at every measured point. The 64-wide pass is bound by the mma.sync issue path, not memory (`docs/ann-blackwell.md:68`). The "gather is the cost" remark (`:55`) is about the 16-query and single-query kernels. NVFP4 codes are already read as full sectors (`blackwell.c:375-380`); only the scale and rowscale loads are amplified. It depends on G1a. Keep its cheap probe if G1a is built: time the existing `AnnBlackwellScoreMatrix` on a scattered 10% rows list against an iota list. Drop the kernel variant below 1.2x.
 - **G2a: SMT/physical-core discriminator as a lever.** 0 by construction. Its supporting fit leans on the two 128-lane points. `perf stat` is reportedly blocked on the benchmark host (gprofng timer samples only). A CPU burner also slows the lanes' blocking-sync wakeups, which biases the test towards H1. Its cheap parts are kept as experiment 4 below.
 - **G3b: size the filtered CAGRA frontier to the filtering rate.** 0 on the benchmark: 1M rows already run at itopk 1024, and the gather wins at k=500.
-  - **The zero-code validation cannot run.** `--itopk` is clamped to 512 (`ann/worker.c:332-333`), and the 0.25 gate blocks `--filtered-itopk` at 40%.
+  - **The zero-code validation cannot run.** `--itopk` is clamped to 512 (`ann/server/worker.c:332-333`), and the 0.25 gate blocks `--filtered-itopk` at 40%.
   - **The baseline is wrong.** At 4M rows, k=100, b1 already meets the floor (221.7k, lowest 0.99). Under the default 4M gather limit these searches already take the graph.
   - **The ratio model of recall is contradicted:** the 10%/k=500 UDF row at ratio 0.82 has recall 1.000.
   - **Costs:** raising the frontier would cut 4M throughput from 884k-1.2M to about 450-800k (*estimate*). `WidenShortJob` caps at 1024 (`cuvs.c:2309, 2340`). The cost profile would need recalibration.

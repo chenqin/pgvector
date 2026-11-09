@@ -1,4 +1,4 @@
-"""CAGRA shards built by scripts/ann/build_cuvs_index.py, served through SQL on GPUs.
+"""CAGRA shards built by ann/builder/build_cuvs_index.py, served through SQL on GPUs.
 
 Needs a cuVS host: ANN_CUVS_TEST=1, ANN_PG_DSN for a local superuser, the
 ann-worker-cuvs build, and Python packages cuvs, cupy, numpy, psycopg.
@@ -16,7 +16,7 @@ from test_server import ROOT, Server, frame, receive  # noqa: E402
 
 DSN = os.environ.get('ANN_PG_DSN')
 PSQL = os.environ.get('ANN_PSQL', 'psql')
-BUILD = os.path.join(ROOT, 'scripts', 'ann', 'build_cuvs_index.py')
+BUILD = os.path.join(ROOT, 'ann', 'builder', 'build_cuvs_index.py')
 
 
 @unittest.skipUnless(os.environ.get('ANN_CUVS_TEST') and DSN, 'set ANN_CUVS_TEST=1 and ANN_PG_DSN on a cuVS host')
@@ -27,11 +27,11 @@ class CuvsIndexTests(unittest.TestCase):
         # A small exact limit sends 2% filters to the GPU: the gather scan by
         # default, filtered CAGRA when the gather scan is off.
         cls.server = Server('--backend', 'cuvs', '--lanes', '8', '--exact-limit', '500',
-                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                            executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
         # Attribute values all get prebuilt bitsets on the graph worker.
         cls.graph = Server('--backend', 'cuvs', '--lanes', '8', '--exact-limit', '500', '--gather-limit', '0',
                            '--bitset-gather-limit', '0', '--bitset-min', '0',
-                           executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                           executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
         cls.table = 'ann_cuvs_' + uuid.uuid4().hex[:10]
         cls.loaded = {}
         cls.psql(f"""
@@ -196,7 +196,7 @@ class CuvsIndexTests(unittest.TestCase):
                             '--matrix-prune', 'on' if mode == 'prune' else 'off',
                             '--matrix-max-mb', '1', '--delay-us', '1000',
                             env={'ANN_PRUNE_MIN_ROWS': '1000'},
-                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                            executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
             try:
                 dtypes = {'exact': ('float16', 'float16_nvfp4'), 'prune': ('float32', 'float16')}.get(
                     mode, ('float32', 'float16', 'float16_nvfp4', 'nvfp4', 'fp8'))
@@ -274,7 +274,7 @@ class CuvsIndexTests(unittest.TestCase):
         server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gather-limit', '0',
                         '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', 'on',
                         '--fp16-exact', 'on', '--filtered-itopk', '1024', '--filtered-slack', str(slack),
-                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                        executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
         name = self.table + '_gpu_rerank'
         try:
             self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float16')", server)
@@ -325,7 +325,7 @@ class CuvsIndexTests(unittest.TestCase):
         server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gather-limit', '0',
                         '--bitset-gather-limit', '0', '--group-gather-limit', '0', '--gpu-rerank', enabled,
                         '--filtered-itopk', '1024', '--filtered-slack', '256',
-                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                        executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
         name = self.table + '_' + dtype + '_native_' + enabled
         # FP16 graphs return distances over the FP16 dataset: small, bounded
         # error instead of FP32 roundoff.
@@ -411,7 +411,7 @@ class CuvsIndexTests(unittest.TestCase):
         # same cold module, rather than mistaking in-progress for unavailable.
         server = Server('--backend','cuvs','--lanes','4','--exact-limit','0',
                         '--matrix-gather','on','--gpu-rerank','on','--group-gather-limit','4000000',
-                        executable=os.path.join(ROOT,'ann','ann-worker-cuvs'),
+                        executable=os.path.join(ROOT,'ann','server','ann-worker-cuvs'),
                         env={'CUDA_VISIBLE_DEVICES':'0'})
         name = self.table + '_cold_module'
         try:
@@ -443,7 +443,7 @@ class CuvsIndexTests(unittest.TestCase):
             self.skipTest('needs at least two GPUs')
         server = Server('--backend', 'cuvs', '--lanes', '8', '--replicate', 'on',
                         '--replica-routing', 'load', '--replica-load-slack', '0', '--exact-limit', '0',
-                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'),
+                        executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'),
                         env={'CUDA_VISIBLE_DEVICES': ','.join(os.environ.get('CUDA_VISIBLE_DEVICES', '0,1').split(',')[:2])})
         name = self.table + '_replicas'
         try:
@@ -594,7 +594,7 @@ class CuvsIndexTests(unittest.TestCase):
             # Canonical forms would merge the two empty programs into one entry.
             server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '500', '--gpu-predicates', enabled,
                             '--canonical-predicates', 'off',
-                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                            executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
             name = f'{self.table}_gpu_predicates_{enabled}'
             try:
                 self.psql(f"SELECT ann_index_load('{name}', '{self.directory.name}/float32')", server)
@@ -655,7 +655,7 @@ class CuvsIndexTests(unittest.TestCase):
         for mode in ('off', 'on'):
             server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--gpu-rerank', 'on',
                             '--matrix-gather', 'on', '--group-gather-limit', '4000000', '--residual-masks', mode,
-                            executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                            executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
             name = f'{table}_{mode}'
             try:
                 self.psql(f"SELECT ann_index_load('{name}', '{path}')", server)
@@ -712,7 +712,7 @@ class CuvsIndexTests(unittest.TestCase):
         from test_index import search_cached_frame, decode_hits
         server = Server('--backend', 'cuvs', '--lanes', '1', '--exact-limit', '0', '--gpu-rerank', 'on',
                         '--group-gather-limit', '4000000', '--mixed-groups', 'on', '--delay-us', '2000',
-                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                        executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
         index = self.table + '_mixed'
         try:
             self.psql(f"SELECT ann_index_load('{index}', '{self.directory.name}/nvfp4_1shard')", server)

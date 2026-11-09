@@ -146,13 +146,13 @@ class WorkerTests(unittest.TestCase):
                   HEADER.pack(b'PVAN', 1, 0, 1, 0, 2**32-1, 0),
                   HEADER.pack(b'PVAN', 1, 1, 1, 1, 8, 0) + b'bad']
         for frame in frames:
-            result = subprocess.run([str(ROOT / 'ann/ann-worker')], input=frame,
+            result = subprocess.run([str(ROOT / 'ann/server/ann-worker')], input=frame,
                                     capture_output=True, timeout=5)
             self.assertNotEqual(result.returncode, 0)
 
     def test_vendor_selection_never_silently_falls_back(self):
         for vendor in ['cuvs', 'hipvs', 'fused-nvfp4', 'unknown']:
-            result = subprocess.run([str(ROOT / 'ann/ann-worker'), '--backend', vendor],
+            result = subprocess.run([str(ROOT / 'ann/server/ann-worker'), '--backend', vendor],
                                     input=b'', capture_output=True, timeout=5)
             self.assertEqual(result.returncode, 2)
             self.assertIn(b'require vendor adapters', result.stderr)

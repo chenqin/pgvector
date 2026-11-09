@@ -113,7 +113,7 @@ log "source at $COMMIT"
 
 # 2. Build, pinned to the test cores
 T="taskset -c $TEST_CORES"
-run build-worker 1800 "$T make -C ann clean >/dev/null && $T make -C ann USE_CUVS=1 USE_RDMA=1 && $T make -C ann ann-batch-tests"
+run build-worker 1800 "$T make -C ann/server clean >/dev/null && $T make -C ann/server USE_CUVS=1 USE_RDMA=1 && $T make -C ann/server ann-batch-tests"
 run build-extension 1800 "$T make PG_CONFIG=$PGBIN/pg_config USE_RDMA=1 -j8 && make PG_CONFIG=$PGBIN/pg_config USE_RDMA=1 install"
 $PGBIN/pg_ctl -D "$ANN_HANDOFF_PGDATA" status > /dev/null || $PGBIN/pg_ctl -D "$ANN_HANDOFF_PGDATA" -l "$H/postgres.log" start
 sleep 2
@@ -122,7 +122,7 @@ $PGBIN/psql "$DSN_TEST" -Xq -c "CREATE EXTENSION vector"
 
 # 3. Tests, one per process group
 export ANN_PG_DSN="$DSN_TEST"
-run ann-check 1800 "$T make -C ann check"
+run ann-check 1800 "$T make -C ann/server check"
 run installcheck 1800 "$T make PG_CONFIG=$PGBIN/pg_config installcheck PGHOST=$ANN_HANDOFF_PGHOST PGPORT=$ANN_HANDOFF_PGPORT"
 list_tests() {
 	python - "$1" <<'EOF'
@@ -170,7 +170,7 @@ else
 				rdma-spin) extra="--rdma $RDMA_DEVICE --rdma-lanes $ANN_HANDOFF_RDMA_LANES --rdma-poll spin"; opts="$opts -c ann.worker_rdma=$RDMA_DEVICE" ;;
 				rdma-wait) extra="--rdma $RDMA_DEVICE --rdma-lanes $ANN_HANDOFF_RDMA_LANES --rdma-poll wait"; opts="$opts -c ann.worker_rdma=$RDMA_DEVICE" ;;
 			esac
-			setsid taskset -c $ANN_HANDOFF_WORKER_CORES ann/ann-worker-cuvs --backend cuvs --listen "$H/ann.sock" \
+			setsid taskset -c $ANN_HANDOFF_WORKER_CORES ann/server/ann-worker-cuvs --backend cuvs --listen "$H/ann.sock" \
 				--listen-tcp 127.0.0.1:$BENCH_PORT --auth-token-file "$TOKEN_FILE" --lanes 96 --itopk 64 $extra \
 				> "$R/worker-$mode.log" 2>&1 < /dev/null &
 			worker=$!

@@ -2,7 +2,7 @@
 
 Needs ANN_PG_DSN for a local superuser (exports write server files, and the
 worker reads them). Export tests also build the CPU worker and run
-scripts/ann/build_cuvs_index.py --no-cagra, which needs numpy and psycopg.
+ann/builder/build_cuvs_index.py --no-cagra, which needs numpy and psycopg.
 """
 
 import filecmp
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_server import ROOT, STATS, Server, frame, receive  # noqa: E402
 
 DSN = os.environ.get('ANN_PG_DSN')
-BUILD = os.path.join(ROOT, 'scripts', 'ann', 'build_cuvs_index.py')
+BUILD = os.path.join(ROOT, 'ann', 'builder', 'build_cuvs_index.py')
 ROWS = 3000
 
 
@@ -412,7 +412,7 @@ class FrozenTests(unittest.TestCase):
 
     def test_generic_plan_limit(self):
         """A generic plan's LIMIT $n (and OFFSET) asks the worker for that many rows in one call."""
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -701,7 +701,7 @@ class FrozenTests(unittest.TestCase):
             self.db.execute(f'DROP ROLE {role}')
 
     def test_precompute_on_the_worker(self):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -855,7 +855,7 @@ class FrozenTests(unittest.TestCase):
             server.close()
 
     def test_worker_route_and_bitmap_identity(self):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -944,7 +944,7 @@ class FrozenTests(unittest.TestCase):
     def test_tombstones(self):
         """ann_frozen_delete: deleted keys leave the frozen route, on the pages and on the worker, and reach
         exports loaded later; the table itself is untouched."""
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -1102,7 +1102,7 @@ class FrozenTests(unittest.TestCase):
         self.db.execute("UPDATE docs SET body = 'changed' WHERE id = 5")
 
     def test_tombstone_delivery_failure(self):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         self.create()
         server = Server('--backend', 'cpu-exact')
@@ -1144,7 +1144,7 @@ class FrozenTests(unittest.TestCase):
             self.assertFalse(set(deleted) & {r[0] for r in first + rest})
 
     def test_tombstone_rollback(self):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         self.create()
         query = '[1,2,3,4]'
@@ -1186,7 +1186,7 @@ class FrozenTests(unittest.TestCase):
             server.close()
 
     def test_generation_mismatch_and_switch(self):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -1324,7 +1324,7 @@ class FrozenTests(unittest.TestCase):
         self.assertIn('absolute path', self.error("SELECT ann_index_export('docs_ann', 'relative')"))
 
     def test_export_build_and_load(self):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -1587,7 +1587,7 @@ class FrozenTests(unittest.TestCase):
 
     def test_multi_valued_worker_route(self):
         """The worker's OVERLAP evaluation from its postings equals the pages', and the route equals SQL."""
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         server = Server('--backend', 'cpu-exact')
         try:
@@ -1624,7 +1624,7 @@ class FrozenCuvsTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         os.chmod(directory.name, 0o777)
         server = Server('--backend', 'cuvs', '--lanes', '4', '--exact-limit', '200',
-                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'))
+                        executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
         db = psycopg.connect(DSN, autocommit=True)
         table = 'ann_frozen_cuvs_' + uuid.uuid4().hex[:8]
         try:
@@ -1763,7 +1763,7 @@ class FrozenCuvsTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         os.chmod(directory.name, 0o777)
         server = Server('--backend', 'cuvs', '--lanes', '4', *worker_args,
-                        executable=os.path.join(ROOT, 'ann', 'ann-worker-cuvs'), env={'ANN_SCAN_DEBUG': '1'})
+                        executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'), env={'ANN_SCAN_DEBUG': '1'})
         db = psycopg.connect(DSN, autocommit=True)
         table = 'ann_frozen_scan_' + uuid.uuid4().hex[:8]
         rows = 30000

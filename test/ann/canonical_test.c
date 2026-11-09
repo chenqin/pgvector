@@ -1,5 +1,5 @@
 /*
- * Canonical predicate programs (ann/canonical.c) must select exactly the rows
+ * Canonical predicate programs (ann/server/canonical.c) must select exactly the rows
  * the original selects, be fixed points, and coincide for programs written
  * differently: operands swapped, value lists reordered or repeated, ranges
  * against the value lists they hold, values the column lacks. Columns a and

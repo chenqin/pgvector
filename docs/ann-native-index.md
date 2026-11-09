@@ -28,7 +28,7 @@ Only fixed-dimension `vector` with L2 is registered, up to 2,000 dimensions. NUL
 | [annbuild.c](../src/annbuild.c) | Table-AM build callback, main/init forks, build WAL |
 | [annfrozen.c](../src/annfrozen.c) | [Frozen indexes](ann-frozen-index.md): guard trigger, `ann_freeze`, page arrays, key-ordered build, `ann_frozen_info`, `ann_frozen_keys` |
 | [annexport.c](../src/annexport.c) | `ann_index_export`: a frozen index's pages as a worker index directory |
-| [annpred.c](../src/annpred.c) | Predicates over a frozen index's attributes as [ann/filter.c](../ann/filter.c) programs, from expressions or filter text |
+| [annpred.c](../src/annpred.c) | Predicates over a frozen index's attributes as [ann/common/filter.c](../ann/common/filter.c) programs, from expressions or filter text |
 | [annfrozenscan.c](../src/annfrozenscan.c) | The frozen search route: a scan-level CustomScan sending predicate programs to the GPU worker, or evaluating them from the pages |
 | [anninsert.c](../src/anninsert.c) | Tuple formation, insertion locks, FSM hints, generic WAL |
 | [annscan.c](../src/annscan.c) | Ordered heap-TID scan, rescan, spillable tuplesort |
@@ -79,7 +79,7 @@ make && make install
 make installcheck
 make prove_installcheck PROVE_TESTS=test/t/050_ann_wal.pl
 python3 -m pip install -r test/ann/requirements-postgres.txt
-ANN_PG_DSN='dbname=test_database' make -C ann check-postgres
+ANN_PG_DSN='dbname=test_database' make -C ann/server check-postgres
 ```
 
 Fresh install and 0.8.7-to-0.9.0 upgrade were also checked, including extension schema relocation. Local validation uses PostgreSQL 17.6 on macOS ARM64. The repository's PostgreSQL CI matrix still needs to run; compatibility beyond the tested host is not claimed. Production rollout also needs broader fault, concurrent-vacuum, and sustained-load tests. Selective exact eligibility execution is now implemented in the opt-in CustomScan. A bounded C worker client with admission is implemented ([worker pipeline](ann-worker-pipeline.md)). CAGRA integration and compilation against cuVS remain deferred, as do hipVS and fused NVFP4 adapters.

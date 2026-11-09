@@ -13,7 +13,7 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "ann.h"
-#include "ann/filter.h"
+#include "ann/common/filter.h"
 #include "access/stratnum.h"
 #include "catalog/dependency.h"
 #include "catalog/pg_opfamily_d.h"
@@ -1888,7 +1888,7 @@ AnnFrozenBuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	return result;
 }
 
-/* Frozen pages as an ann/filter.h source. */
+/* Frozen pages as an ann/common/filter.h source. */
 typedef struct FrozenSource
 {
 	Relation	index;

@@ -49,7 +49,7 @@ def main():
     for calibrated in [False,True]:
         label='calibrated' if calibrated else 'fixed'
         path=args.output/f'{label}.sock'
-        command=[str(ROOT/'ann/ann-worker-cuvs'),'--backend','cuvs','--listen',str(path),'--lanes','1','--max-batch','32',
+        command=[str(ROOT/'ann/server/ann-worker-cuvs'),'--backend','cuvs','--listen',str(path),'--lanes','1','--max-batch','32',
                  '--replicate','off','--itopk','512','--filtered-itopk','1024','--filtered-algo','multi','--filtered-width','4',
                  '--exact-limit','0','--gather-limit','4000000','--bitset-gather-limit','500000','--group-gather-limit','500000',
                  '--matrix-gather','on','--gpu-rerank','on','--memory-pool','20','--predicate-cache-mb','2048','--predicate-device-mb','8192']

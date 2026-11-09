@@ -20,13 +20,13 @@ def main():
     if not 0 <= args.survivor_fraction <= 1 or args.batch_delay_ms < 0:
         parser.error('invalid survivor fraction or delay')
     root = Path(__file__).resolve().parents[2]
-    subprocess.run(['make', '-C', str(root / 'ann'), 'ann-batch-bench'],
+    subprocess.run(['make', '-C', str(root / 'ann' / 'server'), 'ann-batch-bench'],
                    check=True, stdout=subprocess.DEVNULL)
     values = [args.rows, args.dimensions, args.requests,
               int(args.rows * args.survivor_fraction), args.batch_rows,
               args.pending, int(args.batch_delay_ms * 1000),
               int(args.mode == 'unique'), int(args.sequential)]
-    subprocess.run([str(root / 'ann/ann-batch-bench'), *map(str, values)], check=True)
+    subprocess.run([str(root / 'ann/server/ann-batch-bench'), *map(str, values)], check=True)
 
 
 if __name__ == '__main__':

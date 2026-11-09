@@ -14,7 +14,7 @@ extern "C" {
 /*
  * Filtered FP32 CAGRA search whose eligibility is a JIT-LTO user-defined
  * filter (cuVS filtering::udf_filter) instead of a bitset: the predicate
- * interpreter of ann/udf.h runs on the device for each (query, row) the
+ * interpreter of udf.h runs on the device for each (query, row) the
  * search would emit. params points to an AnnUdfParams in device memory. The
  * interpreter's source never changes, so cuVS compiles it once per process.
  *

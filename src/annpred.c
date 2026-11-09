@@ -2,7 +2,7 @@
 
 #include "access/stratnum.h"
 #include "ann.h"
-#include "ann/filter.h"
+#include "ann/common/filter.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_operator_d.h"
 #include "catalog/pg_opfamily_d.h"
@@ -22,7 +22,7 @@
 #include "utils/varlena.h"
 
 /*
- * Predicates over a frozen index's INCLUDE attributes become ann/filter.h
+ * Predicates over a frozen index's INCLUDE attributes become ann/common/filter.h
  * programs: =, <>, <, <=, >, >=, BETWEEN, IN, NOT IN, IS [NOT] NULL, AND,
  * OR and NOT, with integer operands that are constants, parameters or
  * stable expressions, and && of an integer[] attribute with an integer[]

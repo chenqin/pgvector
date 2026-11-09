@@ -1,7 +1,7 @@
 """The worker's predicate cache: a memory budget with least-recently-used
 eviction, pushed bitmaps kept, and index prewarming and memory locking.
 
-Run with the CPU worker (make -C ann check). The fixture has no CAGRA
+Run with the CPU worker (make -C ann/server check). The fixture has no CAGRA
 shards, so GPU backends cannot load it.
 """
 
@@ -62,13 +62,13 @@ def words_of(rows, total):
 
 
 class PredicateCacheTests(unittest.TestCase):
-    worker = os.path.join(ROOT, 'ann', os.environ.get('ANN_INDEX_WORKER', 'ann-worker'))
+    worker = os.path.join(ROOT, 'ann', 'server', os.environ.get('ANN_INDEX_WORKER', 'ann-worker'))
     backend = os.environ.get('ANN_INDEX_BACKEND', 'cpu-exact')
 
     @classmethod
     def setUpClass(cls):
         if not os.environ.get('ANN_INDEX_WORKER'):
-            subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+            subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                            stdout=subprocess.DEVNULL)
         cls.directory = tempfile.TemporaryDirectory()
         rng = random.Random(5)

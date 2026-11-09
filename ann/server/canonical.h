@@ -6,7 +6,7 @@
 #include <stddef.h>
 
 /*
- * A predicate program (ann/filter.h) rewritten into one form per row set
+ * A predicate program (ann/common/filter.h) rewritten into one form per row set
  * this source can tell apart, so equivalent programs share a cache entry.
  * On a single-valued column every row has exactly one value (NULL
  * included), so each leaf there selects the rows whose value lies in a set

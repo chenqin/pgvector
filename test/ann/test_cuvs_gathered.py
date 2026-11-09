@@ -1,6 +1,6 @@
 """Gathered search on a real GPU through the cuVS worker build.
 
-Set ANN_CUVS_TEST=1 after `make -C ann ann-worker-cuvs`; see ann/README.md.
+Set ANN_CUVS_TEST=1 after `make -C ann/server ann-worker-cuvs`; see ann/server/README.md.
 """
 
 import json
@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_server import (GATHERED, ROOT, STATS, Server, decode, expected,  # noqa: E402
                          frame, gathered, receive)
 
-EXECUTABLE = os.path.join(ROOT, 'ann', 'ann-worker-cuvs')
+EXECUTABLE = os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs')
 
 
 @unittest.skipUnless(os.environ.get('ANN_CUVS_TEST'), 'set ANN_CUVS_TEST=1 on a cuVS host')

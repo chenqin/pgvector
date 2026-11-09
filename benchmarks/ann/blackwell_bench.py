@@ -4,7 +4,7 @@
     python3 benchmarks/ann/blackwell_bench.py check            # every gate, every width
     python3 benchmarks/ann/blackwell_bench.py time --dims 128,1024 --rows 100000,1000000
 
-Compiles the worker's own kernel source (ann/blackwell.c, the BlackwellSource
+Compiles the worker's own kernel source (ann/server/blackwell.c, the BlackwellSource
 strings) with NVRTC for sm_100a through CuPy, as the worker does, quantizes
 clustered vectors with the index builder's NVFP4 code, and runs the scan
 (score_mma_nvfp4[_32|_64]), select32 and merge32 with the worker's launch
@@ -32,7 +32,7 @@ import sys
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, os.path.join(ROOT, 'scripts', 'ann'))
+sys.path.insert(0, os.path.join(ROOT, 'ann', 'builder'))
 from build_cuvs_index import E2M1, _e4m3_table, quantize_nvfp4  # noqa: E402
 
 ABSENT = 0xFFFFFFFF
@@ -46,7 +46,7 @@ def query_bytes(width, dims):
 
 
 def kernel_source():
-    text = open(os.path.join(ROOT, 'ann', 'blackwell.c')).read()
+    text = open(os.path.join(ROOT, 'ann', 'server', 'blackwell.c')).read()
     body = text[text.index('BlackwellSource[] = {'):text.index('NULL};')]
     pieces = re.findall(r'"((?:[^"\\]|\\.)*)"', body)
     return ''.join(bytes(p, 'utf-8').decode('unicode_escape') for p in pieces)

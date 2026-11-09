@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 /*
- * cuVS wraps the device interpreter (AnnUdfDeviceSource, ann/udf.c) in its
+ * cuVS wraps the device interpreter (AnnUdfDeviceSource, udf.c) in its
  * JIT-LTO sample filter fragment and keys its compiled-fragment cache by the
  * whole source, so a constant source compiles once per process; queries vary
  * only the AnnUdfParams payload.

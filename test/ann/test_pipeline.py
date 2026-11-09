@@ -57,7 +57,7 @@ EXPLAIN = ("EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF, SUMMARY OFF) SELECT id FROM
 class PipelineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         cls.table = 'ann_pipeline_' + uuid.uuid4().hex[:12]
         cls.psql(f"""

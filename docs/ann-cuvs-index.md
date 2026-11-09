@@ -6,11 +6,11 @@ An offline Python script builds an immutable, sharded CAGRA index directory from
 
 ```sh
 # GPU host: build the worker with cuVS (default builds are CPU-only)
-make -C ann USE_CUVS=1 CUVS_PREFIX=/path/to/libcuvs CUDA_HOME=/path/to/cuda
-ann/ann-worker-cuvs --backend cuvs --listen /tmp/ann.sock --lanes 64
+make -C ann/server USE_CUVS=1 CUVS_PREFIX=/path/to/libcuvs CUDA_HOME=/path/to/cuda
+ann/server/ann-worker-cuvs --backend cuvs --listen /tmp/ann.sock --lanes 64
 
 # offline build: one shard per visible GPU, FP16 dataset for bandwidth
-python3 scripts/ann/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \
+python3 ann/builder/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \
     --key id --vector embedding --out /data/ann/docs --dtype float16
 ```
 
@@ -123,7 +123,7 @@ whether an FP32 copy is on the GPU.
 | `--device-allocator async\|plain` | `plain` makes cuVS allocate with `cudaMalloc`, without the pool. The pool reserves a quarter of its cap (21% of each GPU by default) at the first load, never shrinks, and keeps unloaded indexes' memory: three collection layouts on four 2-GPU nodes held 99.6 GB per GPU with the pool, 37.6 GB with `plain`, and unloading a 4M × 1024 index gave back all 5.3 GB per GPU it took with `plain` (630 MB, the CUDA context, stayed), against 1.1 of the 18.7 GB it took from the pool. The cost is unfiltered throughput: 165k against 222k QPS on the 16M collection; filtered searches were unchanged (tenant 234k, 1% filters 193k, 10% 62k). Use `plain` where indexes are loaded and replaced often or several workers share GPUs. |
 | `--bitset-gather-limit ROWS` | Largest filter that arrives with a ready bitset (a cached bitmap, a sent bitmap, an attribute value with prebuilt bitsets) still sent to the gather scan (default 500,000); broader ones run filtered CAGRA. Key-list filters use `--gather-limit`, because their bitset would be built per query. |
 | `--filter-lanes N`, `--active-lanes N` | Once `active-lanes` lanes (default three quarters of the lanes) work on cached filters, a filter gets at most `filter-lanes` lanes per GPU copy of the index (default 2); other searches over it wait behind them and are then scanned as one group. Below that, lanes start on any filter, so a few hot filters still fill the GPUs. See [same-filter grouping](ann-gpu-filters.md#same-filter-grouping). |
-| `--canonical-predicates on\|off` (worker) | Predicates are cached and evaluated in a canonical form (`ann/canonical.h`): on a single-valued column every leaf becomes a set of the column's distinct values, so sorted and deduplicated value lists, ranges against the values they hold, values the column lacks, negation, NOT and AND/OR of leaves on one column all reach one entry; AND/OR operands are flattened and ordered, and leaves that match nothing or everything fold away. Default on. Never-repeating predicates whose unique part matched every row (`fresh10`) went from 143.9k to 773.7k vectors/s, the cached rate; a half-foldable mix (`mix10`) gained 65–73%; truly distinct predicates are unaffected. Statistic `predicate_canonical`. |
+| `--canonical-predicates on\|off` (worker) | Predicates are cached and evaluated in a canonical form (`ann/server/canonical.h`): on a single-valued column every leaf becomes a set of the column's distinct values, so sorted and deduplicated value lists, ranges against the values they hold, values the column lacks, negation, NOT and AND/OR of leaves on one column all reach one entry; AND/OR operands are flattened and ordered, and leaves that match nothing or everything fold away. Default on. Never-repeating predicates whose unique part matched every row (`fresh10`) went from 143.9k to 773.7k vectors/s, the cached rate; a half-foldable mix (`mix10`) gained 65–73%; truly distinct predicates are unaffected. Statistic `predicate_canonical`. |
 | `--residual-masks on\|off` (worker) | An AND predicate whose narrow operands remove few rows (operands on one single-valued column, at most 2^18 rows removed, such as `tenant <> 7`) is served from the cached entry of its other operands, with the removed rows masked in the matrix gather (scores set to +inf after scoring) and dropped from the eligible count; other routes search each job's own rows. Needs `--canonical-predicates on` (the default) and a base the gather routes take. Default on (`off` evaluates the whole predicate). Distinct predicates excluding one tenant from a 10% window: 363.9k -> 674.7k vectors/s through 64-vector arrays, 10.15k -> 96.6k QPS through SQL (GPU-bound, as cached predicates are), recall unchanged. Statistics `predicate_residual` (server) and `residual_masked` (backend). |
 | `--predicate-admission all\|second` (worker) | Which new predicate results enter the cache: every one (`all`, the default), or only one seen before (`second`: a first sighting is served from a transient result and dropped, so one-off predicates do not evict entries that repeat). Precomputed predicates are always cached. Helps only when the hot predicates outgrow the cache (+11% with a 1 GB cache holding 60 of 91 hot windows); with room for them it costs 11–19%, as a repeating predicate is evaluated twice before it is kept. Statistic `predicate_transient`. |
 | `--predicate-cache-mb MB`, `--predicate-device-mb MB` | Host and GPU memory for cached predicate results per index (operations 22 and 23, from the [frozen route](ann-frozen-index.md#worker-operations-and-caching)); the least recently used go first. Defaults: a quarter of the host's RAM, and 8,192 MB. |
@@ -162,7 +162,7 @@ The Blackwell module is one gate for one NVRTC unit, set by its newest instructi
 
 ## Build flag
 
-The extension never links CUDA: it talks to the worker over a Unix socket, so the extension and the CPU worker build anywhere, including hosts without a GPU. `make -C ann USE_CUVS=1` additionally builds `ann-worker-cuvs` against cuVS (`CUVS_PREFIX`, `CUDA_HOME`, plus `CPPFLAGS`/`LDFLAGS` for pip-installed SDKs) and the CUDA driver library. NVRTC (`libnvrtc.so`, from the CUDA toolkit or the `nvidia-cuda-nvrtc` wheel) is optional: it's opened at run time for the gather scan, and no CUDA compiler is needed to build. Without it, the CPU worker's `cpu-exact` backend serves loaded indexes exactly from `keys.i64` and `vectors.f32`, using the same per-shard tree merge. That makes it the reference for tests.
+The extension never links CUDA: it talks to the worker over a Unix socket, so the extension and the CPU worker build anywhere, including hosts without a GPU. `make -C ann/server USE_CUVS=1` additionally builds `ann-worker-cuvs` against cuVS (`CUVS_PREFIX`, `CUDA_HOME`, plus `CPPFLAGS`/`LDFLAGS` for pip-installed SDKs) and the CUDA driver library. NVRTC (`libnvrtc.so`, from the CUDA toolkit or the `nvidia-cuda-nvrtc` wheel) is optional: it's opened at run time for the gather scan, and no CUDA compiler is needed to build. Without it, the CPU worker's `cpu-exact` backend serves loaded indexes exactly from `keys.i64` and `vectors.f32`, using the same per-shard tree merge. That makes it the reference for tests.
 
 ## Tests
 
@@ -174,7 +174,7 @@ The extension never links CUDA: it talks to the worker over a Unix socket, so th
 | `test/ann/test_frozen.py` | `ANN_PG_DSN`; `ANN_CUVS_TEST=1` for `FrozenCuvsTests` | Frozen indexes, their export, `--from-export` builds and generation-checked loads; see the [guide](ann-frozen-index.md#tests). |
 
 ```sh
-make -C ann check
+make -C ann/server check
 ANN_PG_DSN='host=/tmp dbname=postgres' python3 test/ann/test_index.py
 ANN_CUVS_TEST=1 ANN_PG_DSN='host=/tmp dbname=postgres' python3 test/ann/test_cuvs_index.py
 ```
@@ -222,8 +222,8 @@ Reproduce:
 
 ```sh
 python3 benchmarks/ann/cuvs_load.py generate --dsn "$DSN" --table bench10m --rows 10000000 --dimensions 128
-python3 scripts/ann/build_cuvs_index.py --dsn "$DSN" --table public.bench10m --vector emb --out /data/bench10m
-ann/ann-worker-cuvs --backend cuvs --listen /tmp/ann.sock --lanes 96 --itopk 64
+python3 ann/builder/build_cuvs_index.py --dsn "$DSN" --table public.bench10m --vector emb --out /data/bench10m
+ann/server/ann-worker-cuvs --backend cuvs --listen /tmp/ann.sock --lanes 96 --itopk 64
 python3 benchmarks/ann/cuvs_load.py bench --dsn "$DSN" --table bench10m --index b32 --path /data/bench10m \
     --socket /tmp/ann.sock --clients 64,256,1024,1536 --threads 96
 ```

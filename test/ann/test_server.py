@@ -12,7 +12,7 @@ import time
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-WORKER = os.path.join(ROOT, 'ann', 'ann-worker')
+WORKER = os.path.join(ROOT, 'ann', 'server', 'ann-worker')
 GATHERED = 7
 STATS = 8
 
@@ -88,7 +88,7 @@ def expected(query, vectors, k):
 class ServerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
 
     def setUp(self):

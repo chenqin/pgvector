@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 /*
- * Predicate programs (ann/filter.h) compiled for evaluation row by row, as a
+ * Predicate programs (ann/common/filter.h) compiled for evaluation row by row, as a
  * CAGRA filter UDF does on the GPU, instead of into a bitset over every row.
  * A compiled program is a postfix list of steps over int32 attribute
  * columns; a batch concatenates several programs, one per query, with

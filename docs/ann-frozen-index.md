@@ -8,7 +8,7 @@ A frozen `ann` index is built once from a table that can no longer change. In on
 | Inverted (value → ordinals) | per attribute: distinct values, offsets, postings, bitsets of frequent values, and a dictionary for text | predicate programs evaluated in PostgreSQL, `ann_frozen_filter`, `ann_frozen_keys`, `ann_filter_bitmap_build` |
 | ANN | exported to the cuVS builder, which adds CAGRA shards and quantized copies | the GPU worker, through the frozen route and the `ann_*_search` functions |
 
-The GPU worker already numbers rows by key rank (`keys.i64` is sorted), so the export is byte-for-byte what `scripts/ann/build_cuvs_index.py` writes from SQL. A filter evaluated on either side selects the same bits: PostgreSQL (from the pages) and the worker (from its postings) run the same evaluator, `ann/filter.c`. A content hash (the generation) in the index, the exported manifest, the catalog and every request header ties the GPU index to the table.
+The GPU worker already numbers rows by key rank (`keys.i64` is sorted), so the export is byte-for-byte what `ann/builder/build_cuvs_index.py` writes from SQL. A filter evaluated on either side selects the same bits: PostgreSQL (from the pages) and the worker (from its postings) run the same evaluator, `ann/common/filter.c`. A content hash (the generation) in the index, the exported manifest, the catalog and every request header ties the GPU index to the table.
 
 This implements the [plan](ann-immutable-indexes-plan.md), phases 1 to 4.
 
@@ -77,7 +77,7 @@ SELECT ann_index_export('docs_ann', '/data/ann/docs-export');
 ```
 
 ```sh
-python3 scripts/ann/build_cuvs_index.py --from-export /data/ann/docs-export \
+python3 ann/builder/build_cuvs_index.py --from-export /data/ann/docs-export \
     --out /data/ann/docs --shards 8 --quantize nvfp4
 ```
 
@@ -164,7 +164,7 @@ Vectors are stored as whole `Vector` values, so the distance function reads them
 
 ## Predicates
 
-The planner, `ann_frozen_filter`, `ann_index_filter` and `ann_filter_bitmap_build` turn a predicate over the attribute columns into a predicate program ([ann/filter.h](../ann/filter.h)): a postfix list of leaves and operators.
+The planner, `ann_frozen_filter`, `ann_index_filter` and `ann_filter_bitmap_build` turn a predicate over the attribute columns into a predicate program ([ann/common/filter.h](../ann/common/filter.h)): a postfix list of leaves and operators.
 
 | SQL | Program |
 | --- | --- |
@@ -374,7 +374,7 @@ ANN_PG_DSN='host=/tmp dbname=postgres' python3 test/ann/test_frozen.py
 ANN_CUVS_TEST=1 ANN_PG_DSN='host=/tmp dbname=postgres' python3 test/ann/test_frozen.py FrozenCuvsTests
 ```
 
-`make -C ann check`, `check-postgres` and `check-cuvs` include them.
+`make -C ann/server check`, `check-postgres` and `check-cuvs` include them.
 
 ### Batched TID visibility checks
 

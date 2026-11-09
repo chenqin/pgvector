@@ -19,7 +19,7 @@ SOCKET=$WORK/ann.sock
 trap 'kill $WORKER 2>/dev/null || true; rm -rf "$WORK"' EXIT INT TERM
 
 make -s -C "$ROOT/ann" ann-worker
-"$ROOT/ann/ann-worker" --backend "$BACKEND" --listen "$SOCKET" 2>"$WORK/worker.log" &
+"$ROOT/ann/server/ann-worker" --backend "$BACKEND" --listen "$SOCKET" 2>"$WORK/worker.log" &
 WORKER=$!
 while [ ! -S "$SOCKET" ]; do sleep 0.1; done
 

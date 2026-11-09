@@ -1,6 +1,6 @@
 # cuVS bulk build and filtered ANN implementation plan
 
-Status: CPU worker and batching/admission runtime are implemented in C in [ann/](../ann/README.md). Frozen-table PostgreSQL behavior is validated by test-only Python fixtures; the native C exact L2 AM now provides a storage/lifecycle baseline ([guide](ann-native-index.md)). The opt-in selective exact CustomScan is implemented ([guide](ann-filtered-search.md)); the pipelined native worker route is implemented with a mocked GPU backend ([guide](ann-worker-pipeline.md)). CAGRA integration is implemented in the cuVS worker ([guide](ann-cuvs-index.md)), with GPU-side filters ([guide](ann-gpu-filters.md)) and a Blackwell module ([guide](ann-blackwell.md)). Accelerator generation/delta storage remains proposed; the [immutable indexes plan](ann-immutable-indexes-plan.md) takes it up together with forward and inverted index pages.
+Status: CPU worker and batching/admission runtime are implemented in C in [ann/](../ann/server/README.md). Frozen-table PostgreSQL behavior is validated by test-only Python fixtures; the native C exact L2 AM now provides a storage/lifecycle baseline ([guide](ann-native-index.md)). The opt-in selective exact CustomScan is implemented ([guide](ann-filtered-search.md)); the pipelined native worker route is implemented with a mocked GPU backend ([guide](ann-worker-pipeline.md)). CAGRA integration is implemented in the cuVS worker ([guide](ann-cuvs-index.md)), with GPU-side filters ([guide](ann-gpu-filters.md)) and a Blackwell module ([guide](ann-blackwell.md)). Accelerator generation/delta storage remains proposed; the [immutable indexes plan](ann-immutable-indexes-plan.md) takes it up together with forward and inverted index pages.
 
 Prepared: 2026-10-30. cuVS capability checks below refer to released **v26.10.00**. Compile and runtime smoke tests remain implementation work.
 
@@ -359,7 +359,7 @@ The PostgreSQL adapter should look like another pgvector access method. Keep the
 
 ### Multiple vendors and precision paths
 
-The worker must support independently versioned implementations such as NVIDIA cuVS, AMD hipVS, and a fused NVFP4 scoring path. The initial [AnnBackend interface](../ann/backend.h) provides a statically selected worker-local boundary, with a tested CPU reference implementation. Separate worker processes own each vendor/device context. PostgreSQL continues to own predicate semantics, tuple identity, durability, and final results.
+The worker must support independently versioned implementations such as NVIDIA cuVS, AMD hipVS, and a fused NVFP4 scoring path. The initial [AnnBackend interface](../ann/server/backend.h) provides a statically selected worker-local boundary, with a tested CPU reference implementation. Separate worker processes own each vendor/device context. PostgreSQL continues to own predicate semantics, tuple identity, durability, and final results.
 
 Each adapter must advertise and validate its algorithm, metrics, input/storage precision, filter formats, batch/dimension limits, exactness, and serialization compatibility. cuVS capability findings in this document do not establish hipVS capability parity. AMD describes hipVS as aligned with cuVS 25.10, rather than the 26.10 release used here. [AMD hipVS documentation](https://rocm.docs.amd.com/projects/hipVS/en/latest/)
 
@@ -510,15 +510,15 @@ Deliverable: reproducible harness, capability report, and workload manifest. Gat
 ### Phase 1: Standalone build/search worker
 
 - [ ] Complete CAGRA integration (deferred; existing adapter source is a draft).
-- [x] Compile/link against cuVS 26.10 and validate on a supported GPU host (8× B200, `make -C ann check-cuvs`).
-- [x] Define fixed-width request/response encoding and generation-scoped ID types without leaking PostgreSQL structs or C++ objects across the process boundary (`ann/worker.c`, `test/ann/support/client.py`; serialized reference transport).
-- [x] Implement bounded vector ingestion, CAGRA shard build, serialization, load, and unload: offline `scripts/ann/build_cuvs_index.py`, immutable directories, multi-GPU loading ([guide](ann-cuvs-index.md)). Unloading requires a worker restart.
+- [x] Compile/link against cuVS 26.10 and validate on a supported GPU host (8× B200, `make -C ann/server check-cuvs`).
+- [x] Define fixed-width request/response encoding and generation-scoped ID types without leaking PostgreSQL structs or C++ objects across the process boundary (`ann/server/worker.c`, `test/ann/support/client.py`; serialized reference transport).
+- [x] Implement bounded vector ingestion, CAGRA shard build, serialization, load, and unload: offline `ann/builder/build_cuvs_index.py`, immutable directories, multi-GPU loading ([guide](ann-cuvs-index.md)). Unloading requires a worker restart.
 - [ ] Implement CPU exact reference, GPU gathered exact, GPU filtered brute force, and filtered CAGRA search.
 - [ ] Implement same-filter shared-bitset batches and per-query Roaring batches with explicit ownership and range validation.
 - [x] Add per-shard routing, result merge, memory accounting, timings, deadlines, and cancellation behavior: shard-per-GPU search, pairwise tree merge, shared admission budget, client timeouts.
 - [ ] Define request cleanup after PostgreSQL errors and GPU stream completion; verify that submission never requires retaining a backend buffer content lock.
 - [ ] Fit preliminary route crossovers from complete search costs, including filter setup and transfers.
-- [ ] Add compatible direct-search microbatches, reusable buffers, and admission by estimated work and bytes; sweep batch delay and submission lanes at fixed recall and latency. CPU ready-query microbatching, request/byte/work admission, deadline/cancel handling, and a burst benchmark are implemented in `ann/batching.c`; Server mode adds cross-connection lanes, fair batch splitting and shared-memory request buffers with a mocked device; real GPU buffers and full sweeps remain pending.
+- [ ] Add compatible direct-search microbatches, reusable buffers, and admission by estimated work and bytes; sweep batch delay and submission lanes at fixed recall and latency. CPU ready-query microbatching, request/byte/work admission, deadline/cancel handling, and a burst benchmark are implemented in `ann/server/batching.c`; Server mode adds cross-connection lanes, fair batch splitting and shared-memory request buffers with a mocked device; real GPU buffers and full sweeps remain pending.
 
 Deliverable: worker executable and benchmark reports. Gate: all returned IDs satisfy the supplied allowlist, exact results match the reference, and ANN recall is measured after reload as well as immediately after build.
 
@@ -674,9 +674,9 @@ The priority order is producer-ceiling measurement, compact mapping and safe sha
 
 ## 14. Current implementation and next executable gates
 
-Implemented: standalone C worker, CPU exact top-k with shared/per-query sparse filters, explicit unsupported-vendor selection, bounded versioned frames, generation checks, canonical checksummed snapshot reload, test-only Python client, independent-oracle tests, and a synthetic throughput harness. See [worker documentation](../ann/README.md) for commands and protocol details.
+Implemented: standalone C worker, CPU exact top-k with shared/per-query sparse filters, explicit unsupported-vendor selection, bounded versioned frames, generation checks, canonical checksummed snapshot reload, test-only Python client, independent-oracle tests, and a synthetic throughput harness. See [worker documentation](../ann/server/README.md) for commands and protocol details.
 
-Test reference only: `FrozenIndex` now resides under `test/ann/support/`; it validates SQL predicates, table freezes, and failure behavior. It is not a runtime implementation. Native PostgreSQL integration will be C. `ann/cuvs.c` is an unvalidated FP32 L2 CAGRA draft retained for future integration. CAGRA integration and cuVS SDK compilation are deferred at the user's request and do not count as completed implementation milestones. The draft invokes GPU search serially per query; GPU microbatching and persistent GPU graph artifacts are not implemented.
+Test reference only: `FrozenIndex` now resides under `test/ann/support/`; it validates SQL predicates, table freezes, and failure behavior. It is not a runtime implementation. Native PostgreSQL integration will be C. `ann/server/cuvs.c` is an unvalidated FP32 L2 CAGRA draft retained for future integration. CAGRA integration and cuVS SDK compilation are deferred at the user's request and do not count as completed implementation milestones. The draft invokes GPU search serially per query; GPU microbatching and persistent GPU graph artifacts are not implemented.
 
 Validated locally: compiler warnings as errors, CPU correctness/protocol tests, AddressSanitizer/UndefinedBehaviorSanitizer, and live frozen-table integration tests. A checksum-verified PostgreSQL 17.6 source build was installed in a temporary development directory. This checkout's pgvector compiled, all 15 SQL regression tests passed, and generated text/metadata/exact/HNSW baselines executed successfully. The test cluster is temporary, not a system installation.
 
@@ -702,13 +702,13 @@ The first implementation slice is Phase 0 through Phase 2: bulk build, native Po
 
 ## 15. CPU batching implementation status
 
-Implemented in [ann/batching.c](../ann/batching.c): C backend/index lifetime ownership, compatible batches, private filters, finite collection delay, outstanding request/allocation-byte/work budgets, queued cancellation, monotonic queue/running deadlines, per-request backend errors, and physical-completion accounting. CPU protocol search frames use the C scheduler. Request handles remain valid after close until explicitly released. The [burst benchmark](../benchmarks/ann/batch.c) compares sequential and scheduled requests and includes overload outcomes. This is a tested single-process ready-query scheduler; GPU integration is deferred.
+Implemented in [ann/server/batching.c](../ann/server/batching.c): C backend/index lifetime ownership, compatible batches, private filters, finite collection delay, outstanding request/allocation-byte/work budgets, queued cancellation, monotonic queue/running deadlines, per-request backend errors, and physical-completion accounting. CPU protocol search frames use the C scheduler. Request handles remain valid after close until explicitly released. The [burst benchmark](../benchmarks/ann/batch.c) compares sequential and scheduled requests and includes overload outcomes. This is a tested single-process ready-query scheduler; GPU integration is deferred.
 
 Admission charges the C request object, copied query/filter arrays, and reserved result storage, plus estimated distance work. Resident index memory, allocator overhead, retained caller results, and upstream SQL materialization have separate lifetimes. Full arrival-rate sweeps, deployment SLOs, cross-process fairness, and measured production throughput are not complete. Native PostgreSQL integration must reserve eligibility resources separately before producing large ID sets.
 
 ## 16. Runtime language and test boundary
 
-All runtime implementation is C. [ann/batching.c](../ann/batching.c) implements scheduling and admission; [ann/batching.h](../ann/batching.h) defines ownership and request APIs. The C worker uses this scheduler for CPU search frames. No Python package or runtime scheduler is shipped under `ann/`. Python helpers are confined to `test/ann/support/` and benchmark/test launchers; the batching benchmark executes C code.
+All runtime implementation is C. [ann/server/batching.c](../ann/server/batching.c) implements scheduling and admission; [ann/server/batching.h](../ann/server/batching.h) defines ownership and request APIs. The C worker uses this scheduler for CPU search frames. No Python package or runtime scheduler is shipped under `ann/`. Python helpers are confined to `test/ann/support/` and benchmark/test launchers; the batching benchmark executes C code.
 
 The standalone worker currently uses POSIX threads on Linux/macOS. These threads never call PostgreSQL backend APIs. Native backend code uses PostgreSQL memory contexts, buffer locks, interrupts, and generic WAL in C. Native wire-client deadlines and table-freeze/runtime eligibility remain explicit todos; Python reference tests are not completion of those runtime milestones. CAGRA integration and cuVS compilation remain deferred.
 

@@ -28,14 +28,14 @@ CREATE INDEX ON docs_0 (id);       -- for fetching non-covering columns by key
 **2. Parts:** the builder combines the exports of the partitions a part holds into one index, one CAGRA shard per partition. Partitions must be key ranges (their keys must not overlap); the combined keys stay sorted.
 
 ```sh
-python3 scripts/ann/build_cuvs_index.py --dtype float16 --quantize nvfp4 --out /data/ann/idx/part-0 \
+python3 ann/builder/build_cuvs_index.py --dtype float16 --quantize nvfp4 --out /data/ann/idx/part-0 \
     --from-export /data/ann/exports/export-0 --from-export /data/ann/exports/export-1
 ```
 
 **3. GPU nodes:** a worker per node, as for any [networked node](ann-networked.md).
 
 ```sh
-ann/ann-worker-cuvs --backend cuvs --listen /run/ann.sock --listen-tcp 0.0.0.0:7700 \
+ann/server/ann-worker-cuvs --backend cuvs --listen /run/ann.sock --listen-tcp 0.0.0.0:7700 \
     --auth-token-file /etc/ann/token --lanes 24 --itopk 64 --bitset-gather-limit 4000000 \
     --rdma mlx5_0:1 --rdma-lanes 4 --rdma-poll wait
 ```
@@ -113,7 +113,7 @@ A part's worker searches its shards as for any loaded index: one lane, every sha
 
 ## Traffic between PostgreSQL and the GPU nodes
 
-A search travels as one binary frame per part, operation 22 of the [worker protocol](../ann/README.md): a 32-byte header (`PVAN`, operation, request id, the part's generation, length, status) and a payload of the index name, dimensions, k, the predicate program and the query vector (about 4.2 KB at 1,024 dimensions). The reply is the part's top k keys and distances (136 bytes at k = 10). PostgreSQL's own protocol is used only between the client and the coordinator, and for fetching non-covering columns from the shard hosts.
+A search travels as one binary frame per part, operation 22 of the [worker protocol](../ann/server/README.md): a 32-byte header (`PVAN`, operation, request id, the part's generation, length, status) and a payload of the index name, dimensions, k, the predicate program and the query vector (about 4.2 KB at 1,024 dimensions). The reply is the part's top k keys and distances (136 bytes at k = 10). PostgreSQL's own protocol is used only between the client and the coordinator, and for fetching non-covering columns from the shard hosts.
 
 ```mermaid
 sequenceDiagram
@@ -275,5 +275,5 @@ Throughput per copy scales from the measured per-node rates:
 
 ## Tests
 
-`test/ann/test_collection.py` (part of `make -C ann check`; `ANN_PG_DSN`, superuser) runs three CPU workers as nodes on their own TCP ports and checks that the builder combines exports in key order and refuses overlapping members; that searches equal exact SQL over the partitioned table for every filter shape, query and k; that a pinned tenant reaches only its part and replicas share the requests; that a stopped replica is skipped and a part without a live node is an error; that `ann_collection_search_rows` returns the attribute values exact SQL returns, over one part, several parts in one request and the delta, and checks its column definition list; that delta rows are found under one LIMIT for every filter (also when every part is pruned), and a key in both the delta and a part is returned once; that a rolling rebuild (load under a new name, unload the old) keeps searches exact, including from a session with the old catalog cached; and the catalog's checks. `benchmarks/ann/collection_bench.py` generates, sets up, benchmarks and checks recall as above.
+`test/ann/test_collection.py` (part of `make -C ann/server check`; `ANN_PG_DSN`, superuser) runs three CPU workers as nodes on their own TCP ports and checks that the builder combines exports in key order and refuses overlapping members; that searches equal exact SQL over the partitioned table for every filter shape, query and k; that a pinned tenant reaches only its part and replicas share the requests; that a stopped replica is skipped and a part without a live node is an error; that `ann_collection_search_rows` returns the attribute values exact SQL returns, over one part, several parts in one request and the delta, and checks its column definition list; that delta rows are found under one LIMIT for every filter (also when every part is pruned), and a key in both the delta and a part is returned once; that a rolling rebuild (load under a new name, unload the old) keeps searches exact, including from a session with the old catalog cached; and the catalog's checks. `benchmarks/ann/collection_bench.py` generates, sets up, benchmarks and checks recall as above.
 

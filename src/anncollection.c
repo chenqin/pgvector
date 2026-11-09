@@ -2,7 +2,7 @@
 
 #include "access/table.h"
 #include "ann.h"
-#include "ann/filter.h"
+#include "ann/common/filter.h"
 #include "catalog/pg_type_d.h"
 #include "common/hashfn.h"
 #include "executor/spi.h"

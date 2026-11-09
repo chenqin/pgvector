@@ -325,7 +325,7 @@ Gates: rows inserted into the delta are found under one LIMIT. With a non-empty 
 
 ## 15. What does not change
 
-The page layouts, the freeze contract, the shared evaluator (`ann/filter.c`), the gather, grouped tensor-core and filtered CAGRA routes, the Blackwell module, RDMA lanes and the single-table frozen route all stay as they are. A collection with one partition, one group, one copy and one coordinator is today's deployment. Runtime paths stay in C. Python remains for the offline builder, tests and benchmarks.
+The page layouts, the freeze contract, the shared evaluator (`ann/common/filter.c`), the gather, grouped tensor-core and filtered CAGRA routes, the Blackwell module, RDMA lanes and the single-table frozen route all stay as they are. A collection with one partition, one group, one copy and one coordinator is today's deployment. Runtime paths stay in C. Python remains for the offline builder, tests and benchmarks.
 
 ## 16. Decisions to make
 

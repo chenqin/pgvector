@@ -4,7 +4,7 @@ Worker tests need only the CPU build. SQL tests also need ANN_PG_DSN for a
 superuser on this host (the server connects to the worker's socket); ANN_PSQL
 overrides psql. On a cuVS host, ANN_INDEX_WORKER=ann-worker-cuvs plus
 ANN_INDEX_BACKEND=cuvs runs the same checks against CAGRA files built by
-scripts/ann/build_cuvs_index.py (see test/ann/test_cuvs_index.py).
+ann/builder/build_cuvs_index.py (see test/ann/test_cuvs_index.py).
 """
 
 import json
@@ -146,12 +146,12 @@ def exact(keys, vectors, query, k, allowed=None):
 
 
 class IndexWorkerTests(unittest.TestCase):
-    worker = os.path.join(ROOT, 'ann', os.environ.get('ANN_INDEX_WORKER', 'ann-worker'))
+    worker = os.path.join(ROOT, 'ann', 'server', os.environ.get('ANN_INDEX_WORKER', 'ann-worker'))
     backend = os.environ.get('ANN_INDEX_BACKEND', 'cpu-exact')
 
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
 
     def setUp(self):
@@ -488,7 +488,7 @@ class IndexWorkerTests(unittest.TestCase):
 class IndexSqlTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         cls.directory = tempfile.TemporaryDirectory()
         cls.server = Server('--backend', os.environ.get('ANN_INDEX_BACKEND', 'cpu-exact'),

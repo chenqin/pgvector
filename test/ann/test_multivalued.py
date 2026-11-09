@@ -1,7 +1,7 @@
 """Multi-valued attributes on the worker: the "multivalued" manifest line, its
 row offsets file, and OVERLAP (op 10) predicate leaves.
 
-Run with the CPU worker (make -C ann ann-worker); ANN_INDEX_WORKER selects
+Run with the CPU worker (make -C ann/server ann-worker); ANN_INDEX_WORKER selects
 another executable. Results are checked against the same predicates
 evaluated here over the rows' arrays, so they match PostgreSQL's &&.
 """
@@ -73,13 +73,13 @@ def tags_of(rng, rows):
 
 
 class MultivaluedTests(unittest.TestCase):
-    worker = os.path.join(ROOT, 'ann', os.environ.get('ANN_INDEX_WORKER', 'ann-worker'))
+    worker = os.path.join(ROOT, 'ann', 'server', os.environ.get('ANN_INDEX_WORKER', 'ann-worker'))
     backend = os.environ.get('ANN_INDEX_BACKEND', 'cpu-exact')
 
     @classmethod
     def setUpClass(cls):
         if not os.environ.get('ANN_INDEX_WORKER'):
-            subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+            subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                            stdout=subprocess.DEVNULL)
         rng = random.Random(11)
         # Keys 0 .. ROWS - 1, so a row's ordinal is its key.

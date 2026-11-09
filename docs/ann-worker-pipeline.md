@@ -1,12 +1,12 @@
 # Worker pipeline for filtered search
 
-The opt-in `AnnFilteredSearch` CustomScan can hand distance scoring to the standalone [C worker](../ann/README.md) while PostgreSQL keeps producing eligible rows. GPU execution is mocked: the `mock-gpu` backend models one device submission per batch (launch latency plus transfer time) and computes exact results on the CPU. There is no Windows support for the worker route; the extension still builds there and always scores locally.
+The opt-in `AnnFilteredSearch` CustomScan can hand distance scoring to the standalone [C worker](../ann/server/README.md) while PostgreSQL keeps producing eligible rows. GPU execution is mocked: the `mock-gpu` backend models one device submission per batch (launch latency plus transfer time) and computes exact results on the CPU. There is no Windows support for the worker route; the extension still builds there and always scores locally.
 
 ## Enable
 
 ```sh
-make -C ann
-ann/ann-worker --backend mock-gpu --listen /var/run/postgresql/ann.sock
+make -C ann/server
+ann/server/ann-worker --backend mock-gpu --listen /var/run/postgresql/ann.sock
 ```
 
 ```sql
@@ -106,7 +106,7 @@ At 64 dimensions, where scoring is cheap, the worker route is slightly slower th
 ## Tests and benchmark
 
 ```sh
-make -C ann check                                   # includes test/ann/test_server.py
+make -C ann/server check                                   # includes test/ann/test_server.py
 make installcheck                                   # unavailable-worker fallback in ann_filtered
 ANN_PG_DSN='host=... dbname=...' python3 test/ann/test_pipeline.py
 ANN_PG_DSN='host=... dbname=...' benchmarks/ann/pipeline.sh 100000 256

@@ -187,7 +187,7 @@ WriteExactVectors(Relation index, const AnnFrozenMetaData *meta, const char *dir
  * written as attr-COLUMN.strings and attr-COLUMN.starts; for integer[],
  * every row's elements, with attr-COLUMN.offsets, a u32 start per row plus
  * the end, on a "multivalued" line), and a manifest with the index's
- * generation and no CAGRA shards. scripts/ann/build_cuvs_index.py --from-export adds
+ * generation and no CAGRA shards. ann/builder/build_cuvs_index.py --from-export adds
  * the shards; ann_index_load checks the generation against the table.
  */
 FUNCTION_PREFIX PG_FUNCTION_INFO_V1(ann_index_export);

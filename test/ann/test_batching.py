@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import unittest
 
-EXECUTABLE = Path(__file__).resolve().parents[2] / 'ann/ann-batch-tests'
+EXECUTABLE = Path(__file__).resolve().parents[2] / 'ann/server/ann-batch-tests'
 
 
 class NativeBatchTests(unittest.TestCase):

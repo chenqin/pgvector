@@ -2,7 +2,7 @@
  * CAGRA filter UDF probe: loads one FP32 CAGRA shard through the cuVS C API
  * (as the worker does) and compares, on the same graph and search settings,
  * a device-resident bitset filter with the JIT-LTO predicate UDF of
- * ann/cagra_udf.cpp. Reports cold (JIT compile) and warm latency, recall
+ * ann/server/cagra_udf.cpp. Reports cold (JIT compile) and warm latency, recall
  * against an exact scan of the eligible rows, and whether every returned row
  * satisfies its query's predicate.
  *
@@ -69,7 +69,7 @@ Now(void)
 	return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
 }
 
-/* Program builders (ann/filter.h encoding). */
+/* Program builders (ann/common/filter.h encoding). */
 typedef struct
 {
 	unsigned char b[4096];

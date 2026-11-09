@@ -22,7 +22,7 @@ flowchart LR
 Build the graph from original FP32 vectors:
 
 ```sh
-python scripts/ann/build_cuvs_index.py \
+python ann/builder/build_cuvs_index.py \
   --from-export "$EXPORT_DIR" --out "$FP32_INDEX_DIR" --dtype float32 --shards 1
 ```
 

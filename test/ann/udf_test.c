@@ -1,5 +1,5 @@
 /*
- * The row-by-row predicate interpreter (ann/udf.c, twin of the CAGRA filter
+ * The row-by-row predicate interpreter (ann/server/udf.c, twin of the CAGRA filter
  * UDF) must select exactly the rows AnnFilterEvaluate puts in its bitset:
  * random columns with NULLs, random programs with negated leaves, NOT,
  * AND/OR, ALL and NONE.

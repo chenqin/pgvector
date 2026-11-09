@@ -51,7 +51,7 @@ def main():
     cases += [(f'category BETWEEN 0 AND {hi}', range_program('category', 0, hi)) for hi in (0, 9, 99)]
     modes = [('cpu_rescore', args.baseline_worker, 'off'),
              ('gpu_rescore', args.baseline_worker, 'on'),
-             ('native_fp32', ROOT/'ann/ann-worker-cuvs', 'on')]
+             ('native_fp32', ROOT/'ann/server/ann-worker-cuvs', 'on')]
     rows, snapshots, commands = [], {}, {}
     for label, executable, rerank in modes:
         path = args.output/f'{label}.sock'

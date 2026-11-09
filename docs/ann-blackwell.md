@@ -12,7 +12,7 @@ PostgreSQL, the SQL functions and the network protocol are unchanged: a GPU node
 ## Building a quantized index
 
 ```sh
-python3 scripts/ann/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \
+python3 ann/builder/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \
     --key id --vector embedding --out /data/ann/docs --quantize nvfp4    # or fp8
 ```
 

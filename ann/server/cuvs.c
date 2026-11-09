@@ -1428,7 +1428,7 @@ ReleaseBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 /*
  * --gpu-predicates: a predicate the cache misses is evaluated on a GPU, not
  * by the host over the attribute columns. Its program compiles to the UDF
- * interpreter's steps (ann/udf.h); one thread per row runs it and each warp
+ * interpreter's steps (udf.h); one thread per row runs it and each warp
  * writes its 32 results as one bitmap word. The index's single-valued
  * columns go to a device the first time a predicate reads them there.
  * Programs with BITMAP or OVERLAP leaves, or over multi-valued columns, stay

@@ -9,7 +9,7 @@
 #include <pthread.h>
 
 /*
- * Immutable on-disk index produced by scripts/ann/build_cuvs_index.py:
+ * Immutable on-disk index produced by ann/builder/build_cuvs_index.py:
  *
  *   manifest      text, one "key value..." pair per line (see ann/README.md)
  *   keys.i64      rows sorted unique little-endian int64 table keys
@@ -270,7 +270,7 @@ typedef struct AnnIndexOptions
 	int			gpu_predicates; /* evaluate uncached predicates on the GPU
 								 * (--gpu-predicates); default on */
 	int			canonical_predicates;	/* cache predicates under their
-										 * canonical form (ann/canonical.h);
+										 * canonical form (canonical.h);
 										 * default on */
 	int			predicate_admission;	/* ANN_ADMIT_*: which new predicate
 										 * results enter the cache */
@@ -367,7 +367,7 @@ extern int	(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *p
 									   uint32_t *words, uint64_t *count);
 
 /*
- * Evaluate a predicate program (ann/filter.h) over the index's attribute
+ * Evaluate a predicate program (ann/common/filter.h) over the index's attribute
  * columns and cached bitmaps into words ((rows + 31) / 32 of them).
  * Returns an ANN_FILTER_* code.
  */
@@ -376,7 +376,7 @@ int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t 
 							 uint32_t *words, uint64_t *count, int snapshot);
 
 /*
- * The program's canonical form over this index's columns (ann/canonical.h):
+ * The program's canonical form over this index's columns (canonical.h):
  * 1 and a malloc'd program, or 0 to use the program as written.
  */
 int			AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,

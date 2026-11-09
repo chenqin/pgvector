@@ -62,17 +62,17 @@ its one-block radix kernel was bound by its launch shape, one block per query).
 
 ## What changed in the code
 
-* **Pruned matrix selection** (`--matrix-prune`, `ann/cuvs.c`): after scoring a
+* **Pruned matrix selection** (`--matrix-prune`, `ann/server/cuvs.c`): after scoring a
   group's eligible rows, sample 8,192 scores per query, take the rank-th smallest
   as a cutoff (rank chosen so about four times the k + slack candidates pass, at
   least 32), compact the scores under it, and sort each query's kept list in one
   block's shared memory. A query keeping too few or too many falls back to the full
   radix select, so the candidates equal the full selection's. At 10% (1M rows) the
   cutoff keeps about 3,900 scores; at 1% (100k rows) about 3,000.
-* **Grouped submission** (`ann/server.c`): a batch request's jobs are queued under
+* **Grouped submission** (`ann/server/server.c`): a batch request's jobs are queued under
   one lock and one lane is woken per `--max-batch` of them, instead of a lock and a
   wake-up per vector, which also split groups across lanes.
-* **Settled accounting** (`ann/server.c`, `ann/indexfile.c`): a lane returns a
+* **Settled accounting** (`ann/server/server.c`, `ann/server/indexfile.c`): a lane returns a
   finished batch's pending bytes and drops its index and bitmap references once per
   batch with counted holds and releases; batch submission takes them once per
   request.
@@ -270,7 +270,7 @@ predicates on the GPU is the next section.
 
 The rest of Phase 2: a predicate the worker's cache misses is evaluated on a GPU
 instead of over the attribute columns on the host. The program compiles to the CAGRA
-UDF interpreter's steps (`ann/udf.h`; the interpreter source is now shared by both
+UDF interpreter's steps (`ann/server/udf.h`; the interpreter source is now shared by both
 uses), one thread per row runs it over the single-valued columns (uploaded to a
 device the first time a predicate reads them there), and each warp writes its 32
 results as one bitmap word. Programs with stored-filter or multi-valued leaves stay
@@ -418,7 +418,7 @@ leak on evicted entries was fixed (a0d4a81).
 ## Final configuration
 
 ```sh
-ann/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
+ann/server/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
   --lanes 96 --max-batch 64 --replicate on --itopk 512 --filtered-itopk 1024 \
   --filtered-algo multi --filtered-width 4 --exact-limit 0 \
   --gather-limit 4000000 --bitset-gather-limit 4000000 --group-gather-limit 4000000 \

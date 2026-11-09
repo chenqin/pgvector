@@ -170,7 +170,7 @@ class WorkerAuthTests(unittest.TestCase):
 class RemoteSqlTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
         cls.directory = tempfile.TemporaryDirectory()
         cls.nodes = [Node(cls.directory.name), Node(cls.directory.name)]

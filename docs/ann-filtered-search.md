@@ -65,7 +65,7 @@ A local 4,096-row fixture with 40 qualifying rows used a B-tree child scan, eval
 ```sh
 make && make install
 make installcheck
-ANN_PG_DSN='dbname=test_database' make -C ann check-postgres
+ANN_PG_DSN='dbname=test_database' make -C ann/server check-postgres
 ```
 
 Runtime code remains C; Python drives tests and benchmarks only. Local testing uses PostgreSQL 17.6/macOS ARM64; the full PostgreSQL CI matrix is still required. Native worker IPC and process-wide batching are implemented by the [worker pipeline](ann-worker-pipeline.md); accelerator mappings/generations and sustained-load validation are next milestones. CAGRA integration and compilation against cuVS remain deferred.

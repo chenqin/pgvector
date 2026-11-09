@@ -1349,7 +1349,7 @@ COMMENT ON FUNCTION ann_frozen_keys(regclass, text, integer[]) IS 'keys of the r
 CREATE FUNCTION ann_index_export(index regclass, path text) RETURNS bigint
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT VOLATILE;
 
-COMMENT ON FUNCTION ann_index_export(regclass, text) IS 'write a frozen ann index''s rows as an index directory for scripts/ann/build_cuvs_index.py --from-export';
+COMMENT ON FUNCTION ann_index_export(regclass, text) IS 'write a frozen ann index''s rows as an index directory for ann/builder/build_cuvs_index.py --from-export';
 
 REVOKE ALL ON FUNCTION ann_index_export(regclass, text) FROM PUBLIC;
 

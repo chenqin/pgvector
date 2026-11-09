@@ -165,8 +165,8 @@ joint recall validation are necessary for an approximate implementation.
 
 Raw calibration, quality, plans and stress records are in
 [the retained B200 results](../benchmarks/ann/results/frozen-cost-b200-95/manifest.json).
-The matching implementation is in [cost.h](../ann/cost.h),
-[annfrozenscan.c](../src/annfrozenscan.c), and [cuvs.c](../ann/cuvs.c).
+The matching implementation is in [cost.h](../ann/common/cost.h),
+[annfrozenscan.c](../src/annfrozenscan.c), and [cuvs.c](../ann/server/cuvs.c).
 
 ```sh
 cc -O2 -std=c11 -Iann benchmarks/ann/cost_predict.c -lm -o /tmp/cost-predict

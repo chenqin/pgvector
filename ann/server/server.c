@@ -2403,7 +2403,7 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 
 /*
  * Predicate search payload: u32 name length, name, u32 dimensions, k,
- * flags, program length, the program (ann/filter.h); FP32 query. The rows
+ * flags, program length, the program (ann/common/filter.h); FP32 query. The rows
  * are cached under the program's hash, so repeated predicates share one
  * evaluation and are grouped like cached bitmaps.
  */

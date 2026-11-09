@@ -194,7 +194,7 @@ gprofng display text -limit 60 -functions postgres-cpu.er
 gprofng display text -limit 100 -calltree postgres-cpu.er
 
 # Start a separate worker session, load/precompute the same index, then capture.
-nsys launch --session-new=frozen-gpu --trace=cuda,nvtx ann/ann-worker-cuvs ...
+nsys launch --session-new=frozen-gpu --trace=cuda,nvtx ann/server/ann-worker-cuvs ...
 nsys start --session=frozen-gpu --sample=none --cpuctxsw=none --output=gpu-capture
 # Run the workload during the capture, then stop and summarize.
 nsys stop --session=frozen-gpu
@@ -544,7 +544,7 @@ To reproduce the optimized B200 policy, build with `USE_CUVS=1`, load the
 same index on eight GPUs with replication, and use these worker options:
 
 ```sh
-ann/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
+ann/server/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
   --lanes 64 --max-batch 32 --replicate on --itopk 512 \
   --filtered-itopk 1024 --filtered-algo multi --filtered-width 4 \
   --exact-limit 0 --gather-limit 4000000 --bitset-gather-limit 500000 \

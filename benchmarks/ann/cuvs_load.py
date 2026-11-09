@@ -4,7 +4,7 @@
     # 1. synthetic table: id, tenant (0.1% each), category (1% each), emb vector(D)
     python3 benchmarks/ann/cuvs_load.py generate --dsn ... --table bench10m --rows 10000000 --dimensions 128
     # 2. offline index build (one shard per GPU)
-    python3 scripts/ann/build_cuvs_index.py --dsn ... --table public.bench10m --vector emb --out /data/bench10m
+    python3 ann/builder/build_cuvs_index.py --dsn ... --table public.bench10m --vector emb --out /data/bench10m
     # 3. sweep client concurrency with pgbench for ANN and hybrid queries
     python3 benchmarks/ann/cuvs_load.py bench --dsn ... --table bench10m --index bench10m \\
         --path /data/bench10m --socket /tmp/ann.sock --clients 64,128,256,512

@@ -9,7 +9,7 @@ does not route queries to it yet.
 
 | File | Role |
 | --- | --- |
-| `ann/udf.{h,c}` | Compiles a predicate program (`ann/filter.h`) into postfix steps, evaluates one row on the CPU (`AnnUdfMatch`) and estimates matching rows (`AnnUdfEstimate`) |
+| `ann/udf.{h,c}` | Compiles a predicate program (`ann/common/filter.h`) into postfix steps, evaluates one row on the CPU (`AnnUdfMatch`) and estimates matching rows (`AnnUdfEstimate`) |
 | `ann/cagra_udf.{h,cpp}` | `AnnCagraUdfSearch`: FP32 CAGRA search with a fixed device interpreter as the UDF |
 | `test/ann/udf_test.c` | 3,000 random programs (NULLs, negated leaves, NOT, AND/OR) select the same rows as `AnnFilterEvaluate` |
 | `benchmarks/ann/cagra_udf_probe.c` | Bitset vs UDF benchmark on one FP32 shard |

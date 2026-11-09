@@ -1167,7 +1167,7 @@ AnnIndexBitmapWords(const AnnIndexFile *file, const AnnIndexBitmap *bitmap, uint
 		words[bitmap->ordinals[i] / 32] |= UINT32_C(1) << (bitmap->ordinals[i] % 32);
 }
 
-/* Attribute columns and cached bitmaps as an ann/filter.h source. */
+/* Attribute columns and cached bitmaps as an ann/common/filter.h source. */
 static int
 SourceColumn(void *arg, const char *name)
 {

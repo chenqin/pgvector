@@ -1,7 +1,12 @@
-# Standalone reference worker; independent of PGXS and GPU SDKs.
+# The ANN server: the standalone worker PostgreSQL sends searches to. The
+# CPU build needs no PGXS or GPU SDK; USE_CUVS=1 adds the cuVS GPU build.
+# Shared with the PostgreSQL extension: ../common (filter language, cost model).
 CC ?= cc
 CFLAGS ?= -O2 -g
-CFLAGS += -std=c11 -Wall -Wextra -Werror -pedantic
+COMMON = ../common
+CFLAGS += -std=c11 -Wall -Wextra -Werror -pedantic -I$(COMMON)
+PREFIX ?= /usr/local
+BINDIR ?= $(PREFIX)/bin
 CUDA_HOME ?= /usr/local/cuda
 
 # USE_CUVS=1 also builds the cuVS worker (requires CUVS_PREFIX); hosts
@@ -20,38 +25,38 @@ batching.o: batching.c batching.h backend.h
 cpu.o: cpu.c backend.h indexfile.h
 	$(CC) $(CFLAGS) -c cpu.c -o $@
 
-indexfile.o: indexfile.c indexfile.h backend.h filter.h canonical.h
+indexfile.o: indexfile.c indexfile.h backend.h $(COMMON)/filter.h canonical.h
 	$(CC) $(CFLAGS) -pthread -c indexfile.c -o $@
 
-canonical.o: canonical.c canonical.h filter.h
+canonical.o: canonical.c canonical.h $(COMMON)/filter.h
 	$(CC) $(CFLAGS) -c canonical.c -o $@
 
-filter.o: filter.c filter.h
-	$(CC) $(CFLAGS) -c filter.c -o $@
+filter.o: $(COMMON)/filter.c $(COMMON)/filter.h
+	$(CC) $(CFLAGS) -c $(COMMON)/filter.c -o $@
 
 libannbatch.a: batching.o cpu.o indexfile.o filter.o canonical.o
 	$(AR) rcs $@ batching.o cpu.o indexfile.o filter.o canonical.o
 
-ann-batch-tests: ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c canonical.c batching.h backend.h
-	$(CC) $(CFLAGS) -pthread -I. ../test/ann/batch_test.c batching.c cpu.c indexfile.c filter.c canonical.c -lm -o $@
+ann-batch-tests: ../../test/ann/batch_test.c batching.c cpu.c indexfile.c $(COMMON)/filter.c canonical.c batching.h backend.h
+	$(CC) $(CFLAGS) -pthread -I. ../../test/ann/batch_test.c batching.c cpu.c indexfile.c $(COMMON)/filter.c canonical.c -lm -o $@
 
-ann-udf-tests: ../test/ann/udf_test.c udf.c udf.h filter.c filter.h
-	$(CC) $(CFLAGS) -I. ../test/ann/udf_test.c udf.c filter.c -lm -o $@
+ann-udf-tests: ../../test/ann/udf_test.c udf.c udf.h $(COMMON)/filter.c $(COMMON)/filter.h
+	$(CC) $(CFLAGS) -I. ../../test/ann/udf_test.c udf.c $(COMMON)/filter.c -lm -o $@
 
-ann-canonical-tests: ../test/ann/canonical_test.c canonical.c canonical.h filter.c filter.h
-	$(CC) $(CFLAGS) -I. ../test/ann/canonical_test.c canonical.c filter.c -lm -o $@
+ann-canonical-tests: ../../test/ann/canonical_test.c canonical.c canonical.h $(COMMON)/filter.c $(COMMON)/filter.h
+	$(CC) $(CFLAGS) -I. ../../test/ann/canonical_test.c canonical.c $(COMMON)/filter.c -lm -o $@
 
-ann-cost-tests: ../test/ann/cost_test.c cost.h
-	$(CC) $(CFLAGS) -I. ../test/ann/cost_test.c -lm -o $@
+ann-cost-tests: ../../test/ann/cost_test.c $(COMMON)/cost.h
+	$(CC) $(CFLAGS) -I. ../../test/ann/cost_test.c -lm -o $@
 
-ann-replica-tests: ../test/ann/replica_test.c replica.h
-	$(CC) $(CFLAGS) -pthread -I. ../test/ann/replica_test.c -o $@
+ann-replica-tests: ../../test/ann/replica_test.c replica.h
+	$(CC) $(CFLAGS) -pthread -I. ../../test/ann/replica_test.c -o $@
 
-ann-batch-bench: ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c canonical.c batching.h backend.h
-	$(CC) $(CFLAGS) -pthread -I. ../benchmarks/ann/batch.c batching.c cpu.c indexfile.c filter.c canonical.c -lm -o $@
+ann-batch-bench: ../../benchmarks/ann/batch.c batching.c cpu.c indexfile.c $(COMMON)/filter.c canonical.c batching.h backend.h
+	$(CC) $(CFLAGS) -pthread -I. ../../benchmarks/ann/batch.c batching.c cpu.c indexfile.c $(COMMON)/filter.c canonical.c -lm -o $@
 
-WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c filter.c canonical.c udf.c rdma.c
-WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h filter.h canonical.h udf.h rdma.h cost.h
+WORKER_SRCS = worker.c cpu.c mockgpu.c batching.c server.c indexfile.c $(COMMON)/filter.c canonical.c udf.c rdma.c
+WORKER_DEPS = $(WORKER_SRCS) batching.h backend.h server.h indexfile.h $(COMMON)/filter.h canonical.h udf.h rdma.h $(COMMON)/cost.h
 
 # USE_RDMA=1 enables RDMA search frames over InfiniBand/RoCE verbs
 # (rdma-core); RDMA_PREFIX locates libibverbs if it is not in /usr.
@@ -85,8 +90,8 @@ cagra_udf.o: cagra_udf.cpp cagra_udf.h udf.h
 	$(CXX) $(CXXFLAGS) -O2 -std=c++20 $(CUVS_CXXFLAGS) -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) $(CPPFLAGS) -c cagra_udf.cpp -o $@
 
 # Bitset versus filter UDF on one FP32 CAGRA shard: cagra-udf-probe INDEX_DIR [k itopk slack queries]
-cagra-udf-probe: ../benchmarks/ann/cagra_udf_probe.c cagra_udf.o udf.c udf.h filter.c filter.h
-	$(CC) -O3 -std=gnu11 -fopenmp -Wall -I. -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) ../benchmarks/ann/cagra_udf_probe.c udf.c filter.c cagra_udf.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lm -o $@
+cagra-udf-probe: ../../benchmarks/ann/cagra_udf_probe.c cagra_udf.o udf.c udf.h $(COMMON)/filter.c $(COMMON)/filter.h
+	$(CC) -O3 -std=gnu11 -fopenmp -Wall -I. -I$(COMMON) -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) ../../benchmarks/ann/cagra_udf_probe.c udf.c $(COMMON)/filter.c cagra_udf.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lm -o $@
 
 # Requires cuVS 26.10 C/C++ SDKs, RAFT/RMM/CCCL, DLPack and CUDA runtime headers.
 # A different executable keeps the dependency-free CPU build reproducible.
@@ -99,34 +104,40 @@ check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests
 	./ann-udf-tests
 	./ann-canonical-tests
 	./ann-replica-tests
-	python3 ../test/ann/test_worker.py
-	python3 ../test/ann/test_batching.py
-	python3 ../test/ann/test_server.py
-	python3 ../test/ann/test_index.py
-	python3 ../test/ann/test_multivalued.py
-	python3 ../test/ann/test_predicate_cache.py
-	python3 ../test/ann/test_cuvs.py
-	python3 ../test/ann/test_postgres.py
-	python3 ../test/ann/test_native.py
-	python3 ../test/ann/test_filtered.py
-	python3 ../test/ann/test_pipeline.py
-	python3 ../test/ann/test_frozen.py
-	python3 ../test/ann/test_collection.py
+	python3 ../../test/ann/test_worker.py
+	python3 ../../test/ann/test_batching.py
+	python3 ../../test/ann/test_server.py
+	python3 ../../test/ann/test_index.py
+	python3 ../../test/ann/test_multivalued.py
+	python3 ../../test/ann/test_predicate_cache.py
+	python3 ../../test/ann/test_cuvs.py
+	python3 ../../test/ann/test_postgres.py
+	python3 ../../test/ann/test_native.py
+	python3 ../../test/ann/test_filtered.py
+	python3 ../../test/ann/test_pipeline.py
+	python3 ../../test/ann/test_frozen.py
+	python3 ../../test/ann/test_collection.py
 
 check-cuvs: ann-worker ann-worker-cuvs
-	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs.py
-	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs_gathered.py
-	ANN_CUVS_TEST=1 python3 ../test/ann/test_cuvs_index.py
-	ANN_CUVS_TEST=1 python3 ../test/ann/test_frozen.py FrozenCuvsTests
+	ANN_CUVS_TEST=1 python3 ../../test/ann/test_cuvs.py
+	ANN_CUVS_TEST=1 python3 ../../test/ann/test_cuvs_gathered.py
+	ANN_CUVS_TEST=1 python3 ../../test/ann/test_cuvs_index.py
+	ANN_CUVS_TEST=1 python3 ../../test/ann/test_frozen.py FrozenCuvsTests
 
 check-postgres: ann-worker
 	@test -n "$$ANN_PG_DSN" || { echo 'Set ANN_PG_DSN to a test database with pgvector installed' >&2; exit 1; }
-	python3 ../test/ann/test_postgres.py
-	python3 ../test/ann/test_native.py
-	python3 ../test/ann/test_filtered.py
-	python3 ../test/ann/test_pipeline.py
-	python3 ../test/ann/test_index.py
-	python3 ../test/ann/test_frozen.py
+	python3 ../../test/ann/test_postgres.py
+	python3 ../../test/ann/test_native.py
+	python3 ../../test/ann/test_filtered.py
+	python3 ../../test/ann/test_pipeline.py
+	python3 ../../test/ann/test_index.py
+	python3 ../../test/ann/test_frozen.py
+
+# Installs the workers that were built (ann-worker always, ann-worker-cuvs with USE_CUVS=1).
+install: all
+	install -d "$(DESTDIR)$(BINDIR)"
+	install -m 755 ann-worker "$(DESTDIR)$(BINDIR)/ann-worker"
+	if [ -f ann-worker-cuvs ]; then install -m 755 ann-worker-cuvs "$(DESTDIR)$(BINDIR)/ann-worker-cuvs"; fi
 
 clean:
 	rm -f ann-worker

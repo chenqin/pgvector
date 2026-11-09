@@ -355,7 +355,7 @@ bool		AnnPredicateFromText(Oid relid, const char *filter, const AnnPredicateColu
 								 StringInfo program);
 Relation	AnnFrozenIndexOf(Oid relid, uint64 generation, LOCKMODE lockmode);
 
-/* Statuses shared with ann/backend.h. */
+/* Statuses shared with ann/server/backend.h. */
 #define ANN_STATUS_OK 0
 #define ANN_STATUS_INVALID 1
 #define ANN_STATUS_UNSUPPORTED 2

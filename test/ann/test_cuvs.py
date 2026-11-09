@@ -19,7 +19,7 @@ class CuvsTests(unittest.TestCase):
         vectors = [[rng.random() for _ in range(32)] for _ in range(4096)]
         queries = vectors[::1024]
         filters = [list(range(i, 4096, 4)) for i in range(4)]
-        with Worker() as cpu, Worker(ROOT / 'ann/ann-worker-cuvs', 'cuvs') as gpu:
+        with Worker() as cpu, Worker(ROOT / 'ann/server/ann-worker-cuvs', 'cuvs') as gpu:
             caps = gpu.capabilities()
             self.assertFalse(caps['exact'])
             self.assertEqual(caps['metrics_mask'], 1)
@@ -53,7 +53,7 @@ class CuvsTests(unittest.TestCase):
 
     def test_failed_build_preserves_generation(self):
         vectors = [[float(i), 1] for i in range(256)]
-        with Worker(ROOT / 'ann/ann-worker-cuvs', 'cuvs') as gpu:
+        with Worker(ROOT / 'ann/server/ann-worker-cuvs', 'cuvs') as gpu:
             gpu.build(1, vectors)
             vectors[0][0] = float('nan')
             with self.assertRaises(WorkerError):

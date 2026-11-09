@@ -1,6 +1,6 @@
 # Networked GPU nodes: hybrid search across PostgreSQL hosts
 
-[Loaded cuVS indexes](ann-cuvs-index.md) can be served by GPU nodes on the network, so many PostgreSQL hosts can evaluate SQL filters on their own CPUs and send only vector search to the GPUs. The query path is C on both sides: `src/annremote.c` and `src/annindex.c` in the extension, `ann/server.c` in the worker.
+[Loaded cuVS indexes](ann-cuvs-index.md) can be served by GPU nodes on the network, so many PostgreSQL hosts can evaluate SQL filters on their own CPUs and send only vector search to the GPUs. The query path is C on both sides: `src/annremote.c` and `src/annindex.c` in the extension, `ann/server/server.c` in the worker.
 
 ```mermaid
 flowchart LR
@@ -22,7 +22,7 @@ flowchart LR
 ```sh
 # GPU node: Unix socket for local tooling, TCP for PostgreSQL hosts
 head -c 32 /dev/urandom | base64 > /etc/ann/token && chmod 600 /etc/ann/token
-ann/ann-worker-cuvs --backend cuvs --listen /run/ann.sock \
+ann/server/ann-worker-cuvs --backend cuvs --listen /run/ann.sock \
     --listen-tcp 0.0.0.0:7700 --auth-token-file /etc/ann/token --lanes 96 --itopk 64
 ```
 
@@ -160,8 +160,8 @@ Search frames can bypass the kernel network stack over RDMA. The transport uses 
 
 ```sh
 # GPU node (an active port; check with ibv_devinfo)
-make -C ann USE_CUVS=1 USE_RDMA=1 CUVS_PREFIX=...
-ann/ann-worker-cuvs --backend cuvs --listen /run/ann.sock --listen-tcp 0.0.0.0:7700 \
+make -C ann/server USE_CUVS=1 USE_RDMA=1 CUVS_PREFIX=...
+ann/server/ann-worker-cuvs --backend cuvs --listen /run/ann.sock --listen-tcp 0.0.0.0:7700 \
     --auth-token-file /etc/ann/token --rdma mlx5_0:1 --rdma-lanes 16 [--rdma-poll spin|wait]
 
 # PostgreSQL hosts

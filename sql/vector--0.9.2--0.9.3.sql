@@ -145,3 +145,5 @@ CREATE FUNCTION ann_frozen_search_batch_arrays(name text, queries vector[], k in
 	AS 'MODULE_PATHNAME' LANGUAGE C VOLATILE ROWS 16;
 
 COMMENT ON FUNCTION ann_frozen_search_batch_arrays(text, vector[], integer, text) IS 'ann_frozen_search_batch with one row per query: its hits as id and distance arrays in distance order';
+
+COMMENT ON FUNCTION ann_index_export(regclass, text) IS 'write a frozen ann index''s rows as an index directory for ann/builder/build_cuvs_index.py --from-export';

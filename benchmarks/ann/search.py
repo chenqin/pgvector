@@ -45,7 +45,7 @@ def main():
     latencies = []
     executable = args.worker
     if executable is None and args.backend == 'cuvs':
-        executable = Path(__file__).resolve().parents[2] / 'ann/ann-worker-cuvs'
+        executable = Path(__file__).resolve().parents[2] / 'ann/server/ann-worker-cuvs'
     recalls = []
     with Worker(executable, args.backend) as worker:
         caps = worker.capabilities()

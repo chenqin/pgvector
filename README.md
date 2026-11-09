@@ -568,8 +568,8 @@ This fork is developing filtered vector search across accelerator backends. The 
 From the root of a checkout of this fork, with a C compiler, Make, and Python 3.9+:
 
 ```sh
-make -C ann
-make -C ann check
+make -C ann/server
+make -C ann/server check
 python3 benchmarks/ann/search.py --mode shared --batch 16
 python3 benchmarks/ann/search.py --mode unique --batch 16
 ```
@@ -578,13 +578,13 @@ This build is independent of PGXS and does not require Postgres or a GPU SDK. Th
 
 ### Native C runtime and PostgreSQL reference tests
 
-Worker, backend, and batching/admission runtime code is C, following pgvector's implementation language. See [the native C API](ann/batching.h) and [worker guide](ann/README.md) for build, ownership, and cancellation details. Python is restricted to test helpers and benchmark scripts.
+Worker, backend, and batching/admission runtime code is C, following pgvector's implementation language. See [the native C API](ann/server/batching.h) and [worker guide](ann/server/README.md) for build, ownership, and cancellation details. Python is restricted to test helpers and benchmark scripts.
 
 The frozen-table Python adapter is a test reference only. Run its SQL eligibility and freeze/failure tests against a test database with pgvector installed:
 
 ```sh
 python3 -m pip install -r test/ann/requirements-postgres.txt
-ANN_PG_DSN='dbname=your_test_database' make -C ann check-postgres
+ANN_PG_DSN='dbname=your_test_database' make -C ann/server check-postgres
 ```
 
 See the [native index guide](docs/ann-native-index.md) for SQL, architecture diagrams, source layout, and tests. The [native filtered CustomScan](docs/ann-filtered-search.md) is opt-in (`LOAD 'vector'; SET ann.enable_filtered_search = on;`). The production C protocol client remains a todo. There is no supported Python runtime search API in this fork.
@@ -596,7 +596,7 @@ The current implementation has passed 12 worker tests, 7 native scheduler scenar
 To run live integration tests against a test database with pgvector installed:
 
 ```sh
-ANN_PG_DSN='dbname=your_test_database' make -C ann check-postgres
+ANN_PG_DSN='dbname=your_test_database' make -C ann/server check-postgres
 ```
 
 These tests create/remove uniquely named schemas and need the corresponding database permissions. GPU validation uses the separate `check-cuvs` target described in the worker guide; explicit GPU tests fail when required dependencies or hardware are missing.

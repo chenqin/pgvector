@@ -249,7 +249,7 @@ AnnUdfEstimate(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
 /*
  * The device twin of AnnUdfMatch: ann_predicate_udf(query, row, params)
  * over an AnnUdfParams (declared again as ann_udf_params), for NVRTC. It
- * needs uint32_t and source_index_t defined. Opcodes are ann/filter.h's.
+ * needs uint32_t and source_index_t defined. Opcodes are ann/common/filter.h's.
  */
 static const char deviceSource[] =
 "struct ann_udf_step {\n"

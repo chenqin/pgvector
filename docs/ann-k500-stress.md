@@ -97,7 +97,7 @@ rows are eligible; a GPU gather scan is a better route for those filters here.
 Baseline worker settings (set `CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7`):
 
 ```sh
-ann/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
+ann/server/ann-worker-cuvs --backend cuvs --listen "$SOCKET" \
   --lanes 32 --max-batch 32 --replicate on \
   --itopk 512 --filtered-itopk 1024 --filtered-algo multi --filtered-width 4 \
   --exact-limit 0 --gather-limit 0 --bitset-gather-limit 0 --group-gather-limit 0 \
@@ -244,7 +244,7 @@ SELECT ann_index_export('frozen_stress_ann', '/dev/shm/your-run/export');
 ```
 
 ```sh
-python scripts/ann/build_cuvs_index.py --from-export /dev/shm/your-run/export \
+python ann/builder/build_cuvs_index.py --from-export /dev/shm/your-run/export \
   --out /dev/shm/your-run/index --shards 1 --dtype float16 --quantize nvfp4
 ```
 

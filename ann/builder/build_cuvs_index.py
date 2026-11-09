@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build an immutable, sharded cuVS CAGRA index directory from a PostgreSQL table.
 
-    python3 scripts/ann/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \\
+    python3 ann/builder/build_cuvs_index.py --dsn 'dbname=app' --table public.docs \\
         --key id --vector embedding --out /data/ann/docs --shards 8 --dtype float16
 
 The directory holds a text manifest, keys.i64 (sorted int64 keys), vectors.f32

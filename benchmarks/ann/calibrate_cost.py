@@ -217,7 +217,7 @@ def main():
                     db.execute('SET ann.enable_frozen_search = off')
                 local.append(entry)
         (args.output / 'local.json').write_text(json.dumps(local, indent=2)+'\n')
-    worker = str(ROOT / 'ann/ann-worker-cuvs')
+    worker = str(ROOT / 'ann/server/ann-worker-cuvs')
     for mode in ['scan_host', 'scan_gpu', 'graph_host', 'graph_gpu']:
         scan = mode.startswith('scan')
         gpu = mode.endswith('gpu')

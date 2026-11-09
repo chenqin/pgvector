@@ -7,8 +7,8 @@
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
 #include "ann.h"
-#include "ann/filter.h"
-#include "ann/cost.h"
+#include "ann/common/filter.h"
+#include "ann/common/cost.h"
 #include "catalog/pg_type_d.h"
 #include "commands/defrem.h"
 #include "commands/extension.h"
@@ -36,7 +36,7 @@
 /*
  * Ordered scans of a table with a frozen ann index, answered from the index
  * and the GPU worker: "WHERE <predicate over INCLUDE attributes> ORDER BY
- * vector <-> $q". The predicate becomes an ann/filter.h program; the worker
+ * vector <-> $q". The predicate becomes an ann/common/filter.h program; the worker
  * serving the index's generation evaluates it, caches its rows and searches
  * them (operation 22, ordinals in the reply); without such a worker, the
  * program is evaluated from the frozen pages and candidates are scored on
@@ -870,7 +870,7 @@ LocalSearch(FrozenScanState *state)
 	state->exhausted = true;
 }
 
-/* The worker's route code for an exact scan of the eligible rows (ann/backend.h: ANN_ROUTE_EXACT). */
+/* The worker's route code for an exact scan of the eligible rows (ann/server/backend.h: ANN_ROUTE_EXACT). */
 #define ANN_FROZEN_ROUTE_EXACT 2
 
 /* Operation 22: the top k in ordinals, or false to fall back to the CPU. */

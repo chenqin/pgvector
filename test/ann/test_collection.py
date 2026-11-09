@@ -1,7 +1,7 @@
 """Collections: a table's partitions built into parts served by several worker nodes, searched together.
 
 Needs ANN_PG_DSN for a local superuser (exports write server files, and the
-workers read them). Builds the CPU worker and runs scripts/ann/build_cuvs_index.py
+workers read them). Builds the CPU worker and runs ann/builder/build_cuvs_index.py
 --no-cagra, which needs numpy and psycopg. Each node is a CPU worker on its
 own TCP port, so the coordinator's fan-out, replica choice and failover run
 as they would across hosts.
@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from test_server import ROOT, STATS, Server, frame, receive  # noqa: E402
 
 DSN = os.environ.get('ANN_PG_DSN')
-BUILD = os.path.join(ROOT, 'scripts', 'ann', 'build_cuvs_index.py')
+BUILD = os.path.join(ROOT, 'ann', 'builder', 'build_cuvs_index.py')
 TENANTS = 16
 PER_TENANT = 150
 
@@ -36,7 +36,7 @@ def free_port():
 class CollectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann'), 'ann-worker'], check=True,
+        subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
 
     def setUp(self):

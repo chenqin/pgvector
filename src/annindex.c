@@ -3,7 +3,7 @@
 #include "access/table.h"
 #include "access/tableam.h"
 #include "access/visibilitymap.h"
-#include "ann/filter.h"
+#include "ann/common/filter.h"
 #include "executor/executor.h"
 #include "utils/snapmgr.h"
 #include "access/xact.h"
@@ -266,7 +266,7 @@ CheckSource(const AnnIndexInfo *info)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("ann index is stale: %s has " INT64_FORMAT " rows, index has " UINT64_FORMAT,
 						info->source, count, info->rows),
-				 errhint("Rebuild the index with scripts/ann/build_cuvs_index.py.")));
+				 errhint("Rebuild the index with ann/builder/build_cuvs_index.py.")));
 }
 
 /*
