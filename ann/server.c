@@ -3559,11 +3559,12 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	struct sockaddr_un address = {0};
 	struct sigaction action = {0};
 	pthread_t  *lanes;
-	int			listener;
+	int			listener = -1;
 	int			network = -1;
 
-	if (options->lanes == 0 || options->max_batch_jobs == 0 ||
-		strlen(path) >= sizeof(address.sun_path))
+	/* A Unix socket, a TCP port, or both: TCP-only nodes serve remote hosts. */
+	if (options->lanes == 0 || options->max_batch_jobs == 0 || (path == NULL && options->tcp == NULL) ||
+		(path && strlen(path) >= sizeof(address.sun_path)))
 	{
 		fprintf(stderr, "invalid server options or socket path\n");
 		return 2;
@@ -3599,15 +3600,18 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 			(void) sigaction(fatal[i], &crash, NULL);
 	}
 
-	address.sun_family = AF_UNIX;
-	strcpy(address.sun_path, path);
-	(void) unlink(path);
-	listener = socket(AF_UNIX, SOCK_STREAM, 0);
-	if (listener < 0 || bind(listener, (struct sockaddr *) &address, sizeof(address)) != 0 ||
-		listen(listener, 128) != 0)
+	if (path)
 	{
-		perror("ann-worker listen");
-		return 1;
+		address.sun_family = AF_UNIX;
+		strcpy(address.sun_path, path);
+		(void) unlink(path);
+		listener = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (listener < 0 || bind(listener, (struct sockaddr *) &address, sizeof(address)) != 0 ||
+			listen(listener, 128) != 0)
+		{
+			perror("ann-worker listen");
+			return 1;
+		}
 	}
 	if (options->tcp)
 	{
@@ -3659,8 +3663,8 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 				AnnRdmaDevice(service.rdma), options->rdma_lanes, AnnRdmaMaxFrame(service.rdma),
 				options->rdma_spin ? "spin-polled" : "interrupt-driven");
 	}
-	fprintf(stderr, "ann-worker: backend %s listening on %s%s%s\n", backend->name, path,
-			options->tcp ? " and " : "", options->tcp ? options->tcp : "");
+	fprintf(stderr, "ann-worker: backend %s listening on %s%s%s\n", backend->name, path ? path : "",
+			path && options->tcp ? " and " : "", options->tcp ? options->tcp : "");
 	while (!stopRequested)
 	{
 		struct pollfd pollers[2] = {{listener, POLLIN, 0}, {network, POLLIN, 0}};
@@ -3673,6 +3677,7 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 
 		int			remote;
 
+		/* poll ignores a negative descriptor: an absent Unix listener. */
 		if (poll(pollers, network >= 0 ? 2 : 1, 200) <= 0)
 			continue;
 		remote = !(pollers[0].revents & POLLIN);
@@ -3739,10 +3744,12 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		}
 		(void) pthread_detach(thread);
 	}
-	(void) close(listener);
+	if (listener >= 0)
+		(void) close(listener);
 	if (network >= 0)
 		(void) close(network);
-	(void) unlink(path);
+	if (path)
+		(void) unlink(path);
 	fprintf(stderr, "ann-worker: stopping on signal %d from process %d\n", (int) stopSignal, (int) stopSender);
 	(void) pthread_mutex_lock(&service.mutex);
 	service.stopping = 1;

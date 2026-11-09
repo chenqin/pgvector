@@ -90,6 +90,41 @@ class WorkerAuthTests(unittest.TestCase):
             finally:
                 node.close()
 
+    def test_tcp_only_worker(self):
+        # A GPU node serving only remote hosts needs no Unix socket.
+        with tempfile.TemporaryDirectory() as directory:
+            port = free_port()
+            token = os.path.join(directory, 'token')
+            with open(token, 'w') as out:
+                out.write(TOKEN + '\n')
+            worker = [IndexWorkerTests.worker, '--backend', IndexWorkerTests.backend]
+            process = subprocess.Popen([*worker, '--listen-tcp', f'127.0.0.1:{port}', '--auth-token-file', token],
+                                       stdin=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                deadline = time.monotonic() + 5
+                while True:
+                    self.assertIsNone(process.poll(), process.stderr.read() if process.poll() is not None else '')
+                    try:
+                        connection = socket.create_connection(('127.0.0.1', port), timeout=1)
+                        break
+                    except OSError:
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(0.05)
+                with connection:
+                    connection.sendall(frame(13, 1, TOKEN.encode()))
+                    self.assertEqual(receive(connection)[2], 0)
+                    connection.sendall(frame(5, 2))
+                    self.assertEqual(receive(connection)[2], 0)
+            finally:
+                process.terminate()
+                process.wait(5)
+                process.stderr.close()
+            # A token without a TCP listener used to serve stdin and exit 0 at once.
+            result = subprocess.run([*worker, '--auth-token-file', token], stdin=subprocess.DEVNULL,
+                                    capture_output=True, timeout=10)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(b'--listen-tcp', result.stderr)
+
     def test_packed_filter_decoding(self):
         with tempfile.TemporaryDirectory() as directory:
             node = Node(directory)

@@ -26,6 +26,8 @@ ann/ann-worker-cuvs --backend cuvs --listen /run/ann.sock \
     --listen-tcp 0.0.0.0:7700 --auth-token-file /etc/ann/token --lanes 96 --itopk 64
 ```
 
+`--listen` is optional: a node that serves only remote hosts can run with `--listen-tcp` alone. `--auth-token-file` or `--rdma` without `--listen-tcp` is an error.
+
 ```sql
 -- every PostgreSQL host (superuser settings)
 ALTER SYSTEM SET ann.worker_address = 'gpu1:7700,gpu2:7700';

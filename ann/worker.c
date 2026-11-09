@@ -562,8 +562,14 @@ main(int argc, char **argv)
 		else
 			goto usage;
 	}
-	if (listen)
+	if (listen || serveOptions.tcp)
 		return AnnServe(listen, backend, &serveOptions);
+	if (serveOptions.rdma || serveOptions.token)
+	{
+		/* Without this the worker would serve stdin and exit at once. */
+		fprintf(stderr, "ann-worker: --rdma and --auth-token-file need --listen-tcp\n");
+		return 2;
+	}
 	for (;;)
 	{
 		unsigned char bytes[32];
@@ -724,7 +730,7 @@ main(int argc, char **argv)
 
 usage:
 #ifdef ANN_USE_CUVS
-	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
+	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
@@ -736,7 +742,7 @@ usage:
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
-	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
+	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
