@@ -3456,8 +3456,9 @@ GatherKernels(int device)
 		goto fail;
 	if (module->sortShared < ANN_PRUNE_CAP * 8 || module->select11Shared < ANN_PRUNE_CAP * 4)
 		fprintf(stderr, "cuVS: device %d (compute capability %d.%d) opts in %d KB of shared memory a block; "
-				"pruned sorts past %d scores and the fused radix select past %d scores use select_k\n",
-				device, major, minor, optin / 1024, module->sortShared / 8, module->select11Shared / 4);
+				"pruned sorts past %d scores use select_k%s\n", device, major, minor, optin / 1024,
+				module->sortShared / 8,
+				module->select11Shared < ANN_PRUNE_CAP * 4 ? ", and pruned tiles skip the fused selection" : "");
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
 fail:

@@ -765,9 +765,9 @@ static pthread_mutex_t moduleMutex = PTHREAD_MUTEX_INITIALIZER;
  * and in each chunk the 16 bytes lane t of a quad decodes (byte t of each
  * block's two words) stored together, so a lane loads one 16-byte word per
  * row where it loaded eight 8-byte ones. That takes the kernel from 126 to
- * 96 registers, and __launch_bounds__(256, 3) to 80, so 3 blocks fit a
- * multiprocessor (bounding it to 4 spilled). It costs a second copy of the
- * rows (64 bytes a row at 128 dimensions).
+ * 96 registers, and __launch_bounds__(256, 3) to 80 (with 8 bytes of local
+ * memory), so 3 blocks fit a multiprocessor; bounding it to 4 spills more.
+ * It costs a second copy of the rows (64 bytes a row at 128 dimensions).
  */
 #define FUSE_PACKED_MAX 256
 static struct

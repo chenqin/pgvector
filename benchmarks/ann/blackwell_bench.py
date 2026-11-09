@@ -37,6 +37,12 @@ from build_cuvs_index import E2M1, _e4m3_table, quantize_nvfp4  # noqa: E402
 
 ABSENT = 0xFFFFFFFF
 WIDTHS = {16: '', 32: '_32', 64: '_64'}
+QUERY_PAD = 8  # halves past each query's row in shared memory, as the kernel's ANN_QPAD
+
+
+def query_bytes(width, dims):
+    """Dynamic shared memory for a pass: width FP16 query rows, padded."""
+    return width * (((dims + 15) & ~15) + QUERY_PAD) * 2
 
 
 def kernel_source():
@@ -52,15 +58,23 @@ class Scan:
 
         self.cp = cp
         self.module = cp.RawModule(code=kernel_source(), options=('-arch=sm_100a',), backend='nvrtc')
-        self.sms = cp.cuda.Device().attributes['MultiProcessorCount']
+        attributes = cp.cuda.Device().attributes
+        self.sms = attributes['MultiProcessorCount']
+        optin = attributes['MaxSharedMemoryPerBlockOptin']
         self.functions = {}
         self.fused = {}
+
+        def load(name):
+            # As the worker: static and dynamic shared memory share the opt-in limit.
+            function = self.module.get_function(name)
+            function.max_dynamic_shared_size_bytes = min(160 * 1024, optin - function.shared_size_bytes)
+            return function
+
         for width, suffix in WIDTHS.items():
-            for table, prefix in ((self.functions, 'score_mma_nvfp4'), (self.fused, 'fuse_mma_nvfp4')):
-                function = self.module.get_function(prefix + suffix)
-                if width > 16:
-                    function.max_dynamic_shared_size_bytes = 160 * 1024
-                table[width] = function
+            self.functions[width] = load('score_mma_nvfp4' + suffix)
+            self.fused[width] = load('fuse_mma_nvfp4' + suffix)
+        self.fused128 = load('fuse_mma_nvfp4_64_d128')
+        self.row_norm = self.module.get_function('row_norm_nvfp4')
         self.select = self.module.get_function('select32')
         self.selectc = self.module.get_function('select32c')
         self.merge = self.module.get_function('merge32')
@@ -75,9 +89,25 @@ class Scan:
         values = np.asarray(E2M1)[nibbles & 7] * np.where(nibbles & 8, -1.0, 1.0)
         scale = table[cp.asnumpy(codes)].astype(np.float64) * cp.asnumpy(row)[:, None].astype(np.float64)
         dequantized = (values.reshape(rows, blocks, 16) * scale[:, :, None]).reshape(rows, blocks * 16)[:, :dims]
-        return {'data': cp.ascontiguousarray(packed), 'scales': cp.ascontiguousarray(codes),
-                'rowScales': cp.asarray(row, dtype=cp.float32), 'rowBytes': blocks * 8, 'blocks': blocks,
-                'dims': dims, 'dequantized': dequantized}
+        data = cp.ascontiguousarray(packed)
+        scales = cp.ascontiguousarray(codes)
+        row_scales = cp.asarray(row, dtype=cp.float32)
+        # The fused scan's inputs, as the worker builds them at upload: the lane-contiguous
+        # copy (in each 64-byte chunk of 8 blocks, byte 2k + {0, 1} of lane t's 16 is block
+        # k's byte t and t + 4) and a (row scale, |x|^2) pair per row from row_norm_nvfp4.
+        host = cp.asnumpy(packed).reshape(rows, blocks, 8)
+        chunks = (blocks + 7) // 8
+        lanes = np.zeros((rows, chunks * 8, 4, 2), dtype=np.uint8)
+        lanes[:, :blocks, :, 0] = host[:, :, 0:4]
+        lanes[:, :blocks, :, 1] = host[:, :, 4:8]
+        lanes = lanes.reshape(rows, chunks, 8, 4, 2).transpose(0, 1, 3, 2, 4).reshape(rows, chunks * 64)
+        norms = cp.zeros((rows, 2), dtype=cp.float32)
+        self.row_norm(((rows + 127) // 128,), (256,), (
+            data, scales, row_scales, np.uint32(blocks * 8), np.uint32(blocks), np.uint32(rows), np.int32(dims),
+            norms), shared_mem=query_bytes(8, dims))
+        return {'data': data, 'scales': scales, 'rowScales': row_scales, 'rowBytes': blocks * 8, 'blocks': blocks,
+                'dims': dims, 'dequantized': dequantized, 'packed': cp.asarray(lanes), 'packedRowBytes': chunks * 64,
+                'norms': norms}
 
     def run(self, index, rows, queries, width, fused=False):
         """Scores [nq][n] (unfused) and the merged best 32 (distances, positions) per query."""
@@ -98,8 +128,10 @@ class Scan:
         cand_d = cp.empty((nq, n), dtype=cp.float32)
         cand_r = cp.empty((nq, n), dtype=cp.uint32)
         counts = cp.zeros(nq, dtype=cp.uint32)
-        sgrid = min((n + 127) // 128, self.sms * 4)
-        shared = width * ((dims + 15) & ~15) * 2
+        # As the worker's fused grid: 3 blocks per SM for NVFP4.
+        sgrid = min((n + 127) // 128, self.sms * 3)
+        shared = query_bytes(width, dims)
+        fused = self.fused128 if width == 64 and dims == 128 else self.fused[width]
         part_d = cp.empty(slices * nq * 32, dtype=cp.float32)
         part_r = cp.empty(slices * nq * 32, dtype=cp.uint32)
         out_d = cp.empty(nq * 32, dtype=cp.float32)
@@ -108,10 +140,10 @@ class Scan:
         def launch():
             bound_launch()
             counts.fill(0)
-            self.fused[width]((sgrid,), (256,), (
-                index['data'], index['scales'], index['rowScales'], np.uint32(index['rowBytes']),
+            fused((sgrid,), (256,), (
+                index['packed'], index['scales'], index['rowScales'], np.uint32(index['packedRowBytes']),
                 np.uint32(index['blocks']), rows_d, np.uint32(n), queries_d, np.int32(nq), np.int32(dims),
-                bounds, cand_d, cand_r, counts), shared_mem=shared)
+                bounds, cand_d, cand_r, counts, np.uint32(n), index['norms']), shared_mem=shared)
             self.selectc((slices, nq), (256,), (cand_d, cand_r, counts, np.uint32(n), part_d, part_r))
             self.merge((nq,), (32,), (part_d, part_r, np.uint32(slices), out_d, out_r))
 
@@ -130,7 +162,7 @@ class Scan:
         cap = max(self.sms // 4, 1)
         slices = max(min((n + 8191) // 8192, cap), 1)
         per_slice = (n + slices - 1) // slices
-        shared = width * ((dims + 15) & ~15) * 2
+        shared = query_bytes(width, dims)
         part_d = cp.empty(slices * nq * 32, dtype=cp.float32)
         part_r = cp.empty(slices * nq * 32, dtype=cp.uint32)
         out_d = cp.empty(nq * 32, dtype=cp.float32)
@@ -212,7 +244,7 @@ def check(args):
             for width in WIDTHS:
                 if nq > width or (width == 16 and nq > 16):
                     continue
-                if width * ((dims + 15) & ~15) * 2 > 160 * 1024:
+                if query_bytes(width, dims) > 160 * 1024:
                     continue
                 for fused in (False, True):
                     problems = check_case(scan, dims, index_rows, n, nq, width,
@@ -254,7 +286,7 @@ def time_widths(args):
             rows = np.sort(rng.choice(index_rows, size=n, replace=False)).astype(np.uint32)
             for nq in [int(q) for q in args.queries.split(',')]:
                 for width in WIDTHS:
-                    if nq > width or width * ((dims + 15) & ~15) * 2 > 160 * 1024:
+                    if nq > width or query_bytes(width, dims) > 160 * 1024:
                         continue
                     passes = (nq + width - 1) // width
                     queries = sample(np.random.default_rng(2), nq, dims)
