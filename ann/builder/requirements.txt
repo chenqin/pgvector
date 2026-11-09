@@ -1,0 +1,4 @@
+# Core: reading PostgreSQL or an export, writing keys, vectors, attributes and
+# quantized copies. Enough for --no-cagra builds and CPU-only servers.
+numpy==2.5.4
+psycopg[binary]==3.3.8

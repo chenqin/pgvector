@@ -1,0 +1,4 @@
+# CAGRA shards (and quantizing on the GPU): an NVIDIA GPU with CUDA 13.
+-r requirements.txt
+cupy-cuda13x==14.2.0
+cuvs-cu13==26.10.0
