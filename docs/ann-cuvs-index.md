@@ -132,14 +132,35 @@ whether an FP32 copy is on the GPU.
 | `--group-gather-limit ROWS` | Largest filter a group of same-filter searches scans together on a quantized index's tensor cores (default 4,000,000; exact, and 1.5× batched CAGRA's throughput at 10% filters); broader groups run one batched filtered CAGRA search. Cached bitmaps up to the larger of this and `--bitset-gather-limit` keep their rows. |
 | `--quantized-scan on\|off`, `--quant-slack N` | On compute capability 10.x or 12.x GPUs, gather scans of indexes built with `--quantize` run the [Blackwell module](ann-blackwell.md)'s fused NVFP4/FP8 search (default on); slack applies when k is too large for it. |
 | `--device-bitmaps on\|off` | Keep cached filter bitmaps' per-shard bitsets in GPU memory (default on), instead of copying them per filtered search. |
-| `--max-batch N`, `--delay-us N` | Queries per CAGRA submission, and an optional wait to fill a batch. |
+| `--max-batch N`, `--delay-us N` | Queries per CAGRA submission (default 64), and an optional wait to fill a batch while no lane is idle (default 0), counted from the oldest query's arrival. |
 | `--lanes N` | Concurrent submissions across all GPUs. |
 | `--cagra-persistent on` | cuVS persistent search kernels, for many small batches. |
 | `--replicate on` (worker) | Loads every shard on every GPU, and each lane searches its home GPU's copy. Combined with `--shards 1` in the builder, a query is a single CAGRA search on one GPU: the highest ANN throughput measured. Use it when one copy of the index fits in one GPU's memory. |
 | `--exact-limit ROWS` | Largest filter scanned exactly on the CPU (default 2,000). |
 | `--gather-limit ROWS` | Largest filter sent to the GPU gather scan (default 4,000,000); larger filters run filtered CAGRA. `0` turns the gather scan off. |
+| `--scan-routes on\|off`, `--scan-max-k N` | Searches whose k CAGRA can't serve, and filtered searches on an index with a quantized copy on every GPU, run as exact scans of the eligible rows instead of graph searches (default on). `--scan-max-k` caps the candidates a scan selects (k plus slack; default 2,048). |
+| `--slack-ratio PERCENT` | A quantized scan's extra candidates as a share of k, at least `--quant-slack` (default 100). |
+| `--rescore fp32\|off\|fp16\|fp8-gpu` | How large-k scans re-score their candidates: from the FP32 vectors on the host (default), not at all, from FP16, or from an FP8 copy on the GPU. Only `fp32` keeps distances exact. |
+| `--rerank-prefetch N` | Candidates read ahead when re-scoring from host FP32 vectors (default 8, 0–64). |
 
 cuVS 26.10's CAGRA supports FP32, FP16, int8 and uint8 datasets. It has no NVFP4 or FP8 path, so those aren't offered. int8/uint8 need a quantization scale chosen when building the index; that's left for a later builder option.
+
+## GPU requirements
+
+cuVS is the baseline: any GPU cuVS 26.10 runs on serves CAGRA search, filtered CAGRA and the gather scan. Every faster path is compiled with NVRTC for the device it runs on, checks the device when it loads, and logs once when it can't run there. Searches then take the next path down, with the same results.
+
+| Feature | Needs | Without it |
+| --- | --- | --- |
+| CAGRA search, filtered CAGRA (bitsets) | cuVS 26.10 | — (the worker refuses other cuVS versions) |
+| Gather scan, GPU rerank, pruned matrix selection (`cuvs.c` gather module) | NVRTC; `__reduce_*_sync` on 8.0+, shuffles below | `cuVS: gather scan unavailable on device N; filtered queries use CAGRA` |
+| Pruned sorts at full size: `matrix_prune_sort` 128 KB, `prune_select_s` 64 KB, `final_topk` 48 KB of shared memory a block | Opt-in shared memory per block of 227 KB (9.0, 10.x) or 163 KB (8.0) | On 99 KB devices (8.6, 8.9, 12.x) and 64 KB ones (7.5), larger lists use `select_k`; the worker logs the sizes once (`cuVS: device N ... opts in N KB`) |
+| GPU predicates, residual masks (`cuvs.c` predicate module) | NVRTC | `cuVS: predicate kernel unavailable on device N; predicates are evaluated on the host` |
+| JIT-LTO filter UDF for FP32 CAGRA (`cagra_udf.cpp`) | cuVS 26.10's private index layout | Built only with the `cagra_udf` target; refuses non-FP32 or non-padded datasets |
+| [Blackwell module](ann-blackwell.md): NVFP4/FP8 scans, tensor-core grouped and fused scans | Compute capability 10.x or 12.x: `cvt.rn.f16x2.e2m1x2` needs `sm_100a`/`sm_120a` | `Blackwell module: device N has compute capability X.x ...`; quantized copies aren't uploaded and scans read the CAGRA dataset. A `--scan-only` index (no graphs) doesn't load. |
+
+The Blackwell module is one gate for one NVRTC unit, set by its newest instruction. Its other instructions are older (`cvt.rn.f16x2.e4m3x2` from 8.9, `mma.sync` m16n8k16 and `cvt.rn.f16x2.f32` from 8.0, `ldmatrix` from 7.5), so FP8 and the FP16/FP32 tensor-core scans could run on Hopper or Ada if that unit were split.
+
+Experiment variables that change results print a `WARNING` when the module loads: `ANN_FUSE_ABLATE` (timing only, wrong results) and `ANN_FUSE_TUNE` bit 16 (looser hit test, lower recall).
 
 ## Build flag
 

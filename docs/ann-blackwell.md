@@ -123,6 +123,23 @@ Sending key lists straight to the worker (`ann_index_search` with keys) showed n
 
 **End to end, grouped** (same-filter grouping on, defaults; one GPU and one host, or 8 GPUs with the index replicated and two hosts; QPS): 10% filters 82,058 on one GPU (FP32 index on batched CAGRA: 47,112) and 320,528 on eight; 1% filters 284,012 and 312,812; skewed 1% traffic (10 hot filters) 339,541 and 327,887. All exact in the concurrent checks (4.6M answers).
 
+## Experiment variables
+
+The worker reads these from its environment. They're for tuning and diagnosis; the defaults are the measured best.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `ANN_BLACKWELL_GROUP` | 64 | Most queries per grouped pass: 16, 32 or 64. |
+| `ANN_BLACKWELL_FUSE` | on | `off` turns off the fused pruned selection. |
+| `ANN_BLACKWELL_GROUP_LARGE` | on | `off` sends large-k grouped searches job by job. |
+| `ANN_BLACKWELL_CANDIDATES` | on | `off` makes large-k groups score a full matrix instead of keeping rows under a sampled bound. |
+| `ANN_GROUP_SCORE_MB` | 512 | Distance matrix memory per grouped pass (at least 16). |
+| `ANN_FUSE_LAYOUT`, `ANN_FUSE_TUNE`, `ANN_FUSE_ROWNORM`, `ANN_FUSE_GRID`, `ANN_FUSE_QPAD` | 3, 42, 1, 3 for NVFP4 (else 2), 8 | Fused-scan variants, documented where they're defined in `ann/blackwell.c`. |
+| `ANN_FUSE_STAGE`, `ANN_FUSE_BCAP`, `ANN_FUSE_APPEND`, `ANN_FUSE_APPEND_MODE`, `ANN_FUSE_PREFETCH`, `ANN_FUSE_QVEC` | 32, 32, staged, 5, 0, 3 | The fused scan's hit staging and loads, also in `ann/blackwell.c`. |
+| `ANN_FUSE_ABLATE` | 0 | Timing ablations; nonzero returns wrong results and prints a warning at load. |
+| `ANN_BLACKWELL_VERBOSE` | unset | Logs every kernel's registers and local memory, and upload details. |
+| `ANN_SCAN_DEBUG` | unset | Logs each search's scan routing decision. |
+
 ## Not used, and why
 
 - **Blackwell's new tensor-core instructions (`tcgen05`, block-scaled FP4/FP8 MMA).** The grouped search uses the warp-level `mma.sync` with FP16 inputs, which Blackwell still supports, after converting FP4/FP8 to half. The multiply is already free at that point (136 µs of 250 at 1M rows × 16 queries is the row gather), so the native FP4 MMA would save the conversions but not change the bound. A single filtered query stays matrix-vector work on the scalar kernel.
