@@ -769,30 +769,6 @@ static pthread_mutex_t moduleMutex = PTHREAD_MUTEX_INITIALIZER;
  * memory), so 3 blocks fit a multiprocessor; bounding it to 4 spills more.
  * It costs a second copy of the rows (64 bytes a row at 128 dimensions).
  */
-#define FUSE_PACKED_MAX 256
-static struct
-{
-	const uint8_t *data;
-	uint8_t    *packed;
-}			packedCopies[FUSE_PACKED_MAX];
-static pthread_mutex_t packedMutex = PTHREAD_MUTEX_INITIALIZER;
-
-static uint8_t *
-PackedCopy(const uint8_t *data)
-{
-	uint8_t    *packed = NULL;
-
-	pthread_mutex_lock(&packedMutex);
-	for (int i = 0; i < FUSE_PACKED_MAX; i++)
-		if (packedCopies[i].data == data)
-		{
-			packed = packedCopies[i].packed;
-			break;
-		}
-	pthread_mutex_unlock(&packedMutex);
-	return packed;
-}
-
 /* Halves a query takes in the scan's shared memory. */
 static unsigned
 QueryStride(int dims)
@@ -805,30 +781,6 @@ QueryStride(int dims)
  * upload by the scan's own code (from the original row layout), and the
  * fused scan loads it instead of summing |x|^2.
  */
-typedef struct RowNormEntry
-{
-	const void *data;			/* the shard's device rows */
-	float	   *norms;			/* [rows] (scale, |x|^2) */
-} RowNormEntry;
-
-static RowNormEntry rowNorms[64];
-static pthread_mutex_t rowNormMutex = PTHREAD_MUTEX_INITIALIZER;
-
-static float *
-ShardRowNorms(const AnnBlackwellShard *shard)
-{
-	float	   *norms = NULL;
-
-	if (shard->data == NULL)
-		return NULL;
-	(void) pthread_mutex_lock(&rowNormMutex);
-	for (int i = 0; i < 64; i++)
-		if (rowNorms[i].data == shard->data)
-			norms = rowNorms[i].norms;
-	(void) pthread_mutex_unlock(&rowNormMutex);
-	return norms;
-}
-
 /*
  * The fused scan's rows, row stride and row norms for a shard: for NVFP4 the
  * lane-contiguous copy and the (scale, |x|^2) pairs. Returns 0 when a copy
@@ -839,10 +791,20 @@ FuseInputs(const AnnBlackwellShard *shard, uint8_t **data, unsigned *rowBytes, f
 {
 	int			nvfp4 = shard->quant == ANN_QUANT_NVFP4;
 
-	*data = nvfp4 ? PackedCopy(shard->data) : shard->data;
+	*data = nvfp4 ? shard->packed : shard->data;
 	*rowBytes = nvfp4 ? (shard->blocks + 7) / 8 * 64 : shard->rowBytes;
-	*norms = nvfp4 ? ShardRowNorms(shard) : NULL;
+	*norms = nvfp4 ? shard->norms : NULL;
 	return *data != NULL && !(nvfp4 && *norms == NULL);
+}
+
+int
+AnnBlackwellFuseReady(const AnnBlackwellShard *shard)
+{
+	uint8_t    *data;
+	unsigned	rowBytes;
+	float	   *norms;
+
+	return shard->quant != ANN_QUANT_NONE && FuseInputs(shard, &data, &rowBytes, &norms);
 }
 
 static char *
@@ -1021,30 +983,10 @@ unlock:
 void
 AnnBlackwellFree(AnnBlackwellShard *shard)
 {
-	if (shard->data)
-	{
-		(void) pthread_mutex_lock(&rowNormMutex);
-		for (int i = 0; i < 64; i++)
-			if (rowNorms[i].data == shard->data)
-			{
-				(void) cudaFree(rowNorms[i].norms);
-				rowNorms[i].data = NULL;
-				rowNorms[i].norms = NULL;
-			}
-		(void) pthread_mutex_unlock(&rowNormMutex);
-	}
-	if (shard->owned && shard->data)
-	{
-		pthread_mutex_lock(&packedMutex);
-		for (int i = 0; i < FUSE_PACKED_MAX; i++)
-			if (packedCopies[i].data == shard->data)
-			{
-				(void) cudaFree(packedCopies[i].packed);
-				packedCopies[i].data = NULL;
-				packedCopies[i].packed = NULL;
-			}
-		pthread_mutex_unlock(&packedMutex);
-	}
+	if (shard->norms)
+		(void) cudaFree(shard->norms);
+	if (shard->packed)
+		(void) cudaFree(shard->packed);
 	if (shard->owned)
 	{
 		(void) cudaFree(shard->data);
@@ -1199,13 +1141,8 @@ AnnBlackwellUpload(const AnnIndexFile *file, uint32_t s, int device, AnnBlackwel
 		int			dims = (int) file->dimensions;
 		void	   *args[] = {(void *) &out->data, (void *) &out->scales, (void *) &out->rowScales, &rowBytes,
 		&blocks, &n, &dims, &norms};
-		int			slot = -1;
 
-		(void) pthread_mutex_lock(&rowNormMutex);
-		for (int i = 0; i < 64 && slot < 0; i++)
-			if (rowNorms[i].data == NULL)
-				slot = i;
-		if (slot < 0 || cudaMalloc((void **) &norms, rows * 2 * sizeof(float)) != cudaSuccess ||
+		if (cudaMalloc((void **) &norms, rows * 2 * sizeof(float)) != cudaSuccess ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->rowNorm, (n + 127) / 128, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1,
 						   8 * QueryStride(dims) * sizeof(uint16_t), NULL, args, NULL) != CUDA_SUCCESS ||
@@ -1217,13 +1154,11 @@ AnnBlackwellUpload(const AnnIndexFile *file, uint32_t s, int device, AnnBlackwel
 		}
 		else
 		{
-			rowNorms[slot].data = out->data;
-			rowNorms[slot].norms = norms;
+			out->norms = norms;
 			if (getenv("ANN_BLACKWELL_VERBOSE"))
 				fprintf(stderr, "Blackwell module: shard %u row norms (%zu rows) on device %d\n", s, rows, device);
 			out->bytes += rows * 2 * sizeof(float);
 		}
-		(void) pthread_mutex_unlock(&rowNormMutex);
 	}
 	if (file->quant == ANN_QUANT_NVFP4)
 	{
@@ -1256,19 +1191,8 @@ AnnBlackwellUpload(const AnnIndexFile *file, uint32_t s, int device, AnnBlackwel
 		}
 		free(host);
 		if (ok)
-		{
-			ok = 0;
-			pthread_mutex_lock(&packedMutex);
-			for (int i = 0; i < FUSE_PACKED_MAX && !ok; i++)
-				if (packedCopies[i].data == NULL)
-				{
-					packedCopies[i].data = out->data;
-					packedCopies[i].packed = packed;
-					ok = 1;
-				}
-			pthread_mutex_unlock(&packedMutex);
-		}
-		if (!ok)
+			out->packed = packed;
+		else
 		{
 			fprintf(stderr, "Blackwell module: cannot build shard %u's lane-contiguous copy on device %d\n", s, device);
 			(void) cudaFree(packed);

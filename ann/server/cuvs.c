@@ -2054,6 +2054,10 @@ IsExcluded(const AnnIndexJob *job, uint64_t ordinal)
 	return a < job->nexclude && job->exclude[a] == ordinal;
 }
 
+/* The process-wide device memory resource, set up by the first load (LoadIndex). */
+static pthread_mutex_t memoryResourceMutex = PTHREAD_MUTEX_INITIALIZER;
+static int	memoryResourceReady = 0;
+
 static AnnStatus
 LoadIndex(const char *name, const char *directory)
 {
@@ -2157,17 +2161,28 @@ LoadIndex(const char *name, const char *directory)
 	 * GPU against 37.6 GB with --device-allocator plain (cudaMalloc), which
 	 * costs unfiltered throughput (about a quarter lower) but sizes memory to
 	 * the indexes and returns it on unload.
+	 *
+	 * This is done once per process, at the first load: the resource is
+	 * process-wide, and enabling a pool again would stack a new one, sized
+	 * from what the earlier pools left free, without releasing them (37
+	 * loaded indexes held 99% of each GPU that way).
 	 */
-	for (int d = 0; d < devices; d++)
-		if (cudaSetDevice(d) != cudaSuccess ||
-			(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess &&
-			 cudaGetLastError() != cudaErrorSetOnActiveProcess) ||
-			(AnnIndexConfig.plain_allocator ? cuvsRMMMemoryResourceReset() :
-			 AnnIndexConfig.memory_pool ?
-			 cuvsRMMPoolMemoryResourceEnable((int) AnnIndexConfig.memory_pool / 4 + 1,
-											 (int) AnnIndexConfig.memory_pool, false) :
-			 cuvsRMMAsyncMemoryResourceEnable()) != CUVS_SUCCESS)
-			fprintf(stderr, "cuVS: memory resource unavailable on device %d\n", d);
+	(void) pthread_mutex_lock(&memoryResourceMutex);
+	if (!memoryResourceReady)
+	{
+		for (int d = 0; d < devices; d++)
+			if (cudaSetDevice(d) != cudaSuccess ||
+				(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync) != cudaSuccess &&
+				 cudaGetLastError() != cudaErrorSetOnActiveProcess) ||
+				(AnnIndexConfig.plain_allocator ? cuvsRMMMemoryResourceReset() :
+				 AnnIndexConfig.memory_pool ?
+				 cuvsRMMPoolMemoryResourceEnable((int) AnnIndexConfig.memory_pool / 4 + 1,
+												 (int) AnnIndexConfig.memory_pool, false) :
+				 cuvsRMMAsyncMemoryResourceEnable()) != CUVS_SUCCESS)
+				fprintf(stderr, "cuVS: memory resource unavailable on device %d\n", d);
+		memoryResourceReady = 1;
+	}
+	(void) pthread_mutex_unlock(&memoryResourceMutex);
 	for (uint32_t s = 0; s < total; s++)
 	{
 		uint32_t	copy = s / file->nshards;
@@ -5129,7 +5144,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			size_t		hostOffset = (size_t) s * limit * capacity;
 
 			/* Fused tiles write no score matrix, so none is allocated for them. */
-			int			fusedTile = n && FusedEligible(state, jobs + first, q, n, candidates, dims);
+			int			fusedTile = n && AnnBlackwellFuseReady(&shard->quant) &&
+				FusedEligible(state, jobs + first, q, n, candidates, dims);
 
 			selected[s] = 0;
 			gpu[s] = 0;

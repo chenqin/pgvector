@@ -29,10 +29,16 @@ typedef struct AnnBlackwellShard
 	uint32_t	rowBytes;
 	uint32_t	blocks;
 	size_t		bytes;			/* device memory held */
+	uint8_t    *packed;			/* NVFP4: the lane-contiguous copy the fused
+								 * scan reads */
+	float	   *norms;			/* NVFP4: (row scale, |x|^2) per row */
 } AnnBlackwellShard;
 
 /* Whether the module runs on this device: compute capability 10.x or 12.x and NVRTC. */
 int			AnnBlackwellReady(int device);
+
+/* Whether the fused scan (AnnBlackwellScoreBelow) has every input it reads for this shard. */
+int			AnnBlackwellFuseReady(const AnnBlackwellShard *shard);
 
 /*
  * An FP8 (E4M3, row-scaled) copy of FP32 rows on a device, made at load for
