@@ -2776,47 +2776,6 @@ static const char PruneSource[] =
 "}\n";
 
 /*
- * The final top-k after reranking: one block per query sorts its n reranked
- * candidates (padded to size, a power of two) with their rows in shared
- * memory and writes the best k, in place of a cuVS select_k launch.
- */
-static const char FinalSource[] =
-"extern \"C\" __global__ void final_topk(const float *d, const long long *r, unsigned n, unsigned size,\n"
-"    unsigned k, float *outD, long long *outR)\n"
-"{\n"
-"  extern __shared__ float key[];\n"
-"  long long *val = (long long *) (key + size);\n"
-"  unsigned row = blockIdx.x;\n"
-"  for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
-"  {\n"
-"    bool live = i < n;\n"
-"    key[i] = live ? d[(unsigned long long) row * n + i] : __int_as_float(0x7f800000);\n"
-"    val[i] = live ? r[(unsigned long long) row * n + i] : -1;\n"
-"  }\n"
-"  __syncthreads();\n"
-"  for (unsigned len = 2; len <= size; len <<= 1)\n"
-"    for (unsigned stride = len >> 1; stride > 0; stride >>= 1)\n"
-"    {\n"
-"      for (unsigned i = threadIdx.x; i < size; i += blockDim.x)\n"
-"      {\n"
-"        unsigned j = i ^ stride;\n"
-"        if (j > i)\n"
-"        {\n"
-"          float a = key[i], b = key[j];\n"
-"          bool up = (i & len) == 0;\n"
-"          if ((a > b) == up) { key[i] = b; key[j] = a; long long t = val[i]; val[i] = val[j]; val[j] = t; }\n"
-"        }\n"
-"      }\n"
-"      __syncthreads();\n"
-"    }\n"
-"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
-"  {\n"
-"    outD[(unsigned long long) row * k + i] = key[i];\n"
-"    outR[(unsigned long long) row * k + i] = val[i];\n"
-"  }\n"
-"}\n";
-
-/*
  * The pruned selection's linear steps. matrix_compact4 is matrix_compact
  * reading four scores a thread (rows of n % 4 == 0 are 16-byte aligned): one
  * atomic a warp. matrix_prune_select keeps each query's best k kept scores
@@ -2909,67 +2868,12 @@ static const char SelectSource[] =
 "    }\n"
 "}\n";
 
-/*
- * The fused pruned selection's own steps: each query's cutoff laid out as
- * AnnBlackwellScoreBelow reads it, and matrix_prune_select over its u32
- * candidate lists.
- */
+/* The fused pruned selection's cutoff per query, laid out as AnnBlackwellScoreBelow reads it. */
 static const char FusedSelectSource[] =
 "extern \"C\" __global__ void cutoff32(const float *bounds, unsigned rank, unsigned q, float *out)\n"
 "{\n"
 "  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "  if (i < q) out[i * 32 + 31] = bounds[(unsigned long long) i * rank + rank - 1];\n"
-"}\n"
-"extern \"C\" __global__ void matrix_prune_select32(const float *d, const unsigned *r,\n"
-"    const unsigned *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
-"{\n"
-"  __shared__ unsigned hist[256];\n"
-"  __shared__ unsigned prefix, mask, want, below, ties;\n"
-"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
-"  const float *v = d + (unsigned long long) row * cap;\n"
-"  const unsigned *p = r + (unsigned long long) row * cap;\n"
-"  float *od = outD + (unsigned long long) row * k;\n"
-"  long long *orow = outR + (unsigned long long) row * k;\n"
-"  if (n <= k)\n"
-"  {\n"
-"    for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
-"    {\n"
-"      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
-"      orow[i] = i < n ? (long long) p[i] : -1;\n"
-"    }\n"
-"    return;\n"
-"  }\n"
-"  if (threadIdx.x == 0) { prefix = 0; mask = 0; want = k; below = 0; ties = 0; }\n"
-"  for (int shift = 24; shift >= 0; shift -= 8)\n"
-"  {\n"
-"    for (unsigned b = threadIdx.x; b < 256; b += blockDim.x) hist[b] = 0;\n"
-"    __syncthreads();\n"
-"    for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
-"    {\n"
-"      unsigned u = select_key(v[i]);\n"
-"      if ((u & mask) == prefix) atomicAdd(&hist[(u >> shift) & 255u], 1u);\n"
-"    }\n"
-"    __syncthreads();\n"
-"    if (threadIdx.x == 0)\n"
-"    {\n"
-"      unsigned cum = 0, b = 0;\n"
-"      while (cum + hist[b] < want) { cum += hist[b]; b++; }\n"
-"      prefix |= b << shift; mask |= 255u << shift; want -= cum;\n"
-"    }\n"
-"    __syncthreads();\n"
-"  }\n"
-"  for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
-"  {\n"
-"    unsigned u = select_key(v[i]);\n"
-"    if (u < prefix) { unsigned s = atomicAdd(&below, 1u); od[s] = v[i]; orow[s] = (long long) p[i]; }\n"
-"  }\n"
-"  __syncthreads();\n"
-"  for (unsigned i = threadIdx.x; i < n; i += blockDim.x)\n"
-"    if (select_key(v[i]) == prefix)\n"
-"    {\n"
-"      unsigned t = atomicAdd(&ties, 1u);\n"
-"      if (t < want) { unsigned s = k - want + t; od[s] = v[i]; orow[s] = (long long) p[i]; }\n"
-"    }\n"
 "}\n";
 
 /* Mixed-filter groups (SearchGatherMixed): the same per query's own list. */
@@ -3003,105 +2907,13 @@ static const char SegmentSource[] =
 "}\n";
 
 /*
- * ANN_POST variants of the post-scan stages (default: none, today's
- * kernels). prune_select_reg: matrix_prune_select32 with the candidates'
- * keys held in registers, the passes starting at the first bit where the
- * least and greatest key differ, a parallel scan for each pass's bucket and
- * an early stop once the bucket is taken whole. final_rank: the final top-k
- * by counting each reranked candidate's rank (no bitonic stages). rerank8:
- * the rerank with eight threads a row and 16-byte loads. copy_first32 and
- * copy_first64 are the probes (ANN_POST=probe-*): no selection at all.
+ * The post-scan stages. final_rank: the final top-k by counting each
+ * reranked candidate's rank (no bitonic stages). rerank8: the rerank with
+ * eight threads a row and 16-byte loads.
  */
 static const char PostSource[] =
-"#define PS_ITEMS 16\n"
 "__device__ __forceinline__ float select_float(unsigned u)\n"
-"{ return __uint_as_float((u & 0x80000000u) ? u & 0x7fffffffu : ~u); }\n"
-"extern \"C\" __global__ void __launch_bounds__(1024) prune_select_reg(const float *d, const unsigned *r,\n"
-"    const unsigned *counts, unsigned cap, unsigned k, float *outD, long long *outR)\n"
-"{\n"
-"  __shared__ unsigned hist[256], wsum[8];\n"
-"  __shared__ unsigned s_lo, s_hi, s_prefix, s_want, s_done, below, ties;\n"
-"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
-"  unsigned tid = threadIdx.x, lane = tid & 31, nt = blockDim.x;\n"
-"  const float *v = d + (unsigned long long) row * cap;\n"
-"  const unsigned *p = r + (unsigned long long) row * cap;\n"
-"  float *od = outD + (unsigned long long) row * k;\n"
-"  long long *orow = outR + (unsigned long long) row * k;\n"
-"  if (n <= k)\n"
-"  {\n"
-"    for (unsigned i = tid; i < k; i += nt)\n"
-"    {\n"
-"      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
-"      orow[i] = i < n ? (long long) p[i] : -1;\n"
-"    }\n"
-"    return;\n"
-"  }\n"
-"  unsigned u[PS_ITEMS], lo = 0xffffffffu, hi = 0;\n"
-"#pragma unroll\n"
-"  for (int j = 0; j < PS_ITEMS; j++)\n"
-"  {\n"
-"    unsigned i = tid + j * nt;\n"
-"    u[j] = i < n ? select_key(v[i]) : 0u;\n"
-"    if (i < n) { lo = min(lo, u[j]); hi = max(hi, u[j]); }\n"
-"  }\n"
-"  if (tid == 0) { s_lo = 0xffffffffu; s_hi = 0; below = 0; ties = 0; s_done = 0; }\n"
-"  __syncthreads();\n"
-"  lo = warp_umin(lo); hi = warp_umax(hi);\n"
-"  if (lane == 0) { atomicMin(&s_lo, lo); atomicMax(&s_hi, hi); }\n"
-"  __syncthreads();\n"
-"  lo = s_lo; hi = s_hi;\n"
-"  unsigned diff = lo ^ hi, want = k, prefix, mask;\n"
-"  int top;\n"
-"  if (diff == 0) { prefix = lo; mask = 0xffffffffu; top = -1; }\n"
-"  else { top = 31 - __clz(diff); mask = top == 31 ? 0u : 0xffffffffu << (top + 1); prefix = lo & mask; }\n"
-"  while (top >= 0)\n"
-"  {\n"
-"    int w = top + 1 < 8 ? top + 1 : 8, shift = top - w + 1;\n"
-"    unsigned bins = 1u << w;\n"
-"    if (tid < 256) hist[tid] = 0;\n"
-"    __syncthreads();\n"
-"#pragma unroll\n"
-"    for (int j = 0; j < PS_ITEMS; j++)\n"
-"    {\n"
-"      unsigned i = tid + j * nt;\n"
-"      if (i < n && (u[j] & mask) == prefix) atomicAdd(&hist[(u[j] >> shift) & (bins - 1)], 1u);\n"
-"    }\n"
-"    __syncthreads();\n"
-"    unsigned h = 0, c = 0;\n"
-"    if (tid < 256)\n"
-"    {\n"
-"      h = hist[tid]; c = h;\n"
-"      for (int o = 1; o < 32; o <<= 1) { unsigned y = __shfl_up_sync(0xffffffffu, c, o); if (lane >= o) c += y; }\n"
-"      if (lane == 31) wsum[tid >> 5] = c;\n"
-"    }\n"
-"    __syncthreads();\n"
-"    if (tid < 256)\n"
-"    {\n"
-"      for (unsigned w2 = 0; w2 < (tid >> 5); w2++) c += wsum[w2];\n"
-"      unsigned ex = c - h;\n"
-"      if (ex < want && want <= c) { s_prefix = prefix | (tid << shift); s_want = want - ex; s_done = h == want - ex; }\n"
-"    }\n"
-"    __syncthreads();\n"
-"    prefix = s_prefix; want = s_want; mask |= (bins - 1) << shift; top = shift - 1;\n"
-"    if (s_done) break;\n"
-"  }\n"
-"#pragma unroll\n"
-"  for (int j = 0; j < PS_ITEMS; j++)\n"
-"    if (j * nt < n)\n"
-"    {\n"
-"      unsigned i = tid + j * nt, m = u[j] & mask;\n"
-"      bool b = i < n && m < prefix;\n"
-"      unsigned bal = __ballot_sync(0xffffffffu, b), base = 0;\n"
-"      if (lane == 0 && bal) base = atomicAdd(&below, __popc(bal));\n"
-"      base = __shfl_sync(0xffffffffu, base, 0);\n"
-"      if (b) { unsigned s = base + __popc(bal & ((1u << lane) - 1)); od[s] = select_float(u[j]); orow[s] = (long long) p[i]; }\n"
-"      if (i < n && m == prefix)\n"
-"      {\n"
-"        unsigned t = atomicAdd(&ties, 1u);\n"
-"        if (t < want) { unsigned s = k - want + t; od[s] = select_float(u[j]); orow[s] = (long long) p[i]; }\n"
-"      }\n"
-"    }\n"
-"}\n";
+"{ return __uint_as_float((u & 0x80000000u) ? u & 0x7fffffffu : ~u); }\n";
 
 static const char PostSource1[] =
 "extern \"C\" __global__ void __launch_bounds__(1024) final_rank(const float *d, const long long *r, unsigned n,\n"
@@ -3187,32 +2999,14 @@ static const char PostSource2[] =
 "  long long *p, unsigned top, unsigned nq, const float *q, int d, float *o) { rerank8(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
 "extern \"C\" __global__ void rerank8_h_i64(const unsigned short *v, long long st, const unsigned *r, unsigned ne,\n"
 "  unsigned nr, long long *p, unsigned top, unsigned nq, const float *q, int d, float *o)\n"
-"  { rerank8(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
-"extern \"C\" __global__ void copy_first32(const float *d, const unsigned *r, const unsigned *counts, unsigned cap,\n"
-"    unsigned k, float *outD, long long *outR)\n"
-"{\n"
-"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : counts[row];\n"
-"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
-"  {\n"
-"    outD[(unsigned long long) row * k + i] = i < n ? d[(unsigned long long) row * cap + i] : __int_as_float(0x7f800000);\n"
-"    outR[(unsigned long long) row * k + i] = i < n ? (long long) r[(unsigned long long) row * cap + i] : -1;\n"
-"  }\n"
-"}\n"
-"extern \"C\" __global__ void copy_first64(const float *d, const long long *r, unsigned n, unsigned k,\n"
-"    float *outD, long long *outR)\n"
-"{\n"
-"  unsigned row = blockIdx.x;\n"
-"  for (unsigned i = threadIdx.x; i < k; i += blockDim.x)\n"
-"  {\n"
-"    outD[(unsigned long long) row * k + i] = i < n ? d[(unsigned long long) row * n + i] : __int_as_float(0x7f800000);\n"
-"    outR[(unsigned long long) row * k + i] = i < n ? r[(unsigned long long) row * n + i] : -1;\n"
-"  }\n"
-"}\n";
+"  { rerank8(v, st, r, ne, nr, p, top, nq, q, d, o); }\n";
 
 /*
- * prune_select_s (ANN_POST bit 64): prune_select_reg with the keys in
- * shared memory (compact loops: the block runs once per SM, so code size
- * costs instruction fetches), 11-bit digits, and a stop once the bucket
+ * prune_select_s: the fused pruned selection's radix select over each
+ * query's u32 candidate list, with the keys in shared memory (compact loops:
+ * the block runs once per SM, so code size costs instruction fetches), the
+ * passes starting at the first bit where the least and greatest key differ,
+ * 11-bit digits, and a stop once the bucket
  * holding the k-th key has at most 256 keys, which are then ranked among
  * themselves (ties by row, then position, so the result does not depend on
  * the order the scan appended them). Positions are gathered once at the end.
@@ -3311,7 +3105,7 @@ static const char PostSource3b[] =
 "}\n";
 
 /*
- * final_bucket (ANN_POST bit 128, n <= 1024): a counting sort of the
+ * final_bucket (n <= 1024): a counting sort of the
  * reranked candidates into 2048 buckets spanning their least to greatest
  * key; each candidate's rank is its bucket's start plus its rank among the
  * bucket's keys (ties by position).
@@ -3370,7 +3164,7 @@ static const char PostSource4[] =
 "}\n";
 
 /*
- * rerank_final (ANN_POST bit 256, n <= 1024): the rerank and the final
+ * rerank_final (n <= 1024): the rerank and the final
  * top-k in one block a query. Four threads rerank a candidate (16-byte
  * loads, every candidate's row read first), keeping its distance and row in
  * shared memory for bucket_topk.
@@ -3450,52 +3244,7 @@ static const char PostSource5[] =
 "    const unsigned *r, unsigned ne, unsigned nr, const long long *p, unsigned n, unsigned k, const float *q, int d,\n"
 "    float *oD, long long *oR) { rerank_final(v, st, r, ne, nr, p, n, k, q, d, oD, oR); }\n";
 
-#define ANN_POST_SELECT 1		/* prune_select_reg for the fused sort */
-#define ANN_POST_FINAL 2		/* final_rank for the final top-k */
-#define ANN_POST_RERANK 4		/* rerank8 */
-#define ANN_POST_PROBE_SORT 8	/* probe: no sort (copy the first kept) */
-#define ANN_POST_PROBE_FINAL 16 /* probe: no final top-k */
-#define ANN_POST_PROBE_RERANK 32	/* probe: no rerank */
-#define ANN_POST_SELECT11 64	/* prune_select_s for the fused sort */
-#define ANN_POST_CHUNK 128		/* final_bucket for the final top-k */
-#define ANN_POST_FUSED 256		/* rerank_final: rerank and final top-k in one */
-
-/*
- * ANN_POST: the post-scan variants, a number (the bits above) or a list of
- * select, final, rerank, probe-sort, probe-final, probe-rerank. Unset: 452
- * (rerank8, prune_select_s, final_bucket and rerank_final); 0 restores the
- * earlier kernels.
- */
-static int
-PostVariant(void)
-{
-	static _Atomic int variant = -1;
-	int			value = atomic_load_explicit(&variant, memory_order_relaxed);
-
-	if (value < 0)
-	{
-		const char *setting = getenv("ANN_POST");
-
-		value = setting ? 0 : ANN_POST_RERANK | ANN_POST_SELECT11 | ANN_POST_CHUNK | ANN_POST_FUSED;
-		if (setting && setting[0] >= '0' && setting[0] <= '9')
-			value = (int) strtol(setting, NULL, 0);
-		else if (setting)
-		{
-			value |= strstr(setting, "probe-sort") ? ANN_POST_PROBE_SORT : 0;
-			value |= strstr(setting, "probe-final") ? ANN_POST_PROBE_FINAL : 0;
-			value |= strstr(setting, "probe-rerank") ? ANN_POST_PROBE_RERANK : 0;
-			value |= strstr(setting, "select") && !strstr(setting, "probe-select") ? ANN_POST_SELECT : 0;
-			value |= (strstr(setting, "final,") ||
-					  (strlen(setting) >= 5 && strcmp(setting + strlen(setting) - 5, "final") == 0 &&
-					   (strlen(setting) == 5 || setting[strlen(setting) - 6] == ','))) ? ANN_POST_FINAL : 0;
-			value |= (strncmp(setting, "rerank", 6) == 0 || strstr(setting, ",rerank")) ? ANN_POST_RERANK : 0;
-		}
-		atomic_store_explicit(&variant, value, memory_order_relaxed);
-	}
-	return value;
-}
-
-#define ANN_FINAL_MAX 4096		/* most reranked candidates final_topk sorts */
+#define ANN_FINAL_MAX 4096		/* most reranked candidates final_rank ranks */
 #define ANN_PRUNE_SAMPLE 8192	/* sampled scores per query */
 #define ANN_PRUNE_RANK 32		/* the sample's least cutoff rank */
 #define ANN_PRUNE_MARGIN 4		/* expected kept / needed candidates */
@@ -3585,19 +3334,14 @@ typedef struct GatherModule
 	CUfunction	pruneFill;
 	CUfunction	pruneCompact;
 	CUfunction	pruneSort;
-	CUfunction	finalTopk;
 	CUfunction	pruneCompact4;
 	CUfunction	pruneSelect;
-	CUfunction	pruneSelect32;
 	CUfunction	cutoff32;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
-	CUfunction	postSelect;		/* ANN_POST kernels */
-	CUfunction	postFinal;
+	CUfunction	postFinal;		/* post-scan stages */
 	CUfunction	postRerank;
 	CUfunction	postRerankHalf;
-	CUfunction	postCopy32;
-	CUfunction	postCopy64;
 	CUfunction	postSelect11;
 	CUfunction	postChunk;
 	CUfunction	postFusedF;
@@ -3610,7 +3354,6 @@ typedef struct GatherModule
 	 * the select_k path instead.
 	 */
 	int			sortShared;		/* matrix_prune_sort */
-	int			finalShared;	/* final_topk */
 	int			select11Shared; /* prune_select_s */
 } GatherModule;
 
@@ -3665,7 +3408,7 @@ GatherKernels(int device)
 		optin = 0;
 	snprintf(arch, sizeof(arch), "sm_%d%d", major, minor);
 	source = malloc(strlen(GatherSource) + strlen(RerankSource) + strlen(PruneSource) +
-					strlen(FinalSource) + strlen(SelectSource) + strlen(FusedSelectSource) + strlen(SegmentSource) +
+					strlen(SelectSource) + strlen(FusedSelectSource) + strlen(SegmentSource) +
 					strlen(PostSource) + strlen(PostSource1) + strlen(PostSource2) +
 					strlen(PostSource3) + strlen(PostSource3b) + strlen(PostSource4) + strlen(PostSource5) + 1);
 	if (source == NULL)
@@ -3673,7 +3416,6 @@ GatherKernels(int device)
 	strcpy(source, GatherSource);
 	strcat(source, RerankSource);
 	strcat(source, PruneSource);
-	strcat(source, FinalSource);
 	strcat(source, SelectSource);
 	strcat(source, FusedSelectSource);
 	strcat(source, SegmentSource);
@@ -3697,20 +3439,14 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneFill, module->module, "matrix_fill") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact, module->module, "matrix_compact") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->finalTopk, module->module, "final_topk") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact4, module->module, "matrix_compact4") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSelect, module->module, "matrix_prune_select") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->pruneSelect32, module->module, "matrix_prune_select32") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->cutoff32, module->module, "cutoff32") != CUDA_SUCCESS ||
-		(module->finalShared = OptInShared(module->finalTopk, optin, ANN_FINAL_MAX * 12)) < 0 ||
 		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentCompact, module->module, "segment_compact") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->postSelect, module->module, "prune_select_reg") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFinal, module->module, "final_rank") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postRerank, module->module, "rerank8_i64") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postRerankHalf, module->module, "rerank8_h_i64") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->postCopy32, module->module, "copy_first32") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->postCopy64, module->module, "copy_first64") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postSelect11, module->module, "prune_select_s") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postChunk, module->module, "final_bucket") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFusedF, module->module, "rerank_final_f") != CUDA_SUCCESS ||
@@ -3718,12 +3454,10 @@ GatherKernels(int device)
 		(module->select11Shared = OptInShared(module->postSelect11, optin, ANN_PRUNE_CAP * 4)) < 0 ||
 		(module->sortShared = OptInShared(module->pruneSort, optin, ANN_PRUNE_CAP * 8)) < 0)
 		goto fail;
-	if (module->sortShared < ANN_PRUNE_CAP * 8 || module->finalShared < ANN_FINAL_MAX * 12 ||
-		module->select11Shared < ANN_PRUNE_CAP * 4)
+	if (module->sortShared < ANN_PRUNE_CAP * 8 || module->select11Shared < ANN_PRUNE_CAP * 4)
 		fprintf(stderr, "cuVS: device %d (compute capability %d.%d) opts in %d KB of shared memory a block; "
-				"pruned sorts past %d scores, final top-k past %d candidates and the fused radix select past "
-				"%d scores use select_k\n", device, major, minor, optin / 1024, module->sortShared / 8,
-				module->finalShared / 12, module->select11Shared / 4);
+				"pruned sorts past %d scores and the fused radix select past %d scores use select_k\n",
+				device, major, minor, optin / 1024, module->sortShared / 8, module->select11Shared / 4);
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
 fail:
@@ -3817,12 +3551,10 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 	void	   *args[] = {(void *) &shard->rerank, &stride, (void *) &rows, &eligible, &nrows,
 	&positions, &top, &nq, (void *) &queries, &dimensions, &out};
 
-	if (module && wide && (PostVariant() & (ANN_POST_RERANK | ANN_POST_PROBE_RERANK)))
+	if (module && wide)
 	{
 		size_t		element = shard->rerankHalf ? 2 : 4;
 
-		if (PostVariant() & ANN_POST_PROBE_RERANK)
-			return 1;
 		if (dims % 8 == 0 && stride % 8 == 0 && ((uintptr_t) shard->rerank) % 16 == 0 &&
 			((uintptr_t) queries) % 16 == 0 && element * 8 >= 16)
 		{
@@ -4982,43 +4714,32 @@ static int
 FinalTopk(AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q, uint32_t candidates, uint32_t outk)
 {
 	GatherModule *module;
-	unsigned	size = 2,
-				n = candidates,
+	unsigned	n = candidates,
 				k = outk;
 
-	while (size < candidates)
-		size <<= 1;
 	if (candidates > ANN_FINAL_MAX || (module = GatherKernels(device)) == NULL)
 		return AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices, lane->matrixValues,
 							  lane->matrixRows, q, candidates, outk, 1, NULL) == CUVS_SUCCESS;
 	{
-		void	   *args[] = {&lane->matrixCandidates, &lane->matrixIndices, &n, &size, &k, &lane->matrixValues,
-		&lane->matrixRows};
 		void	   *postArgs[] = {&lane->matrixCandidates, &lane->matrixIndices, &n, &k, &lane->matrixValues,
 		&lane->matrixRows};
 
-		if ((PostVariant() & ANN_POST_CHUNK) && !(PostVariant() & ANN_POST_PROBE_FINAL) && n <= 1024)
+		/*
+		 * final_bucket up to 1024 candidates, final_rank above (its keys fit
+		 * the default 48 KB).
+		 */
+		if (n <= 1024)
 			return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 				cuLaunchKernel(module->postChunk, q, 1, 1, 1024, 1, 1, 0, (CUstream) stream, postArgs,
 							   NULL) == CUDA_SUCCESS;
-		if (PostVariant() & (ANN_POST_FINAL | ANN_POST_CHUNK | ANN_POST_PROBE_FINAL))
-			return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
-				cuLaunchKernel((PostVariant() & ANN_POST_PROBE_FINAL) ? module->postCopy64 : module->postFinal,
-							   q, 1, 1, (PostVariant() & ANN_POST_PROBE_FINAL) ? 256 : 1024, 1, 1,
-							   (PostVariant() & ANN_POST_PROBE_FINAL) ? 0 : (((n + 3) & ~3u) + n) * 4,
-							   (CUstream) stream, postArgs, NULL) == CUDA_SUCCESS;
-		if (size * 12 > (unsigned) module->finalShared)
-			return AnnSelectBatch(lane->resources, lane->matrixCandidates, lane->matrixIndices, lane->matrixValues,
-								  lane->matrixRows, q, candidates, outk, 1, NULL) == CUVS_SUCCESS;
 		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
-			cuLaunchKernel(module->finalTopk, q, 1, 1, 1024, 1, 1, size * 12, (CUstream) stream, args, NULL) ==
-			CUDA_SUCCESS;
+			cuLaunchKernel(module->postFinal, q, 1, 1, 1024, 1, 1, (((n + 3) & ~3u) + n) * 4,
+						   (CUstream) stream, postArgs, NULL) == CUDA_SUCCESS;
 	}
 }
 
 /*
- * ANN_POST bit 256: the rerank and the final top-k of the matrix gather in
- * one launch (rerank_final), when each query has at most 1024 candidates and
+ * The rerank and the final top-k of the matrix gather in one launch (rerank_final), when each query has at most 1024 candidates and
  * the rerank rows allow 16-byte loads. Returns -1 when it does not apply
  * (the caller runs RerankDevice and FinalTopk), else whether it launched.
  */
@@ -5032,7 +4753,7 @@ RerankFinal(const AnnCuvsShard *shard, AnnCuvsDevice *lane, uint32_t dims, const
 	unsigned	n = candidates,
 				k = outk;
 
-	if (!(PostVariant() & ANN_POST_FUSED) || candidates > 1024 || outk > candidates || dims % 8 != 0 ||
+	if (candidates > 1024 || outk > candidates || dims % 8 != 0 ||
 		stride % 8 != 0 || ((uintptr_t) shard->rerank) % 16 != 0 || ((uintptr_t) lane->queries) % 16 != 0 ||
 		(module = GatherKernels(shard->device)) == NULL)
 		return -1;
@@ -5065,21 +4786,6 @@ PrunedChecked(AnnCuvsIndex *state, const AnnCuvsDevice *lane, uint32_t q, uint32
 
 static double MonotonicMs(void);
 
-/* The fused pruned selection unless ANN_MATRIX_FUSE=off (for measurements). */
-static int
-FuseMatrixEnabled(void)
-{
-	static int	enabled = -1;
-
-	if (enabled < 0)
-	{
-		const char *value = getenv("ANN_MATRIX_FUSE");
-
-		enabled = !(value && strcmp(value, "off") == 0);
-	}
-	return enabled;
-}
-
 /*
  * Whether a tile can take the fused pruned selection: the pruned
  * selection's own bounds, one shard, and no residual masks (they mask a
@@ -5092,7 +4798,7 @@ FusedEligible(const AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t q, uint32_
 	uint64_t	rank;
 	GatherModule *module;
 
-	if (!FuseMatrixEnabled() || !AnnIndexConfig.matrix_prune || state->nshards != 1 || n < PruneMinRows() ||
+	if (!AnnIndexConfig.matrix_prune || state->nshards != 1 || n < PruneMinRows() ||
 		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || dims > ANN_BLACKWELL_FUSE_DIMS ||
 		(module = GatherKernels(state->shards[0].device)) == NULL)
 		return 0;
@@ -5101,8 +4807,7 @@ FusedEligible(const AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t q, uint32_
 	 * prune_select_s keeps up to ANN_PRUNE_CAP keys in shared memory; a
 	 * failed fused tile fails its batch.
 	 */
-	if ((PostVariant() & (ANN_POST_SELECT11 | ANN_POST_PROBE_SORT)) == ANN_POST_SELECT11 &&
-		module->select11Shared < ANN_PRUNE_CAP * 4)
+	if (module->select11Shared < ANN_PRUNE_CAP * 4)
 		return 0;
 	rank = ((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n;
 	if (rank < ANN_PRUNE_RANK)
@@ -5167,12 +4872,8 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 									cap, stream) ||
 			!PruneMark(lane, 1, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
-			cuLaunchKernel((PostVariant() & ANN_POST_PROBE_SORT) ? module->postCopy32 :
-						   (PostVariant() & ANN_POST_SELECT11) ? module->postSelect11 :
-						   (PostVariant() & ANN_POST_SELECT) ? module->postSelect : module->pruneSelect32,
-						   q, 1, 1, 1024, 1, 1,
-						   (PostVariant() & (ANN_POST_SELECT11 | ANN_POST_PROBE_SORT)) == ANN_POST_SELECT11 ?
-						   ANN_PRUNE_CAP * 4 : 0, (CUstream) stream, selectArgs, NULL) != CUDA_SUCCESS ||
+			cuLaunchKernel(module->postSelect11, q, 1, 1, 1024, 1, 1, ANN_PRUNE_CAP * 4, (CUstream) stream,
+						   selectArgs, NULL) != CUDA_SUCCESS ||
 			!PruneMark(lane, 2, stream) ||
 			cudaMemcpyAsync(lane->hostFuseCounts, lane->fuseCounts, (size_t) q * sizeof(uint32_t),
 							cudaMemcpyDeviceToHost, stream) != cudaSuccess)
@@ -6057,36 +5758,6 @@ StageAdd(const StageTimes *pass)
 	(void) pthread_mutex_unlock(&stageMutex);
 }
 
-/* Grouped large-k scans unless ANN_BLACKWELL_GROUP_LARGE=off (for measurements). */
-static int
-GroupLargeEnabled(void)
-{
-	static int	enabled = -1;
-
-	if (enabled < 0)
-	{
-		const char *value = getenv("ANN_BLACKWELL_GROUP_LARGE");
-
-		enabled = value == NULL || strcmp(value, "off") != 0;
-	}
-	return enabled;
-}
-
-/* Sampled candidate bounds for large k unless ANN_BLACKWELL_CANDIDATES=off (for measurements). */
-static int
-CandidatesEnabled(void)
-{
-	static int	enabled = -1;
-
-	if (enabled < 0)
-	{
-		const char *value = getenv("ANN_BLACKWELL_CANDIDATES");
-
-		enabled = value == NULL || strcmp(value, "off") != 0;
-	}
-	return enabled;
-}
-
 /* Bytes of [queries][rows] distances one lane holds per grouped large-k pass (ANN_GROUP_SCORE_MB). */
 static size_t
 GroupScoreBytes(void)
@@ -6151,7 +5822,7 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 	double		hostStart = 0,
 				hostSelected = 0;
 
-	if (!GroupLargeEnabled() || !state->grouped || !state->quantized || ordinals == NULL || limit < 2)
+	if (!state->grouped || !state->quantized || ordinals == NULL || limit < 2)
 		return 0;
 	for (uint32_t j = 0; j < m; j++)
 		if (jobs[j]->k > k)
@@ -6198,7 +5869,7 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 		 * Enough rows for a sample to bound the candidates: no score matrix,
 		 * and single queries take this path too.
 		 */
-		cap[s] = eligible && CandidatesEnabled() ? AnnBlackwellCandidateCap((unsigned) eligible, wanted[s]) : 0;
+		cap[s] = eligible ? AnnBlackwellCandidateCap((unsigned) eligible, wanted[s]) : 0;
 		bounded |= cap[s] != 0;
 		if (eligible && cap[s] == 0 && eligible > widestMatrix)
 			widestMatrix = eligible;

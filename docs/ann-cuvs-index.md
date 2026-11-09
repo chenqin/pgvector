@@ -153,14 +153,12 @@ cuVS is the baseline: any GPU cuVS 26.10 runs on serves CAGRA search, filtered C
 | --- | --- | --- |
 | CAGRA search, filtered CAGRA (bitsets) | cuVS 26.10 | — (the worker refuses other cuVS versions) |
 | Gather scan, GPU rerank, pruned matrix selection (`cuvs.c` gather module) | NVRTC; `__reduce_*_sync` on 8.0+, shuffles below | `cuVS: gather scan unavailable on device N; filtered queries use CAGRA` |
-| Pruned sorts at full size: `matrix_prune_sort` 128 KB, `prune_select_s` 64 KB, `final_topk` 48 KB of shared memory a block | Opt-in shared memory per block of 227 KB (9.0, 10.x) or 163 KB (8.0) | On 99 KB devices (8.6, 8.9, 12.x) and 64 KB ones (7.5), larger lists use `select_k`; the worker logs the sizes once (`cuVS: device N ... opts in N KB`) |
+| Pruned sorts at full size: `matrix_prune_sort` 128 KB and `prune_select_s` 64 KB of shared memory a block | Opt-in shared memory per block of 227 KB (9.0, 10.x) or 163 KB (8.0) | On 99 KB devices (8.6, 8.9, 12.x) and 64 KB ones (7.5), larger lists use `select_k`; the worker logs the sizes once (`cuVS: device N ... opts in N KB`) |
 | GPU predicates, residual masks (`cuvs.c` predicate module) | NVRTC | `cuVS: predicate kernel unavailable on device N; predicates are evaluated on the host` |
 | JIT-LTO filter UDF for FP32 CAGRA (`cagra_udf.cpp`) | cuVS 26.10's private index layout | Built only with the `cagra_udf` target; refuses non-FP32 or non-padded datasets |
 | [Blackwell module](ann-blackwell.md): NVFP4/FP8 scans, tensor-core grouped and fused scans | Compute capability 10.x or 12.x: `cvt.rn.f16x2.e2m1x2` needs `sm_100a`/`sm_120a` | `Blackwell module: device N has compute capability X.x ...`; quantized copies aren't uploaded and scans read the CAGRA dataset. A `--scan-only` index (no graphs) doesn't load. |
 
 The Blackwell module is one gate for one NVRTC unit, set by its newest instruction. Its other instructions are older (`cvt.rn.f16x2.e4m3x2` from 8.9, `mma.sync` m16n8k16 and `cvt.rn.f16x2.f32` from 8.0, `ldmatrix` from 7.5), so FP8 and the FP16/FP32 tensor-core scans could run on Hopper or Ada if that unit were split.
-
-Experiment variables that change results print a `WARNING` when the module loads: `ANN_FUSE_ABLATE` (timing only, wrong results) and `ANN_FUSE_TUNE` bit 16 (looser hit test, lower recall).
 
 ## Build flag
 

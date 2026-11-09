@@ -276,6 +276,8 @@ G3a validation note: `matrix_prune_fallbacks` cannot detect the 4M disablement. 
 
 ## Results so far
 
+The environment switches named below (`ANN_FUSE_*`, `ANN_POST`, `ANN_MATRIX_FUSE` and the like) were how variants were measured. Only the winners were kept: their code is now unconditional and the switches no longer exist.
+
 **P01 falsifier (experiment 1): passed.** A throwaway build dropped the `tenant` operand from the canonical AND, so `distinct10` was served from its category window alone (wrong answers by design; the recall check uses `mixed10` predicates and cannot see the difference). Same settings as the final configuration with `--gpu-predicates on`, 30 s:
 
 | Run | Arrays, vectors/s | SQL, QPS | PostgreSQL cores | Worker cores | GPU busy |
