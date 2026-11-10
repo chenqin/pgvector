@@ -60,6 +60,10 @@ typedef struct AnnServeOptions
 	int			rdma_spin;		/* busy-poll completions instead of interrupts */
 	const char *trace;			/* per-request timings, appended to this file */
 	uint32_t	trace_sample;	/* trace requests whose id is a multiple */
+	uint32_t	readers;		/* threads reading connections' frames (epoll,
+								 * Linux); 0 for a thread per connection */
+	int			merge_duplicates;	/* search identical index jobs in a batch
+									 * once */
 } AnnServeOptions;
 
 void		AnnServeDefaultOptions(AnnServeOptions *options);

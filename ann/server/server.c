@@ -18,12 +18,16 @@
 #include <string.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#ifdef __linux__
+#include <sys/epoll.h>
+#endif
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -115,12 +119,14 @@ typedef struct Composite
 } Composite;
 
 /*
- * --trace: one line per sampled request, "W id rdma arrived queued started
+ * --trace: one line per sampled job (every trace_sample-th finished), "W id rdma arrived queued started
  * done replied" in realtime nanoseconds, so a coordinator's trace of
  * the same requests on this host lines up (benchmarks/ann/fanout_trace.py).
  */
 static FILE *traceFile = NULL;
 static pthread_mutex_t traceMutex = PTHREAD_MUTEX_INITIALIZER;
+static uint64_t traceCount = 0; /* every trace_sample-th finished job is
+								 * traced */
 static _Thread_local uint64_t frameArrived = 0;
 
 /* Hits to return when SubmitBitmapJob's caller over-fetches (else 0). */
@@ -141,6 +147,16 @@ static _Thread_local uint32_t submittingPart = 0;
  */
 static _Thread_local Job **submittingDeferred = NULL;
 static _Thread_local uint32_t submittingDeferredCount = 0;
+
+/*
+ * While set, a pool reader collects the index jobs of one epoll round here
+ * (each with its file and connection references taken) and queues them
+ * under one scheduler lock (EnqueueDeferred): readers took that lock once
+ * per frame, and at 400k frames/s the lock and its wakeups cost 60 cores.
+ */
+#define ANN_READER_DEFERRED 256
+static _Thread_local Job **readerDeferred = NULL;
+static _Thread_local uint32_t readerDeferredCount = 0;
 
 /*
  * A filter the worker already holds (a cached bitmap's rows, an attribute
@@ -172,7 +188,8 @@ typedef struct Service
 	pthread_cond_t condition;
 	Job		   *head;
 	Job		   *tail;
-	uint64_t	pending_bytes;
+	uint64_t	pending_bytes;	/* atomic: added under mutex, released without
+								 * it */
 	uint64_t	queued;
 	uint32_t	idle;
 	int			stopping;
@@ -187,13 +204,15 @@ typedef struct Service
 	uint64_t	grouped_jobs;	/* jobs in those groups */
 	uint64_t	held;			/* pickups that found only jobs whose filter
 								 * enough lanes were already on */
+	uint64_t	merged;			/* index jobs answered from an identical job's
+								 * search in their batch (atomic) */
 	uint64_t	predicate_hits; /* operation 22 programs found cached */
 	uint64_t	predicate_evaluations;
 	uint64_t	predicate_eval_us;	/* time spent evaluating them */
 	uint64_t	predicate_canonical;	/* lookups under a rewritten program */
 	uint64_t	predicate_transient;	/* first sightings served uncached */
-	uint64_t	predicate_residual; /* searches over a base entry with
-									 * masked rows (--residual-masks) */
+	uint64_t	predicate_residual; /* searches over a base entry with masked
+									 * rows (--residual-masks) */
 	uint32_t	blockedWaiters; /* lanes waiting for a filter to free up */
 	uint32_t	activeLanes;	/* lanes working on cached filters */
 	FilterEntry *filters[ANN_FILTER_BUCKETS];
@@ -213,7 +232,8 @@ typedef struct Service
 } Service;
 
 static volatile sig_atomic_t stopRequested;
-static volatile sig_atomic_t stopSignal;	/* the signal that stopped the worker, and its sender */
+static volatile sig_atomic_t stopSignal;	/* the signal that stopped the
+											 * worker, and its sender */
 static volatile sig_atomic_t stopSender;
 
 void
@@ -235,10 +255,12 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 	options->rdma = NULL;
 	options->rdma_lanes = 1;
 	options->rdma_spin = 1;
+	options->readers = 64;
+	options->merge_duplicates = 1;
 }
 
 static void
-OnSignal(int signal, siginfo_t *info, void *context)
+OnSignal(int signal, siginfo_t * info, void *context)
 {
 	(void) context;
 	stopSignal = signal;
@@ -327,22 +349,6 @@ ReadFull(int fd, unsigned char *data, size_t size)
 	return 1;
 }
 
-static int
-WriteFull(int fd, const unsigned char *data, size_t size)
-{
-	while (size)
-	{
-		ssize_t		n = write(fd, data, size);
-
-		if (n < 0 && errno == EINTR)
-			continue;
-		if (n <= 0)
-			return 0;
-		data += n;
-		size -= (size_t) n;
-	}
-	return 1;
-}
 
 static void
 Release(Connection *connection)
@@ -365,6 +371,37 @@ Release(Connection *connection)
 	}
 }
 
+/* A frame's header and payload in one writev: one syscall per reply, not two. */
+static int
+WriteFrame(int fd, const unsigned char *header, const unsigned char *data, size_t size)
+{
+	struct iovec iov[2] = {{(void *) header, 32}, {(void *) data, size}};
+	int			parts = size ? 2 : 1;
+	struct iovec *at = iov;
+
+	while (parts)
+	{
+		ssize_t		n = writev(fd, at, parts);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			return 0;
+		while (parts && (size_t) n >= at->iov_len)
+		{
+			n -= (ssize_t) at->iov_len;
+			at++;
+			parts--;
+		}
+		if (parts && n)
+		{
+			at->iov_base = (unsigned char *) at->iov_base + n;
+			at->iov_len -= (size_t) n;
+		}
+	}
+	return 1;
+}
+
 /* Replies are written whole under the connection mutex, in completion order. */
 static void
 Reply(Connection *connection, uint16_t operation, uint64_t request,
@@ -379,9 +416,7 @@ Reply(Connection *connection, uint16_t operation, uint64_t request,
 	Write(header + 24, size, 4);
 	Write(header + 28, status, 4);
 	(void) pthread_mutex_lock(&connection->mutex);
-	if (!connection->broken &&
-		(!WriteFull(connection->fd, header, sizeof(header)) ||
-		 (size && !WriteFull(connection->fd, data, size))))
+	if (!connection->broken && !WriteFrame(connection->fd, header, data, size))
 	{
 		connection->broken = 1;
 		(void) shutdown(connection->fd, SHUT_RDWR);
@@ -653,18 +688,21 @@ SettleAdd(Settlement *settle, Job *job)
 	return 1;
 }
 
+/*
+ * Budgets are released without the scheduler's mutex: admission adds to
+ * them under it, so a release only ever makes room sooner.
+ */
 static void
 Settle(Service *service, Settlement *settle)
 {
 	if (settle->n == 0)
 		return;
-	(void) pthread_mutex_lock(&service->mutex);
-	service->pending_bytes -= settle->charge;
+	(void) __atomic_sub_fetch(&service->pending_bytes, settle->charge, __ATOMIC_RELAXED);
 	for (uint32_t i = 0; i < settle->n; i++)
 		if (settle->entries[i].file)
-			settle->entries[i].file->pendingBytes -= settle->entries[i].charge;
-	service->failed += settle->failed;
-	(void) pthread_mutex_unlock(&service->mutex);
+			(void) __atomic_sub_fetch(&settle->entries[i].file->pendingBytes, settle->entries[i].charge,
+									  __ATOMIC_RELAXED);
+	(void) __atomic_add_fetch(&service->failed, settle->failed, __ATOMIC_RELAXED);
 	for (uint32_t i = 0; i < settle->n; i++)
 	{
 		if (settle->entries[i].bitmap)
@@ -790,7 +828,7 @@ Finish(Service *service, Job *job, Settlement *settle)
 	if (!job->composite)
 		SendReply(job->connection, job->rdma, job->operation, job->request, job->job.status,
 				  data, job->job.status == ANN_OK ? size : 0);
-	if (traceFile && job->request % service->options.trace_sample == 0)
+	if (traceFile && __atomic_fetch_add(&traceCount, 1, __ATOMIC_RELAXED) % service->options.trace_sample == 0)
 	{
 		(void) pthread_mutex_lock(&traceMutex);
 		fprintf(traceFile, "W %llu %d %llu %llu %llu %llu %llu\n", (unsigned long long) job->request, job->rdma,
@@ -802,13 +840,11 @@ Finish(Service *service, Job *job, Settlement *settle)
 	settled = settle && SettleAdd(settle, job);
 	if (!settled)
 	{
-		(void) pthread_mutex_lock(&service->mutex);
-		service->pending_bytes -= job->charge;
+		(void) __atomic_sub_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
 		if (job->kind == JOB_INDEX && job->bitmapFile)
-			job->bitmapFile->pendingBytes -= job->charge;
+			(void) __atomic_sub_fetch(&job->bitmapFile->pendingBytes, job->charge, __ATOMIC_RELAXED);
 		if (job->job.status != ANN_OK)
-			service->failed++;
-		(void) pthread_mutex_unlock(&service->mutex);
+			(void) __atomic_add_fetch(&service->failed, 1, __ATOMIC_RELAXED);
 	}
 	Release(job->connection);
 	free(job->job.results);
@@ -1009,6 +1045,73 @@ Eligible(Service *service)
 }
 
 /*
+ * Identical index searches: same index, filter (the same shared arrays, or
+ * unfiltered; job-owned key lists never compare equal), excluded rows and
+ * query. A Muse request's rankers often ask
+ * one group the same question with the same filter (CPC and CPM rankers at
+ * k 300); arriving together, they land in one filter group, so one search at
+ * the larger k answers both.
+ */
+static int
+SameSearch(const AnnIndexJob *a, const AnnIndexJob *b)
+{
+	if (a->dimensions != b->dimensions || a->filtered != b->filtered || a->filter != b->filter ||
+		a->nfilter != b->nfilter || a->ordinals != b->ordinals || a->bitsets != b->bitsets ||
+		a->deviceBitsets != b->deviceBitsets || a->deviceRows != b->deviceRows ||
+		a->exclude != b->exclude || a->nexclude != b->nexclude || strcmp(a->name, b->name) != 0)
+		return 0;
+	return memcmp(a->query, b->query, sizeof(float) * a->dimensions) == 0;
+}
+
+/*
+ * Search a batch of index jobs, each distinct search once: the copy with the
+ * largest k runs, and the others take their first k of its hits.
+ */
+static void
+SearchIndexJobs(Service *service, Job **batch, uint32_t count, AnnIndexJob *indexJobs, uint32_t *slots,
+				uint32_t *runs)
+{
+	uint32_t	nruns = 0;
+
+	for (uint32_t i = 0; i < count; i++)
+	{
+		uint32_t	s = 0;
+
+		if (service->options.merge_duplicates)
+			while (s < nruns && !SameSearch(&batch[runs[s]]->index, &batch[i]->index))
+				s++;
+		else
+			s = nruns;
+		if (s == nruns)
+			runs[nruns++] = i;
+		else if (batch[i]->index.k > batch[runs[s]]->index.k)
+			runs[s] = i;
+		slots[i] = s;
+	}
+	for (uint32_t s = 0; s < nruns; s++)
+		indexJobs[s] = batch[runs[s]]->index;
+	service->backend->search_index(indexJobs, nruns);
+	for (uint32_t s = 0; s < nruns; s++)
+		batch[runs[s]]->index = indexJobs[s];
+	if (nruns == count)
+		return;
+	for (uint32_t i = 0; i < count; i++)
+	{
+		const AnnIndexJob *run = &batch[runs[slots[i]]]->index;
+		AnnIndexJob *job = &batch[i]->index;
+
+		if (runs[slots[i]] == i)
+			continue;
+		job->status = run->status;
+		job->route = run->route;
+		job->nresults = run->nresults < job->k ? run->nresults : job->k;
+		if (job->nresults)
+			memcpy(job->results, run->results, sizeof(AnnIndexHit) * job->nresults);
+	}
+	(void) __atomic_fetch_add(&service->merged, count - nruns, __ATOMIC_RELAXED);
+}
+
+/*
  * A lane takes the oldest job and every queued job that fits the batch
  * limits, optionally waiting delay_us for more, then makes one submission.
  */
@@ -1044,8 +1147,15 @@ Lane(void *argument)
 	Job		  **batch = calloc(service->options.max_batch_jobs, sizeof(*batch));
 	AnnGatheredJob *jobs = calloc(service->options.max_batch_jobs, sizeof(*jobs));
 	AnnIndexJob *indexJobs = calloc(service->options.max_batch_jobs, sizeof(*indexJobs));
+	uint32_t   *slots = calloc(service->options.max_batch_jobs, sizeof(*slots));
+	uint32_t   *runs = calloc(service->options.max_batch_jobs, sizeof(*runs));
 
-	if (batch == NULL || jobs == NULL || indexJobs == NULL)
+	FilterEntry *released = NULL;	/* the last batch's filters, freed at the
+									 * next pickup under the same lock */
+	FilterEntry *releasedExtras[ANN_MIXED_FILTERS];
+	uint32_t	nreleased = 0;
+
+	if (batch == NULL || jobs == NULL || indexJobs == NULL || slots == NULL || runs == NULL)
 		abort();
 	for (;;)
 	{
@@ -1059,6 +1169,22 @@ Lane(void *argument)
 		uint32_t	nextras = 0;
 
 		(void) pthread_mutex_lock(&service->mutex);
+		if (released)
+		{
+			/* The filters are free again: one waiting lane may take a queue. */
+			released->active--;
+			service->activeLanes--;
+			FilterDone(service, released);
+			for (uint32_t e = 0; e < nreleased; e++)
+			{
+				releasedExtras[e]->active--;
+				FilterDone(service, releasedExtras[e]);
+			}
+			released = NULL;
+			nreleased = 0;
+			if (service->blockedWaiters)
+				(void) pthread_cond_signal(&service->condition);
+		}
 		service->idle++;
 		while (!service->stopping && (job = Eligible(service)) == NULL)
 		{
@@ -1108,7 +1234,13 @@ Lane(void *argument)
 			owns = job->filter;
 			owns->active++;
 			service->activeLanes++;
-			while (count < limit && owns->head)
+
+			/*
+			 * The whole group, not the idle lanes' share: the filter's rows
+			 * are scored once however many queries ride along, and a group
+			 * split over lanes costs a scan per piece.
+			 */
+			while (count < service->options.max_batch_jobs && owns->head)
 			{
 				Job		   *same = owns->head;
 
@@ -1197,13 +1329,7 @@ Lane(void *argument)
 			service->rows += batch[i]->job.rows;
 		(void) pthread_mutex_unlock(&service->mutex);
 		if (batch[0]->kind == JOB_INDEX)
-		{
-			for (uint32_t i = 0; i < count; i++)
-				indexJobs[i] = batch[i]->index;
-			service->backend->search_index(indexJobs, count);
-			for (uint32_t i = 0; i < count; i++)
-				batch[i]->index = indexJobs[i];
-		}
+			SearchIndexJobs(service, batch, count, indexJobs, slots, runs);
 		else
 		{
 			for (uint32_t i = 0; i < count; i++)
@@ -1221,26 +1347,20 @@ Lane(void *argument)
 				Finish(service, batch[i], &settle);
 			Settle(service, &settle);
 		}
-		if (owns)
-		{
-			/* The filter is free again: one waiting lane may take its queue. */
-			(void) pthread_mutex_lock(&service->mutex);
-			owns->active--;
-			service->activeLanes--;
-			FilterDone(service, owns);
-			for (uint32_t e = 0; e < nextras; e++)
-			{
-				extras[e]->active--;
-				FilterDone(service, extras[e]);
-			}
-			if (service->blockedWaiters)
-				(void) pthread_cond_signal(&service->condition);
-			(void) pthread_mutex_unlock(&service->mutex);
-		}
+
+		/*
+		 * Release the filters at the next pickup, which takes the lock
+		 * anyway.
+		 */
+		released = owns;
+		nreleased = nextras;
+		memcpy(releasedExtras, extras, sizeof(*extras) * nextras);
 	}
 	free(batch);
 	free(jobs);
 	free(indexJobs);
+	free(slots);
+	free(runs);
 	return NULL;
 }
 
@@ -1315,7 +1435,7 @@ Submit(Service *service, Connection *connection, int rdma, uint16_t operation,
 	job->payload = payload;
 	job->charge = charge;
 	(void) pthread_mutex_lock(&service->mutex);
-	if (service->pending_bytes + charge > service->options.max_pending_bytes)
+	if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + charge > service->options.max_pending_bytes)
 	{
 		service->rejected++;
 		(void) pthread_mutex_unlock(&service->mutex);
@@ -1323,7 +1443,7 @@ Submit(Service *service, Connection *connection, int rdma, uint16_t operation,
 		free(job);
 		return ANN_OVERLOADED;
 	}
-	service->pending_bytes += charge;
+	(void) __atomic_add_fetch(&service->pending_bytes, charge, __ATOMIC_RELAXED);
 	(void) pthread_mutex_lock(&connection->mutex);
 	connection->references++;
 	(void) pthread_mutex_unlock(&connection->mutex);
@@ -1374,7 +1494,7 @@ Enqueue(Service *service, Connection *connection, Job *job)
 	AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
 
 	(void) pthread_mutex_lock(&service->mutex);
-	if (service->pending_bytes + job->charge > service->options.max_pending_bytes)
+	if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + job->charge > service->options.max_pending_bytes)
 	{
 		service->rejected++;
 		(void) pthread_mutex_unlock(&service->mutex);
@@ -1386,7 +1506,7 @@ Enqueue(Service *service, Connection *connection, Job *job)
 	 * budget, so a flood on one index leaves room for the others.
 	 */
 	if (file && service->options.index_pending_share < 100 &&
-		file->pendingBytes + job->charge >
+		__atomic_load_n(&file->pendingBytes, __ATOMIC_RELAXED) + job->charge >
 		service->options.max_pending_bytes / 100 * service->options.index_pending_share)
 	{
 		service->rejected++;
@@ -1395,8 +1515,8 @@ Enqueue(Service *service, Connection *connection, Job *job)
 		return 0;
 	}
 	if (file)
-		file->pendingBytes += job->charge;
-	service->pending_bytes += job->charge;
+		(void) __atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
+	(void) __atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
 	(void) pthread_mutex_lock(&connection->mutex);
 	connection->references++;
 	(void) pthread_mutex_unlock(&connection->mutex);
@@ -1429,13 +1549,13 @@ EnqueueMany(Service *service, Connection *connection, Job **jobs, uint32_t count
 		AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
 
 		admitted[i] = 0;
-		if (service->pending_bytes + job->charge > service->options.max_pending_bytes)
+		if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + job->charge > service->options.max_pending_bytes)
 		{
 			service->rejected++;
 			continue;
 		}
 		if (file && service->options.index_pending_share < 100 &&
-			file->pendingBytes + job->charge >
+			__atomic_load_n(&file->pendingBytes, __ATOMIC_RELAXED) + job->charge >
 			service->options.max_pending_bytes / 100 * service->options.index_pending_share)
 		{
 			service->rejected++;
@@ -1443,8 +1563,8 @@ EnqueueMany(Service *service, Connection *connection, Job **jobs, uint32_t count
 			continue;
 		}
 		if (file)
-			file->pendingBytes += job->charge;
-		service->pending_bytes += job->charge;
+			(void) __atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
+		(void) __atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
 		if (traceFile)
 		{
 			job->arrived = frameArrived;
@@ -1465,6 +1585,79 @@ EnqueueMany(Service *service, Connection *connection, Job **jobs, uint32_t count
 	}
 	(void) pthread_mutex_unlock(&service->mutex);
 	return n;
+}
+
+/*
+ * Queue a pool reader's deferred jobs under one lock. A job the budget
+ * refuses is answered ANN_OVERLOADED here, as its submitter would have.
+ */
+static void
+EnqueueDeferred(Service *service)
+{
+	uint32_t	count = readerDeferredCount;
+	uint32_t	n = 0;
+	uint32_t	per = service->options.max_batch_jobs ? service->options.max_batch_jobs : 1;
+	char		admitted[ANN_READER_DEFERRED];
+
+	readerDeferredCount = 0;
+	if (count == 0)
+		return;
+	(void) pthread_mutex_lock(&service->mutex);
+	for (uint32_t i = 0; i < count; i++)
+	{
+		Job		   *job = readerDeferred[i];
+		AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
+
+		admitted[i] = 0;
+		if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + job->charge >
+			service->options.max_pending_bytes)
+		{
+			service->rejected++;
+			continue;
+		}
+		if (file && service->options.index_pending_share < 100 &&
+			__atomic_load_n(&file->pendingBytes, __ATOMIC_RELAXED) + job->charge >
+			service->options.max_pending_bytes / 100 * service->options.index_pending_share)
+		{
+			service->rejected++;
+			service->rejected_index++;
+			continue;
+		}
+		if (file)
+			(void) __atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
+		(void) __atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
+		if (traceFile)
+			job->queued = Now();
+		Append		(service, job);
+
+		admitted[i] = 1;
+		n++;
+	}
+
+	/*
+	 * One lane per max_batch jobs, as EnqueueMany: waking a lane per filter
+	 * group instead gave smaller batches and a quarter less throughput.
+	 */
+	for (uint32_t woken = 0; woken < (n + per - 1) / per; woken++)
+		(void) pthread_cond_signal(&service->condition);
+	(void) pthread_mutex_unlock(&service->mutex);
+	for (uint32_t i = 0; i < count; i++)
+	{
+		Job		   *job = readerDeferred[i];
+
+		if (admitted[i])
+			continue;
+		SendReply(job->connection, job->rdma, job->operation, job->request, ANN_OVERLOADED, NULL, 0);
+		if (job->bitmap)
+			AnnIndexBitmapRelease(job->bitmapFile, job->bitmap);
+		if (job->bitmapFile)
+			AnnIndexPut(job->bitmapFile);
+		Release(job->connection);
+		free(job->index.results);
+		free(job->exclude);
+		free(job->payload);
+		free(job);
+	}
 }
 
 static int
@@ -2212,6 +2405,20 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 	}
 	if (file)
 		AnnIndexHold(file);		/* until Finish: unloading waits for it */
+	if (readerDeferred && readerDeferredCount < ANN_READER_DEFERRED)
+	{
+		/*
+		 * Queued with the reader's other jobs of this round; see
+		 * EnqueueDeferred.
+		 */
+		(void) pthread_mutex_lock(&connection->mutex);
+		connection->references++;
+		(void) pthread_mutex_unlock(&connection->mutex);
+		if (traceFile)
+			job->arrived = frameArrived;
+		readerDeferred[readerDeferredCount++] = job;
+		return ANN_PENDING;
+	}
 	if (Enqueue(service, connection, job))
 		return ANN_PENDING;
 	if (file)
@@ -3207,6 +3414,355 @@ DictionaryOperation(uint16_t operation, const unsigned char *payload, uint32_t l
 	return status;
 }
 
+/*
+ * Reads one frame from a connection and serves it (or queues its job). 0 when
+ * the connection is done: closed, broken, or a protocol error.
+ */
+static int
+ServeFrame(Service *service, Connection *connection)
+{
+	unsigned char header[32];
+	unsigned char *payload;
+	uint16_t	operation;
+	uint64_t	request;
+	uint64_t	generation;
+	uint32_t	length;
+	AnnStatus	status;
+
+	if (!ReadFull(connection->fd, header, sizeof(header)) ||
+		memcmp(header, "PVAN", 4) != 0 || Read(header + 4, 2) != 1 ||
+		Read(header + 28, 4) != 0 || (length = (uint32_t) Read(header + 24, 4)) > ANN_MAX_BYTES)
+		return 0;
+	if (traceFile)
+		frameArrived = Now();
+	operation = (uint16_t) Read(header + 6, 2);
+	request = Read(header + 8, 8);
+	generation = Read(header + 16, 8);
+	payload = malloc(length ? length : 1);
+	if (payload == NULL || !ReadFull(connection->fd, payload, length))
+	{
+		free(payload);
+		return 0;
+	}
+	if (connection->remote && !connection->authenticated)
+	{
+		/*
+		 * The first network frame must carry the token; anything else closes.
+		 */
+		int			ok = operation == ANN_OP_AUTH && service->options.token &&
+			TokenMatches(service->options.token, payload, length);
+
+		free(payload);
+		if (!ok)
+			return 0;
+		connection->authenticated = 1;
+		{
+			/*
+			 * Authenticated clients may idle between queries. With --readers,
+			 * frames are read only once readable, so the timeout bounds a
+			 * frame that stops halfway, which would hold a reader.
+			 */
+			struct timeval idle = {service->options.readers ? 30 : 0, 0};
+
+			(void) setsockopt(connection->fd, SOL_SOCKET, SO_RCVTIMEO, &idle, sizeof(idle));
+		}
+		Reply(connection, operation, request, ANN_OK, NULL, 0);
+		return 1;
+	}
+	if ((status = CheckGeneration(operation, payload, length, generation)) != ANN_OK)
+	{
+		free(payload);
+		Reply(connection, operation, request, status, NULL, 0);
+		return 1;
+	}
+	if (connection->remote &&
+		(operation == ANN_OP_ATTACH_SHARED || operation == ANN_OP_SHARED_SEARCH))
+	{
+		/* Shared memory only works on the same host. */
+		free(payload);
+		Reply(connection, operation, request, ANN_UNSUPPORTED, NULL, 0);
+		return 1;
+	}
+	if (operation == ANN_OP_GATHERED_SEARCH || operation == ANN_OP_SHARED_SEARCH)
+	{
+		status = Submit(service, connection, 0, operation, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;			/* the lane owns the payload */
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == 0 || operation == ANN_OP_STATS)
+	{
+		char		message[1024];
+		int			size;
+		uint64_t	predicateEntries = 0,
+					predicateBytes = 0,
+					predicateDeviceBytes = 0,
+					predicateEvictions = 0;
+
+		uint64_t	rdmaFrames = 0,
+					rdmaFallbacks = 0;
+		int			rdmaLanes = 0;
+
+		if (service->rdma)
+			AnnRdmaStats(service->rdma, &rdmaFrames, &rdmaFallbacks, &rdmaLanes);
+		(void) rdmaFrames;
+		if (operation == ANN_OP_STATS)
+			AnnIndexPredicateStats(&predicateEntries, &predicateBytes, &predicateDeviceBytes,
+								   &predicateEvictions);
+		(void) pthread_mutex_lock(&service->mutex);
+		if (operation == 0)
+			size = snprintf(message, sizeof(message),
+							"{\"backend\":\"%s\",\"mode\":\"server\",\"operations\":[0,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,25,26,27,28,29,30,31],"
+							"\"metrics_mask\":%u,\"exact\":%s,\"lanes\":%u,\"max_batch_jobs\":%u,"
+							"\"max_frame_bytes\":%u}",
+							service->backend->name, service->backend->metrics,
+							service->backend->exact ? "true" : "false",
+							service->options.lanes, service->options.max_batch_jobs, ANN_MAX_BYTES);
+		else
+			size = snprintf(message, sizeof(message),
+							"{\"jobs\":%llu,\"batches\":%llu,\"max_batch\":%llu,\"rows\":%llu,"
+							"\"rejected\":%llu,\"rejected_index\":%llu,\"failed\":%llu,\"pending_bytes\":%llu,\"device_jobs\":%llu,"
+							"\"rdma_frames\":%llu,\"rdma_fallbacks\":%llu,\"rdma_lanes\":%d,"
+							"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu,\"predicate_hits\":%llu,"
+							"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
+							"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
+							"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
+							"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_residual\":%llu,"
+							"\"merged\":%llu}",
+							(unsigned long long) service->jobs, (unsigned long long) service->batches,
+							(unsigned long long) service->max_batch, (unsigned long long) service->rows,
+							(unsigned long long) service->rejected, (unsigned long long) service->rejected_index,
+							(unsigned long long) __atomic_load_n(&service->failed, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED),
+							(unsigned long long) (service->backend->device_jobs ?
+												  service->backend->device_jobs() : 0),
+							(unsigned long long) __atomic_load_n(&service->rdma_frames, __ATOMIC_RELAXED),
+							(unsigned long long) rdmaFallbacks,
+							rdmaLanes, (unsigned long long) service->groups,
+							(unsigned long long) service->grouped_jobs, (unsigned long long) service->held,
+							(unsigned long long) service->predicate_hits,
+							(unsigned long long) service->predicate_evaluations,
+							(unsigned long long) service->predicate_eval_us,
+							(unsigned long long) predicateEntries, (unsigned long long) predicateBytes,
+							(unsigned long long) predicateDeviceBytes,
+							(unsigned long long) predicateEvictions,
+							(unsigned long long) __atomic_load_n(&service->predicate_canonical, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->predicate_residual, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->merged, __ATOMIC_RELAXED));
+		(void) pthread_mutex_unlock(&service->mutex);
+		Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
+			  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);
+	}
+	else if (operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED)
+	{
+		status = SubmitIndex(service, connection, 0, operation, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_INDEX_SEARCH_MATCH)
+	{
+		status = SubmitMatch(service, connection, 0, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_INDEX_SEARCH_BITMAP)
+	{
+		status = SubmitBitmap(service, connection, 0, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_INDEX_SEARCH_CACHED)
+	{
+		status = SubmitCached(service, connection, 0, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
+	{
+		status = SubmitPredicate(service, connection, 0, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_INDEX_SEARCH_BATCH)
+	{
+		status = SubmitBatch(service, connection, 0, request, payload, length, generation);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_COLLECTION_SEARCH)
+	{
+		status = SubmitCollection(service, connection, 0, request, payload, length);
+		if (status == ANN_PENDING)
+			return 1;
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_INDEX_ROUTING_STATS)
+	{
+		char		name[ANN_INDEX_NAME_MAX + 1];
+		char		message[8192];
+		size_t		size = 0;
+		AnnIndexFile *file;
+
+		status = ANN_INVALID;
+		if (length > 0 && length <= ANN_INDEX_NAME_MAX && !memchr(payload, '\0', length))
+		{
+			memcpy(name, payload, length);
+			name[length] = '\0';
+			if ((file = AnnIndexGet(name)) == NULL)
+				status = ANN_STALE;
+			else
+			{
+				if (AnnIndexRoutingStats)
+					size = AnnIndexRoutingStats(file, message, sizeof(message));
+				status = size ? ANN_OK : ANN_UNSUPPORTED;
+				AnnIndexPut(file);
+			}
+		}
+		Reply(connection, operation, request, status, (unsigned char *) message, size);
+	}
+	else if (operation == ANN_OP_INDEX_PREDICATE)
+	{
+		unsigned char *bitmap = NULL;
+		size_t		bitmapLength = 0;
+
+		status = EvaluatePredicate(service, payload, length, &bitmap, &bitmapLength);
+		Reply(connection, operation, request, status, bitmap, bitmapLength);
+		free(bitmap);
+	}
+	else if (operation == ANN_OP_BITMAP_PUT)
+		Reply(connection, operation, request, PutBitmap(payload, length), NULL, 0);
+	else if (operation == ANN_OP_INDEX_BITMAP)
+	{
+		unsigned char *bitmap = NULL;
+		size_t		bitmapLength = 0;
+
+		status = BuildBitmap(payload, length, &bitmap, &bitmapLength);
+		Reply(connection, operation, request, status, bitmap, bitmapLength);
+		free(bitmap);
+	}
+	else if (operation == ANN_OP_LOAD_INDEX)
+	{
+		char		message[512];
+		size_t		textLength = 0;
+
+		/* Loading blocks only this connection's reader. */
+		status = LoadIndex(service, payload, length, message, sizeof(message), &textLength);
+		Reply(connection, operation, request, status, (unsigned char *) message,
+			  status == ANN_OK ? textLength : 0);
+	}
+	else if (operation == ANN_OP_INDEX_INFO)
+	{
+		char		message[512];
+		size_t		textLength = 0;
+
+		status = DescribeIndex(payload, length, message, sizeof(message), &textLength);
+
+		Reply(connection, operation, request, status, (unsigned char *) message,
+			  status == ANN_OK ? textLength : 0);
+	}
+	else if (operation == ANN_OP_DELETE_KEYS)
+	{
+		/* u32 name length, name, u32 count, keys; reply: added, total */
+		char		name[ANN_INDEX_NAME_MAX + 1];
+		uint32_t	nameLength = length >= 4 ? (uint32_t) Read(payload, 4) : 0;
+		uint32_t	count = 0;
+		unsigned char answer[16];
+		AnnIndexFile *file = NULL;
+		uint64_t	added = 0;
+
+		if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length < 8 + (uint64_t) nameLength ||
+			(uint64_t) length != 8 + (uint64_t) nameLength +
+			8 * (uint64_t) (count = (uint32_t) Read(payload + 4 + nameLength, 4)) ||
+			memchr(payload + 4, '\0', nameLength))
+			status = ANN_INVALID;
+		else
+		{
+			int64_t    *keys = malloc(sizeof(int64_t) * (count ? count : 1));
+
+			memcpy(name, payload + 4, nameLength);
+			name[nameLength] = '\0';
+			if (keys == NULL)
+				status = ANN_NOMEM;
+			else if ((file = AnnIndexGet(name)) == NULL)
+				status = ANN_STALE;
+			else
+			{
+				for (uint32_t i = 0; i < count; i++)
+					keys[i] = (int64_t) Read(payload + 8 + nameLength + (size_t) i * 8, 8);
+				status = AnnIndexDelete(file, keys, count, &added);
+				Write(answer, added, 8);
+				Write(answer + 8, __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE), 8);
+				AnnIndexPut(file);
+			}
+			free(keys);
+		}
+		Reply(connection, operation, request, status, answer, status == ANN_OK ? 16 : 0);
+	}
+	else if (operation == ANN_OP_DICTIONARY || operation == ANN_OP_REMAP)
+	{
+		unsigned char *data = NULL;
+		size_t		dataLength = 0;
+
+		status = DictionaryOperation(operation, payload, length, &data, &dataLength);
+		Reply(connection, operation, request, status, data, status == ANN_OK ? dataLength : 0);
+		free(data);
+	}
+	else if (operation == ANN_OP_UNLOAD_INDEX)
+	{
+		/* u32 name length, name; freed after its searches */
+		char		name[ANN_INDEX_NAME_MAX + 1];
+		uint32_t	nameLength = length >= 4 ? (uint32_t) Read(payload, 4) : 0;
+
+		if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length != 4 + (uint64_t) nameLength ||
+			memchr(payload + 4, '\0', nameLength))
+			status = ANN_INVALID;
+		else
+		{
+			memcpy(name, payload + 4, nameLength);
+			name[nameLength] = '\0';
+			status = AnnIndexUnload(name);
+		}
+		Reply(connection, operation, request, status, NULL, 0);
+	}
+	else if (operation == ANN_OP_AUTH)
+		Reply(connection, operation, request, ANN_OK, NULL, 0);
+	else if (operation == ANN_OP_RDMA_HELLO)
+	{
+		unsigned char message[1400];
+		size_t		messageLength = 0;
+
+		status = Hello(service, connection, payload, length, message, sizeof(message), &messageLength);
+		Reply(connection, operation, request, status, message, status == ANN_OK ? messageLength : 0);
+	}
+	else if (operation == ANN_OP_ATTACH_SHARED)
+		Reply(connection, operation, request, Attach(connection, payload, length), NULL, 0);
+	else if (operation == 5)
+		Reply(connection, operation, request, ANN_OK, NULL, 0);
+	else
+		Reply(connection, operation, request, ANN_UNSUPPORTED, NULL, 0);
+	free(payload);
+	return 1;
+}
+
+static void
+CloseConnection(Service *service, Connection *connection)
+{
+	(void) pthread_mutex_lock(&connection->mutex);
+	connection->broken = 1;
+	(void) shutdown(connection->fd, SHUT_RDWR);
+	(void) pthread_mutex_unlock(&connection->mutex);
+	Goodbye(service, connection);
+	Release(connection);
+}
+
+/* --readers 0: one thread per connection. */
 static void *
 Reader(void *argument)
 {
@@ -3215,338 +3771,54 @@ Reader(void *argument)
 	Connection *connection = args->connection;
 
 	free(args);
-	for (;;)
-	{
-		unsigned char header[32];
-		unsigned char *payload;
-		uint16_t	operation;
-		uint64_t	request;
-		uint64_t	generation;
-		uint32_t	length;
-		AnnStatus	status;
-
-		if (!ReadFull(connection->fd, header, sizeof(header)) ||
-			memcmp(header, "PVAN", 4) != 0 || Read(header + 4, 2) != 1 ||
-			Read(header + 28, 4) != 0 || (length = (uint32_t) Read(header + 24, 4)) > ANN_MAX_BYTES)
-			break;
-		if (traceFile)
-			frameArrived = Now();
-		operation = (uint16_t) Read(header + 6, 2);
-		request = Read(header + 8, 8);
-		generation = Read(header + 16, 8);
-		payload = malloc(length ? length : 1);
-		if (payload == NULL || !ReadFull(connection->fd, payload, length))
-		{
-			free(payload);
-			break;
-		}
-		if (connection->remote && !connection->authenticated)
-		{
-			/*
-			 * The first network frame must carry the token; anything else
-			 * closes.
-			 */
-			int			ok = operation == ANN_OP_AUTH && service->options.token &&
-				TokenMatches(service->options.token, payload, length);
-
-			free(payload);
-			if (!ok)
-				break;
-			connection->authenticated = 1;
-			{
-				struct timeval none = {0, 0};
-
-				/* Authenticated clients may idle between queries. */
-				(void) setsockopt(connection->fd, SOL_SOCKET, SO_RCVTIMEO, &none, sizeof(none));
-			}
-			Reply(connection, operation, request, ANN_OK, NULL, 0);
-			continue;
-		}
-		if ((status = CheckGeneration(operation, payload, length, generation)) != ANN_OK)
-		{
-			free(payload);
-			Reply(connection, operation, request, status, NULL, 0);
-			continue;
-		}
-		if (connection->remote &&
-			(operation == ANN_OP_ATTACH_SHARED || operation == ANN_OP_SHARED_SEARCH))
-		{
-			/* Shared memory only works on the same host. */
-			free(payload);
-			Reply(connection, operation, request, ANN_UNSUPPORTED, NULL, 0);
-			continue;
-		}
-		if (operation == ANN_OP_GATHERED_SEARCH || operation == ANN_OP_SHARED_SEARCH)
-		{
-			status = Submit(service, connection, 0, operation, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;		/* the lane owns the payload */
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == 0 || operation == ANN_OP_STATS)
-		{
-			char		message[1024];
-			int			size;
-			uint64_t	predicateEntries = 0,
-						predicateBytes = 0,
-						predicateDeviceBytes = 0,
-						predicateEvictions = 0;
-
-			uint64_t	rdmaFrames = 0,
-						rdmaFallbacks = 0;
-			int			rdmaLanes = 0;
-
-			if (service->rdma)
-				AnnRdmaStats(service->rdma, &rdmaFrames, &rdmaFallbacks, &rdmaLanes);
-			(void) rdmaFrames;
-			if (operation == ANN_OP_STATS)
-				AnnIndexPredicateStats(&predicateEntries, &predicateBytes, &predicateDeviceBytes,
-									   &predicateEvictions);
-			(void) pthread_mutex_lock(&service->mutex);
-			if (operation == 0)
-				size = snprintf(message, sizeof(message),
-								"{\"backend\":\"%s\",\"mode\":\"server\",\"operations\":[0,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,25,26,27,28,29,30,31],"
-								"\"metrics_mask\":%u,\"exact\":%s,\"lanes\":%u,\"max_batch_jobs\":%u,"
-								"\"max_frame_bytes\":%u}",
-								service->backend->name, service->backend->metrics,
-								service->backend->exact ? "true" : "false",
-								service->options.lanes, service->options.max_batch_jobs, ANN_MAX_BYTES);
-			else
-				size = snprintf(message, sizeof(message),
-								"{\"jobs\":%llu,\"batches\":%llu,\"max_batch\":%llu,\"rows\":%llu,"
-								"\"rejected\":%llu,\"rejected_index\":%llu,\"failed\":%llu,\"pending_bytes\":%llu,\"device_jobs\":%llu,"
-								"\"rdma_frames\":%llu,\"rdma_fallbacks\":%llu,\"rdma_lanes\":%d,"
-								"\"groups\":%llu,\"grouped_jobs\":%llu,\"held\":%llu,\"predicate_hits\":%llu,"
-								"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
-								"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
-								"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
-								"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_residual\":%llu}",
-								(unsigned long long) service->jobs, (unsigned long long) service->batches,
-								(unsigned long long) service->max_batch, (unsigned long long) service->rows,
-								(unsigned long long) service->rejected, (unsigned long long) service->rejected_index,
-								(unsigned long long) service->failed, (unsigned long long) service->pending_bytes,
-								(unsigned long long) (service->backend->device_jobs ?
-													  service->backend->device_jobs() : 0),
-								(unsigned long long) __atomic_load_n(&service->rdma_frames, __ATOMIC_RELAXED),
-								(unsigned long long) rdmaFallbacks,
-								rdmaLanes, (unsigned long long) service->groups,
-								(unsigned long long) service->grouped_jobs, (unsigned long long) service->held,
-								(unsigned long long) service->predicate_hits,
-								(unsigned long long) service->predicate_evaluations,
-								(unsigned long long) service->predicate_eval_us,
-								(unsigned long long) predicateEntries, (unsigned long long) predicateBytes,
-								(unsigned long long) predicateDeviceBytes,
-								(unsigned long long) predicateEvictions,
-								(unsigned long long) __atomic_load_n(&service->predicate_canonical, __ATOMIC_RELAXED),
-								(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED),
-								(unsigned long long) __atomic_load_n(&service->predicate_residual, __ATOMIC_RELAXED));
-			(void) pthread_mutex_unlock(&service->mutex);
-			Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
-				  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);
-		}
-		else if (operation == ANN_OP_INDEX_SEARCH || operation == ANN_OP_INDEX_SEARCH_PACKED)
-		{
-			status = SubmitIndex(service, connection, 0, operation, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_INDEX_SEARCH_MATCH)
-		{
-			status = SubmitMatch(service, connection, 0, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_INDEX_SEARCH_BITMAP)
-		{
-			status = SubmitBitmap(service, connection, 0, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_INDEX_SEARCH_CACHED)
-		{
-			status = SubmitCached(service, connection, 0, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_INDEX_SEARCH_PREDICATE)
-		{
-			status = SubmitPredicate(service, connection, 0, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_INDEX_SEARCH_BATCH)
-		{
-			status = SubmitBatch(service, connection, 0, request, payload, length, generation);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_COLLECTION_SEARCH)
-		{
-			status = SubmitCollection(service, connection, 0, request, payload, length);
-			if (status == ANN_PENDING)
-				continue;
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_INDEX_ROUTING_STATS)
-		{
-			char		name[ANN_INDEX_NAME_MAX + 1];
-			char		message[8192];
-			size_t		size = 0;
-			AnnIndexFile *file;
-
-			status = ANN_INVALID;
-			if (length > 0 && length <= ANN_INDEX_NAME_MAX && !memchr(payload, '\0', length))
-			{
-				memcpy(name, payload, length);
-				name[length] = '\0';
-				if ((file = AnnIndexGet(name)) == NULL)
-					status = ANN_STALE;
-				else
-				{
-					if (AnnIndexRoutingStats)
-						size = AnnIndexRoutingStats(file, message, sizeof(message));
-					status = size ? ANN_OK : ANN_UNSUPPORTED;
-					AnnIndexPut(file);
-				}
-			}
-			Reply(connection, operation, request, status, (unsigned char *) message, size);
-		}
-		else if (operation == ANN_OP_INDEX_PREDICATE)
-		{
-			unsigned char *bitmap = NULL;
-			size_t		bitmapLength = 0;
-
-			status = EvaluatePredicate(service, payload, length, &bitmap, &bitmapLength);
-			Reply(connection, operation, request, status, bitmap, bitmapLength);
-			free(bitmap);
-		}
-		else if (operation == ANN_OP_BITMAP_PUT)
-			Reply(connection, operation, request, PutBitmap(payload, length), NULL, 0);
-		else if (operation == ANN_OP_INDEX_BITMAP)
-		{
-			unsigned char *bitmap = NULL;
-			size_t		bitmapLength = 0;
-
-			status = BuildBitmap(payload, length, &bitmap, &bitmapLength);
-			Reply(connection, operation, request, status, bitmap, bitmapLength);
-			free(bitmap);
-		}
-		else if (operation == ANN_OP_LOAD_INDEX)
-		{
-			char		message[512];
-			size_t		textLength = 0;
-
-			/* Loading blocks only this connection's reader. */
-			status = LoadIndex(service, payload, length, message, sizeof(message), &textLength);
-			Reply(connection, operation, request, status, (unsigned char *) message,
-				  status == ANN_OK ? textLength : 0);
-		}
-		else if (operation == ANN_OP_INDEX_INFO)
-		{
-			char		message[512];
-			size_t		textLength = 0;
-
-			status = DescribeIndex(payload, length, message, sizeof(message), &textLength);
-
-			Reply(connection, operation, request, status, (unsigned char *) message,
-				  status == ANN_OK ? textLength : 0);
-		}
-		else if (operation == ANN_OP_DELETE_KEYS)
-		{
-			/* u32 name length, name, u32 count, keys; reply: added, total */
-			char		name[ANN_INDEX_NAME_MAX + 1];
-			uint32_t	nameLength = length >= 4 ? (uint32_t) Read(payload, 4) : 0;
-			uint32_t	count = 0;
-			unsigned char answer[16];
-			AnnIndexFile *file = NULL;
-			uint64_t	added = 0;
-
-			if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length < 8 + (uint64_t) nameLength ||
-				(uint64_t) length != 8 + (uint64_t) nameLength +
-				8 * (uint64_t) (count = (uint32_t) Read(payload + 4 + nameLength, 4)) ||
-				memchr(payload + 4, '\0', nameLength))
-				status = ANN_INVALID;
-			else
-			{
-				int64_t    *keys = malloc(sizeof(int64_t) * (count ? count : 1));
-
-				memcpy(name, payload + 4, nameLength);
-				name[nameLength] = '\0';
-				if (keys == NULL)
-					status = ANN_NOMEM;
-				else if ((file = AnnIndexGet(name)) == NULL)
-					status = ANN_STALE;
-				else
-				{
-					for (uint32_t i = 0; i < count; i++)
-						keys[i] = (int64_t) Read(payload + 8 + nameLength + (size_t) i * 8, 8);
-					status = AnnIndexDelete(file, keys, count, &added);
-					Write(answer, added, 8);
-					Write(answer + 8, __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE), 8);
-					AnnIndexPut(file);
-				}
-				free(keys);
-			}
-			Reply(connection, operation, request, status, answer, status == ANN_OK ? 16 : 0);
-		}
-		else if (operation == ANN_OP_DICTIONARY || operation == ANN_OP_REMAP)
-		{
-			unsigned char *data = NULL;
-			size_t		dataLength = 0;
-
-			status = DictionaryOperation(operation, payload, length, &data, &dataLength);
-			Reply(connection, operation, request, status, data, status == ANN_OK ? dataLength : 0);
-			free(data);
-		}
-		else if (operation == ANN_OP_UNLOAD_INDEX)
-		{
-			/* u32 name length, name; freed after its searches */
-			char		name[ANN_INDEX_NAME_MAX + 1];
-			uint32_t	nameLength = length >= 4 ? (uint32_t) Read(payload, 4) : 0;
-
-			if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length != 4 + (uint64_t) nameLength ||
-				memchr(payload + 4, '\0', nameLength))
-				status = ANN_INVALID;
-			else
-			{
-				memcpy(name, payload + 4, nameLength);
-				name[nameLength] = '\0';
-				status = AnnIndexUnload(name);
-			}
-			Reply(connection, operation, request, status, NULL, 0);
-		}
-		else if (operation == ANN_OP_AUTH)
-			Reply(connection, operation, request, ANN_OK, NULL, 0);
-		else if (operation == ANN_OP_RDMA_HELLO)
-		{
-			unsigned char message[1400];
-			size_t		messageLength = 0;
-
-			status = Hello(service, connection, payload, length, message, sizeof(message), &messageLength);
-			Reply(connection, operation, request, status, message, status == ANN_OK ? messageLength : 0);
-		}
-		else if (operation == ANN_OP_ATTACH_SHARED)
-			Reply(connection, operation, request, Attach(connection, payload, length), NULL, 0);
-		else if (operation == 5)
-			Reply(connection, operation, request, ANN_OK, NULL, 0);
-		else
-			Reply(connection, operation, request, ANN_UNSUPPORTED, NULL, 0);
-		free(payload);
-	}
-	(void) pthread_mutex_lock(&connection->mutex);
-	connection->broken = 1;
-	(void) shutdown(connection->fd, SHUT_RDWR);
-	(void) pthread_mutex_unlock(&connection->mutex);
-	Goodbye(service, connection);
-	Release(connection);
+	while (ServeFrame(service, connection))
+		;
+	CloseConnection(service, connection);
 	return NULL;
 }
+
+#ifdef __linux__
+static int *readerPolls;		/* one epoll set per --readers thread */
+static unsigned nextReader;		/* round robin, accept thread only */
+
+/*
+ * A --readers thread: serves frames of the connections it was given, in turn
+ * as they become readable. Each connection belongs to one reader, so its
+ * frames are read in order without rearming, and readers share no lock: one
+ * epoll set with EPOLLONESHOT rearmed after every frame had all of them
+ * queued in the kernel on that set. Idle connections cost no thread.
+ */
+static void *
+PoolReader(void *argument)
+{
+	Service    *service = argument;
+	int			poll = readerPolls[__atomic_fetch_add(&nextReader, 1, __ATOMIC_RELAXED) % service->options.readers];
+
+	Job		   *deferred[ANN_READER_DEFERRED];
+
+	readerDeferred = deferred;
+	for (;;)
+	{
+		struct epoll_event events[ANN_READER_DEFERRED];
+		int			n = epoll_wait(poll, events, ANN_READER_DEFERRED, -1);
+
+		for (int i = 0; i < n; i++)
+		{
+			Connection *connection = events[i].data.ptr;
+
+			if (!ServeFrame(service, connection))
+			{
+				(void) epoll_ctl(poll, EPOLL_CTL_DEL, connection->fd, NULL);
+				CloseConnection(service, connection);
+			}
+			if (readerDeferredCount == ANN_READER_DEFERRED)
+				EnqueueDeferred(service);
+		}
+		EnqueueDeferred(service);
+	}
+	return NULL;
+}
+#endif
 
 int
 AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *options)
@@ -3561,6 +3833,9 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	pthread_t  *lanes;
 	int			listener = -1;
 	int			network = -1;
+#ifdef __linux__
+	unsigned	nextConnection = 0; /* round robin over the readers */
+#endif
 
 	/* A Unix socket, a TCP port, or both: TCP-only nodes serve remote hosts. */
 	if (options->lanes == 0 || options->max_batch_jobs == 0 || (path == NULL && options->tcp == NULL) ||
@@ -3607,7 +3882,7 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		(void) unlink(path);
 		listener = socket(AF_UNIX, SOCK_STREAM, 0);
 		if (listener < 0 || bind(listener, (struct sockaddr *) &address, sizeof(address)) != 0 ||
-			listen(listener, 128) != 0)
+			listen(listener, 4096) != 0)
 		{
 			perror("ann-worker listen");
 			return 1;
@@ -3635,7 +3910,7 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		if (getaddrinfo(host, colon + 1, &hints, &result) != 0 ||
 			(network = socket(result->ai_family, SOCK_STREAM, 0)) < 0 ||
 			setsockopt(network, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on)) != 0 ||
-			bind(network, result->ai_addr, result->ai_addrlen) != 0 || listen(network, 1024) != 0)
+			bind(network, result->ai_addr, result->ai_addrlen) != 0 || listen(network, 4096) != 0)
 		{
 			perror("ann-worker tcp listen");
 			return 1;
@@ -3648,6 +3923,26 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	for (uint32_t i = 0; i < options->lanes; i++)
 		if (pthread_create(&lanes[i], NULL, Lane, &service) != 0)
 			return 1;
+#ifdef __linux__
+	if (service.options.readers)
+	{
+		pthread_t	reader;
+
+		if ((readerPolls = calloc(service.options.readers, sizeof(*readerPolls))) == NULL)
+			return 1;
+		for (uint32_t i = 0; i < service.options.readers; i++)
+			if ((readerPolls[i] = epoll_create1(EPOLL_CLOEXEC)) < 0)
+				return 1;
+		for (uint32_t i = 0; i < service.options.readers; i++)
+		{
+			if (pthread_create(&reader, NULL, PoolReader, &service) != 0)
+				return 1;
+			(void) pthread_detach(reader);
+		}
+	}
+#else
+	service.options.readers = 0;	/* epoll only: a thread per connection */
+#endif
 	if (options->rdma)
 	{
 		char		error[512];
@@ -3736,6 +4031,17 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		(void) pthread_mutex_init(&connection->mutex, NULL);
 		args->service = &service;
 		args->connection = connection;
+#ifdef __linux__
+		if (service.options.readers)
+		{
+			struct epoll_event event = {.events = EPOLLIN,.data.ptr = connection};
+
+			free(args);
+			if (epoll_ctl(readerPolls[nextConnection++ % service.options.readers], EPOLL_CTL_ADD, fd, &event) != 0)
+				Release(connection);
+			continue;
+		}
+#endif
 		if (pthread_create(&thread, NULL, Reader, args) != 0)
 		{
 			free(args);

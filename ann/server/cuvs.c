@@ -606,8 +606,10 @@ typedef struct AnnCuvsIndex
 	int			fp16;
 	int			quantized;		/* every shard copy has its quantized rows */
 	int			grouped;		/* every shard copy can be scored in groups */
-	int			scanOnly;		/* no CAGRA graphs: every search scans the quantized rows */
-	int			rescoreGpu;		/* every shard copy has its FP8 re-scoring rows */
+	int			scanOnly;		/* no CAGRA graphs: every search scans the
+								 * quantized rows */
+	int			rescoreGpu;		/* every shard copy has its FP8 re-scoring
+								 * rows */
 	AnnCuvsShard *shards;
 	AnnCuvsRoute routing[ANN_CUVS_MAX_DEVICES];
 	atomic_uint_fast64_t matrix_queries;
@@ -809,7 +811,8 @@ typedef struct AnnCuvsDevice
 	size_t		queryBytes;
 	size_t		resultCount;
 	size_t		bitsetWords;
-	float	   *groupScores;	/* grouped large-k scan: [queries][rows] distances */
+	float	   *groupScores;	/* grouped large-k scan: [queries][rows]
+								 * distances */
 	size_t		groupCapacity;
 	float	   *hostBest;		/* pinned: selected distances (--rescore off) */
 	uint32_t   *rescoreRows;	/* --rescore fp8-gpu: candidates' shard rows */
@@ -817,9 +820,10 @@ typedef struct AnnCuvsDevice
 	uint32_t   *hostRescoreRows;	/* pinned */
 	float	   *hostRescoreOut; /* pinned */
 	size_t		rescoreCapacity;
-	cudaEvent_t timing[4];		/* ANN_KERNEL_TIMING: candidate scan and copy marks */
+	cudaEvent_t timing[4];		/* ANN_KERNEL_TIMING: candidate scan and copy
+								 * marks */
 	cudaEvent_t matrixTiming[6];	/* ANN_KERNEL_TIMING: matrix gather stages */
-	cudaEvent_t pruneTiming[3];		/* the selection's cutoff, compact, sort ends */
+	cudaEvent_t pruneTiming[3]; /* the selection's cutoff, compact, sort ends */
 	int			pruneMarks;
 	int			pruneFused;		/* the marks are the fused path's */
 	int			matrixTimingReady;
@@ -872,12 +876,16 @@ typedef struct AnnCuvsDevice
 	uint32_t   *expandBlocks;
 	size_t		expandWordCap,
 				expandBlockCap;
-	/* fused pruned selection: sampled rows, cutoffs, u32 candidates and counts */
+
+	/*
+	 * fused pruned selection: sampled rows, cutoffs, u32 candidates and
+	 * counts
+	 */
 	uint32_t   *fuseSampleRows;
 	float	   *fuseBounds;
 	uint32_t   *fusePositions;
 	uint32_t   *fuseCounts;
-	uint32_t   *hostFuseCounts;	/* pinned */
+	uint32_t   *hostFuseCounts; /* pinned */
 	size_t		fuseSampleRowCap,
 				fuseBoundCap,
 				fusePositionCap,
@@ -1031,7 +1039,10 @@ LoadShard(void *argument)
 	shard->device = args->device;
 	if (args->state->scanOnly)
 	{
-		/* No graph: the shard's keys and quantized rows are all the GPU holds. */
+		/*
+		 * No graph: the shard's keys and quantized rows are all the GPU
+		 * holds.
+		 */
 		if (cudaSetDevice(shard->device) != cudaSuccess)
 			return NULL;
 		goto keys;
@@ -1126,6 +1137,47 @@ keys:
 			shard->rerank = shard->rows;
 			shard->rerankHalf = 1;
 			shard->rerankStride = shard->stride;
+		}
+		else if (!AnnIndexConfig.fp16_exact)
+		{
+			/*
+			 * No dataset on the device (scan-only shards): an FP16 copy with
+			 * rows padded to a multiple of 8 dimensions, so the fused rerank
+			 * kernels' 16-byte loads apply, at half the bytes of FP32.
+			 */
+			uint64_t	rows = args->file->shards[args->shard].rows;
+			uint32_t	dims = args->file->dimensions;
+			uint32_t	pad = (dims + 7) & ~7u;
+			size_t		bytes = (size_t) rows * pad * sizeof(uint16_t);
+			uint16_t   *copy = NULL;
+			uint16_t   *staged = calloc((size_t) rows * pad, sizeof(uint16_t));
+
+			if (staged)
+			{
+				const float *from = args->file->vectors + args->file->shards[args->shard].first * dims;
+
+				for (uint64_t r = 0; r < rows; r++)
+					for (uint32_t d = 0; d < dims; d++)
+						staged[r * pad + d] = AnnIndexHalf(from[r * dims + d]);
+			}
+			if (staged && cudaMalloc((void **) &copy, bytes) == cudaSuccess &&
+				cudaMemcpy(copy, staged, bytes, cudaMemcpyHostToDevice) == cudaSuccess)
+			{
+				shard->rerank = copy;
+				shard->rerankHalf = 1;
+				shard->rerankBytes = bytes;
+				shard->rerankStride = pad;
+			}
+			else
+			{
+				if (copy)
+					(void) cudaFree(copy);
+				shard->rerank = NULL;
+				(void) cudaGetLastError();
+				fprintf(stderr, "cuVS: FP16 rerank copy unavailable on device %d shard %u; using host reranking\n",
+						shard->device, args->shard);
+			}
+			free(staged);
 		}
 		else
 		{
@@ -1242,9 +1294,11 @@ UploadStream(int device)
 		cudaMemPool_t pool;
 
 		/*
-		 * Keep freed bitmap memory in the pool instead of unmapping it, up to the cached rows' budget
-		 * and 2 GB more. Lane buffers come from the same pool and regrow as filters widen (232k, then
-		 * 1.4M, then 11.6M rows): kept without a bound, every generation stayed reserved, 27.6 of 32 GB.
+		 * Keep freed bitmap memory in the pool instead of unmapping it, up to
+		 * the cached rows' budget and 2 GB more. Lane buffers come from the
+		 * same pool and regrow as filters widen (232k, then 1.4M, then 11.6M
+		 * rows): kept without a bound, every generation stayed reserved, 27.6
+		 * of 32 GB.
 		 */
 		uint64_t	keep = AnnIndexConfig.predicate_device_bytes + (UINT64_C(2) << 30);
 
@@ -2086,7 +2140,13 @@ LoadIndex(const char *name, const char *directory)
 	if (devices > ANN_CUVS_MAX_DEVICES)
 		devices = ANN_CUVS_MAX_DEVICES;
 	state = calloc(1, sizeof(*state));
-	copies = AnnIndexConfig.replicate ? (uint32_t) devices : 1;
+
+	/*
+	 * --replicate on: a copy per GPU; --replicate N: N copies, shards spread
+	 * over the GPUs.
+	 */
+	copies = AnnIndexConfig.replicate == 1 || AnnIndexConfig.replicate >= devices ? (uint32_t) devices :
+		AnnIndexConfig.replicate > 1 ? (uint32_t) AnnIndexConfig.replicate : 1;
 	total = file->nshards * copies;
 	args = calloc(total, sizeof(*args));
 	threads = calloc(total, sizeof(*threads));
@@ -2190,7 +2250,8 @@ LoadIndex(const char *name, const char *directory)
 
 		args[s] = (LoadArgs)
 		{
-			file, state, shard, s, copies > 1 ? (int) copy : (int) (shard % (uint32_t) devices),
+			file, state, shard, s, copies == (uint32_t) devices ? (int) copy :
+				(int) ((copy * file->nshards + shard) % (uint32_t) devices),
 				1, ANN_BACKEND_ERROR
 		};
 		if (pthread_create(&threads[s], NULL, LoadShard, &args[s]) != 0)
@@ -2478,7 +2539,17 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			lane->params->max_iterations = AnnIndexConfig.filtered_iterations;
 		}
 		if (lane->params->algo != MULTI_CTA && lane->params->itopk_size > 512)
-			lane->params->itopk_size = 512;
+		{
+			/*
+			 * Single-CTA search takes at most 512 of itopk; a k above that
+			 * (an unfiltered k=1000 over a shard too large for the scan)
+			 * needs the multi-CTA search, which cuVS otherwise rejects.
+			 */
+			if (k > 512)
+				lane->params->algo = MULTI_CTA;
+			else
+				lane->params->itopk_size = 512;
+		}
 		queries = QueryTensor(lane->queries, shard->device, state->fp16, queryShape);
 		neighbors = Tensor(lane->neighbors + slot[s], kDLCUDA, shard->device, kDLUInt, 2, resultShape);
 		distances = Tensor(lane->distances + slot[s], kDLCUDA, shard->device, kDLFloat, 2, resultShape);
@@ -2586,9 +2657,9 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 /* cuVS CAGRA's top-k selection takes at most this many candidates. */
 #define ANN_CAGRA_MAX_ITOPK 1024
 
-static int SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *const *jobs,
-						uint32_t m, uint32_t k, uint32_t itopk, uint32_t **bitsets, void *const *deviceBitsets,
-						const int *useShard, AnnIndexHit *lists, uint32_t *counts);
+static int	SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *const *jobs,
+						 uint32_t m, uint32_t k, uint32_t itopk, uint32_t **bitsets, void *const *deviceBitsets,
+						 const int *useShard, AnnIndexHit *lists, uint32_t *counts);
 
 /* Merge per-shard lists for query j into its job's results. */
 static void
@@ -2889,6 +2960,24 @@ static const char FusedSelectSource[] =
 "{\n"
 "  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
 "  if (i < q) out[i * 32 + 31] = bounds[(unsigned long long) i * rank + rank - 1];\n"
+"}\n"
+"/* The rank-th smallest sampled score, from the unordered rank smallest (prune_select_s), placed last. */\n"
+"extern \"C\" __global__ void bound_max(float *bounds, unsigned rank, unsigned q)\n"
+"{\n"
+"  __shared__ float part[32];\n"
+"  unsigned row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;\n"
+"  float *b = bounds + (unsigned long long) row * rank, m = -__int_as_float(0x7f800000);\n"
+"  if (row >= q) return;\n"
+"  for (unsigned i = tid; i < rank; i += blockDim.x) m = fmaxf(m, b[i]);\n"
+"  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));\n"
+"  if (lane == 0) part[warp] = m;\n"
+"  __syncthreads();\n"
+"  if (warp == 0)\n"
+"  {\n"
+"    m = lane < (blockDim.x >> 5) ? part[lane] : -__int_as_float(0x7f800000);\n"
+"    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));\n"
+"    if (lane == 0) b[rank - 1] = m;\n"
+"  }\n"
 "}\n";
 
 /* Mixed-filter groups (SearchGatherMixed): the same per query's own list. */
@@ -2961,31 +3050,42 @@ static const char PostSource1[] =
 "}\n";
 
 static const char PostSource2[] =
-"__device__ __forceinline__ double sq8(const unsigned short *v, const float *q)\n"
+"/* The query's next m (<= 8) coordinates: vector loads when aligned and a full step, else scalar. */\n"
+"__device__ __forceinline__ void ldq8(const float *q, int m, float *qq)\n"
 "{\n"
-"  uint4 x = *(const uint4 *) v; float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
-"  unsigned w[4] = {x.x, x.y, x.z, x.w}; float qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  if (m == 8 && (((size_t) q) & 15) == 0) { float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
+"    qq[0] = a.x; qq[1] = a.y; qq[2] = a.z; qq[3] = a.w; qq[4] = b.x; qq[5] = b.y; qq[6] = b.z; qq[7] = b.w; }\n"
+"  else\n"
+"  {\n"
+"#pragma unroll\n"
+"    for (int e = 0; e < 8; e++) qq[e] = e < m ? q[e] : 0.f;\n"
+"  }\n"
+"}\n"
+"__device__ __forceinline__ double sq8(const unsigned short *v, const float *q, int m)\n"
+"{\n"
+"  uint4 x = *(const uint4 *) v; unsigned w[4] = {x.x, x.y, x.z, x.w}; float qq[8];\n"
+"  ldq8(q, m, qq);\n"
 "  double s = 0.;\n"
 "#pragma unroll\n"
 "  for (int e = 0; e < 8; e++)\n"
 "  {\n"
 "    float f; unsigned short h = (unsigned short) (w[e >> 1] >> ((e & 1) * 16));\n"
 "    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h));\n"
-"    double t = (double) f - qq[e]; s += t * t;\n"
+"    double t = (double) f - qq[e]; s += e < m ? t * t : 0.;\n"
 "  }\n"
 "  return s;\n"
 "}\n"
-"__device__ __forceinline__ double sq8(const float *v, const float *q)\n"
+"__device__ __forceinline__ double sq8(const float *v, const float *q, int m)\n"
 "{\n"
 "  float4 x0 = *(const float4 *) v, x1 = *(const float4 *) (v + 4);\n"
-"  float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
-"  float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w}, qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  float xs[8] = {x0.x, x0.y, x0.z, x0.w, x1.x, x1.y, x1.z, x1.w}, qq[8];\n"
+"  ldq8(q, m, qq);\n"
 "  double s = 0.;\n"
 "#pragma unroll\n"
-"  for (int e = 0; e < 8; e++) { double t = (double) xs[e] - qq[e]; s += t * t; }\n"
+"  for (int e = 0; e < 8; e++) { double t = (double) xs[e] - qq[e]; s += e < m ? t * t : 0.; }\n"
 "  return s;\n"
 "}\n"
-"/* Eight threads a row, eight dimensions a step (dims % 8 == 0, 16-byte aligned rows). */\n"
+"/* Eight threads a row, eight dimensions a step (rows padded to a multiple of 8, 16-byte aligned). */\n"
 "template <typename D> __device__ void rerank8(const D *data, long long stride, const unsigned *rows,\n"
 "    unsigned eligible, unsigned nr, long long *positions, unsigned top, unsigned nq, const float *queries,\n"
 "    int dims, float *out)\n"
@@ -3001,7 +3101,7 @@ static const char PostSource2[] =
 "  {\n"
 "    const D *v = data + (long long) row * stride;\n"
 "    const float *q = queries + (unsigned long long) (g / top) * dims;\n"
-"    for (int e = sub * 8; e < dims; e += 64) sum += sq8(v + e, q + e);\n"
+"    for (int e = sub * 8; e < dims; e += 64) sum += sq8(v + e, q + e, dims - e < 8 ? dims - e : 8);\n"
 "  }\n"
 "  for (int o = 4; o; o >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, o);\n"
 "  if (live && sub == 0)\n"
@@ -3025,6 +3125,8 @@ static const char PostSource2[] =
  * holding the k-th key has at most 256 keys, which are then ranked among
  * themselves (ties by row, then position, so the result does not depend on
  * the order the scan appended them). Positions are gathered once at the end.
+ * Without r and counts it selects over a q x cap score matrix in place
+ * (positions are the columns): the matrix gather's direct selection.
  */
 static const char PostSource3[] =
 "extern \"C\" __global__ void __launch_bounds__(1024) prune_select_s(const float *d, const unsigned *r,\n"
@@ -3033,10 +3135,10 @@ static const char PostSource3[] =
 "  extern __shared__ unsigned keys[];\n"
 "  __shared__ unsigned hist[2048], wsum[32], bu[256], bi[256], bp[256], sel[4096];\n"
 "  __shared__ unsigned s_lo, s_hi, s_prefix, s_want, s_m, below, ties, nb;\n"
-"  unsigned row = blockIdx.x, n = counts[row] > cap ? cap : (unsigned) counts[row];\n"
+"  unsigned row = blockIdx.x, n = !counts || counts[row] > cap ? cap : (unsigned) counts[row];\n"
 "  unsigned tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nt = blockDim.x;\n"
 "  const float *v = d + (unsigned long long) row * cap;\n"
-"  const unsigned *p = r + (unsigned long long) row * cap;\n"
+"  const unsigned *p = r ? r + (unsigned long long) row * cap : 0;\n"
 "  float *od = outD + (unsigned long long) row * k;\n"
 "  long long *orow = outR + (unsigned long long) row * k;\n"
 "  if (n <= k)\n"
@@ -3044,7 +3146,7 @@ static const char PostSource3[] =
 "    for (unsigned i = tid; i < k; i += nt)\n"
 "    {\n"
 "      od[i] = i < n ? v[i] : __int_as_float(0x7f800000);\n"
-"      orow[i] = i < n ? (long long) p[i] : -1;\n"
+"      orow[i] = i < n ? (long long) (p ? p[i] : i) : -1;\n"
 "    }\n"
 "    return;\n"
 "  }\n"
@@ -3100,7 +3202,7 @@ static const char PostSource3b[] =
 "    if (b) { unsigned s = base + __popc(bal & ((1u << lane) - 1)); od[s] = select_float(x); sel[s] = i; }\n"
 "    if (i < n && mk == prefix)\n"
 "    {\n"
-"      if (small) { unsigned s = atomicAdd(&nb, 1u); bu[s] = x; bi[s] = i; bp[s] = p[i]; }\n"
+"      if (small) { unsigned s = atomicAdd(&nb, 1u); bu[s] = x; bi[s] = i; bp[s] = p ? p[i] : i; }\n"
 "      else\n"
 "      {\n"
 "        unsigned t = atomicAdd(&ties, 1u);\n"
@@ -3116,7 +3218,7 @@ static const char PostSource3b[] =
 "    if (rk < want) { unsigned s = k - want + rk; od[s] = select_float(uk); sel[s] = ik; }\n"
 "  }\n"
 "  __syncthreads();\n"
-"  for (unsigned i = tid; i < k; i += nt) orow[i] = (long long) p[sel[i]];\n"
+"  for (unsigned i = tid; i < k; i += nt) orow[i] = (long long) (p ? p[sel[i]] : sel[i]);\n"
 "}\n";
 
 /*
@@ -3187,29 +3289,29 @@ static const char PostSource4[] =
 static const char PostSource5[] =
 "__device__ __forceinline__ void ld8(const unsigned short *v, uint4 &a, uint4 &b) { a = *(const uint4 *) v; }\n"
 "__device__ __forceinline__ void ld8(const float *v, uint4 &a, uint4 &b) { a = *(const uint4 *) v; b = *(const uint4 *) (v + 4); }\n"
-"__device__ __forceinline__ double sq8r(const unsigned short *, uint4 x, uint4, const float *q)\n"
+"__device__ __forceinline__ double sq8r(const unsigned short *, uint4 x, uint4, const float *q, int m)\n"
 "{\n"
-"  float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
-"  unsigned w[4] = {x.x, x.y, x.z, x.w}; float qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  unsigned w[4] = {x.x, x.y, x.z, x.w}; float qq[8];\n"
+"  ldq8(q, m, qq);\n"
 "  double s = 0.;\n"
 "#pragma unroll\n"
 "  for (int e = 0; e < 8; e++)\n"
 "  {\n"
 "    float f; unsigned short h = (unsigned short) (w[e >> 1] >> ((e & 1) * 16));\n"
 "    asm(\"cvt.f32.f16 %0, %1;\" : \"=f\"(f) : \"h\"(h));\n"
-"    double t = (double) f - qq[e]; s += t * t;\n"
+"    double t = (double) f - qq[e]; s += e < m ? t * t : 0.;\n"
 "  }\n"
 "  return s;\n"
 "}\n"
-"__device__ __forceinline__ double sq8r(const float *, uint4 x0, uint4 x1, const float *q)\n"
+"__device__ __forceinline__ double sq8r(const float *, uint4 x0, uint4 x1, const float *q, int m)\n"
 "{\n"
-"  float4 a = *(const float4 *) q, b = *(const float4 *) (q + 4);\n"
 "  float xs[8] = {__uint_as_float(x0.x), __uint_as_float(x0.y), __uint_as_float(x0.z), __uint_as_float(x0.w),\n"
 "                 __uint_as_float(x1.x), __uint_as_float(x1.y), __uint_as_float(x1.z), __uint_as_float(x1.w)};\n"
-"  float qq[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};\n"
+"  float qq[8];\n"
+"  ldq8(q, m, qq);\n"
 "  double s = 0.;\n"
 "#pragma unroll\n"
-"  for (int e = 0; e < 8; e++) { double t = (double) xs[e] - qq[e]; s += t * t; }\n"
+"  for (int e = 0; e < 8; e++) { double t = (double) xs[e] - qq[e]; s += e < m ? t * t : 0.; }\n"
 "  return s;\n"
 "}\n"
 "template <typename D> __device__ __forceinline__ void rerank_final(const D *data, long long stride,\n"
@@ -3242,7 +3344,7 @@ static const char PostSource5[] =
 "#pragma unroll\n"
 "      for (int c = 0; c < 4; c++) { int e = e0 + c * 32 + sub * 8; if (ok && e < dims) ld8(v + e, xa[c], xb[c]); }\n"
 "#pragma unroll\n"
-"      for (int c = 0; c < 4; c++) { int e = e0 + c * 32 + sub * 8; if (ok && e < dims) sum += sq8r(v, xa[c], xb[c], qv + e); }\n"
+"      for (int c = 0; c < 4; c++) { int e = e0 + c * 32 + sub * 8; if (ok && e < dims) sum += sq8r(v, xa[c], xb[c], qv + e, dims - e < 8 ? dims - e : 8); }\n"
 "    }\n"
 "    sum += __shfl_xor_sync(0xffffffffu, sum, 1);\n"
 "    sum += __shfl_xor_sync(0xffffffffu, sum, 2);\n"
@@ -3352,6 +3454,7 @@ typedef struct GatherModule
 	CUfunction	pruneCompact4;
 	CUfunction	pruneSelect;
 	CUfunction	cutoff32;
+	CUfunction	boundMax;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
 	CUfunction	postFinal;		/* post-scan stages */
@@ -3369,7 +3472,8 @@ typedef struct GatherModule
 	 * the select_k path instead.
 	 */
 	int			sortShared;		/* matrix_prune_sort */
-	int			select11Shared; /* prune_select_s */
+	int			select11Shared; /* prune_select_s (as much as the device
+								 * allows: the direct selection's keys) */
 } GatherModule;
 
 static GatherModule gatherModules[ANN_CUVS_MAX_DEVICES];
@@ -3457,6 +3561,7 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneCompact4, module->module, "matrix_compact4") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSelect, module->module, "matrix_prune_select") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->cutoff32, module->module, "cutoff32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->boundMax, module->module, "bound_max") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentCompact, module->module, "segment_compact") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFinal, module->module, "final_rank") != CUDA_SUCCESS ||
@@ -3466,7 +3571,8 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->postChunk, module->module, "final_bucket") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFusedF, module->module, "rerank_final_f") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->postFusedH, module->module, "rerank_final_h") != CUDA_SUCCESS ||
-		(module->select11Shared = OptInShared(module->postSelect11, optin, ANN_PRUNE_CAP * 4)) < 0 ||
+		(module->select11Shared = OptInShared(module->postSelect11, optin,
+											  optin > ANN_PRUNE_CAP * 4 ? optin : ANN_PRUNE_CAP * 4)) < 0 ||
 		(module->sortShared = OptInShared(module->pruneSort, optin, ANN_PRUNE_CAP * 8)) < 0)
 		goto fail;
 	if (module->sortShared < ANN_PRUNE_CAP * 8 || module->select11Shared < ANN_PRUNE_CAP * 4)
@@ -3571,7 +3677,7 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 	{
 		size_t		element = shard->rerankHalf ? 2 : 4;
 
-		if (dims % 8 == 0 && stride % 8 == 0 && ((uintptr_t) shard->rerank) % 16 == 0 &&
+		if (stride >= (long long) ((dims + 7) & ~7u) && stride % 8 == 0 && ((uintptr_t) shard->rerank) % 16 == 0 &&
 			((uintptr_t) queries) % 16 == 0 && element * 8 >= 16)
 		{
 			unsigned	blocks8 = (unsigned) (((uint64_t) nq * top * 8 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
@@ -3714,7 +3820,7 @@ SearchGather(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		perDeviceKeys[device] += eligible[s];
 		perDeviceTop[device] += wanted[s];
 		if (eligible[s] && ((shards[s].rows == NULL && !state->quantized) || shards[s].keys == NULL ||
-						   GatherKernels(device) == NULL))
+							GatherKernels(device) == NULL))
 			return 0;
 	}
 	lists = malloc(sizeof(AnnIndexHit) * (size_t) (k + slack) * state->nshards);
@@ -4083,7 +4189,10 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	{
 		if (job->filter == NULL && job->ordinals == NULL)
 		{
-			/* Bitsets alone: predicates on these indexes keep their rows (server.c). */
+			/*
+			 * Bitsets alone: predicates on these indexes keep their rows
+			 * (server.c).
+			 */
 			job->status = ANN_INVALID;
 			return;
 		}
@@ -4248,7 +4357,10 @@ SearchUnfiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jo
 
 	if (state->scanOnly)
 	{
-		/* Unfiltered frozen searches come as all-rows filters; others have no graph to search. */
+		/*
+		 * Unfiltered frozen searches come as all-rows filters; others have no
+		 * graph to search.
+		 */
 		for (uint32_t j = 0; j < m; j++)
 			jobs[j]->status = ANN_INVALID;
 		return;
@@ -4600,6 +4712,30 @@ PruneMark(AnnCuvsDevice *lane, int mark, cudaStream_t stream)
 	return 1;
 }
 
+/*
+ * Each query's rank-th smallest sampled score into pruneBounds[row * rank +
+ * rank - 1]: a shared-memory radix select over the sample (prune_select_s
+ * over its q x sample scores in place) and a max, instead of cuVS select_k
+ * sorting rank values of 8192 (about 170 us a batch, half the fused scan).
+ */
+static int
+SampleCutoff(GatherModule *module, AnnCuvsDevice *lane, cudaStream_t stream, uint32_t q, unsigned sample,
+			 unsigned rank)
+{
+	const void *none = NULL;
+	void	   *selectArgs[] = {&lane->pruneSample, &none, &none, &sample, &rank, &lane->pruneBounds,
+	&lane->pruneBoundRows};
+	void	   *maxArgs[] = {&lane->pruneBounds, &rank, &q};
+
+	if (rank > 4096 || (uint64_t) sample * 4 > (uint64_t) module->select11Shared)
+		return AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
+							  q, sample, rank, 1, NULL) == CUVS_SUCCESS;
+	return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+		cuLaunchKernel(module->postSelect11, q, 1, 1, 1024, 1, 1, sample * 4, (CUstream) stream, selectArgs,
+					   NULL) == CUDA_SUCCESS &&
+		cuLaunchKernel(module->boundMax, q, 1, 1, 256, 1, 1, 0, (CUstream) stream, maxArgs, NULL) == CUDA_SUCCESS;
+}
+
 static int
 PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q,
 			 uint32_t n, uint32_t candidates, int deferred)
@@ -4646,8 +4782,7 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->pruneSample, sampleBlocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
 						   sampleArgs, NULL) != CUDA_SUCCESS ||
-			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
-						   q, sample, rank, 1, NULL) != CUVS_SUCCESS ||
+			!SampleCutoff(module, lane, stream, q, sample, rank) ||
 			!PruneMark(lane, 0, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(n % 4 == 0 ? module->pruneCompact4 : module->pruneCompact,
@@ -4722,6 +4857,55 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 }
 
 /*
+ * Rows up to which the matrix gather selects each query's candidates with
+ * prune_select_s over its scores in shared memory rather than select_k:
+ * ANN_DIRECT_SELECT_ROWS, else what the device's shared memory holds; 0
+ * turns it off.
+ */
+static uint32_t
+DirectSelectRows(void)
+{
+	static _Atomic int64_t rows = -1;
+	int64_t		value = atomic_load_explicit(&rows, memory_order_relaxed);
+
+	if (value < 0)
+	{
+		const char *text = getenv("ANN_DIRECT_SELECT_ROWS");
+
+		value = text ? (int64_t) strtoul(text, NULL, 10) : UINT32_MAX;
+
+		atomic_store_explicit(&rows, value, memory_order_relaxed);
+	}
+	return (uint32_t) value;
+}
+
+/*
+ * The matrix gather's selection for scores that fit one block's shared
+ * memory: prune_select_s over the q x n score matrix in place, one block a
+ * query (a radix select in shared memory). select_k over 14-25k scores a
+ * query took 86 us a batch of four queries, half of the gather's GPU time.
+ * Unordered, like select_k here (the rerank and the final top-k order
+ * them). Returns 0 when it does not apply; the caller then uses select_k.
+ */
+static int
+DirectSelect(AnnCuvsDevice *lane, int device, cudaStream_t stream, uint32_t q, uint32_t n, uint32_t candidates)
+{
+	GatherModule *module;
+	unsigned	cap = n,
+				k = candidates;
+	const void *none = NULL;
+	void	   *args[] = {&lane->matrixScores, &none, &none, &cap, &k, &lane->matrixCandidates,
+	&lane->matrixIndices};
+
+	if (n == 0 || n > DirectSelectRows() || candidates > 4096 || candidates > n ||
+		(module = GatherKernels(device)) == NULL || (uint64_t) n * 4 > (uint64_t) module->select11Shared)
+		return 0;
+	return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+		cuLaunchKernel(module->postSelect11, q, 1, 1, 1024, 1, 1, n * 4, (CUstream) stream, args,
+					   NULL) == CUDA_SUCCESS;
+}
+
+/*
  * The best outk of each query's reranked candidates (matrixCandidates and
  * matrixIndices, q rows of candidates) into matrixValues and matrixRows,
  * sorted: a shared-memory sort for lists up to ANN_FINAL_MAX, else cuVS.
@@ -4769,7 +4953,7 @@ RerankFinal(const AnnCuvsShard *shard, AnnCuvsDevice *lane, uint32_t dims, const
 	unsigned	n = candidates,
 				k = outk;
 
-	if (candidates > 1024 || outk > candidates || dims % 8 != 0 ||
+	if (candidates > 1024 || outk > candidates || stride < (long long) ((dims + 7) & ~7u) ||
 		stride % 8 != 0 || ((uintptr_t) shard->rerank) % 16 != 0 || ((uintptr_t) lane->queries) % 16 != 0 ||
 		(module = GatherKernels(shard->device)) == NULL)
 		return -1;
@@ -4804,19 +4988,21 @@ static double MonotonicMs(void);
 
 /*
  * Whether a tile can take the fused pruned selection: the pruned
- * selection's own bounds, one shard, and no residual masks (they mask a
- * score matrix the fused scan does not write).
+ * selection's own bounds, a shard alone on its device (its kept counts are
+ * read after the batch's sync from that device's lane buffers), and no
+ * residual masks (they mask a score matrix the fused scan does not write).
  */
 static int
-FusedEligible(const AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t q, uint32_t n, uint32_t candidates,
-			  uint32_t dims)
+FusedEligible(const AnnCuvsIndex *state, int device, int distinct, AnnIndexJob **jobs, uint32_t q, uint32_t n,
+			  uint32_t candidates, uint32_t dims)
 {
 	uint64_t	rank;
 	GatherModule *module;
 
-	if (!AnnIndexConfig.matrix_prune || state->nshards != 1 || n < PruneMinRows() ||
+	(void) state;
+	if (!AnnIndexConfig.matrix_prune || !distinct || n < PruneMinRows() ||
 		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || dims > ANN_BLACKWELL_FUSE_DIMS ||
-		(module = GatherKernels(state->shards[0].device)) == NULL)
+		(module = GatherKernels(device)) == NULL)
 		return 0;
 
 	/*
@@ -4876,8 +5062,7 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 		if (!AnnBlackwellStrideRows(shard->device, rows, n, sample, lane->fuseSampleRows, stream) ||
 			!AnnBlackwellScoreMatrix(&shard->quant, shard->device, lane->fuseSampleRows, sample, lane->queries, q,
 									 (int) dims, lane->pruneSample, stream) ||
-			AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
-						   q, sample, rank, 1, NULL) != CUVS_SUCCESS ||
+			!SampleCutoff(module, lane, stream, q, sample, rank) ||
 			!PruneMark(lane, 0, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->cutoff32, (q + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
@@ -5052,7 +5237,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 	uint32_t	dims = file->dimensions;
 	uint32_t	limit = (uint32_t) AnnBlackwellGroupLimit((int) dims);
 	uint32_t	maxk = 0;
-	uint32_t	slack = state->quantized ? AnnIndexConfig.quant_slack : ANN_GATHER_SLACK;
+	uint32_t	slack;
 	uint32_t	capacity;
 	uint64_t	start[ANN_INDEX_MAX_SHARDS + 1];
 	uint32_t	selected[ANN_INDEX_MAX_SHARDS];
@@ -5067,12 +5252,23 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 	float	   *hostQueries;
 	uint64_t	reranked = 0;
 	int			ok = 1;
+	int			distinct = 1;	/* every shard of this copy on its own device */
 
 	if (!state->grouped || ordinals == NULL || limit < 2 || m == 0)
 		return 0;
+	for (uint32_t s = 1; s < state->nshards && distinct; s++)
+		for (uint32_t t = 0; t < s; t++)
+			if (shards[s].device == shards[t].device)
+				distinct = 0;
 	for (uint32_t j = 0; j < m; j++)
 		if (jobs[j]->k > maxk)
 			maxk = jobs[j]->k;
+
+	/*
+	 * As the gather scan's: --quant-slack, or --slack-ratio of k when that is
+	 * more.
+	 */
+	slack = GatherSlack(state, maxk);
 	if (maxk + 8 <= ANN_BLACKWELL_TOP)
 		return 0;
 	capacity = (uint32_t) ((uint64_t) maxk + slack < jobs[0]->nfilter ?
@@ -5138,14 +5334,32 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			uint32_t	n = (uint32_t) (start[s + 1] - start[s]);
 			uint32_t	candidates = capacity < n ? capacity : n;
 			uint32_t	outk = maxk < candidates ? maxk : candidates;
+
+			/*
+			 * --shard-topk-share: a shard of a split index holds about k /
+			 * nshards of the answer, so it hands the merge a share of k, not
+			 * all of it: the merge of nshards x k hits was half the lane CPU.
+			 */
+			if (state->nshards > 1 && AnnIndexConfig.shard_topk_share < 100)
+			{
+				uint32_t	share = (maxk * AnnIndexConfig.shard_topk_share + 99) / 100;
+
+				if (share < 128)
+					share = 128;
+				if (share < outk)
+					outk = share;
+			}
 			AnnCuvsDevice *lane;
 			cudaStream_t stream;
 			const uint32_t *rows;
 			size_t		hostOffset = (size_t) s * limit * capacity;
 
-			/* Fused tiles write no score matrix, so none is allocated for them. */
+			/*
+			 * Fused tiles write no score matrix, so none is allocated for
+			 * them.
+			 */
 			int			fusedTile = n && AnnBlackwellFuseReady(&shard->quant) &&
-				FusedEligible(state, jobs + first, q, n, candidates, dims);
+				FusedEligible(state, shard->device, distinct, jobs + first, q, n, candidates, dims);
 
 			selected[s] = 0;
 			gpu[s] = 0;
@@ -5218,22 +5432,44 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				pruned[s] = 2;
 			}
 			else if (!MatrixMark(lane, s, 0, stream) ||
-				!AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
-										 (int) dims, lane->matrixScores, stream) ||
-				!MatrixMark(lane, s, 1, stream) ||
-				!MaskExcluded(file, s, jobs + first, q, n, candidates, rows, lane, shard->device, stream,
-							  lane->matrixScores) ||
-				!MatrixMark(lane, s, 2, stream) ||
-				(!(pruned[s] = PrunedSelect(state, lane, shard->device, stream, q, n, candidates,
-											state->nshards == 1)) &&
-				 AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
-								lane->matrixIndices, q, n, candidates, 0, NULL) != CUVS_SUCCESS) ||
-				!MatrixMark(lane, s, 3, stream))
+					 !AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, n, lane->queries, q,
+											  (int) dims, lane->matrixScores, stream) ||
+					 !MatrixMark(lane, s, 1, stream) ||
+					 !MaskExcluded(file, s, jobs + first, q, n, candidates, rows, lane, shard->device, stream,
+								   lane->matrixScores) ||
+					 !MatrixMark(lane, s, 2, stream) ||
+					 (!(pruned[s] = PrunedSelect(state, lane, shard->device, stream, q, n, candidates,
+												 distinct)) &&
+					  !DirectSelect(lane, shard->device, stream, q, n, candidates) &&
+					  AnnSelectBatch(lane->resources, lane->matrixScores, NULL, lane->matrixCandidates,
+									 lane->matrixIndices, q, n, candidates, 0, NULL) != CUVS_SUCCESS) ||
+					 !MatrixMark(lane, s, 3, stream))
 			{
 				ok = 0;
 				break;
 			}
-			if (shard->rerank && laneRerank != 0)
+			if (AnnIndexConfig.rescore == ANN_RESCORE_OFF && candidates <= ANN_FINAL_MAX)
+			{
+				/*
+				 * --rescore off: the scan's own distances are final. No
+				 * rerank rows are read, so the device needs no fp16 vectors;
+				 * the positions stay indexes into the eligible rows (gpu 2).
+				 */
+				if (!MatrixMark(lane, s, 4, stream) ||
+					!FinalTopk(lane, shard->device, stream, q, candidates, outk) ||
+					!MatrixMark(lane, s, 5, stream) ||
+					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
+									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,
+									(size_t) q * outk * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
+				selected[s] = outk;
+				gpu[s] = 2;
+			}
+			else if (shard->rerank && laneRerank != 0)
 			{
 				int			fusedPost = RerankFinal(shard, lane, dims, rows, n, file->shards[s].rows, q, candidates,
 													outk, stream);
@@ -5282,7 +5518,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				ok = 0;
 		if (ok)
 			MatrixStagesAdd(&laneDevices[shards[0].device], q);
-		for (uint32_t s = 0; ok && state->nshards == 1 && s < state->nshards; s++)
+		for (uint32_t s = 0; ok && distinct && s < state->nshards; s++)
 		{
 			uint32_t	got = capacity < (uint32_t) (start[s + 1] - start[s]) ?
 				capacity : (uint32_t) (start[s + 1] - start[s]);
@@ -5340,14 +5576,15 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 					uint64_t	row;
 					AnnIndexHit hit;
 
-					if (pos < 0 || (uint64_t) pos >= (gpu[s] ? file->shards[s].rows : n))
+					if (pos < 0 || (uint64_t) pos >= (gpu[s] == 1 ? file->shards[s].rows : n))
 						continue;
-					row = gpu[s] ? file->shards[s].first + (uint64_t) pos : ordinals[start[s] + (uint64_t) pos];
+					row = gpu[s] == 1 ? file->shards[s].first + (uint64_t) pos : ordinals[start[s] + (uint64_t) pos];
 					if (IsExcluded(job, row))
 						continue;
 					hit.key = gathered && gathered[i] >= 0 ? gathered[i] : file->keys[row];
 					hit.ordinal = row;
-					hit.distance = gpu[s] ? distances[i] : ExactDistance(file, row, job->query);
+					hit.distance = gpu[s] == 2 ? sqrtf(distances[i]) : gpu[s] ? distances[i] :
+						ExactDistance(file, row, job->query);
 					if (gpu[s] && isnan(hit.distance))
 						hit.distance = ExactDistance(file, row, job->query);
 					if (!gpu[s])
@@ -5399,7 +5636,7 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 static int
 MixedEligible(const AnnIndexFile *file, const AnnCuvsIndex *state, const AnnIndexJob *job)
 {
-	uint64_t	candidates = (uint64_t) job->k + AnnIndexConfig.quant_slack;
+	uint64_t	candidates = (uint64_t) job->k + GatherSlack(state, job->k);
 
 	return AnnIndexConfig.mixed_groups && AnnIndexConfig.gpu_rerank && state->nshards == 1 && state->quantized &&
 		file->quant == ANN_QUANT_NVFP4 && job->filtered && job->ordinals != NULL && job->deviceRows != NULL &&
@@ -5468,7 +5705,7 @@ SearchGatherMixed(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 	for (uint32_t j = 0; j < m; j++)
 		if (jobs[j]->k > maxk)
 			maxk = jobs[j]->k;
-	candidates = maxk + AnnIndexConfig.quant_slack;
+	candidates = maxk + GatherSlack(state, maxk);
 	for (uint32_t j = 0; j < m; j++)
 	{
 		uint32_t	n = jobs[j]->nfilter;
@@ -5831,7 +6068,8 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 	AnnIndexHit *lists;
 	uint32_t   *counts;
 	float	   *hostQueries;
-	int64_t    *picked;			/* each pass's candidates: [query][shard][stride] */
+	int64_t    *picked;			/* each pass's candidates:
+								 * [query][shard][stride] */
 	float	   *pickedD;		/* and their scan distances */
 	int			ok = 1;
 	int			bounded = 0;
@@ -6003,9 +6241,12 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 				continue;
 			}
 
-			/* One scoring pass for the group; cuvsSelectK takes one row at a time. */
+			/*
+			 * One scoring pass for the group; cuvsSelectK takes one row at a
+			 * time.
+			 */
 			ok = AnnBlackwellScoreMatrix(&shard->quant, shard->device, rows, eligible, lane->queries, q, (int) dims,
-										lane->groupScores, stream);
+										 lane->groupScores, stream);
 			for (uint32_t j = 0; ok && j < q; j++)
 			{
 				size_t		slot = topSlot[s] + (size_t) j * wanted[s];
@@ -6081,7 +6322,11 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 
 		if (timed)
 			hostStart = MonotonicMs();
-		/* Each query's candidates on each shard: positions in the rows, and the scan's distances. */
+
+		/*
+		 * Each query's candidates on each shard: positions in the rows, and
+		 * the scan's distances.
+		 */
 		for (uint32_t s = 0; ok && s < state->nshards; s++)
 		{
 			uint32_t	eligible = (uint32_t) (start[s + 1] - start[s]);
@@ -6118,7 +6363,10 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 			}
 		}
 
-		/* --rescore fp8-gpu: every candidate scored again on the GPU from the FP8 rows. */
+		/*
+		 * --rescore fp8-gpu: every candidate scored again on the GPU from the
+		 * FP8 rows.
+		 */
 		if (ok && AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && state->rescoreGpu)
 		{
 			int			used[ANN_CUVS_MAX_DEVICES] = {0};
@@ -6221,7 +6469,7 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 		}
 		if (timed && ok && cap[0])
 		{
-			StageTimes pass = {0};
+			StageTimes	pass = {0};
 			float		candidates = 0,
 						copy = 0;
 			AnnCuvsDevice *lane = &laneDevices[shards[0].device];
@@ -6272,10 +6520,9 @@ CalibratedFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJ
 	int			mode;
 
 	/*
-	 * A profile is calibrated on its index (the generation matches it):
-	 * FP16 graphs were measured with FP32 rescoring, so their profiles apply
-	 * only with --fp16-exact; FP32 graphs use their native distances either
-	 * way.
+	 * A profile is calibrated on its index (the generation matches it): FP16
+	 * graphs were measured with FP32 rescoring, so their profiles apply only
+	 * with --fp16-exact; FP32 graphs use their native distances either way.
 	 */
 	if (AnnIndexCostProfile == NULL || file->quant != ANN_QUANT_NVFP4 || file->nshards != 1 ||
 		(state->fp16 && !AnnIndexConfig.fp16_exact) ||
@@ -6327,7 +6574,7 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 		excluding = jobs[j]->nexclude != 0;
 	if (excluding)
 	{
-		if (!state->scanOnly && AnnIndexConfig.matrix_gather && n > AnnIndexConfig.exact_limit &&
+		if (AnnIndexConfig.matrix_gather && n > AnnIndexConfig.exact_limit &&
 			n <= AnnIndexConfig.group_gather_limit && SearchGatherMatrix(file, state, jobs, m))
 		{
 			(void) atomic_fetch_add_explicit(&state->residual_masked, m, memory_order_relaxed);
@@ -6347,7 +6594,8 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 	{
 		if (m > 1 && SearchGatherGroup(file, state, jobs, m))
 			return;
-		if (!state->scanOnly && AnnIndexConfig.matrix_gather && SearchGatherMatrix(file, state, jobs, m))
+		/* Scan-only shards rerank from their uploaded vectors like any other. */
+		if (AnnIndexConfig.matrix_gather && SearchGatherMatrix(file, state, jobs, m))
 			return;
 	}
 	if (n > AnnIndexConfig.exact_limit && SearchGatherGroupLarge(file, state, jobs, m))

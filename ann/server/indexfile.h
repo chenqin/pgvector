@@ -20,7 +20,8 @@
  * contiguous ordinal ranges, so key to shard mapping is a binary search.
  */
 #define ANN_INDEX_MAX_SHARDS 64
-#define ANN_INDEX_NO_GRAPH "-"	/* shard file of an index served by quantized scans only */
+#define ANN_INDEX_NO_GRAPH "-"	/* shard file of an index served by quantized
+								 * scans only */
 #define ANN_INDEX_NAME_MAX 63
 /* As many as a PostgreSQL index has columns (INDEX_MAX_KEYS): every frozen INCLUDE attribute. */
 #define ANN_INDEX_MAX_ATTRIBUTES 32
@@ -179,7 +180,8 @@ struct AnnIndexFile
 	size_t		quantScalesBytes;
 	size_t		rowScalesBytes;
 	int			quantActive;	/* set by a backend scanning the copy */
-	int			scanOnly;		/* no graphs: every search scans the quantized copy's rows */
+	int			scanOnly;		/* no graphs: every search scans the quantized
+								 * copy's rows */
 	pthread_mutex_t bitmapMutex;
 	AnnIndexBitmap *bitmaps[ANN_INDEX_BITMAP_BUCKETS];
 	uint64_t	nbitmaps;
@@ -190,8 +192,8 @@ struct AnnIndexFile
 	uint64_t	predicateBytes; /* host memory they hold */
 	uint64_t	predicateDeviceBytes;	/* device memory they hold */
 	uint64_t	predicateEvictions;
-	uint64_t	pendingBytes;	/* its queued and running searches' charge,
-								 * under the scheduler's mutex */
+	uint64_t	pendingBytes;	/* its queued and running searches' charge
+								 * (atomic; added under the scheduler's mutex) */
 	uint32_t   *deleted;		/* tombstones: a bit per ordinal, set only */
 	uint64_t	ndeleted;		/* bits set (atomic reads) */
 	const int64_t *keys;		/* mapped */
@@ -200,6 +202,8 @@ struct AnnIndexFile
 	size_t		keysBytes;		/* mapped or reserved bytes, for munmap */
 	size_t		vectorsBytes;
 	void	   *device;			/* backend-owned device state */
+	int32_t		references;		/* __atomic: the registry's and every
+								 * holder's; the index is destroyed at zero */
 };
 
 /* Worker-wide tuning shared by index backends; set once before serving. */
@@ -209,7 +213,8 @@ typedef struct AnnIndexOptions
 	uint32_t	filtered_itopk; /* ceiling for filtered queries */
 	uint32_t	exact_limit;	/* filtered queries this selective run exact */
 	int			persistent;		/* CAGRA persistent kernels */
-	int			replicate;		/* full shard set on every GPU */
+	int			replicate;		/* 1: full shard set on every GPU; N > 1: N
+								 * copies with the shards spread over GPUs */
 	uint32_t	gather_limit;	/* filtered queries this selective run a GPU
 								 * gather scan */
 	uint64_t	bitset_min;		/* attribute values with more rows get
@@ -239,10 +244,9 @@ typedef struct AnnIndexOptions
 	int			lock_memory;	/* mlock them */
 	int			plain_allocator;	/* --device-allocator plain: cuVS
 									 * allocates with cudaMalloc, no pool */
-	int			scan_off;		/* --scan-routes off: no exact scans in
-								 * place of graph searches (0: on) */
-	uint32_t	scan_max_k;		/* most candidates a scan selects; 0 for
-								 * 2048 */
+	int			scan_off;		/* --scan-routes off: no exact scans in place
+								 * of graph searches (0: on) */
+	uint32_t	scan_max_k;		/* most candidates a scan selects; 0 for 2048 */
 	int			rescore;		/* --rescore: how large-k scans re-score their
 								 * candidates (ANN_RESCORE_*) */
 	uint32_t	slack_ratio;	/* --slack-ratio: a quantized scan's extra
@@ -277,6 +281,9 @@ typedef struct AnnIndexOptions
 	int			residual_masks; /* cache AND predicates' wide operands, mask
 								 * the few rows their narrow ones remove
 								 * (--residual-masks); default on */
+	uint32_t	shard_topk_share;	/* --shard-topk-share: percent of k each
+									 * shard of a split index returns to the
+									 * merge (at least 128); 100 for all */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */
@@ -390,6 +397,7 @@ int			AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t
 int			AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, size_t size, uint64_t maxExcluded,
 								   unsigned char **base, size_t *baseSize, AnnFilterExclusion *exclusions,
 								   uint32_t *nexclusions);
+
 /*
  * A job with excluded rows turned into a plain one: its ordinals without
  * them (job->ownedOrdinals), no bitsets, device copies or keys. Returns 0

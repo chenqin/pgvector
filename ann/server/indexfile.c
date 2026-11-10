@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100};
 int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;
@@ -148,16 +148,20 @@ small:
 	return 1;
 }
 
+/*
+ * The loaded indexes by name. Lookups take the read lock; loads and unloads
+ * the write lock. References live in each file (AnnIndexFile.references), so
+ * holding and putting one never takes the lock: every search did, several
+ * times, and hundreds of reader and lane threads queued on it.
+ */
 typedef struct Entry
 {
 	AnnIndexFile *file;
-	int			references;
 	struct Entry *next;
 } Entry;
 
-static pthread_mutex_t registryMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t registryLock = PTHREAD_RWLOCK_INITIALIZER;
 static Entry *registry;
-static Entry *retired;			/* unloaded, freed at their last reference */
 
 void		(*AnnIndexDeviceDestroy) (void *device) = NULL;
 
@@ -1600,7 +1604,7 @@ void
 AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *deviceBytes, uint64_t *evictions)
 {
 	*entries = *bytes = *deviceBytes = *evictions = 0;
-	(void) pthread_mutex_lock(&registryMutex);
+	(void) pthread_rwlock_rdlock(&registryLock);
 	for (Entry *entry = registry; entry; entry = entry->next)
 	{
 		AnnIndexFile *file = entry->file;
@@ -1612,7 +1616,7 @@ AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *deviceBytes
 		*evictions += file->predicateEvictions;
 		(void) pthread_mutex_unlock(&file->bitmapMutex);
 	}
-	(void) pthread_mutex_unlock(&registryMutex);
+	(void) pthread_rwlock_unlock(&registryLock);
 }
 
 AnnIndexBitmap *
@@ -1950,24 +1954,24 @@ AnnIndexRegister(AnnIndexFile *file)
 {
 	Entry	   *entry;
 
-	(void) pthread_mutex_lock(&registryMutex);
+	(void) pthread_rwlock_wrlock(&registryLock);
 	for (entry = registry; entry; entry = entry->next)
 		if (strcmp(entry->file->name, file->name) == 0)
 		{
-			(void) pthread_mutex_unlock(&registryMutex);
+			(void) pthread_rwlock_unlock(&registryLock);
 			return ANN_STALE;
 		}
 	entry = calloc(1, sizeof(*entry));
 	if (entry == NULL)
 	{
-		(void) pthread_mutex_unlock(&registryMutex);
+		(void) pthread_rwlock_unlock(&registryLock);
 		return ANN_NOMEM;
 	}
 	entry->file = file;
-	entry->references = 1;
+	__atomic_store_n(&file->references, 1, __ATOMIC_RELEASE);	/* the registry's */
 	entry->next = registry;
 	registry = entry;
-	(void) pthread_mutex_unlock(&registryMutex);
+	(void) pthread_rwlock_unlock(&registryLock);
 	return ANN_OK;
 }
 
@@ -1976,15 +1980,16 @@ AnnIndexGet(const char *name)
 {
 	AnnIndexFile *file = NULL;
 
-	(void) pthread_mutex_lock(&registryMutex);
+	(void) pthread_rwlock_rdlock(&registryLock);
 	for (Entry *entry = registry; entry; entry = entry->next)
 		if (strcmp(entry->file->name, name) == 0)
 		{
-			entry->references++;
+			/* The registry's reference keeps it alive while the lock is held. */
+			(void) __atomic_add_fetch(&entry->file->references, 1, __ATOMIC_ACQ_REL);
 			file = entry->file;
 			break;
 		}
-	(void) pthread_mutex_unlock(&registryMutex);
+	(void) pthread_rwlock_unlock(&registryLock);
 	return file;
 }
 
@@ -1999,14 +2004,7 @@ AnnIndexHold(AnnIndexFile *file)
 void
 AnnIndexHoldCount(AnnIndexFile *file, uint32_t count)
 {
-	(void) pthread_mutex_lock(&registryMutex);
-	for (Entry *entry = registry; entry; entry = entry->next)
-		if (entry->file == file)
-			entry->references += (int) count;
-	for (Entry *entry = retired; entry; entry = entry->next)
-		if (entry->file == file)
-			entry->references += (int) count;
-	(void) pthread_mutex_unlock(&registryMutex);
+	(void) __atomic_add_fetch(&file->references, (int32_t) count, __ATOMIC_ACQ_REL);
 }
 
 static void
@@ -2028,31 +2026,14 @@ AnnIndexPut(AnnIndexFile *file)
 void
 AnnIndexPutCount(AnnIndexFile *file, uint32_t count)
 {
-	Entry	   *dead = NULL;
-
-	(void) pthread_mutex_lock(&registryMutex);
-	for (Entry *entry = registry; entry; entry = entry->next)
-		if (entry->file == file)
-		{
-			entry->references -= (int) count;
-			break;
-		}
-	for (Entry **link = &retired; *link; link = &(*link)->next)
-		if ((*link)->file == file)
-		{
-			if (((*link)->references -= (int) count) == 0)
-			{
-				dead = *link;
-				*link = dead->next;
-			}
-			break;
-		}
-	(void) pthread_mutex_unlock(&registryMutex);
-	if (dead)
+	/*
+	 * Zero only after unload removed the registry's reference: nothing can
+	 * find it again.
+	 */
+	if (__atomic_sub_fetch(&file->references, (int32_t) count, __ATOMIC_ACQ_REL) == 0)
 	{
-		fprintf(stderr, "ann index %s: unloaded\n", dead->file->name);
-		Destroy(dead->file);
-		free(dead);
+		fprintf(stderr, "ann index %s: unloaded\n", file->name);
+		Destroy(file);
 	}
 }
 
@@ -2065,21 +2046,22 @@ AnnStatus
 AnnIndexUnload(const char *name)
 {
 	Entry	   *found = NULL;
+	AnnIndexFile *file;
 
-	(void) pthread_mutex_lock(&registryMutex);
+	(void) pthread_rwlock_wrlock(&registryLock);
 	for (Entry **link = &registry; *link; link = &(*link)->next)
 		if (strcmp((*link)->file->name, name) == 0)
 		{
 			found = *link;
 			*link = found->next;
-			found->next = retired;
-			retired = found;
 			break;
 		}
-	(void) pthread_mutex_unlock(&registryMutex);
+	(void) pthread_rwlock_unlock(&registryLock);
 	if (found == NULL)
 		return ANN_STALE;
-	AnnIndexPut(found->file);	/* the registry's own reference */
+	file = found->file;
+	free(found);
+	AnnIndexPut(file);			/* the registry's own reference */
 	return ANN_OK;
 }
 
