@@ -1238,7 +1238,8 @@ Lane(void *argument)
 			/*
 			 * The whole group, not the idle lanes' share: the filter's rows
 			 * are scored once however many queries ride along, and a group
-			 * split over lanes costs a scan per piece.
+			 * split over lanes costs a scan per piece (measured neutral on
+			 * the Muse mix, where groups are short).
 			 */
 			while (count < service->options.max_batch_jobs && owns->head)
 			{

@@ -109,7 +109,7 @@ one_group() {
   elif [ $gpus_given -eq 1 ]; then
     export CUDA_VISIBLE_DEVICES=$(IFS=,; echo "${gpus[*]}")
   fi
-  python3 -I "$BUILDER" --from-export "$EXPORT_ROOT/$t" --out "$OUT_ROOT/$t" --dtype float16 \
+  python3 -I "$BUILDER" --from-export "$EXPORT_ROOT/$t" --out "$OUT_ROOT/$t" --dtype float16 ${BUILDER_ARGS:-} \
     --quantize "$QUANT" --shards "$SHARDS" > "$LOG_DIR/$t.build.log" 2>&1 & child=$!
   wait $child && [ -f "$OUT_ROOT/$t/manifest" ] ||
     { note "$t FAILED in build after $(seconds $(( $(now_ms) - start )))s (export $(seconds $export_ms)s): see $LOG_DIR/$t.build.log"; return 1; }

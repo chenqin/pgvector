@@ -117,10 +117,14 @@ on the multi-shard matrix route, and, on a host without other tenants,
 
 ## Reproducing
 
-On the GPU host (`~/b200dev`): `wk.sh NAME PORT ROOT [flags]` starts a
-worker, `agentB/muse_direct` drives it, `prof/ann_profile.sh LABEL SECONDS`
+Build: `BUILDER_ARGS=--scan-only benchmarks/ann/scale_pipeline.sh OUT 4715 4 fp8`
+(the seed index directories and the group catalog as its environment
+describes). Load: `benchmarks/ann/muse_direct.c` compiled with
+`cc -O2 -std=c11 -pthread`; `benchmarks/ann/ann_profile.sh LABEL SECONDS`
 profiles a window (GPU utilisation, kernel stage times, gdb stack
-sampling, lock waits, server counters). Final worker flags:
+sampling, lock waits, server counters). The host's `~/b200dev/wk.sh NAME
+PORT ROOT [flags]` wraps the worker start and the parallel load; the
+final worker flags:
 
 ```
 --replicate 2 --lanes 96 --readers 64 --filter-lanes 16 --max-batch 64
