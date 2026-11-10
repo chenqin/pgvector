@@ -76,6 +76,7 @@ typedef struct Job
 	struct Job *fnext;			/* the same filter's jobs, or the plain jobs
 								 * of this kind, oldest first */
 	struct FilterEntry *filter; /* NULL for a job that cannot share a scan */
+	uint32_t	shard;			/* the scheduler shard it is queued in */
 	uint32_t	compositePart;	/* query position for operation 30 */
 	struct Composite *composite;	/* operation 25: the request this part
 									 * answers into */
@@ -180,23 +181,31 @@ typedef struct FilterEntry
 #define ANN_FILTER_BUCKETS 4096
 #define ANN_MIXED_FILTERS 64	/* most other filters a mixed group adds */
 
-typedef struct Service
+/*
+ * One shard of the scheduler: a queue with its own lock, filter table and
+ * lanes. With one mutex for every reader and lane, 45% of lane samples and
+ * 82% of reader samples at 1.03M searches/s were waits on it; a filter's jobs
+ * all hash to one shard, so they still meet and batch together, while
+ * different filters mostly take different locks.
+ */
+#define ANN_MAX_SCHEDULERS 64	/* a reader's round marks its shards in 64
+								 * bits */
+
+typedef struct Scheduler
 {
-	const AnnBackend *backend;
-	AnnServeOptions options;
 	pthread_mutex_t mutex;
 	pthread_cond_t condition;
 	Job		   *head;
 	Job		   *tail;
-	uint64_t	pending_bytes;	/* atomic: added under mutex, released without
-								 * it */
-	uint64_t	queued;
-	uint32_t	idle;
-	int			stopping;
+	uint64_t	queued;			/* written under mutex; lanes of other shards
+								 * read it without, looking for work */
+	uint32_t	idle;			/* lanes at pickup */
+	uint32_t	waiting;		/* of those, asleep or about to be; written
+								 * under mutex, read without it by Kick */
+	uint32_t	blockedWaiters; /* lanes waiting for a filter to free up */
 	uint64_t	jobs;
 	uint64_t	rejected;
 	uint64_t	rejected_index; /* of those, over an index's share */
-	uint64_t	failed;
 	uint64_t	batches;
 	uint64_t	max_batch;
 	uint64_t	rows;
@@ -204,6 +213,33 @@ typedef struct Service
 	uint64_t	grouped_jobs;	/* jobs in those groups */
 	uint64_t	held;			/* pickups that found only jobs whose filter
 								 * enough lanes were already on */
+	Job		   *plainHead[2];	/* jobs that cannot share a scan, by kind */
+	Job		   *plainTail[2];
+
+	/*
+	 * Last, so the fields above (written at every pickup) are 32 kB away from
+	 * the next shard's.
+	 */
+	FilterEntry *filters[ANN_FILTER_BUCKETS];
+} Scheduler;
+
+typedef struct Service
+{
+	const AnnBackend *backend;
+	AnnServeOptions options;
+	Scheduler  *schedulers;		/* the shards; lane i serves shard i %
+								 * nschedulers first */
+	uint32_t	nschedulers;
+	uint32_t	nextScheduler;	/* atomic: round robin for jobs without a
+								 * shared filter */
+	uint32_t	nextKick;		/* atomic: where Kick starts looking */
+	uint32_t	waiting;		/* atomic: lanes asleep or about to be, over
+								 * all shards */
+	uint32_t	activeLanes;	/* atomic: lanes working on cached filters,
+								 * over all shards */
+	uint64_t	pending_bytes;	/* atomic */
+	int			stopping;		/* atomic */
+	uint64_t	failed;
 	uint64_t	merged;			/* index jobs answered from an identical job's
 								 * search in their batch (atomic) */
 	uint64_t	predicate_hits; /* operation 22 programs found cached */
@@ -213,11 +249,6 @@ typedef struct Service
 	uint64_t	predicate_transient;	/* first sightings served uncached */
 	uint64_t	predicate_residual; /* searches over a base entry with masked
 									 * rows (--residual-masks) */
-	uint32_t	blockedWaiters; /* lanes waiting for a filter to free up */
-	uint32_t	activeLanes;	/* lanes working on cached filters */
-	FilterEntry *filters[ANN_FILTER_BUCKETS];
-	Job		   *plainHead[2];	/* jobs that cannot share a scan, by kind */
-	Job		   *plainTail[2];
 	AnnRdma    *rdma;
 
 	/*
@@ -257,6 +288,7 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 	options->rdma_spin = 1;
 	options->readers = 64;
 	options->merge_duplicates = 0;
+	options->scheduler_shards = 0;
 }
 
 static void
@@ -689,8 +721,8 @@ SettleAdd(Settlement *settle, Job *job)
 }
 
 /*
- * Budgets are released without the scheduler's mutex: admission adds to
- * them under it, so a release only ever makes room sooner.
+ * Budgets are released without a scheduler mutex: admission adds to them
+ * atomically (Admit), so a release only ever makes room sooner.
  */
 static void
 Settle(Service *service, Settlement *settle)
@@ -885,13 +917,13 @@ JobBytes(const Job *job)
 }
 
 /*
- * Bucket of a filter's arrays. Every pointer bit counts: arrays a thread
+ * Hash of a filter's arrays. Every pointer bit counts: arrays a thread
  * allocated under load come from arena chunks whose low bits barely differ,
  * and a hash of the low bits put hundreds of filters in a few buckets, whose
- * chains every enqueue then walked under service->mutex.
+ * chains every enqueue then walked under the scheduler's mutex.
  */
-static FilterEntry **
-FilterBucket(Service *service, const void *ordinals, const void *bitsets, uint32_t nfilter)
+static uint64_t
+FilterHash(const void *ordinals, const void *bitsets, uint32_t nfilter)
 {
 	uint64_t	hash = (uint64_t) (uintptr_t) ordinals * UINT64_C(0x9E3779B97F4A7C15) ^
 		(uint64_t) (uintptr_t) bitsets * UINT64_C(0xC2B2AE3D27D4EB4F) ^ nfilter;
@@ -899,18 +931,52 @@ FilterBucket(Service *service, const void *ordinals, const void *bitsets, uint32
 	hash ^= hash >> 31;
 	hash *= UINT64_C(0xBF58476D1CE4E5B9);
 	hash ^= hash >> 29;
-	return &service->filters[hash & (ANN_FILTER_BUCKETS - 1)];
+	return hash;
+}
+
+/* A filter's bucket in its shard: the hash's low bits (SchedulerOf has the high). */
+static FilterEntry **
+FilterBucket(Scheduler *scheduler, const void *ordinals, const void *bitsets, uint32_t nfilter)
+{
+	return &scheduler->filters[FilterHash(ordinals, bitsets, nfilter) & (ANN_FILTER_BUCKETS - 1)];
+}
+
+/*
+ * The shard a job is queued in. Every job of one filter goes to the same
+ * shard, so a lane still finds the whole group; the shard comes from the
+ * hash's high half, the bucket from its low bits, or a shard would use only
+ * one bucket in nschedulers. Jobs that cannot share a scan go to "plain", a
+ * shard their submitter picks once per call, so they still fill one batch.
+ */
+static uint32_t
+SchedulerOf(const Service *service, const Job *job, uint32_t plain)
+{
+	if (service->nschedulers == 1)
+		return 0;
+	if (!Shareable(job))
+		return plain;
+	return (uint32_t) ((FilterHash(job->index.ordinals, job->index.bitsets, job->index.nfilter) >> 32) %
+					   service->nschedulers);
+}
+
+/* The shard for a call's jobs without a shared filter: round robin. */
+static uint32_t
+PlainScheduler(Service *service)
+{
+	if (service->nschedulers == 1)
+		return 0;
+	return __atomic_fetch_add(&service->nextScheduler, 1, __ATOMIC_RELAXED) % service->nschedulers;
 }
 
 /* Drop a filter's entry once no queued or running search uses it. */
 static void
-FilterDone(Service *service, FilterEntry *entry)
+FilterDone(Scheduler *scheduler, FilterEntry *entry)
 {
 	FilterEntry **link;
 
 	if (entry->queued || entry->active || entry->head)
 		return;
-	for (link = FilterBucket(service, entry->ordinals, entry->bitsets, entry->nfilter); *link;
+	for (link = FilterBucket(scheduler, entry->ordinals, entry->bitsets, entry->nfilter); *link;
 		 link = &(*link)->next)
 		if (*link == entry)
 		{
@@ -922,9 +988,9 @@ FilterDone(Service *service, FilterEntry *entry)
 
 /* The entry for a shareable job's filter, created on first sight. */
 static FilterEntry *
-FilterFor(Service *service, const Job *job)
+FilterFor(Scheduler *scheduler, const Job *job)
 {
-	FilterEntry **bucket = FilterBucket(service, job->index.ordinals, job->index.bitsets, job->index.nfilter);
+	FilterEntry **bucket = FilterBucket(scheduler, job->index.ordinals, job->index.bitsets, job->index.nfilter);
 	FilterEntry *entry;
 
 	for (entry = *bucket; entry; entry = entry->next)
@@ -943,20 +1009,20 @@ FilterFor(Service *service, const Job *job)
 
 /* Take a queued job: out of the queue and out of its filter's or kind's list. */
 static void
-Take(Service *service, Job *job)
+Take(Scheduler *scheduler, Job *job)
 {
-	Job		  **head = job->filter ? &job->filter->head : &service->plainHead[job->kind];
-	Job		  **tail = job->filter ? &job->filter->tail : &service->plainTail[job->kind];
+	Job		  **head = job->filter ? &job->filter->head : &scheduler->plainHead[job->kind];
+	Job		  **tail = job->filter ? &job->filter->tail : &scheduler->plainTail[job->kind];
 
 	if (job->prev)
 		job->prev->next = job->next;
 	else
-		service->head = job->next;
+		scheduler->head = job->next;
 	if (job->next)
 		job->next->prev = job->prev;
 	else
-		service->tail = job->prev;
-	service->queued--;
+		scheduler->tail = job->prev;
+	__atomic_store_n(&scheduler->queued, scheduler->queued - 1, __ATOMIC_SEQ_CST);
 	if (traceFile)
 		job->started = Now();
 	if (job->filter)
@@ -983,22 +1049,23 @@ Take(Service *service, Job *job)
 	job->prev = job->next = job->fnext = NULL;
 }
 
-/* Queue a job: last in the queue and in its filter's or kind's list. */
+/* Queue a job: last in its shard's queue and in its filter's or kind's list. */
 static void
-Append		(Service *service, Job *job)
+Append		(Service *service, Scheduler *scheduler, Job *job)
 {
-	job->prev = service->tail;
+	job->prev = scheduler->tail;
 	job->next = NULL;
 	job->fnext = NULL;
-	if (service->tail)
-		service->tail->next = job;
+	if (scheduler->tail)
+		scheduler->tail->next = job;
 	else
-		service->head = job;
-	service->tail = job;
-	service->queued++;
+		scheduler->head = job;
+	scheduler->tail = job;
+	/* Sequentially consistent with a lane's "waiting": see Steal. */
+	__atomic_store_n(&scheduler->queued, scheduler->queued + 1, __ATOMIC_SEQ_CST);
 	if (service->options.delay_us)
 		job->enqueued = Now();
-	job->filter = Shareable(job) ? FilterFor(service, job) : NULL;
+	job->filter = Shareable(job) ? FilterFor(scheduler, job) : NULL;
 	if (job->filter)
 	{
 		FilterEntry *entry = job->filter;
@@ -1012,16 +1079,17 @@ Append		(Service *service, Job *job)
 	}
 	else
 	{
-		if (service->plainTail[job->kind])
-			service->plainTail[job->kind]->fnext = job;
+		if (scheduler->plainTail[job->kind])
+			scheduler->plainTail[job->kind]->fnext = job;
 		else
-			service->plainHead[job->kind] = job;
-		service->plainTail[job->kind] = job;
+			scheduler->plainHead[job->kind] = job;
+		scheduler->plainTail[job->kind] = job;
 	}
 }
 
 /*
- * The oldest queued job a lane may start on. Once active_lanes lanes work on
+ * The oldest job queued in a shard that a lane may start on. Once
+ * active_lanes lanes (over all shards) work on
  * cached filters, a filter takes no more than filter_lanes lanes per index
  * copy: searches over it arriving meanwhile wait and form one group behind
  * them, so the group size follows the load. Below that, lanes start on any
@@ -1030,18 +1098,95 @@ Append		(Service *service, Job *job)
  * ran fastest with 2 each; 21 of 28 lanes active suits both).
  */
 static Job *
-Eligible(Service *service)
+Eligible(Service *service, Scheduler *scheduler)
 {
 	uint32_t	limit = service->options.filter_lanes ? service->options.filter_lanes : 1;
 	uint32_t	target = service->options.active_lanes ? service->options.active_lanes :
 		service->options.lanes * 3 / 4 ? service->options.lanes * 3 / 4 : 1;
+	uint32_t	active = __atomic_load_n(&service->activeLanes, __ATOMIC_RELAXED);
 	uint32_t	scanned = 0;
 
 	limit *= AnnIndexConfig.index_copies ? AnnIndexConfig.index_copies : 1;
-	for (Job *job = service->head; job && scanned < ANN_GROUP_SCAN; job = job->next, scanned++)
-		if (job->filter == NULL || job->filter->active < limit || service->activeLanes < target)
+	for (Job *job = scheduler->head; job && scanned < ANN_GROUP_SCAN; job = job->next, scanned++)
+		if (job->filter == NULL || job->filter->active < limit || active < target)
 			return job;
 	return NULL;
+}
+
+/*
+ * A lane with nothing to do in its own shard looks in the others before it
+ * sleeps, or a hot filter would queue behind its shard's lanes while the
+ * rest idle. It holds its own shard's mutex and only tries the others', so
+ * no lane ever waits for a second scheduler mutex. Returns the shard, locked,
+ * and its oldest eligible job.
+ *
+ * The caller has counted itself in "waiting" before this reads "queued", and
+ * an enqueuer adds to "queued" before it reads "waiting" (Kick), all
+ * sequentially consistent: either the lane sees the job here, or the
+ * enqueuer sees the lane and wakes it.
+ */
+static Scheduler *
+Steal(Service *service, uint32_t home, Job **job)
+{
+	for (uint32_t i = 1; i < service->nschedulers; i++)
+	{
+		Scheduler  *other = &service->schedulers[(home + i) % service->nschedulers];
+
+		if (__atomic_load_n(&other->queued, __ATOMIC_SEQ_CST) == 0 || pthread_mutex_trylock(&other->mutex) != 0)
+			continue;
+		if ((*job = Eligible(service, other)) != NULL)
+			return other;
+		(void) pthread_mutex_unlock(&other->mutex);
+	}
+	return NULL;
+}
+
+/*
+ * Jobs were queued in shards ("full", a bit each) with too few sleeping lanes
+ * to wake for them: wake lanes that sleep in other shards, which then find
+ * the jobs (Steal). The full shards' own sleepers were signalled already.
+ * Called without any scheduler mutex. The signal is sent under the sleeper's
+ * mutex, which a lane holds from counting itself in "waiting" until it
+ * sleeps, so the wakeup is not lost. At full load no lane sleeps and this
+ * reads one shared counter.
+ */
+static void
+Kick(Service *service, uint32_t lanes, uint64_t full)
+{
+	uint32_t	start;
+
+	if (service->nschedulers == 1 || __atomic_load_n(&service->waiting, __ATOMIC_SEQ_CST) == 0)
+		return;
+	start = __atomic_fetch_add(&service->nextKick, 1, __ATOMIC_RELAXED);
+	for (uint32_t i = 0; i < service->nschedulers && lanes; i++)
+	{
+		uint32_t	s = (start + i) % service->nschedulers;
+		Scheduler  *other = &service->schedulers[s];
+
+		if ((full & (UINT64_C(1) << s)) || __atomic_load_n(&other->waiting, __ATOMIC_SEQ_CST) == 0)
+			continue;
+		(void) pthread_mutex_lock(&other->mutex);
+		(void) pthread_cond_signal(&other->condition);
+		(void) pthread_mutex_unlock(&other->mutex);
+		lanes--;
+	}
+}
+
+/* A lane's finished batch frees its filters, in the shard they came from. */
+static void
+ReleaseFilters(Service *service, Scheduler *scheduler, FilterEntry *owned, FilterEntry **extras, uint32_t nextras)
+{
+	owned->active--;
+	(void) __atomic_sub_fetch(&service->activeLanes, 1, __ATOMIC_RELAXED);
+	FilterDone(scheduler, owned);
+	for (uint32_t e = 0; e < nextras; e++)
+	{
+		extras[e]->active--;
+		FilterDone(scheduler, extras[e]);
+	}
+	/* The filters are free again: one waiting lane may take a queue. */
+	if (scheduler->blockedWaiters)
+		(void) pthread_cond_signal(&scheduler->condition);
 }
 
 /*
@@ -1140,10 +1285,19 @@ DeviceLostCheck(Service *service, Job **batch, uint32_t count)
 	_exit(ANN_EXIT_DEVICE_LOST);
 }
 
+typedef struct LaneArgs
+{
+	Service    *service;
+	uint32_t	index;
+} LaneArgs;
+
 static void *
 Lane(void *argument)
 {
-	Service    *service = argument;
+	LaneArgs   *args = argument;
+	Service    *service = args->service;
+	uint32_t	homeIndex = args->index % service->nschedulers;
+	Scheduler  *home = &service->schedulers[homeIndex];
 	Job		  **batch = calloc(service->options.max_batch_jobs, sizeof(*batch));
 	AnnGatheredJob *jobs = calloc(service->options.max_batch_jobs, sizeof(*jobs));
 	AnnIndexJob *indexJobs = calloc(service->options.max_batch_jobs, sizeof(*indexJobs));
@@ -1154,6 +1308,7 @@ Lane(void *argument)
 									 * next pickup under the same lock */
 	FilterEntry *releasedExtras[ANN_MIXED_FILTERS];
 	uint32_t	nreleased = 0;
+	Scheduler  *releasedFrom = NULL;	/* the shard that batch came from */
 
 	if (batch == NULL || jobs == NULL || indexJobs == NULL || slots == NULL || runs == NULL)
 		abort();
@@ -1164,46 +1319,69 @@ Lane(void *argument)
 		uint64_t	bytes = 0;
 		uint64_t	deadline;
 		Job		   *job = NULL;
+		Scheduler  *scheduler = home;	/* the shard this batch comes from */
 		FilterEntry *owns = NULL;
 		FilterEntry *extras[ANN_MIXED_FILTERS]; /* --mixed-groups */
 		uint32_t	nextras = 0;
 
-		(void) pthread_mutex_lock(&service->mutex);
-		if (released)
+		/*
+		 * Filters of a batch taken from another shard are released under that
+		 * shard's mutex, before this lane takes its own: no lane waits for
+		 * one scheduler mutex holding another.
+		 */
+		if (released && releasedFrom != home)
 		{
-			/* The filters are free again: one waiting lane may take a queue. */
-			released->active--;
-			service->activeLanes--;
-			FilterDone(service, released);
-			for (uint32_t e = 0; e < nreleased; e++)
-			{
-				releasedExtras[e]->active--;
-				FilterDone(service, releasedExtras[e]);
-			}
+			(void) pthread_mutex_lock(&releasedFrom->mutex);
+			ReleaseFilters(service, releasedFrom, released, releasedExtras, nreleased);
+			(void) pthread_mutex_unlock(&releasedFrom->mutex);
 			released = NULL;
 			nreleased = 0;
-			if (service->blockedWaiters)
-				(void) pthread_cond_signal(&service->condition);
 		}
-		service->idle++;
-		while (!service->stopping && (job = Eligible(service)) == NULL)
+		(void) pthread_mutex_lock(&home->mutex);
+		if (released)
 		{
-			if (service->head)
+			ReleaseFilters(service, home, released, releasedExtras, nreleased);
+			released = NULL;
+			nreleased = 0;
+		}
+		home->idle++;
+		while (!__atomic_load_n(&service->stopping, __ATOMIC_RELAXED) && (job = Eligible(service, home)) == NULL)
+		{
+			Scheduler  *other;
+
+			/*
+			 * About to sleep: from here until it wakes, the lane counts as
+			 * waiting, so an enqueuer in another shard knows to wake it
+			 * (Kick). First it looks in the other shards itself.
+			 */
+			__atomic_store_n(&home->waiting, home->waiting + 1, __ATOMIC_SEQ_CST);
+			(void) __atomic_add_fetch(&service->waiting, 1, __ATOMIC_SEQ_CST);
+			if (service->nschedulers > 1 && (other = Steal(service, homeIndex, &job)) != NULL)
+				scheduler = other;
+			else if (home->head)
 			{
-				service->held++;
-				service->blockedWaiters++;
-				(void) pthread_cond_wait(&service->condition, &service->mutex);
-				service->blockedWaiters--;
+				home->held++;
+				home->blockedWaiters++;
+				(void) pthread_cond_wait(&home->condition, &home->mutex);
+				home->blockedWaiters--;
 			}
 			else
-				(void) pthread_cond_wait(&service->condition, &service->mutex);
+				(void) pthread_cond_wait(&home->condition, &home->mutex);
+			__atomic_store_n(&home->waiting, home->waiting - 1, __ATOMIC_SEQ_CST);
+			(void) __atomic_sub_fetch(&service->waiting, 1, __ATOMIC_SEQ_CST);
+			if (scheduler != home)
+				break;
 		}
-		service->idle--;
+		home->idle--;
 		if (job == NULL)
 		{
-			(void) pthread_mutex_unlock(&service->mutex);
+			(void) pthread_mutex_unlock(&home->mutex);
 			break;
 		}
+
+		/* A batch from another shard: only that shard's mutex stays held. */
+		if (scheduler != home)
+			(void) pthread_mutex_unlock(&home->mutex);
 
 		/*
 		 * The fill window counts from the job's arrival, so a job that
@@ -1215,12 +1393,12 @@ Lane(void *argument)
 		 * Leave a share of the queue for idle lanes instead of serializing
 		 * it.
 		 */
-		limit = (uint32_t) ((service->queued + service->idle) / (service->idle + 1));
+		limit = (uint32_t) ((scheduler->queued + scheduler->idle) / (scheduler->idle + 1));
 		if (limit > service->options.max_batch_jobs)
 			limit = service->options.max_batch_jobs;
 		if (limit < 1)
 			limit = 1;
-		Take(service, job);
+		Take(scheduler, job);
 		batch[count++] = job;
 		bytes += JobBytes(job);
 		if (job->filter)
@@ -1233,7 +1411,7 @@ Lane(void *argument)
 			 */
 			owns = job->filter;
 			owns->active++;
-			service->activeLanes++;
+			(void) __atomic_add_fetch(&service->activeLanes, 1, __ATOMIC_RELAXED);
 
 			/*
 			 * The whole group, not the idle lanes' share: the filter's rows
@@ -1245,14 +1423,14 @@ Lane(void *argument)
 			{
 				Job		   *same = owns->head;
 
-				Take(service, same);
+				Take(scheduler, same);
 				batch[count++] = same;
 				pulled++;
 			}
 			if (pulled)
 			{
-				service->groups++;
-				service->grouped_jobs += pulled + 1;
+				scheduler->groups++;
+				scheduler->grouped_jobs += pulled + 1;
 			}
 
 			/*
@@ -1265,7 +1443,7 @@ Lane(void *argument)
 			{
 				uint32_t	scanned = 0;
 
-				for (Job *other = service->head; other && count < limit && scanned < ANN_GROUP_SCAN; scanned++)
+				for (Job *other = scheduler->head; other && count < limit && scanned < ANN_GROUP_SCAN; scanned++)
 				{
 					Job		   *next = other->next;
 					FilterEntry *entry = other->filter;
@@ -1287,7 +1465,7 @@ Lane(void *argument)
 							extras[nextras++] = entry;
 							entry->active++;
 						}
-						Take(service, other);
+						Take(scheduler, other);
 						batch[count++] = other;
 						bytes += JobBytes(other);
 					}
@@ -1305,30 +1483,31 @@ Lane(void *argument)
 		{
 			Job		   *plain;
 
-			while (count < limit && (plain = service->plainHead[batch[0]->kind]) != NULL &&
+			while (count < limit && (plain = scheduler->plainHead[batch[0]->kind]) != NULL &&
 				   bytes + JobBytes(plain) <= service->options.max_batch_bytes)
 			{
-				Take(service, plain);
+				Take(scheduler, plain);
 				batch[count++] = plain;
 				bytes += JobBytes(plain);
 			}
-			if (count >= limit || service->idle || service->stopping || Now() >= deadline)
+			if (count >= limit || scheduler->idle || __atomic_load_n(&service->stopping, __ATOMIC_RELAXED) ||
+				Now() >= deadline)
 				break;
 			{
 				struct timespec ts = {(time_t) (deadline / 1000000000),
 				(long) (deadline % 1000000000)};
 
-				(void) pthread_cond_timedwait(&service->condition, &service->mutex, &ts);
+				(void) pthread_cond_timedwait(&scheduler->condition, &scheduler->mutex, &ts);
 			}
 			limit = service->options.max_batch_jobs;
 		}
-		service->batches++;
-		service->jobs += count;
-		if (count > service->max_batch)
-			service->max_batch = count;
+		scheduler->batches++;
+		scheduler->jobs += count;
+		if (count > scheduler->max_batch)
+			scheduler->max_batch = count;
 		for (uint32_t i = 0; i < count; i++)
-			service->rows += batch[i]->job.rows;
-		(void) pthread_mutex_unlock(&service->mutex);
+			scheduler->rows += batch[i]->job.rows;
+		(void) pthread_mutex_unlock(&scheduler->mutex);
 		if (batch[0]->kind == JOB_INDEX)
 			SearchIndexJobs(service, batch, count, indexJobs, slots, runs);
 		else
@@ -1350,10 +1529,12 @@ Lane(void *argument)
 		}
 
 		/*
-		 * Release the filters at the next pickup, which takes the lock
-		 * anyway.
+		 * Release the filters at the next pickup, which takes the lock anyway
+		 * (its own shard's; a batch from another shard costs one more lock
+		 * there).
 		 */
 		released = owns;
+		releasedFrom = scheduler;
 		nreleased = nextras;
 		memcpy(releasedExtras, extras, sizeof(*extras) * nextras);
 	}
@@ -1370,6 +1551,14 @@ Lane(void *argument)
  * vectors. Shared payload: the same four fields, u64 byte offset into the
  * attached segment, then the FP32 query; vectors stay in the segment.
  */
+/* What EnqueueJobs writes in a job's trace: nothing, queued, or arrived too. */
+#define ENQUEUE_STAMP_NONE 0
+#define ENQUEUE_STAMP_QUEUED 1
+#define ENQUEUE_STAMP_ARRIVED 2
+
+static uint32_t EnqueueJobs(Service *service, Connection *connection, Job **jobs, uint32_t count, char *admitted,
+							int stamp);
+
 static AnnStatus
 Submit(Service *service, Connection *connection, int rdma, uint16_t operation,
 	   uint64_t request, unsigned char *payload, uint32_t size)
@@ -1382,6 +1571,7 @@ Submit(Service *service, Connection *connection, int rdma, uint16_t operation,
 	size_t		header = operation == ANN_OP_SHARED_SEARCH ? 24 : 16;
 	float	   *values = (float *) (void *) (payload + header);
 	const float *vectors;
+	char		admitted;
 
 	if (size < header)
 		return ANN_INVALID;
@@ -1435,23 +1625,12 @@ Submit(Service *service, Connection *connection, int rdma, uint16_t operation,
 	job->request = request;
 	job->payload = payload;
 	job->charge = charge;
-	(void) pthread_mutex_lock(&service->mutex);
-	if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + charge > service->options.max_pending_bytes)
+	if (EnqueueJobs(service, connection, &job, 1, &admitted, ENQUEUE_STAMP_NONE) == 0)
 	{
-		service->rejected++;
-		(void) pthread_mutex_unlock(&service->mutex);
 		free(job->job.results);
 		free(job);
 		return ANN_OVERLOADED;
 	}
-	(void) __atomic_add_fetch(&service->pending_bytes, charge, __ATOMIC_RELAXED);
-	(void) pthread_mutex_lock(&connection->mutex);
-	connection->references++;
-	(void) pthread_mutex_unlock(&connection->mutex);
-	Append		(service, job);
-
-	(void) pthread_cond_signal(&service->condition);
-	(void) pthread_mutex_unlock(&service->mutex);
 	return ANN_PENDING;
 }
 
@@ -1488,17 +1667,21 @@ Attach(Connection *connection, const unsigned char *name, uint32_t size)
 	return ANN_OK;
 }
 
-/* Admit a prepared job and queue it; false when over the pending budget. */
+/*
+ * Charge a job to the pending budgets; false when it is over one. The charge
+ * is added first and taken back on refusal: with a mutex per shard, a check
+ * before the add would let enqueuers in different shards pass it together.
+ * Called under the job's shard mutex, which guards the shard's counters.
+ */
 static int
-Enqueue(Service *service, Connection *connection, Job *job)
+Admit(Service *service, Scheduler *scheduler, Job *job)
 {
 	AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
 
-	(void) pthread_mutex_lock(&service->mutex);
-	if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + job->charge > service->options.max_pending_bytes)
+	if (__atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED) > service->options.max_pending_bytes)
 	{
-		service->rejected++;
-		(void) pthread_mutex_unlock(&service->mutex);
+		(void) __atomic_sub_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
+		scheduler->rejected++;
 		return 0;
 	}
 
@@ -1506,142 +1689,143 @@ Enqueue(Service *service, Connection *connection, Job *job)
 	 * --index-pending-share: one index's searches may hold only part of the
 	 * budget, so a flood on one index leaves room for the others.
 	 */
-	if (file && service->options.index_pending_share < 100 &&
-		__atomic_load_n(&file->pendingBytes, __ATOMIC_RELAXED) + job->charge >
-		service->options.max_pending_bytes / 100 * service->options.index_pending_share)
+	if (file == NULL)
+		return 1;
+	if (__atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED) >
+		service->options.max_pending_bytes / 100 * service->options.index_pending_share &&
+		service->options.index_pending_share < 100)
 	{
-		service->rejected++;
-		service->rejected_index++;
-		(void) pthread_mutex_unlock(&service->mutex);
+		(void) __atomic_sub_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
+		(void) __atomic_sub_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
+		scheduler->rejected++;
+		scheduler->rejected_index++;
 		return 0;
 	}
-	if (file)
-		(void) __atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
-	(void) __atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
-	(void) pthread_mutex_lock(&connection->mutex);
-	connection->references++;
-	(void) pthread_mutex_unlock(&connection->mutex);
-	if (traceFile)
-	{
-		job->arrived = frameArrived;
-		job->queued = Now();
-	}
-	Append		(service, job);
-
-	(void) pthread_cond_signal(&service->condition);
-	(void) pthread_mutex_unlock(&service->mutex);
 	return 1;
 }
 
 /*
- * Admit and queue several prepared jobs under one lock, waking one lane per
- * full batch of them; admitted[i] tells which fit the pending budget.
+ * Admit and queue prepared jobs, each in its shard, taking every shard's
+ * mutex once and waking one lane per full batch of the jobs queued there.
+ * With one shard that is one lane per max_batch jobs of the call, which beat
+ * a lane per filter group by a quarter in throughput; with many shards a
+ * call's jobs spread out and it wakes up to a lane per shard it touches
+ * (not measured: compare jobs per batch against --scheduler-shards 1).
+ * admitted[i] tells which fit the pending budget. A connection given here
+ * gets a reference per admitted job, taken before the job's shard is
+ * unlocked: after that a lane may finish the job and drop it.
+ */
+static uint32_t
+EnqueueJobs(Service *service, Connection *connection, Job **jobs, uint32_t count, char *admitted, int stamp)
+{
+	uint32_t	per = service->options.max_batch_jobs ? service->options.max_batch_jobs : 1;
+	uint32_t	plain = PlainScheduler(service);
+	uint64_t	shards = 0;
+	uint64_t	full = 0;
+	uint32_t	n = 0;
+	uint32_t	unwoken = 0;
+
+	for (uint32_t i = 0; i < count; i++)
+	{
+		jobs[i]->shard = SchedulerOf(service, jobs[i], plain);
+		shards |= UINT64_C(1) << jobs[i]->shard;
+		admitted[i] = 2;		/* not yet looked at */
+	}
+	for (uint32_t s = 0; s < service->nschedulers; s++)
+	{
+		Scheduler  *scheduler = &service->schedulers[s];
+		uint32_t	queued = 0;
+
+		if (!(shards & (UINT64_C(1) << s)))
+			continue;
+		(void) pthread_mutex_lock(&scheduler->mutex);
+		for (uint32_t i = 0; i < count; i++)
+		{
+			Job		   *job = jobs[i];
+
+			/*
+			 * A job queued in an earlier shard may be finished and freed by
+			 * now: admitted[] says so before the job is looked at.
+			 */
+			if (admitted[i] != 2 || job->shard != s)
+				continue;
+			if (!Admit(service, scheduler, job))
+			{
+				admitted[i] = 0;
+				continue;
+			}
+			if (traceFile && stamp != ENQUEUE_STAMP_NONE)
+			{
+				if (stamp == ENQUEUE_STAMP_ARRIVED)
+					job->arrived = frameArrived;
+				job->queued = Now();
+			}
+			Append		(service, scheduler, job);
+
+			admitted[i] = 1;
+			queued++;
+		}
+		if (queued)
+		{
+			uint32_t	wake = (queued + per - 1) / per;
+
+			if (connection)
+			{
+				(void) pthread_mutex_lock(&connection->mutex);
+				connection->references += queued;
+				(void) pthread_mutex_unlock(&connection->mutex);
+			}
+			for (uint32_t woken = 0; woken < wake; woken++)
+				(void) pthread_cond_signal(&scheduler->condition);
+			if (wake > scheduler->waiting)
+			{
+				unwoken += wake - scheduler->waiting;
+				full |= UINT64_C(1) << s;
+			}
+		}
+		(void) pthread_mutex_unlock(&scheduler->mutex);
+		n += queued;
+	}
+	if (unwoken)
+		Kick(service, unwoken, full);
+	return n;
+}
+
+/* Admit a prepared job and queue it; false when over the pending budget. */
+static int
+Enqueue(Service *service, Connection *connection, Job *job)
+{
+	char		admitted;
+
+	return EnqueueJobs(service, connection, &job, 1, &admitted, ENQUEUE_STAMP_ARRIVED) == 1;
+}
+
+/*
+ * Admit and queue several prepared jobs together, so lanes find a whole
+ * same-filter group at once; admitted[i] tells which fit the pending budget.
  */
 static uint32_t
 EnqueueMany(Service *service, Connection *connection, Job **jobs, uint32_t count, char *admitted)
 {
-	uint32_t	n = 0;
-	uint32_t	per = service->options.max_batch_jobs ? service->options.max_batch_jobs : 1;
-
-	(void) pthread_mutex_lock(&service->mutex);
-	for (uint32_t i = 0; i < count; i++)
-	{
-		Job		   *job = jobs[i];
-		AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
-
-		admitted[i] = 0;
-		if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + job->charge > service->options.max_pending_bytes)
-		{
-			service->rejected++;
-			continue;
-		}
-		if (file && service->options.index_pending_share < 100 &&
-			__atomic_load_n(&file->pendingBytes, __ATOMIC_RELAXED) + job->charge >
-			service->options.max_pending_bytes / 100 * service->options.index_pending_share)
-		{
-			service->rejected++;
-			service->rejected_index++;
-			continue;
-		}
-		if (file)
-			(void) __atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
-		(void) __atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
-		if (traceFile)
-		{
-			job->arrived = frameArrived;
-			job->queued = Now();
-		}
-		Append		(service, job);
-
-		admitted[i] = 1;
-		n++;
-	}
-	if (n)
-	{
-		(void) pthread_mutex_lock(&connection->mutex);
-		connection->references += n;
-		(void) pthread_mutex_unlock(&connection->mutex);
-		for (uint32_t woken = 0; woken < (n + per - 1) / per; woken++)
-			(void) pthread_cond_signal(&service->condition);
-	}
-	(void) pthread_mutex_unlock(&service->mutex);
-	return n;
+	return EnqueueJobs(service, connection, jobs, count, admitted, ENQUEUE_STAMP_ARRIVED);
 }
 
 /*
- * Queue a pool reader's deferred jobs under one lock. A job the budget
+ * Queue a pool reader's deferred jobs, grouped by shard: one lock per shard
+ * the round touches. A job the budget
  * refuses is answered ANN_OVERLOADED here, as its submitter would have.
  */
 static void
 EnqueueDeferred(Service *service)
 {
 	uint32_t	count = readerDeferredCount;
-	uint32_t	n = 0;
-	uint32_t	per = service->options.max_batch_jobs ? service->options.max_batch_jobs : 1;
 	char		admitted[ANN_READER_DEFERRED];
 
 	readerDeferredCount = 0;
 	if (count == 0)
 		return;
-	(void) pthread_mutex_lock(&service->mutex);
-	for (uint32_t i = 0; i < count; i++)
-	{
-		Job		   *job = readerDeferred[i];
-		AnnIndexFile *file = job->kind == JOB_INDEX ? job->bitmapFile : NULL;
-
-		admitted[i] = 0;
-		if (__atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED) + job->charge >
-			service->options.max_pending_bytes)
-		{
-			service->rejected++;
-			continue;
-		}
-		if (file && service->options.index_pending_share < 100 &&
-			__atomic_load_n(&file->pendingBytes, __ATOMIC_RELAXED) + job->charge >
-			service->options.max_pending_bytes / 100 * service->options.index_pending_share)
-		{
-			service->rejected++;
-			service->rejected_index++;
-			continue;
-		}
-		if (file)
-			(void) __atomic_add_fetch(&file->pendingBytes, job->charge, __ATOMIC_RELAXED);
-		(void) __atomic_add_fetch(&service->pending_bytes, job->charge, __ATOMIC_RELAXED);
-		if (traceFile)
-			job->queued = Now();
-		Append		(service, job);
-
-		admitted[i] = 1;
-		n++;
-	}
-
-	/*
-	 * One lane per max_batch jobs, as EnqueueMany: waking a lane per filter
-	 * group instead gave smaller batches and a quarter less throughput.
-	 */
-	for (uint32_t woken = 0; woken < (n + per - 1) / per; woken++)
-		(void) pthread_cond_signal(&service->condition);
-	(void) pthread_mutex_unlock(&service->mutex);
+	/* The jobs hold their connection references already. */
+	(void) EnqueueJobs(service, NULL, readerDeferred, count, admitted, ENQUEUE_STAMP_QUEUED);
 	for (uint32_t i = 0; i < count; i++)
 	{
 		Job		   *job = readerDeferred[i];
@@ -2527,7 +2711,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned 
 		{
 			if (__atomic_load_n(&(*result)->uploadDeferred, __ATOMIC_ACQUIRE))
 				AnnIndexBitmapUploadDeferred(file, *result);
-			/* Not under service->mutex: every search would contend for it. */
+			/* Not under a scheduler mutex: every search would contend for it. */
 			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
 			free(canonical);
 			return ANN_OK;
@@ -3503,6 +3687,18 @@ ServeFrame(Service *service, Connection *connection)
 		uint64_t	rdmaFrames = 0,
 					rdmaFallbacks = 0;
 		int			rdmaLanes = 0;
+		struct
+		{
+			uint64_t	jobs;
+			uint64_t	batches;
+			uint64_t	max_batch;
+			uint64_t	rows;
+			uint64_t	rejected;
+			uint64_t	rejected_index;
+			uint64_t	groups;
+			uint64_t	grouped_jobs;
+			uint64_t	held;
+		}			total = {0, 0, 0, 0, 0, 0, 0, 0, 0};
 
 		if (service->rdma)
 			AnnRdmaStats(service->rdma, &rdmaFrames, &rdmaFallbacks, &rdmaLanes);
@@ -3510,7 +3706,28 @@ ServeFrame(Service *service, Connection *connection)
 		if (operation == ANN_OP_STATS)
 			AnnIndexPredicateStats(&predicateEntries, &predicateBytes, &predicateDeviceBytes,
 								   &predicateEvictions);
-		(void) pthread_mutex_lock(&service->mutex);
+
+		/*
+		 * The scheduler's counters, summed over its shards, one lock at a
+		 * time.
+		 */
+		for (uint32_t s = 0; operation != 0 && s < service->nschedulers; s++)
+		{
+			Scheduler  *scheduler = &service->schedulers[s];
+
+			(void) pthread_mutex_lock(&scheduler->mutex);
+			total.jobs += scheduler->jobs;
+			total.batches += scheduler->batches;
+			if (scheduler->max_batch > total.max_batch)
+				total.max_batch = scheduler->max_batch;
+			total.rows += scheduler->rows;
+			total.rejected += scheduler->rejected;
+			total.rejected_index += scheduler->rejected_index;
+			total.groups += scheduler->groups;
+			total.grouped_jobs += scheduler->grouped_jobs;
+			total.held += scheduler->held;
+			(void) pthread_mutex_unlock(&scheduler->mutex);
+		}
 		if (operation == 0)
 			size = snprintf(message, sizeof(message),
 							"{\"backend\":\"%s\",\"mode\":\"server\",\"operations\":[0,5,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,25,26,27,28,29,30,31],"
@@ -3530,17 +3747,17 @@ ServeFrame(Service *service, Connection *connection)
 							"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
 							"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_residual\":%llu,"
 							"\"merged\":%llu}",
-							(unsigned long long) service->jobs, (unsigned long long) service->batches,
-							(unsigned long long) service->max_batch, (unsigned long long) service->rows,
-							(unsigned long long) service->rejected, (unsigned long long) service->rejected_index,
+							(unsigned long long) total.jobs, (unsigned long long) total.batches,
+							(unsigned long long) total.max_batch, (unsigned long long) total.rows,
+							(unsigned long long) total.rejected, (unsigned long long) total.rejected_index,
 							(unsigned long long) __atomic_load_n(&service->failed, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->pending_bytes, __ATOMIC_RELAXED),
 							(unsigned long long) (service->backend->device_jobs ?
 												  service->backend->device_jobs() : 0),
 							(unsigned long long) __atomic_load_n(&service->rdma_frames, __ATOMIC_RELAXED),
 							(unsigned long long) rdmaFallbacks,
-							rdmaLanes, (unsigned long long) service->groups,
-							(unsigned long long) service->grouped_jobs, (unsigned long long) service->held,
+							rdmaLanes, (unsigned long long) total.groups,
+							(unsigned long long) total.grouped_jobs, (unsigned long long) total.held,
 							(unsigned long long) service->predicate_hits,
 							(unsigned long long) service->predicate_evaluations,
 							(unsigned long long) service->predicate_eval_us,
@@ -3551,7 +3768,6 @@ ServeFrame(Service *service, Connection *connection)
 							(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->predicate_residual, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->merged, __ATOMIC_RELAXED));
-		(void) pthread_mutex_unlock(&service->mutex);
 		Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 			  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);
 	}
@@ -3832,6 +4048,7 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	struct sockaddr_un address = {0};
 	struct sigaction action = {0};
 	pthread_t  *lanes;
+	LaneArgs   *laneArgs;
 	int			listener = -1;
 	int			network = -1;
 #ifdef __linux__
@@ -3858,9 +4075,42 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		if (service.options.trace_sample == 0)
 			service.options.trace_sample = 1;
 	}
-	(void) pthread_mutex_init(&service.mutex, NULL);
+
+	/*
+	 * Scheduler shards: one per 24 lanes unless told. With one, every reader
+	 * and lane met on one mutex (see Scheduler: 45% of lane samples waited
+	 * for it at a million searches a second); with many, lanes take work
+	 * sooner and batches shrink. 96 lanes on the Muse mix held a 50 ms p99
+	 * to 110k requests/s with 1 shard, 150k with 4 and 140k with 12.
+	 */
+	service.nschedulers = options->scheduler_shards ? options->scheduler_shards : options->lanes / 24;
+	if (service.nschedulers > options->lanes)
+		service.nschedulers = options->lanes;
+	if (service.nschedulers > ANN_MAX_SCHEDULERS)
+		service.nschedulers = ANN_MAX_SCHEDULERS;
+	if (service.nschedulers < 1)
+		service.nschedulers = 1;
+	if ((service.schedulers = calloc(service.nschedulers, sizeof(*service.schedulers))) == NULL)
+		return 1;
+	for (uint32_t s = 0; s < service.nschedulers; s++)
+	{
+		pthread_mutexattr_t attributes;
+
+		/*
+		 * Readers and lanes hold a scheduler mutex for a few hundred
+		 * nanoseconds at a time, 70,000 times a second at a million searches:
+		 * spinning briefly for it beats sleeping (46% of lane samples and 82%
+		 * of reader samples were futex waits on it).
+		 */
+		(void) pthread_mutexattr_init(&attributes);
+#ifdef __GLIBC__				/* an enum there, not a macro */
+		(void) pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_ADAPTIVE_NP);
+#endif
+		(void) pthread_mutex_init(&service.schedulers[s].mutex, &attributes);
+		(void) pthread_mutexattr_destroy(&attributes);
+		(void) pthread_cond_init(&service.schedulers[s].condition, NULL);
+	}
 	(void) pthread_mutex_init(&service.peersMutex, NULL);
-	(void) pthread_cond_init(&service.condition, NULL);
 	action.sa_sigaction = OnSignal;
 	action.sa_flags = SA_SIGINFO;
 	(void) sigaction(SIGINT, &action, NULL);
@@ -3919,11 +4169,16 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		freeaddrinfo(result);
 	}
 	lanes = calloc(options->lanes, sizeof(*lanes));
-	if (lanes == NULL)
+	laneArgs = calloc(options->lanes, sizeof(*laneArgs));
+	if (lanes == NULL || laneArgs == NULL)
 		return 1;
 	for (uint32_t i = 0; i < options->lanes; i++)
-		if (pthread_create(&lanes[i], NULL, Lane, &service) != 0)
+	{
+		laneArgs[i].service = &service;
+		laneArgs[i].index = i;
+		if (pthread_create(&lanes[i], NULL, Lane, &laneArgs[i]) != 0)
 			return 1;
+	}
 #ifdef __linux__
 	if (service.options.readers)
 	{
@@ -4058,13 +4313,22 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	if (path)
 		(void) unlink(path);
 	fprintf(stderr, "ann-worker: stopping on signal %d from process %d\n", (int) stopSignal, (int) stopSender);
-	(void) pthread_mutex_lock(&service.mutex);
-	service.stopping = 1;
-	(void) pthread_cond_broadcast(&service.condition);
-	(void) pthread_mutex_unlock(&service.mutex);
+
+	/*
+	 * Every shard's lanes: a lane reads the flag under its shard's mutex
+	 * before it sleeps, so it either sees it or gets the broadcast.
+	 */
+	__atomic_store_n(&service.stopping, 1, __ATOMIC_SEQ_CST);
+	for (uint32_t s = 0; s < service.nschedulers; s++)
+	{
+		(void) pthread_mutex_lock(&service.schedulers[s].mutex);
+		(void) pthread_cond_broadcast(&service.schedulers[s].condition);
+		(void) pthread_mutex_unlock(&service.schedulers[s].mutex);
+	}
 	for (uint32_t i = 0; i < options->lanes; i++)
 		(void) pthread_join(lanes[i], NULL);
 	free(lanes);
+	free(laneArgs);
 
 	/*
 	 * Stop RDMA progress threads so no new frames are handled; the rest of

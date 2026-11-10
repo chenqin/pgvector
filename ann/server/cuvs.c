@@ -635,6 +635,7 @@ typedef struct AnnCuvsIndex
 /* Keep the full lane ordinal: wrapping before modulo copies biases 3/6/7 GPUs. */
 static _Thread_local int64_t laneHome = -1;
 static atomic_uint nextHome;
+static atomic_uint nextPlacement;	/* --replicate N: indexes placed so far */
 static _Thread_local uint32_t laneCopy;
 
 /* -1 uses deployment defaults; 0/1 is a batch-local calibrated decision. */
@@ -830,25 +831,29 @@ typedef struct AnnCuvsDevice
 	int			matrixMarks;	/* marks recorded in the current batch */
 	int			timingReady;
 	float	   *matrixScores,
-			   *matrixCandidates,
-			   *matrixValues;
-	int64_t    *matrixIndices,
-			   *matrixRows;
-	float	   *matrixHostValues;
-	int64_t    *matrixHostRows;
+			   *matrixCandidates;
+	int64_t    *matrixIndices;
+
+	/*
+	 * A tile's results are regions of one device allocation and one pinned
+	 * one, so one copy brings them all to the host (MatrixOutAt): the
+	 * pointers below are set by MatrixBuffers for the tile at hand.
+	 */
+	void	   *matrixOut;
+	void	   *matrixHostOut;	/* pinned */
+	size_t		matrixOutCap,	/* bytes */
+				matrixHostOutCap;
+	float	   *matrixValues;
+	int64_t    *matrixRows;
 	int64_t    *matrixKeys;		/* keys of matrixRows, gathered on the GPU */
-	int64_t    *matrixHostKeys; /* pinned */
-	size_t		matrixKeyCap,
-				matrixHostKeyCap;
+	float	   *matrixHostValues;	/* the first tile's region of
+									 * matrixHostOut */
+	int64_t    *matrixHostRows;
 	float	   *rerankQueries;
 	size_t		rerankQueryCap;
 	size_t		matrixScoreCap,
-				matrixCandidateCap,
-				matrixValueCap;
-	size_t		matrixIndexCap,
-				matrixRowCap,
-				matrixHostValueCap,
-				matrixHostRowCap;
+				matrixCandidateCap;
+	size_t		matrixIndexCap;
 	/* --matrix-prune: sampled cutoffs and the scores under them */
 	float	   *pruneSample;
 	float	   *pruneBounds;
@@ -884,13 +889,11 @@ typedef struct AnnCuvsDevice
 	uint32_t   *fuseSampleRows;
 	float	   *fuseBounds;
 	uint32_t   *fusePositions;
-	uint32_t   *fuseCounts;
-	uint32_t   *hostFuseCounts; /* pinned */
+	uint32_t   *fuseCounts;		/* in matrixOut */
+	uint32_t   *hostFuseCounts; /* in the tile's region of matrixHostOut */
 	size_t		fuseSampleRowCap,
 				fuseBoundCap,
-				fusePositionCap,
-				fuseCountCap,
-				hostFuseCountCap;
+				fusePositionCap;
 	/* --residual-masks: (query, shard row) pairs to mask, and their staging */
 	uint32_t   *maskPairs;
 	uint32_t   *hostMaskPairs;	/* pinned */
@@ -1353,7 +1356,7 @@ FreeDeviceArrays(const AnnCuvsIndex *state, void **arrays)
  * that form on the per-query path.
  */
 static int	GatherKeys(const AnnCuvsShard *shard, uint64_t shardRows, AnnCuvsDevice *lane, int device,
-					   cudaStream_t stream, uint32_t count, int64_t *hostKeys);
+					   cudaStream_t stream, uint32_t count);
 static int	MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t q, uint32_t n,
 						 uint32_t candidates, const uint32_t *rows, AnnCuvsDevice *lane, int device,
 						 cudaStream_t stream, float *scores);
@@ -2064,28 +2067,27 @@ MaskExcluded(const AnnIndexFile *file, uint32_t s, AnnIndexJob **jobs, uint32_t 
 
 /*
  * The keys of the first count entries of lane->matrixRows (shard rows, -1
- * for none), read from the shard's device keys and copied to hostKeys on
- * the lane's stream: the host then reads no key per hit. Returns 0 when the
- * kernel is unavailable (the host reads the keys itself).
+ * for none), read from the shard's device keys into lane->matrixKeys on the
+ * lane's stream: the host then reads no key per hit. The caller copies them
+ * to the host with the rows and distances they follow in matrixOut (which
+ * MatrixBuffers sized for count entries). Returns 0 when the kernel is
+ * unavailable (the host reads the keys itself).
  */
 static int
 GatherKeys(const AnnCuvsShard *shard, uint64_t shardRows, AnnCuvsDevice *lane, int device, cudaStream_t stream,
-		   uint32_t count, int64_t *hostKeys)
+		   uint32_t count)
 {
 	PredicateModule *module;
 	unsigned long long rows = shardRows;
 
-	if (shard->keys == NULL || count == 0 || (module = PredicateKernels(device)) == NULL ||
-		!GrowDevice((void **) &lane->matrixKeys, &lane->matrixKeyCap, count, sizeof(int64_t), 0, stream))
+	if (shard->keys == NULL || count == 0 || (module = PredicateKernels(device)) == NULL)
 		return 0;
 	{
 		void	   *args[] = {(void *) &shard->keys, &lane->matrixRows, &lane->matrixKeys, &count, &rows};
 
 		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 			cuLaunchKernel(module->gatherKeys, (count + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
-						   args, NULL) == CUDA_SUCCESS &&
-			cudaMemcpyAsync(hostKeys, lane->matrixKeys, (size_t) count * sizeof(int64_t), cudaMemcpyDeviceToHost,
-							stream) == cudaSuccess;
+						   args, NULL) == CUDA_SUCCESS;
 	}
 }
 
@@ -2121,6 +2123,7 @@ LoadIndex(const char *name, const char *directory)
 	pthread_t  *threads;
 	uint32_t	copies;
 	uint32_t	total;
+	uint32_t	base = 0;
 	int			devices = 0;
 	AnnStatus	status = AnnIndexFileOpen(name, directory, &file);
 
@@ -2243,6 +2246,15 @@ LoadIndex(const char *name, const char *directory)
 		memoryResourceReady = 1;
 	}
 	(void) pthread_mutex_unlock(&memoryResourceMutex);
+
+	/*
+	 * --replicate N: each index takes the next nshards * N devices in turn,
+	 * so indexes of few shards spread over the GPUs instead of all starting
+	 * on the first: 37 one-shard indexes with 2 copies put 9 or 10 on each of
+	 * 8 GPUs, and a search runs on one GPU with no shard lists to merge.
+	 */
+	if (AnnIndexConfig.replicate > 1 && copies < (uint32_t) devices)
+		base = atomic_fetch_add(&nextPlacement, 1) * total % (uint32_t) devices;
 	for (uint32_t s = 0; s < total; s++)
 	{
 		uint32_t	copy = s / file->nshards;
@@ -2251,7 +2263,7 @@ LoadIndex(const char *name, const char *directory)
 		args[s] = (LoadArgs)
 		{
 			file, state, shard, s, copies == (uint32_t) devices ? (int) copy :
-				(int) ((copy * file->nshards + shard) % (uint32_t) devices),
+				(int) ((base + copy * file->nshards + shard) % (uint32_t) devices),
 				1, ANN_BACKEND_ERROR
 		};
 		if (pthread_create(&threads[s], NULL, LoadShard, &args[s]) != 0)
@@ -2674,6 +2686,36 @@ MergeJob(AnnIndexJob *job, AnnIndexHit *lists, uint32_t *counts, uint32_t nshard
 }
 
 /*
+ * Whether a reranked list is sorted by distance and names no row twice. A
+ * row returned twice has one distance, so in a sorted list its copies share
+ * a run of equal distances: only those runs are compared, where hashing
+ * every position (AnnIndexPositionsDistinct) took 5 to 8 us a list of 1000.
+ * False for an unsorted list too; the caller then hashes.
+ */
+static int
+SortedDistinct(const int64_t *positions, const float *distances, uint32_t n)
+{
+	uint32_t	run = 0;		/* first entry of the current distance's run */
+
+	for (uint32_t i = 1; i < n; i++)
+	{
+		if (!(distances[i] >= distances[i - 1]))
+			return 0;
+		if (distances[i] != distances[run])
+		{
+			run = i;
+			continue;
+		}
+		if (i - run > 16)
+			return 0;			/* long runs (equal vectors, padding): hash */
+		for (uint32_t j = run; j < i; j++)
+			if (positions[j] == positions[i] && positions[i] >= 0)
+				return 0;
+	}
+	return 1;
+}
+
+/*
  * A graph search can return fewer than k hits although more rows qualify: its
  * candidate list holds invalid entries, or the walk never reached the rows
  * the filter allows. Replying short makes PostgreSQL finish the search itself,
@@ -2954,12 +2996,32 @@ static const char SelectSource[] =
 "    }\n"
 "}\n";
 
-/* The fused pruned selection's cutoff per query, laid out as AnnBlackwellScoreBelow reads it. */
+/*
+ * The fused pruned selection's cutoff per query, laid out as
+ * AnnBlackwellScoreBelow reads it. bound_cut is bound_max, the copy of the
+ * cutoff to the scan's layout and the zeroing of the scan's kept counts in
+ * one launch instead of three (each tiny launch is 10-25 us of pipeline
+ * latency and 5-8 us of lane CPU under the context's driver lock).
+ */
 static const char FusedSelectSource[] =
-"extern \"C\" __global__ void cutoff32(const float *bounds, unsigned rank, unsigned q, float *out)\n"
+"extern \"C\" __global__ void bound_cut(const float *bounds, unsigned rank, unsigned q, float *out,\n"
+"    unsigned *counts)\n"
 "{\n"
-"  unsigned i = blockIdx.x * blockDim.x + threadIdx.x;\n"
-"  if (i < q) out[i * 32 + 31] = bounds[(unsigned long long) i * rank + rank - 1];\n"
+"  __shared__ float part[32];\n"
+"  unsigned row = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;\n"
+"  const float *b = bounds + (unsigned long long) row * rank;\n"
+"  float m = -__int_as_float(0x7f800000);\n"
+"  if (row >= q) return;\n"
+"  for (unsigned i = tid; i < rank; i += blockDim.x) m = fmaxf(m, b[i]);\n"
+"  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));\n"
+"  if (lane == 0) part[warp] = m;\n"
+"  __syncthreads();\n"
+"  if (warp == 0)\n"
+"  {\n"
+"    m = lane < (blockDim.x >> 5) ? part[lane] : -__int_as_float(0x7f800000);\n"
+"    for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(0xffffffffu, m, o));\n"
+"    if (lane == 0) { out[row * 32 + 31] = m; counts[row] = 0; }\n"
+"  }\n"
 "}\n"
 "/* The rank-th smallest sampled score, from the unordered rank smallest (prune_select_s), placed last. */\n"
 "extern \"C\" __global__ void bound_max(float *bounds, unsigned rank, unsigned q)\n"
@@ -3365,7 +3427,8 @@ static const char PostSource5[] =
 #define ANN_PRUNE_SAMPLE 8192	/* sampled scores per query */
 #define ANN_PRUNE_RANK 32		/* the sample's least cutoff rank */
 #define ANN_PRUNE_MARGIN 4		/* expected kept / needed candidates */
-#define ANN_PRUNE_CAP 16384		/* most scores kept per query */
+#define ANN_PRUNE_CAP 32768		/* most scores kept per query: 4 x the most
+								 * candidates (k + slack up to 4096) */
 #define ANN_PRUNE_MIN_ROWS 65536	/* smaller rows select in full */
 
 /* ANN_PRUNE_MIN_ROWS, or the environment's (tests prune small indexes). */
@@ -3453,7 +3516,7 @@ typedef struct GatherModule
 	CUfunction	pruneSort;
 	CUfunction	pruneCompact4;
 	CUfunction	pruneSelect;
-	CUfunction	cutoff32;
+	CUfunction	boundCut;
 	CUfunction	boundMax;
 	CUfunction	segmentSample;
 	CUfunction	segmentCompact;
@@ -3560,7 +3623,7 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->pruneSort, module->module, "matrix_prune_sort") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneCompact4, module->module, "matrix_compact4") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSelect, module->module, "matrix_prune_select") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->cutoff32, module->module, "cutoff32") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->boundCut, module->module, "bound_cut") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->boundMax, module->module, "bound_max") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentSample, module->module, "segment_sample") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->segmentCompact, module->module, "segment_compact") != CUDA_SUCCESS ||
@@ -4670,18 +4733,77 @@ MatrixScores(AnnCuvsDevice *lane, size_t needed, cudaStream_t stream)
 	return 1;
 }
 
-/* Independently sized buffers also recover cleanly from a partial allocation failure. */
-static int
-MatrixBuffers(AnnCuvsDevice *lane, size_t scores, size_t candidates, size_t output, size_t host,
-			  cudaStream_t stream)
+/*
+ * A tile's results, end to end in one allocation so that one device-to-host
+ * copy moves them all (three copies and the fused counts' own were four
+ * driver calls a tile, each 5-8 us of lane CPU under the context's lock):
+ * the fused selection's kept count per query, then count rows, count
+ * distances and count keys, the 8-byte regions on 8-byte offsets. The counts
+ * come first so their place does not depend on count, and the keys last so
+ * a tile without them copies a prefix.
+ */
+typedef struct MatrixOut
 {
-	return MatrixScores(lane, scores, stream) &&
-		GrowDevice((void **) &lane->matrixCandidates, &lane->matrixCandidateCap, candidates, sizeof(float), 0, stream) &&
-		GrowDevice((void **) &lane->matrixIndices, &lane->matrixIndexCap, candidates, sizeof(int64_t), 0, stream) &&
-		GrowDevice((void **) &lane->matrixValues, &lane->matrixValueCap, output, sizeof(float), 0, stream) &&
-		GrowDevice((void **) &lane->matrixRows, &lane->matrixRowCap, output, sizeof(int64_t), 0, stream) &&
-		GrowPinned((void **) &lane->matrixHostValues, &lane->matrixHostValueCap, host, sizeof(float), 0) &&
-		GrowPinned((void **) &lane->matrixHostRows, &lane->matrixHostRowCap, host, sizeof(int64_t), 0);
+	uint32_t   *counts;
+	int64_t    *rows;
+	float	   *values;
+	int64_t    *keys;
+} MatrixOut;
+
+/* Bytes of a tile's results: through the keys, or only through the distances. */
+static size_t
+MatrixOutBytes(size_t queries, size_t count, int keys)
+{
+	size_t		bytes = ((queries * sizeof(uint32_t) + 7) & ~(size_t) 7) + count * sizeof(int64_t);
+
+	return keys ? bytes + ((count * sizeof(float) + 7) & ~(size_t) 7) + count * sizeof(int64_t) :
+		bytes + count * sizeof(float);
+}
+
+static MatrixOut
+MatrixOutAt(void *base, size_t queries, size_t count)
+{
+	MatrixOut	out;
+	char	   *at = base;
+
+	out.counts = (uint32_t *) (void *) at;
+	at += (queries * sizeof(uint32_t) + 7) & ~(size_t) 7;
+	out.rows = (int64_t *) (void *) at;
+	at += count * sizeof(int64_t);
+	out.values = (float *) (void *) at;
+	at += (count * sizeof(float) + 7) & ~(size_t) 7;
+	out.keys = (int64_t *) (void *) at;
+	return out;
+}
+
+/*
+ * Size a tile's buffers: output results of `queries` queries on the device,
+ * hostBytes of pinned results (every tile of the batch, each MatrixOutBytes
+ * of the largest). The result pointers are set for this tile's layout, the
+ * host ones for a tile at the start of the pinned buffer.
+ */
+static int
+MatrixBuffers(AnnCuvsDevice *lane, size_t scores, size_t candidates, size_t queries, size_t output,
+			  size_t hostBytes, cudaStream_t stream)
+{
+	MatrixOut	out;
+
+	if (!MatrixScores(lane, scores, stream) ||
+		!GrowDevice((void **) &lane->matrixCandidates, &lane->matrixCandidateCap, candidates, sizeof(float), 0, stream) ||
+		!GrowDevice((void **) &lane->matrixIndices, &lane->matrixIndexCap, candidates, sizeof(int64_t), 0, stream) ||
+		!GrowDevice(&lane->matrixOut, &lane->matrixOutCap, MatrixOutBytes(queries, output, 1), 1, 0, stream) ||
+		!GrowPinned(&lane->matrixHostOut, &lane->matrixHostOutCap, hostBytes, 1, 0))
+		return 0;
+	out = MatrixOutAt(lane->matrixOut, queries, output);
+	lane->fuseCounts = out.counts;
+	lane->matrixRows = out.rows;
+	lane->matrixValues = out.values;
+	lane->matrixKeys = out.keys;
+	out = MatrixOutAt(lane->matrixHostOut, queries, output);
+	lane->hostFuseCounts = out.counts;
+	lane->matrixHostRows = out.rows;
+	lane->matrixHostValues = out.values;
+	return 1;
 }
 
 /*
@@ -4717,23 +4839,33 @@ PruneMark(AnnCuvsDevice *lane, int mark, cudaStream_t stream)
  * rank - 1]: a shared-memory radix select over the sample (prune_select_s
  * over its q x sample scores in place) and a max, instead of cuVS select_k
  * sorting rank values of 8192 (about 170 us a batch, half the fused scan).
+ *
+ * fused: the max goes to fuseBounds[row * 32 + 31] instead, where the fused
+ * scan reads it, and the same launch zeroes fuseCounts (bound_cut). select_k
+ * leaves its rank values sorted, so their max is still the cutoff there.
  */
 static int
 SampleCutoff(GatherModule *module, AnnCuvsDevice *lane, cudaStream_t stream, uint32_t q, unsigned sample,
-			 unsigned rank)
+			 unsigned rank, int fused)
 {
 	const void *none = NULL;
 	void	   *selectArgs[] = {&lane->pruneSample, &none, &none, &sample, &rank, &lane->pruneBounds,
 	&lane->pruneBoundRows};
 	void	   *maxArgs[] = {&lane->pruneBounds, &rank, &q};
+	void	   *cutArgs[] = {&lane->pruneBounds, &rank, &q, &lane->fuseBounds, &lane->fuseCounts};
 
 	if (rank > 4096 || (uint64_t) sample * 4 > (uint64_t) module->select11Shared)
 		return AnnSelectBatch(lane->resources, lane->pruneSample, NULL, lane->pruneBounds, lane->pruneBoundRows,
-							  q, sample, rank, 1, NULL) == CUVS_SUCCESS;
+							  q, sample, rank, 1, NULL) == CUVS_SUCCESS &&
+			(!fused ||
+			 (cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			  cuLaunchKernel(module->boundCut, q, 1, 1, 256, 1, 1, 0, (CUstream) stream, cutArgs,
+							 NULL) == CUDA_SUCCESS));
 	return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 		cuLaunchKernel(module->postSelect11, q, 1, 1, 1024, 1, 1, sample * 4, (CUstream) stream, selectArgs,
 					   NULL) == CUDA_SUCCESS &&
-		cuLaunchKernel(module->boundMax, q, 1, 1, 256, 1, 1, 0, (CUstream) stream, maxArgs, NULL) == CUDA_SUCCESS;
+		cuLaunchKernel(fused ? module->boundCut : module->boundMax, q, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+					   fused ? cutArgs : maxArgs, NULL) == CUDA_SUCCESS;
 }
 
 static int
@@ -4782,7 +4914,7 @@ PrunedSelect(AnnCuvsIndex *state, AnnCuvsDevice *lane, int device, cudaStream_t 
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->pruneSample, sampleBlocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
 						   sampleArgs, NULL) != CUDA_SUCCESS ||
-			!SampleCutoff(module, lane, stream, q, sample, rank) ||
+			!SampleCutoff(module, lane, stream, q, sample, rank, 0) ||
 			!PruneMark(lane, 0, stream) ||
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(n % 4 == 0 ? module->pruneCompact4 : module->pruneCompact,
@@ -5001,7 +5133,9 @@ FusedEligible(const AnnCuvsIndex *state, int device, int distinct, AnnIndexJob *
 
 	(void) state;
 	if (!AnnIndexConfig.matrix_prune || !distinct || n < PruneMinRows() ||
-		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || dims > ANN_BLACKWELL_FUSE_DIMS ||
+		n == 0 || candidates > ANN_PRUNE_CAP / ANN_PRUNE_MARGIN || candidates > 4096 || /* prune_select_s:
+																						 * sel[4096] */
+		dims > ANN_BLACKWELL_FUSE_DIMS ||
 		(module = GatherKernels(device)) == NULL)
 		return 0;
 
@@ -5028,7 +5162,9 @@ FusedEligible(const AnnCuvsIndex *state, int device, int distinct, AnnIndexJob *
  * it, then score every row once more keeping only distances at or under
  * the cutoff (AnnBlackwellScoreBelow), and radix-select the candidates. The
  * candidates equal those the matrix path compacts. The counts are checked
- * after the batch's sync (FusedChecked).
+ * after the batch's sync (FusedChecked): they are kept in lane->fuseCounts,
+ * the head of the tile's results (MatrixBuffers), and the caller copies them
+ * to lane->hostFuseCounts with those.
  */
 static int
 FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane, cudaStream_t stream,
@@ -5038,7 +5174,6 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 	unsigned	sample = ANN_PRUNE_SAMPLE,
 				cap = ANN_PRUNE_CAP,
 				k = candidates,
-				queries = q,
 				rank = (unsigned) (((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n);
 
 	if (rank < ANN_PRUNE_RANK)
@@ -5050,24 +5185,17 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 		!GrowDevice((void **) &lane->pruneBoundRows, &lane->pruneBoundRowCap, (size_t) q * rank, sizeof(int64_t), 0, stream) ||
 		!GrowDevice((void **) &lane->fuseBounds, &lane->fuseBoundCap, (size_t) q * 32, sizeof(float), 0, stream) ||
 		!GrowDevice((void **) &lane->pruneScores, &lane->pruneScoreCap, (size_t) q * cap, sizeof(float), 0, stream) ||
-		!GrowDevice((void **) &lane->fusePositions, &lane->fusePositionCap, (size_t) q * cap, sizeof(uint32_t), 0, stream) ||
-		!GrowDevice((void **) &lane->fuseCounts, &lane->fuseCountCap, q, sizeof(uint32_t), 0, stream) ||
-		!GrowPinned((void **) &lane->hostFuseCounts, &lane->hostFuseCountCap, q, sizeof(uint32_t), 0))
+		!GrowDevice((void **) &lane->fusePositions, &lane->fusePositionCap, (size_t) q * cap, sizeof(uint32_t), 0, stream))
 		return 0;
 	{
-		void	   *cutoffArgs[] = {&lane->pruneBounds, &rank, &queries, &lane->fuseBounds};
 		void	   *selectArgs[] = {&lane->pruneScores, &lane->fusePositions, &lane->fuseCounts, &cap, &k,
 		&lane->matrixCandidates, &lane->matrixIndices};
 
 		if (!AnnBlackwellStrideRows(shard->device, rows, n, sample, lane->fuseSampleRows, stream) ||
 			!AnnBlackwellScoreMatrix(&shard->quant, shard->device, lane->fuseSampleRows, sample, lane->queries, q,
 									 (int) dims, lane->pruneSample, stream) ||
-			!SampleCutoff(module, lane, stream, q, sample, rank) ||
+			!SampleCutoff(module, lane, stream, q, sample, rank, 1) ||
 			!PruneMark(lane, 0, stream) ||
-			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
-			cuLaunchKernel(module->cutoff32, (q + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
-						   cutoffArgs, NULL) != CUDA_SUCCESS ||
-			cudaMemsetAsync(lane->fuseCounts, 0, (size_t) q * sizeof(uint32_t), stream) != cudaSuccess ||
 			!AnnBlackwellScoreBelow(&shard->quant, shard->device, rows, n, lane->queries, q, (int) dims,
 									lane->fuseBounds, lane->pruneScores, lane->fusePositions, lane->fuseCounts,
 									cap, stream) ||
@@ -5075,9 +5203,7 @@ FusedPrunedSelect(AnnCuvsIndex *state, AnnCuvsShard *shard, AnnCuvsDevice *lane,
 			cuCtxSetCurrent(module->context) != CUDA_SUCCESS ||
 			cuLaunchKernel(module->postSelect11, q, 1, 1, 1024, 1, 1, ANN_PRUNE_CAP * 4, (CUstream) stream,
 						   selectArgs, NULL) != CUDA_SUCCESS ||
-			!PruneMark(lane, 2, stream) ||
-			cudaMemcpyAsync(lane->hostFuseCounts, lane->fuseCounts, (size_t) q * sizeof(uint32_t),
-							cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+			!PruneMark(lane, 2, stream))
 			return 0;
 	}
 	(void) atomic_fetch_add_explicit(&state->matrix_pruned_queries, q, memory_order_relaxed);
@@ -5352,7 +5478,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			AnnCuvsDevice *lane;
 			cudaStream_t stream;
 			const uint32_t *rows;
-			size_t		hostOffset = (size_t) s * limit * capacity;
+			size_t		hostOffset = (size_t) s * MatrixOutBytes(limit, (size_t) limit * capacity, 1);
+			char	   *hostOut;
 
 			/*
 			 * Fused tiles write no score matrix, so none is allocated for
@@ -5370,12 +5497,20 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 			lane = LaneDevice(shard->device, (size_t) q * dims * sizeof(float), 1, 1);
 			if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
 				!GatherBuffers(lane, jobs[0]->nfilter, 1) ||
-				!MatrixBuffers(lane, fusedTile ? 1 : (size_t) q * n, (size_t) q * candidates,
-							   (size_t) q * outk, (size_t) state->nshards * limit * capacity, stream))
+				!MatrixBuffers(lane, fusedTile ? 1 : (size_t) q * n, (size_t) q * candidates, q,
+							   (size_t) q * outk,
+							   state->nshards * MatrixOutBytes(limit, (size_t) limit * capacity, 1), stream))
 			{
 				ok = 0;
 				break;
 			}
+
+			/*
+			 * This shard's results on the host: its own region of the pinned
+			 * buffer, laid out as the device's (MatrixOutAt).
+			 */
+			hostOut = (char *) lane->matrixHostOut + hostOffset;
+			lane->hostFuseCounts = (uint32_t *) (void *) hostOut;
 			used[shard->device] = 1;
 			if (!uploaded[shard->device])
 			{
@@ -5458,10 +5593,8 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				if (!MatrixMark(lane, s, 4, stream) ||
 					!FinalTopk(lane, shard->device, stream, q, candidates, outk) ||
 					!MatrixMark(lane, s, 5, stream) ||
-					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
-									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,
-									(size_t) q * outk * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+					cudaMemcpyAsync(hostOut, lane->matrixOut, MatrixOutBytes(q, (size_t) q * outk, 0),
+									cudaMemcpyDeviceToHost, stream) != cudaSuccess)
 				{
 					ok = 0;
 					break;
@@ -5480,27 +5613,38 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 								   candidates, q, lane->queries, lane->matrixCandidates, stream, 1)) ||
 					!MatrixMark(lane, s, 4, stream) ||
 					(fusedPost < 0 && !FinalTopk(lane, shard->device, stream, q, candidates, outk)) ||
-					!MatrixMark(lane, s, 5, stream) ||
-					cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixRows,
-									(size_t) q * outk * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
-					cudaMemcpyAsync(lane->matrixHostValues + hostOffset, lane->matrixValues,
-									(size_t) q * outk * sizeof(float), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+					!MatrixMark(lane, s, 5, stream))
 				{
 					ok = 0;
 					break;
 				}
-				keyed[s] = GrowPinned((void **) &lane->matrixHostKeys, &lane->matrixHostKeyCap,
-									  (size_t) state->nshards * limit * capacity, sizeof(int64_t), 0) &&
-					GatherKeys(shard, file->shards[s].rows, lane, shard->device, stream, q * outk,
-							   lane->matrixHostKeys + hostOffset);
+
+				/*
+				 * One copy for the fused counts, the rows, the distances and
+				 * (when the device gathered them) the keys.
+				 */
+				keyed[s] = GatherKeys(shard, file->shards[s].rows, lane, shard->device, stream, q * outk);
+				if (cudaMemcpyAsync(hostOut, lane->matrixOut, MatrixOutBytes(q, (size_t) q * outk, keyed[s]),
+									cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+				{
+					ok = 0;
+					break;
+				}
 				selected[s] = outk;
 				gpu[s] = 1;
 				reranked += (uint64_t) q * candidates;
 			}
 			else
 			{
-				if (cudaMemcpyAsync(lane->matrixHostRows + hostOffset, lane->matrixIndices,
-									(size_t) q * candidates * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+				/*
+				 * The candidates go where the host reads rows; a fused tile's
+				 * counts apart.
+				 */
+				if (cudaMemcpyAsync(MatrixOutAt(hostOut, q, (size_t) q * candidates).rows, lane->matrixIndices,
+									(size_t) q * candidates * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess ||
+					(pruned[s] == 2 &&
+					 cudaMemcpyAsync(hostOut, lane->fuseCounts, (size_t) q * sizeof(uint32_t),
+									 cudaMemcpyDeviceToHost, stream) != cudaSuccess))
 				{
 					ok = 0;
 					break;
@@ -5534,14 +5678,17 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				AnnIndexHit *hits = lists + ((size_t) (first + j) * state->nshards + s) * maxk;
 				uint32_t   *found = &counts[(size_t) (first + j) * state->nshards + s];
 				AnnCuvsDevice *lane = &laneDevices[shards[s].device];
-				const int64_t *positions = lane->matrixHostRows + (size_t) s * limit * capacity + (size_t) j * selected[s];
-				const float *distances = lane->matrixHostValues + (size_t) s * limit * capacity + (size_t) j * selected[s];
-				const int64_t *gathered = keyed[s] ?
-					lane->matrixHostKeys + (size_t) s * limit * capacity + (size_t) j * selected[s] : NULL;
+				MatrixOut	out = MatrixOutAt((char *) lane->matrixHostOut +
+											  (size_t) s * MatrixOutBytes(limit, (size_t) limit * capacity, 1),
+											  q, (size_t) q * selected[s]);
+				const int64_t *positions = out.rows + (size_t) j * selected[s];
+				const float *distances = out.values + (size_t) j * selected[s];
+				const int64_t *gathered = keyed[s] ? out.keys + (size_t) j * selected[s] : NULL;
 				uint32_t	n = (uint32_t) (start[s + 1] - start[s]);
 				int			ordered = 1;
 
-				if (!AnnIndexPositionsDistinct(positions, selected[s]))
+				if (!(gpu[s] == 1 && SortedDistinct(positions, distances, selected[s])) &&
+					!AnnIndexPositionsDistinct(positions, selected[s]))
 				{
 					AnnIndexJob part = *job;
 
@@ -5594,9 +5741,27 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 					}
 					else
 					{
-						if (*found && HitCompare(hits + *found - 1, &hit) > 0)
-							ordered = 0;
-						hits[(*found)++] = hit;
+						uint32_t	at = *found;
+
+						/*
+						 * The device orders by distance alone. Among 1000
+						 * close float distances two are often equal, and a
+						 * pair in the wrong key order used to sort the whole
+						 * list: slide the hit into its run of equals instead.
+						 */
+						if (at && HitCompare(hits + at - 1, &hit) > 0)
+						{
+							if (hits[at - 1].distance == hit.distance)
+								while (at && hits[at - 1].distance == hit.distance && hits[at - 1].key > hit.key)
+								{
+									hits[at] = hits[at - 1];
+									at--;
+								}
+							else
+								ordered = 0;
+						}
+						hits[at] = hit;
+						(*found)++;
 					}
 				}
 				if (!gpu[s])
@@ -5655,7 +5820,8 @@ MixedRank(uint32_t n, uint32_t candidates)
 {
 	uint64_t	rank;
 
-	if (n <= ANN_PRUNE_CAP)
+	if (n <= 16384)				/* what matrix_prune_sort's shared memory
+								 * holds */
 		return 0;
 	rank = ((uint64_t) ANN_PRUNE_MARGIN * candidates * ANN_PRUNE_SAMPLE + n - 1) / n;
 	if (rank < ANN_PRUNE_RANK)
@@ -5726,7 +5892,8 @@ SearchGatherMixed(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **j
 	rows = (unsigned) total;
 	if ((lane = LaneDevice(shard->device, (size_t) m * dims * sizeof(float), 1, 1)) == NULL ||
 		cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
-		!MatrixBuffers(lane, total, (size_t) m * candidates, (size_t) m * maxk, (size_t) m * maxk, stream) ||
+		!MatrixBuffers(lane, total, (size_t) m * candidates, m, (size_t) m * maxk,
+					   MatrixOutBytes(m, (size_t) m * maxk, 1), stream) ||
 		!GrowDevice((void **) &lane->mixedRows, &lane->mixedRowCap, total, sizeof(uint32_t), 0, stream) ||
 		!GrowDevice((void **) &lane->mixedOffsets, &lane->mixedOffsetCap, m + 1, sizeof(uint32_t), 0, stream) ||
 		!GrowDevice((void **) &lane->mixedRanks, &lane->mixedRankCap, m, sizeof(uint32_t), 0, stream) ||

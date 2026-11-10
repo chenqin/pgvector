@@ -284,6 +284,9 @@ typedef struct AnnIndexOptions
 	uint32_t	shard_topk_share;	/* --shard-topk-share: percent of k each
 									 * shard of a split index returns to the
 									 * merge (at least 128); 100 for all */
+	int			scan_skip_tail; /* --scan-skip-tail: FP8 matrix scans leave
+								 * out a last 16-dimension block holding one
+								 * coordinate (dims % 16 == 1) */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */

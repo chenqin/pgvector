@@ -34,7 +34,7 @@ fp16 CAGRA datasets, built by `benchmarks/ann/scale_pipeline.sh`. The graph
 build fails on 33-dim groups and graph searches return garbage on this data
 (thousands of copies per seed make every node's neighbours its own clique),
 so the graphs are useless here: the winning route never reads them, and the
-final layout is scan-only (`--scan-only`, 588 GB on disk, 50 min to build).
+final layout is scan-only (`--scan-only`, 588 GB on disk, 50 min to build). With the 8-shard index (834 GB) kept beside it the test host's disk is full (44 GB free of 1.8 TB).
 
 Load time is 9 minutes with `load.py` sending 8 loads at once (59 minutes
 one at a time); `--prewarm off` keeps `vectors.f32` on disk, which the GPU
@@ -67,6 +67,57 @@ replication of the shard would need ~640 GB per GPU.
 Per-GPU slice replicated 8× (5.8M rows per group, 1 shard, what each GPU
 holds in production) ran at 126k with the small request file (37% merged),
 so about 100k honest: the 4 × 2 layout on the full shard matches it.
+
+## One shard per group (2026-11-09, later the same day)
+
+Each batch of the 4 × 2 layout cost about 1 ms in its lane whatever it
+scanned (a 9.6 times wider filter added 4%), plus 30–60 µs a query merging
+the four shard lists. So each group became one shard living whole on one
+GPU, with 2 copies on a pair of GPUs (`--replicate 2`; the index files are
+the same, hard-linked under a manifest with `shards 1`). GPU memory is
+unchanged, 107–109 GB per GPU.
+
+One shard has no per-shard over-fetch, so recall needs more slack: 50%
+gave 0.977 mean / 0.752 worst, 100% 0.988 / 0.855, 300% (4,000 candidates
+at k = 1000, `ANN_PRUNE_CAP` raised to 32,768 for it) 0.998 / 0.986. The
+rows below use 300%.
+
+| Build | Peak Muse req/s | p99 at 120k/s | 140k/s | 160k/s |
+| --- | ---: | ---: | ---: | ---: |
+| One scheduler queue, 16 driver calls a batch | 176k | – | 68 ms | 118 ms |
+| 12 scheduler queues, 11 driver calls | 210k | 45 ms | 50 ms | 59 ms |
+| **4 scheduler queues (the default at 96 lanes)** | **214k** (1.29M ANN/s) | 40 ms | **44 ms** | 59 ms |
+| 64 lanes, 8 queues | 170k | 65 ms | 84 ms | 125 ms |
+| 48 lanes, 6 queues | 154k | 82 ms | 179 ms | – |
+
+The rate held under a 50 ms p99 is about 150k Muse requests/s, against
+65k for 4 × 2. With one queue the GPUs were 60–67% busy and lanes waited
+on the scheduler mutex (45% of samples); with the queues split the GPUs
+run at 98–100% and batches are 16 searches instead of 40.
+
+What changed in the worker for it: per-index device placement for
+`--replicate N`; scheduler shards (`--scheduler-shards`); `bound_cut`
+replacing three launches and one result copy replacing four; equal
+distances in a result list fixed in place (a host sort of the whole list
+ran for about half the lists, 17% of lane CPU); a duplicate check over
+runs of equal distances instead of a hash; `--scan-skip-tail`.
+
+### Smaller K
+
+The request's K (300/600/1000) is the leaf's eager top-K; the root keeps
+60–552 a ranker. With K sized for half the candidates surviving the root's
+filters (30–182 a ranker; `benchmarks/ann` frames rewritten in place), the
+same worker held a 50 ms p99 to about 250k requests/s and peaked at 424k
+(2.5M ANN searches/s, event-driven client). Whether those K are acceptable
+needs the root's survival and depth-used statistics.
+
+### Load generator
+
+`muse_direct --epoll` drives all of a process's clients from one thread.
+It matches the thread mode against a mock server and lifted the peak where
+the client was the limit (small K); at k = 1000 one thread a process
+drains 8 GB/s of replies and reads about 7 ms higher at p99, so latency
+points at large K use the thread mode.
 
 ## What moved the number (3k → 137k)
 
@@ -110,10 +161,10 @@ batching: batches are per filter, the 2,482 test filters are equally
 popular, and a 4-GPU batch costs ~2.4 ms in a lane whatever its size, so at
 20k requests/s a request waits ~25 ms for enough same-filter company. Real
 traffic with hot filters batches better; traffic with far more distinct
-filters batches worse (54k at 11,954 filters). The levers left are a cheaper
-small batch (fewer launches per tile, CUDA graphs), mixed-filter batching
-on the multi-shard matrix route, and, on a host without other tenants,
-2 shards × 4 copies with rerank (about 160 GB per GPU).
+filters batches worse (54k at 11,954 filters). The section above took the
+first lever (a cheaper batch, by putting each group on one GPU). 2 shards
+× 4 copies with rerank does not fit: 163 GB of index a GPU before any
+working memory.
 
 ## Reproducing
 
@@ -124,12 +175,13 @@ describes). Load: `benchmarks/ann/muse_direct.c` compiled with
 profiles a window (GPU utilisation, kernel stage times, gdb stack
 sampling, lock waits, server counters). The host's `~/b200dev/wk.sh NAME
 PORT ROOT [flags]` wraps the worker start and the parallel load; the
-final worker flags:
+final worker flags (one shard per group; for 4 × 2 use `--shard-topk-share 40
+--slack-ratio 5` instead of the slack and skip-tail flags):
 
 ```
 --replicate 2 --lanes 96 --readers 64 --filter-lanes 16 --max-batch 64
 --matrix-gather on --matrix-prune on --gpu-rerank on --matrix-max-mb 512
---shard-topk-share 40 --slack-ratio 5 --quant-slack 16 --merge-duplicates on
+--slack-ratio 300 --quant-slack 16 --merge-duplicates on --scan-skip-tail on
 --gather-limit 4000000 --bitset-gather-limit 4000000 --group-gather-limit 4000000
 --memory-pool 60 --predicate-cache-mb 8192 --predicate-device-mb 2048 --prewarm off
 ```

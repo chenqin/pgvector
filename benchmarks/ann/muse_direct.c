@@ -2,15 +2,15 @@
  * Muse-shaped load straight to an ANN server over TCP, without PostgreSQL.
  *
  *   muse_direct HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP]
- *               [--processes N] [--rate R]
+ *               [--processes N] [--rate R] [--epoll]
  *
  * FRAMES is written by benchmarks/ann/muse_stress.py --emit-ann: u32
  * requests, u32 sub-requests per request, then per sub-request a u32 size
  * and a ready protocol frame (operation 22, search by predicate program).
- * Each client thread holds one authenticated connection per sub-request,
- * sends a request's sub-requests together and waits for every reply, as a
- * Muse SCORE_BLEND request runs its rankers in parallel; the request's
- * latency is its slowest sub-request's. Prints one JSON line.
+ * Each client (a thread, unless --epoll) holds one authenticated connection
+ * per sub-request, sends a request's sub-requests together and waits for
+ * every reply, as a Muse SCORE_BLEND request runs its rankers in parallel;
+ * the request's latency is its slowest sub-request's. Prints one JSON line.
  *
  * WARMUP (seconds, default 3) runs load before the SECONDS that are
  * measured. A request is counted when its last reply arrives inside the
@@ -45,12 +45,26 @@
  * requests per second; "unsent" counts the scheduled sends of the measured
  * window that had not been sent when it ended.
  *
+ * --epoll (Linux only; elsewhere the option is refused) replaces the thread
+ * per client with one thread per process that drives all of the process's
+ * clients through one level-triggered epoll set: non-blocking sockets, a
+ * frame sent when its request starts (what the socket does not take at once
+ * follows when it becomes writable), replies read as they arrive, the
+ * --rate schedules kept in a heap behind a timerfd. Everything is measured
+ * and reported as with threads; only the load generator's own cost differs
+ * (one core per process at most, instead of a thread per client). The one
+ * thread serves its clients in turn, so a process with more work than one
+ * core can do adds its own queueing to the latencies: give it enough
+ * --processes. Connections are still made with blocking calls, by up to 256
+ * short-lived threads per process, before the run starts.
+ *
  * JSON: "request_ms" percentiles and "max_ms" over the measured requests;
  * "subrequest_ms" by position of the sub-request within the request, from
  * the request's send (scheduled send with --rate) to that reply's arrival;
  * "requests_per_s_series" the requests completed in each measured second;
  * "connect_seconds" from the first attempt to the last authentication;
- * "connect_retries" the attempts that had to be repeated.
+ * "connect_retries" the attempts that had to be repeated; "mode" is
+ * "epoll" or "threads".
  *
  * Exit status: 0 with the JSON line; 1 bad arguments, or connecting or
  * authenticating failed; 2 a connection broke or stalled during the run.
@@ -60,6 +74,7 @@
 #define _DARWIN_C_SOURCE		/* likewise MAP_ANON (macOS) */
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -79,6 +94,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sys/epoll.h>
+#include <sys/timerfd.h>
+#endif
 
 #if !defined(MAP_ANONYMOUS) && defined(MAP_ANON)
 #define MAP_ANONYMOUS MAP_ANON
@@ -653,6 +672,504 @@ Process(unsigned first, unsigned count)
 	_exit(0);
 }
 
+#ifdef __linux__
+/*
+ * --epoll: one thread drives every client of the process. What is counted,
+ * and when, follows Client() above line by line.
+ */
+#define EPOLL_EVENTS 1024
+#define SCRATCH_BYTES 65536
+
+/* One connection: a frame on its way out, then its reply on its way in. */
+typedef struct EpollConnection
+{
+	int			fd;				/* -1 once its client has finished */
+	uint32_t	client;			/* within the process */
+	int			waiting;		/* a reply is outstanding */
+	int			writing;		/* registered for EPOLLOUT too */
+	const unsigned char *out;	/* what of the frame is still to send */
+	size_t		outLeft;
+	size_t		have;			/* bytes of the reply read */
+	size_t		need;			/* its size; 0 until the header is read */
+	uint64_t	arrival;
+	unsigned char head[36];		/* the header and the hit count */
+} EpollConnection;
+
+typedef struct EpollClient
+{
+	uint32_t	r;				/* next request */
+	uint32_t	pending;		/* replies outstanding */
+	atomic_uint ready;			/* connections made */
+	uint64_t	first,			/* open loop: the first scheduled send */
+				sends,
+				origin,			/* (scheduled) send of the current request */
+				sent,
+				end;
+} EpollClient;
+
+static int	epollSet,
+			epollTimer;
+static unsigned epollFirst,		/* this process's first client, among all */
+			epollCount,
+			epollLive;			/* clients that have not finished */
+static EpollClient *epollClients;
+static EpollConnection *epollConnections;	/* [client * nsubs + sub] */
+static atomic_uint epollNext;	/* next connection to make */
+static uint32_t *epollHeap;		/* idle clients, by origin (open loop) */
+static unsigned epollHeaped;
+static uint64_t epollArmed;		/* what the timer is set to */
+static uint64_t epollMeasureFrom,
+			epollDeadline;
+static uint32_t *epollSeries;
+static uint64_t epollRequests,
+			epollSubrequests,
+			epollErrors,
+			epollHits,
+			epollNotReady,
+			epollUnsent,
+			epollMaxNs;
+static unsigned char epollScratch[SCRATCH_BYTES];
+
+static void
+EpollPush(uint32_t c)
+{
+	unsigned	i = epollHeaped++;
+
+	while (i > 0)
+	{
+		unsigned	up = (i - 1) / 2;
+
+		if (epollClients[epollHeap[up]].origin <= epollClients[c].origin)
+			break;
+		epollHeap[i] = epollHeap[up];
+		i = up;
+	}
+	epollHeap[i] = c;
+}
+
+static uint32_t
+EpollPop(void)
+{
+	uint32_t	top = epollHeap[0],
+				last = epollHeap[--epollHeaped];
+	unsigned	i = 0;
+
+	for (;;)
+	{
+		unsigned	child = 2 * i + 1;
+
+		if (child >= epollHeaped)
+			break;
+		if (child + 1 < epollHeaped &&
+			epollClients[epollHeap[child + 1]].origin < epollClients[epollHeap[child]].origin)
+			child++;
+		if (epollClients[last].origin <= epollClients[epollHeap[child]].origin)
+			break;
+		epollHeap[i] = epollHeap[child];
+		i = child;
+	}
+	epollHeap[i] = last;
+	return top;
+}
+
+/* Sends what the socket takes now; the rest goes when it is writable again. */
+static void
+EpollFlush(EpollConnection *connection)
+{
+	int			writing;
+
+	while (connection->outLeft)
+	{
+		ssize_t		n = send(connection->fd, connection->out, connection->outLeft, MSG_NOSIGNAL);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			break;
+		if (n <= 0)
+			Fatal(2, "connection to %s:%s broke while sending: %s", host, port,
+				  n < 0 ? strerror(errno) : "closed by the server");
+		connection->out += n;
+		connection->outLeft -= (size_t) n;
+	}
+	writing = connection->outLeft != 0;
+	if (writing != connection->writing)
+	{
+		struct epoll_event event;
+
+		memset(&event, 0, sizeof(event));
+		event.events = EPOLLIN | (writing ? EPOLLOUT : 0);
+		event.data.ptr = connection;
+		if (epoll_ctl(epollSet, EPOLL_CTL_MOD, connection->fd, &event) != 0)
+			Fatal(2, "epoll_ctl: %s", strerror(errno));
+		connection->writing = writing;
+	}
+}
+
+/* Sends the client's next request; its origin is set. */
+static void
+EpollLaunch(uint32_t c, uint64_t now)
+{
+	EpollClient *client = &epollClients[c];
+
+	client->sent = now;
+	client->pending = nsubs;
+	for (uint32_t s = 0; s < nsubs; s++)
+	{
+		EpollConnection *connection = &epollConnections[(size_t) c * nsubs + s];
+
+		connection->out = frames[(size_t) client->r * nsubs + s];
+		connection->outLeft = frameSizes[(size_t) client->r * nsubs + s];
+		connection->have = 0;
+		connection->need = 0;
+		connection->waiting = 1;
+		EpollFlush(connection);
+	}
+}
+
+/*
+ * The client is idle: sends its next request, or queues it until its
+ * scheduled time, or ends the client when the run is over.
+ */
+static void
+EpollNext(uint32_t c)
+{
+	EpollClient *client = &epollClients[c];
+	uint64_t	now = Now();
+
+	if (interval > 0)
+	{
+		client->origin = client->first + (uint64_t) (interval * (double) client->sends);
+		if (client->origin < epollDeadline && now < epollDeadline)
+		{
+			if (now < client->origin)
+			{
+				EpollPush(c);
+				return;
+			}
+			client->sends++;
+			EpollLaunch(c, now);
+			return;
+		}
+		if (client->origin < epollDeadline)
+		{
+			/* Still behind at the end: these were due and never went out. */
+			uint64_t	origin = client->origin < epollMeasureFrom ? epollMeasureFrom : client->origin;
+
+			epollUnsent += (uint64_t) ((double) (epollDeadline - origin) / interval) + 1;
+		}
+	}
+	else if (now < epollDeadline)
+	{
+		client->origin = now;
+		EpollLaunch(c, now);
+		return;
+	}
+	for (uint32_t s = 0; s < nsubs; s++)
+	{
+		EpollConnection *connection = &epollConnections[(size_t) c * nsubs + s];
+
+		close(connection->fd);	/* which also takes it out of the set */
+		connection->fd = -1;
+	}
+	epollLive--;
+}
+
+/* Every reply of the client's request has arrived. */
+static void
+EpollAnswered(uint32_t c)
+{
+	EpollClient *client = &epollClients[c];
+	EpollConnection *connections = &epollConnections[(size_t) c * nsubs];
+	uint64_t	origin = client->origin,
+				end = client->end;
+	int			failed = 0;
+
+	client->r = (client->r + 1) % nrequests;
+	if (end < epollMeasureFrom || end >= epollDeadline)
+		return;
+	for (uint32_t s = 0; s < nsubs; s++)
+	{
+		uint32_t	status = Read32(connections[s].head + 28);
+
+		epollSubrequests++;
+		if (connections[s].have >= 36)
+			epollHits += Read32(connections[s].head + 32);
+		if (status != 0)
+			failed = 1;
+		if (status == 3 || status == 11)
+			epollNotReady++;
+	}
+	if (failed)
+	{
+		epollErrors++;
+		return;
+	}
+	epollRequests++;
+	epollSeries[(end - epollMeasureFrom) / SECOND]++;
+	if (end - origin > epollMaxNs)
+		epollMaxNs = end - origin;
+	atomic_fetch_add(&shared->counts[Bin(end - origin)], 1);
+	for (uint32_t s = 0; s < nsubs; s++)
+		atomic_fetch_add(&shared->counts[(size_t) (1 + s) * BINS + Bin(connections[s].arrival - origin)], 1);
+}
+
+/*
+ * Reads what has arrived on a connection. One reply is outstanding per
+ * connection at most, so everything that arrives belongs to it; all but
+ * the header and the hit count goes to the scratch buffer.
+ */
+static void
+EpollRead(EpollConnection *connection)
+{
+	EpollClient *client = &epollClients[connection->client];
+
+	if (!connection->waiting)
+	{
+		/*
+		 * Nothing is expected: the server closed it, or sent what it should
+		 * not.
+		 */
+		ssize_t		n = recv(connection->fd, epollScratch, sizeof(epollScratch), 0);
+
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+			return;
+		Fatal(2, "connection to %s:%s broke between requests: %s", host, port,
+			  n < 0 ? strerror(errno) : n == 0 ? "closed by the server" : "data without a request");
+	}
+	for (;;)
+	{
+		unsigned char *into;
+		size_t		want;
+		ssize_t		n;
+
+		if (connection->have < sizeof(connection->head))
+		{
+			into = connection->head + connection->have;
+			want = (connection->need && connection->need < sizeof(connection->head) ?
+					connection->need : sizeof(connection->head)) - connection->have;
+		}
+		else
+		{
+			into = epollScratch;
+			want = connection->need - connection->have;
+			if (want > sizeof(epollScratch))
+				want = sizeof(epollScratch);
+		}
+		n = recv(connection->fd, into, want, 0);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		if (n <= 0)
+			Fatal(2, "connection to %s:%s broke while waiting for a reply", host, port);
+		connection->have += (size_t) n;
+		if (connection->need == 0 && connection->have >= 32)
+		{
+			if (memcmp(connection->head, "PVAN", 4) != 0)
+				Fatal(2, "connection to %s:%s broke while waiting for a reply", host, port);
+			connection->need = 32 + (size_t) Read32(connection->head + 24);
+			if (connection->have > connection->need)
+				Fatal(2, "connection to %s:%s broke while waiting for a reply", host, port);
+		}
+		if (connection->need && connection->have == connection->need)
+			break;
+		if ((size_t) n < want)
+			return;				/* the socket is empty; epoll tells of more */
+	}
+	connection->waiting = 0;
+	connection->arrival = client->end = Now();
+	if (--client->pending == 0)
+	{
+		EpollAnswered(connection->client);
+		EpollNext(connection->client);
+	}
+}
+
+/* Makes connections until none is left to make; several threads run this. */
+static void *
+EpollConnector(void *arg)
+{
+	(void) arg;
+	for (;;)
+	{
+		unsigned	i = atomic_fetch_add(&epollNext, 1);
+		EpollConnection *connection;
+		struct epoll_event event;
+		uint32_t	seed;
+		int			flags;
+
+		if (i >= epollCount * nsubs)
+			return NULL;
+		connection = &epollConnections[i];
+		seed = (epollFirst * nsubs + i) * UINT32_C(2654435761) + 1;
+		connection->fd = Connect(epollFirst * nsubs + i, &seed);
+		connection->client = i / nsubs;
+		flags = fcntl(connection->fd, F_GETFL, 0);
+		if (flags < 0 || fcntl(connection->fd, F_SETFL, flags | O_NONBLOCK) != 0)
+			Fatal(1, "fcntl: %s", strerror(errno));
+		memset(&event, 0, sizeof(event));
+		event.events = EPOLLIN;
+		event.data.ptr = connection;
+		if (epoll_ctl(epollSet, EPOLL_CTL_ADD, connection->fd, &event) != 0)
+			Fatal(1, "epoll_ctl: %s", strerror(errno));
+		/* The client counts as connected when nothing is left to set up. */
+		if (atomic_fetch_add(&epollClients[i / nsubs].ready, 1) + 1 == nsubs)
+			atomic_fetch_add(&shared->connected, 1);
+	}
+}
+
+/* A forked process with --epoll: clients [first, first + count) of the run. */
+static void
+EpollProcess(unsigned first, unsigned count)
+{
+	unsigned	nconnectors = count * nsubs < MAX_CONNECTING ? count * nsubs : MAX_CONNECTING;
+	pthread_t  *threads = calloc(nconnectors, sizeof(*threads));
+	pthread_attr_t attributes;
+	struct epoll_event *events = calloc(EPOLL_EVENTS, sizeof(*events));
+	struct epoll_event event;
+	uint64_t	start,
+				scanned,
+				seen;
+
+	epollFirst = first;
+	epollCount = epollLive = count;
+	epollClients = calloc(count, sizeof(*epollClients));
+	epollConnections = calloc((size_t) count * nsubs, sizeof(*epollConnections));
+	epollHeap = calloc(count, sizeof(*epollHeap));
+	epollSeries = calloc(seconds, sizeof(*epollSeries));
+	if (threads == NULL || events == NULL || epollClients == NULL || epollConnections == NULL ||
+		epollHeap == NULL || epollSeries == NULL)
+		Fatal(1, "out of memory");
+	for (unsigned c = 0; c < count; c++)
+		atomic_init(&epollClients[c].ready, 0);
+	if ((epollSet = epoll_create1(0)) < 0)
+		Fatal(1, "epoll_create1: %s", strerror(errno));
+	if ((epollTimer = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK)) < 0)
+		Fatal(1, "timerfd_create: %s", strerror(errno));
+	memset(&event, 0, sizeof(event));
+	event.events = EPOLLIN;
+	event.data.ptr = NULL;		/* the timer; connections have theirs */
+	if (epoll_ctl(epollSet, EPOLL_CTL_ADD, epollTimer, &event) != 0)
+		Fatal(1, "epoll_ctl: %s", strerror(errno));
+
+	/* Connect as the threads of Process() do, MAX_CONNECTING at a time. */
+	if (pthread_attr_init(&attributes) != 0 || pthread_attr_setstacksize(&attributes, STACK_BYTES) != 0)
+		Fatal(1, "cannot prepare %u threads", nconnectors);
+	for (unsigned t = 0; t < nconnectors; t++)
+	{
+		int			error = pthread_create(&threads[t], &attributes, EpollConnector, NULL);
+
+		if (error != 0)
+			Fatal(1, "pthread_create (connecting thread %u of %u in one process): %s", t + 1, nconnectors, strerror(error));
+	}
+	for (unsigned t = 0; t < nconnectors; t++)
+		pthread_join(threads[t], NULL);
+	free(threads);
+
+	pthread_mutex_lock(&shared->lock);
+	while (!shared->go)
+	{
+		struct timespec until;
+
+		clock_gettime(CLOCK_REALTIME, &until);
+		until.tv_sec += 1;
+		(void) pthread_cond_timedwait(&shared->started, &shared->lock, &until);
+		if (getppid() != parent)
+			_exit(3);			/* the parent is gone: no run will start */
+	}
+	start = shared->start;
+	epollMeasureFrom = shared->measureFrom;
+	epollDeadline = shared->deadline;
+	pthread_mutex_unlock(&shared->lock);
+
+	/*
+	 * Open loop: every client's schedule, staggered against the other
+	 * clients', waits in the heap. Closed loop: all send at the start.
+	 */
+	if (interval == 0)
+		SleepUntil(start);
+	for (unsigned c = 0; c < count; c++)
+	{
+		unsigned	client = first + c; /* among all processes */
+
+		epollClients[c].r = (uint32_t) ((uint64_t) client * nrequests / clients);
+		epollClients[c].first = start + (uint64_t) (interval * client / clients);
+		EpollNext(c);
+	}
+	scanned = Now();
+	while (epollLive)
+	{
+		uint64_t	now;
+		int			n;
+
+		if (epollHeaped && epollClients[epollHeap[0]].origin != epollArmed)
+		{
+			struct itimerspec when;
+
+			memset(&when, 0, sizeof(when));
+			epollArmed = epollClients[epollHeap[0]].origin;
+			when.it_value.tv_sec = (time_t) (epollArmed / SECOND);
+			when.it_value.tv_nsec = (long) (epollArmed % SECOND);
+			if (timerfd_settime(epollTimer, TFD_TIMER_ABSTIME, &when, NULL) != 0)
+				Fatal(2, "timerfd_settime: %s", strerror(errno));
+		}
+		n = epoll_wait(epollSet, events, EPOLL_EVENTS, 1000);
+		if (n < 0 && errno != EINTR)
+			Fatal(2, "epoll_wait: %s", strerror(errno));
+		for (int i = 0; i < n; i++)
+		{
+			EpollConnection *connection = events[i].data.ptr;
+
+			if (connection == NULL)
+			{
+				uint64_t	expirations;
+
+				(void) !read(epollTimer, &expirations, sizeof(expirations));
+				epollArmed = 0;
+				continue;
+			}
+			/* An earlier event of this round may have ended the client. */
+			if (connection->fd >= 0 && (events[i].events & EPOLLOUT))
+				EpollFlush(connection);
+			if (connection->fd >= 0 && (events[i].events & ~(uint32_t) EPOLLOUT))
+				EpollRead(connection);
+		}
+
+		/* The scheduled sends that are due. */
+		now = Now();
+		while (epollHeaped && epollClients[epollHeap[0]].origin <= now)
+		{
+			uint32_t	c = EpollPop();
+
+			epollClients[c].sends++;
+			EpollLaunch(c, now);
+		}
+		if (now - scanned >= SECOND)
+		{
+			scanned = now;
+			for (unsigned c = 0; c < count; c++)
+				if (epollClients[c].pending && now > epollClients[c].sent &&
+					now - epollClients[c].sent >= REPLY_SECONDS * SECOND)
+					Fatal(2, "no reply from %s:%s within %d s", host, port, REPLY_SECONDS);
+		}
+	}
+	atomic_fetch_add(&shared->requests, epollRequests);
+	atomic_fetch_add(&shared->subrequests, epollSubrequests);
+	atomic_fetch_add(&shared->errors, epollErrors);
+	atomic_fetch_add(&shared->hits, epollHits);
+	atomic_fetch_add(&shared->notReady, epollNotReady);
+	atomic_fetch_add(&shared->unsent, epollUnsent);
+	for (unsigned i = 0; i < seconds; i++)
+		if (epollSeries[i])
+			atomic_fetch_add(&shared->counts[(size_t) (1 + nsubs) * BINS + i], epollSeries[i]);
+	seen = atomic_load(&shared->maxNs);
+	while (seen < epollMaxNs && !atomic_compare_exchange_weak(&shared->maxNs, &seen, epollMaxNs))
+		;
+	_exit(0);
+}
+#endif							/* __linux__ */
+
 static void
 StopChildren(void)
 {
@@ -692,7 +1209,7 @@ Reaped(pid_t pid, int status, int running)
 static int
 Usage(const char *program)
 {
-	fprintf(stderr, "usage: %s HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP] [--processes N] [--rate R]\n", program);
+	fprintf(stderr, "usage: %s HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP] [--processes N] [--rate R] [--epoll]\n", program);
 	return 1;
 }
 
@@ -712,7 +1229,8 @@ main(int argc, char **argv)
 	size_t		sharedSize;
 	uint64_t	connectFrom,
 				reported;
-	int			option = 7;
+	int			option = 7,
+				useEpoll = 0;
 
 	if (argc < 7)
 		return Usage(argv[0]);
@@ -722,15 +1240,27 @@ main(int argc, char **argv)
 	clients = (unsigned) atoi(argv[6]);
 	if (argc > 7 && strncmp(argv[7], "--", 2) != 0)
 		warmup = (unsigned) atoi(argv[option++]);
-	for (; option < argc; option += 2)
+	while (option < argc)
 	{
+		if (strcmp(argv[option], "--epoll") == 0)
+		{
+			useEpoll = 1;
+			option += 1;
+			continue;
+		}
 		if (option + 1 < argc && strcmp(argv[option], "--processes") == 0)
 			processes = (unsigned) atoi(argv[option + 1]);
 		else if (option + 1 < argc && strcmp(argv[option], "--rate") == 0)
 			rate = atof(argv[option + 1]);
 		else
 			return Usage(argv[0]);
+		option += 2;
 	}
+#ifndef __linux__
+	if (useEpoll)
+		return fprintf(stderr, "muse_direct: --epoll needs Linux (epoll and timerfd); "
+					   "run without it for a thread per client\n"), 1;
+#endif
 	if (seconds == 0 || clients == 0 || processes == 0 || processes > clients || rate < 0)
 		return fprintf(stderr, "muse_direct: SECONDS, CLIENTS and --processes must be positive, "
 					   "--processes at most CLIENTS, --rate not negative\n"), 1;
@@ -843,6 +1373,10 @@ main(int argc, char **argv)
 			(void) sigaction(SIGINT, &action, NULL);
 			(void) sigaction(SIGTERM, &action, NULL);
 			(void) sigaction(SIGHUP, &action, NULL);
+#ifdef __linux__
+			if (useEpoll)
+				EpollProcess(first, count);
+#endif
 			Process(first, count);
 		}
 		if (pid < 0)
@@ -905,7 +1439,7 @@ main(int argc, char **argv)
 		printf("{\"clients\": %u, \"seconds\": %u, \"requests\": %llu, \"requests_per_s\": %.1f, "
 			   "\"subrequests_per_s\": %.1f, \"hits_per_subrequest\": %.1f, \"errors\": %llu, \"not_ready\": %llu, "
 			   "\"request_ms\": {\"50\": %.2f, \"95\": %.2f, \"99\": %.2f, \"99.9\": %.2f}, \"max_ms\": %.2f, "
-			   "\"processes\": %u, \"connections\": %llu, \"connect_seconds\": %.3f, \"connect_retries\": %llu, ",
+			   "\"processes\": %u, \"mode\": \"%s\", \"connections\": %llu, \"connect_seconds\": %.3f, \"connect_retries\": %llu, ",
 			   clients, seconds, (unsigned long long) n, (double) n / seconds,
 			   (double) subrequests / seconds,
 			   subrequests ? (double) atomic_load(&shared->hits) / (double) subrequests : 0.0,
@@ -913,7 +1447,7 @@ main(int argc, char **argv)
 			   Percentile(shared->counts, n, 0.50), Percentile(shared->counts, n, 0.95),
 			   Percentile(shared->counts, n, 0.99), Percentile(shared->counts, n, 0.999),
 			   (double) atomic_load(&shared->maxNs) / 1e6,
-			   processes, (unsigned long long) clients * nsubs, connectSeconds,
+			   processes, useEpoll ? "epoll" : "threads", (unsigned long long) clients * nsubs, connectSeconds,
 			   (unsigned long long) atomic_load(&shared->retries));
 		if (rate > 0)
 			printf("\"target_rate\": %.1f, \"achieved_rate\": %.1f, \"unsent\": %llu, ",

@@ -732,7 +732,11 @@ typedef struct SearchSlot
 	unsigned   *outR;
 	float	   *hostD;
 	unsigned   *hostR;
-	/* Large-k candidates (AnnBlackwellCandidates): sampled rows, their scores, bounded lists. */
+
+	/*
+	 * Large-k candidates (AnnBlackwellCandidates): sampled rows, their
+	 * scores, bounded lists.
+	 */
 	unsigned   *largeSample;
 	size_t		largeSampleCapacity;
 	float	   *largeSampleScores;
@@ -850,7 +854,11 @@ LoadScoreFunctions(BlackwellModule *module, size_t optin)
 					return 0;
 				if (w == 0)
 					continue;
-				/* Static and dynamic shared memory share the device's opt-in limit. */
+
+				/*
+				 * Static and dynamic shared memory share the device's opt-in
+				 * limit.
+				 */
 				if (cuFuncGetAttribute(&fixed, CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES, *functions[kind]) != CUDA_SUCCESS)
 					return 0;
 				if (optin > 0 && optin - (size_t) fixed < dynamic)
@@ -1022,7 +1030,9 @@ E4m3(float value)
 		return sign;
 	if (magnitude >= 448.0f)
 		return sign | 0x7e;
-	fraction = frexpf(magnitude, &exponent);	/* magnitude = fraction * 2^exponent, fraction in [0.5, 1) */
+	fraction = frexpf(magnitude, &exponent);	/* magnitude = fraction *
+												 * 2^exponent, fraction in
+												 * [0.5, 1) */
 	if (exponent + 6 >= 1)
 	{
 		int			biased = exponent + 6;
@@ -1038,7 +1048,10 @@ E4m3(float value)
 		return sign | (uint8_t) (biased << 3 | mantissa);
 	}
 	{
-		/* Subnormals are multiples of 2^-9; eight of them make the smallest normal. */
+		/*
+		 * Subnormals are multiples of 2^-9; eight of them make the smallest
+		 * normal.
+		 */
 		int			units = (int) nearbyintf(magnitude * 512.0f);
 
 		return sign | (uint8_t) (units >= 8 ? 0x08 : units);
@@ -1066,7 +1079,10 @@ AnnBlackwellUploadFp8(const float *vectors, uint64_t rows, uint32_t dims, int de
 	{
 		uint64_t	count = rows - first < chunk ? rows - first : chunk;
 
-		/* As build_cuvs_index.py --quantize fp8 writes them: a row scale of max |x| / 448. */
+		/*
+		 * As build_cuvs_index.py --quantize fp8 writes them: a row scale of
+		 * max |x| / 448.
+		 */
 		for (uint64_t r = 0; r < count; r++)
 		{
 			const float *x = vectors + (first + r) * dims;
@@ -1321,6 +1337,25 @@ AnnBlackwellGroupLimit(int dims)
 	return 16 * qstride * 2 <= 45 * 1024 ? 16 : 1;
 }
 
+/*
+ * The 16-dimension blocks an FP8 matrix scan reads of each row. With
+ * --scan-skip-tail a last block holding a single coordinate is left out
+ * (65 dimensions: 4 of 5 blocks, 33: 2 of 3): the cosine-as-L2 coordinate,
+ * the same for every row of unit vectors, moves each of a query's distances
+ * by one amount, so the candidates are the same and the scan a fifth or a
+ * third shorter. The score matrix and the fused scan must agree (the cutoff
+ * of one prunes the other), and the rerank reads every dimension.
+ */
+static unsigned
+ScanBlocks(unsigned rowBytes, int dims)
+{
+	unsigned	blocks = rowBytes / 16;
+
+	if (AnnIndexConfig.scan_skip_tail && AnnIndexConfig.rescore != ANN_RESCORE_OFF && blocks > 1 && dims % 16 == 1)
+		blocks--;
+	return blocks;
+}
+
 int
 AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
 						unsigned n, const float *queries, unsigned nq, int dims,
@@ -1343,7 +1378,7 @@ AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32
 	if (grid > (unsigned) module->sms * 4)
 		grid = (unsigned) module->sms * 4;
 	if (shard->quant == ANN_QUANT_FP8)
-		blocks = rowBytes / 16;
+		blocks = ScanBlocks(rowBytes, dims);
 	else if (shard->quant >= ANN_BLACKWELL_HALF)
 		blocks = ((unsigned) dims + 15) / 16;
 	return cuLaunchKernel(module->mma[shard->quant - 1][width], grid, 1, 1,
@@ -1389,7 +1424,7 @@ AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_
 	if (grid > (unsigned) module->sms * FuseGridPerSm(shard->quant))
 		grid = (unsigned) module->sms * FuseGridPerSm(shard->quant);
 	if (shard->quant == ANN_QUANT_FP8)
-		blocks = rowBytes / 16;
+		blocks = ScanBlocks(rowBytes, dims);
 	else if (shard->quant >= ANN_BLACKWELL_HALF)
 		blocks = ((unsigned) dims + 15) / 16;
 	return cuLaunchKernel(module->fuse128 && shard->quant == ANN_QUANT_NVFP4 && width == 2 && dims == 128 &&

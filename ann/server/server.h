@@ -64,6 +64,9 @@ typedef struct AnnServeOptions
 								 * Linux); 0 for a thread per connection */
 	int			merge_duplicates;	/* search identical index jobs in a batch
 									 * once */
+	uint32_t	scheduler_shards;	/* queues with their own lock, filters and
+									 * lanes; 0 for one per 24 lanes, 1 for a
+									 * single queue */
 } AnnServeOptions;
 
 void		AnnServeDefaultOptions(AnnServeOptions *options);

@@ -307,6 +307,8 @@ main(int argc, char **argv)
 			serveOptions.readers = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--merge-duplicates") == 0)
 			serveOptions.merge_duplicates = strcmp(value, "on") == 0;
+		else if (strcmp(argv[i], "--scheduler-shards") == 0)
+			serveOptions.scheduler_shards = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--active-lanes") == 0)
 			serveOptions.active_lanes = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--filter-lanes") == 0)
@@ -507,6 +509,8 @@ main(int argc, char **argv)
 			AnnIndexConfig.scan_max_k = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--quant-slack") == 0)
 			AnnIndexConfig.quant_slack = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--scan-skip-tail") == 0)
+			AnnIndexConfig.scan_skip_tail = strcmp(value, "on") == 0;
 		else if (strcmp(argv[i], "--shard-topk-share") == 0)
 		{
 			unsigned long share = strtoul(value, NULL, 10);
@@ -747,19 +751,19 @@ main(int argc, char **argv)
 usage:
 #ifdef ANN_USE_CUVS
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
-			"[--lanes N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
+			"[--lanes N] [--scheduler-shards N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
 			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off]\n"
 			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--residual-masks on|off] [--quantized-scan on|off] [--quant-slack N]\n"
-			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--rerank-prefetch N] [--predicate-cache N]\n"
+			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--scan-skip-tail on|off] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--scan-routes on|off] [--scan-max-k N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
-			"[--lanes N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
+			"[--lanes N] [--scheduler-shards N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
