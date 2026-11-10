@@ -88,7 +88,7 @@ so about 100k honest: the 4 × 2 layout on the full shard matches it.
    each epoll round's searches are queued under one lock; pending-byte
    budgets became atomics; a lane releases its filter at its next pickup.
 7. Replies went out as two writes: one `writev`.
-8. Identical searches in a batch run once (`--merge-duplicates`, 1 in 6).
+8. Identical searches in a batch run once (`--merge-duplicates on`, 1 in 6).
 9. Each shard returns a share of k to the merge (`--shard-topk-share`),
    which was half the lane CPU with 8 lists of 1000; slack 50% → 5%.
 10. `--replicate N` copies with shards spread over GPUs: 4 × 2 halves the
@@ -129,7 +129,7 @@ final worker flags:
 ```
 --replicate 2 --lanes 96 --readers 64 --filter-lanes 16 --max-batch 64
 --matrix-gather on --matrix-prune on --gpu-rerank on --matrix-max-mb 512
---shard-topk-share 40 --slack-ratio 5 --quant-slack 16
+--shard-topk-share 40 --slack-ratio 5 --quant-slack 16 --merge-duplicates on
 --gather-limit 4000000 --bitset-gather-limit 4000000 --group-gather-limit 4000000
 --memory-pool 60 --predicate-cache-mb 8192 --predicate-device-mb 2048 --prewarm off
 ```

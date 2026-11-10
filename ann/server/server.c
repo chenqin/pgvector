@@ -256,7 +256,7 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 	options->rdma_lanes = 1;
 	options->rdma_spin = 1;
 	options->readers = 64;
-	options->merge_duplicates = 1;
+	options->merge_duplicates = 0;
 }
 
 static void
