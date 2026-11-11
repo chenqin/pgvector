@@ -311,8 +311,21 @@ a query). Every point ran the GPUs at 88-100%.
 | 1536, 20, 8 | 128, 32 | 95k | 0.970 / 0.83 | 7.2 ms | 22 ms |
 | 3072, 10, 4 | 128, 32 | 100k | 0.963 / 0.68 | 3.4 ms | 11 ms |
 
-At the 0.95 gate the shard serves about 115-125k Muse requests/s with a
-single-digit p99 at 60k/s; the earlier graph result was 21.4k at recall
+A second pass around the best point, 20 s closed loop and 15 s per rate, 192
+lanes and batch 64 (256 lanes peaked the same with a higher p99 at every
+rate):
+
+| itopk, iterations, samplings, block size | Peak Muse req/s | Recall | p99 at 60k/s | 75k | 90k | 105k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **1536, 18, 4, 64** | **139k** | **0.951** | 7.2 ms | 7.9 ms | 8.8 ms | **10.3 ms** |
+| 1536, 20, 4, 64 | 128k | 0.957 | 8.0 ms | 8.9 ms | 10.2 ms | 12.5 ms |
+| 1536, 18, 4, automatic | 136k | 0.951 | 4.1 ms | 11.7 ms | 21.9 ms | 28.6 ms |
+| 1536, 16, 8, automatic | 120k | 0.961 | 4.3 ms | 13.4 ms | 26.1 ms | 38.4 ms |
+| 1536, 16, 4, automatic | 149k | 0.944 | 3.4 ms | 4.8 ms | 15.3 ms | 21.3 ms |
+
+`--filtered-block-size 64` costs a few milliseconds at 60k/s and keeps the
+p99 flat above it. At the 0.95 gate the shard serves 128-139k Muse
+requests/s and holds a 10-13 ms p99 at 105k/s; the earlier graph result was 21.4k at recall
 0.72 on the bandwidth-4 tree. More walkers buy recall more cheaply than
 more iterations; a thread-block size of 64 and the kernel variants tried on
 one GPU (fewer second-hop entries, skipping the second hop when the first

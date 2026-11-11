@@ -2635,6 +2635,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				lane->params->search_width = AnnIndexConfig.filtered_width;
 			lane->params->max_iterations = AnnIndexConfig.filtered_iterations;
 		}
+		lane->params->thread_block_size = bitsets ? AnnIndexConfig.filtered_block : 0;
 #ifdef CUVS_CAGRA_HAS_FILTER_EXPANSION
 		lane->params->filter_expansion = CUVS_CAGRA_FILTER_SCORE_ALL;
 		lane->params->num_random_samplings = 1;

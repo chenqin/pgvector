@@ -305,6 +305,9 @@ typedef struct AnnIndexOptions
 								 * different filters of an index share one
 								 * two-hop graph search, each with its own
 								 * bitset */
+	uint32_t	filtered_block; /* --filtered-block-size: threads per cuVS
+								 * thread block of a bitset CAGRA search
+								 * (64, 128, 256); 0 lets cuVS choose */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */

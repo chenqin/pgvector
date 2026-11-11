@@ -577,6 +577,8 @@ main(int argc, char **argv)
 			AnnIndexConfig.filtered_expansion = strcmp(value, "two-hop") == 0;
 		else if (strcmp(argv[i], "--filtered-samplings") == 0)
 			AnnIndexConfig.filtered_samplings = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--filtered-block-size") == 0)
+			AnnIndexConfig.filtered_block = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--mixed-graph") == 0)
 			AnnIndexConfig.mixed_graph = strcmp(value, "on") == 0;
 		else if (strcmp(argv[i], "--predicate-cache") == 0)
@@ -763,7 +765,7 @@ usage:
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--scheduler-shards N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
-			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
+			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--filtered-block-size N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
 			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off]\n"
 			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--residual-masks on|off] [--quantized-scan on|off] [--quant-slack N]\n"
@@ -775,7 +777,7 @@ usage:
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
 			"[--lanes N] [--scheduler-shards N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
-			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
+			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--filtered-block-size N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
 			"cuvs, hipvs, and fused-nvfp4 require vendor adapters\n");
 #endif
