@@ -166,6 +166,167 @@ first lever (a cheaper batch, by putting each group on one GPU). 2 shards
 × 4 copies with rerank does not fit: 163 GB of index a GPU before any
 working memory.
 
+## Graph route with a bitset filter (2026-11-10)
+
+The same shard served from fp16 CAGRA graphs instead of the scan, to
+compare the two ways of applying a `pg_ids` filter. Both start the same
+way: the predicate is evaluated once on the host from the worker's posting
+lists and cached per distinct filter. The scan route sends the result to
+the GPU as a row list and scans those rows once for a whole same-filter
+batch; the graph route sends it as a bitset, and each search walks the
+graph on its own, keeping only the nodes that pass.
+
+The graphs are useless on the tree above, so this ran on a rebuild with
+the copies spread 8 times wider (`scale_export.py --bandwidth 4`, against
+the default 0.5): 37 groups × 46.5M rows, one shard each, fp16 graphs and
+FP8 codes, 952 GB. Every group built, the 33-dim ones included. The
+requests use the smaller K (30–182); recall is from 120 checked
+sub-queries.
+
+| | Scan, K 300–1000 | Scan, K 30–182 | Graph, K 30–182 |
+| --- | ---: | ---: | ---: |
+| Peak Muse req/s | 214k | 424k | 10.9k |
+| ANN searches/s at the peak | 1.29M | 2.5M | 65.5k |
+| Rate held under a 50 ms p99 | ~150k | ~250k | > 8k |
+| Recall mean / lowest | 0.998 / 0.986 | not checked | 0.72 / 0.34 |
+| Spread of the copies (bandwidth) | 0.5 | 0.5 | 4 |
+
+The graph route held a 4.5 ms p99 at 8k requests/s; the next step
+offered, 16k, saturated it at 10.9k. At the same K the scan peaks at about
+39 times the graph route, and the graph route's recall is far below the
+0.95 gate. The trees differ in spread, so the ratio is indicative: graph
+searches return garbage on the scan's tree, and the scan was not rerun on
+this one.
+
+Where the graph route's time goes (nsys over 5 s at 65k searches/s):
+`search_multi_cta` is 95.8% of GPU kernel time, one launch per search at
+450 µs on average. Batches averaged 1.7 searches. The worker used 10.6 cores,
+lanes spent 59% of samples in `cudaStreamSynchronize` and readers sat in
+`epoll_wait`, and the GPUs were 94–98% busy: GPU-bound.
+
+The allocator set the first limit:
+
+| Allocator | Peak Muse req/s | p99 at 2k/s | p99 at 8k/s |
+| --- | ---: | ---: | ---: |
+| `--device-allocator plain` | 3.0k | 843 ms | saturated |
+| `--memory-pool 0` (stream-ordered) | 10.9k | 80 ms | 308 ms |
+| `--memory-pool 95` (RMM pool) | 10.9k | 2.9 ms | 4.5 ms |
+
+With the plain allocator two thirds of lane samples waited on the
+driver's lock in `cuMemAlloc` and `cuMemFree`. Stream-ordered allocation
+lifts the peak and the pool also removes the latency. `--memory-pool 60`
+ran out of pool memory loading several groups' graphs; 95 fits, at
+115–123 GB a GPU.
+
+The walk length sets the cost. A worker with two of the groups (g0 and
+g19, 2 copies each on 4 GPUs, the same K, multi-CTA,
+`--filtered-itopk 512`, width 4):
+
+| `--filtered-iterations` | ANN searches/s | Recall mean / lowest |
+| ---: | ---: | ---: |
+| 8 | 204k | 0.31 / 0.07 |
+| 16 | 108k | 0.52 / 0.10 |
+| 32 | 51k | 0.67 / 0.20 |
+| 64 | 25.6k | 0.81 / 0.30 |
+| 128 | 13.3k | 0.90 / 0.57 |
+| 0 (automatic) | 41.4–41.8k | 0.71 / 0.27 |
+
+Iterations times searches/s stays at 1.6–1.7M. The shortfall from full
+recall roughly halves per doubling (0.33, 0.19, 0.10 from 32 to 128), so
+0.95 would take about 256 iterations: about 6.7k searches/s on this
+worker and, scaled by the full worker's ratio at the automatic setting
+(65.5k against about 41.6k), about 1.75k Muse requests/s on the shard.
+That is an extrapolation, not a measurement.
+
+At the automatic setting, `--filtered-itopk` 256 or 512 and
+`--filtered-width` 1, 2 or 4 all gave 41.4–41.8k at recall 0.71, and
+single-CTA gave 3.0–6.5k at recall 0.18–0.19. At today's K a longer list
+did raise recall: 0.80, 0.85 and 0.90 at 1024, 2048 and 4096 (plain
+allocator, not rerun with the pool).
+
+With 0.5–4% of rows passing, most nodes a walk reaches fail the bitset,
+so collecting K passing neighbours takes many iterations, and every
+search pays for its own walk; the scan pays once per same-filter batch.
+This test had no unfiltered or broad-filter traffic, so where the graph
+route overtakes the scan is not measured. Real embeddings, without
+thousands of close copies per seed, may need shorter walks.
+
+Graph worker flags (on top of the `wk.sh` defaults):
+
+```
+--replicate 2 --lanes 48 --max-batch 32 --filter-lanes 16 --memory-pool 95
+--quantized-scan off --matrix-gather off --gpu-rerank off --scan-routes off
+--exact-limit 0 --gather-limit 0 --bitset-gather-limit 0 --group-gather-limit 0
+--itopk 512 --filtered-algo multi --filtered-itopk 512 --filtered-width 4
+--merge-duplicates on --predicate-device-mb 4096 --prewarm off
+```
+
+## Graph route walking passing rows only (2026-11-11)
+
+cuVS' filtered search scores every neighbour of a node it expands, keeps
+rejected rows on its list as stepping stones and lengthens the list by the
+filter's pass rate. The `chenqin/cuvs` fork's `main` (27.02 plus
+`PASSING_TWO_HOP`) walks the passing rows instead, which is what makes the
+scan cheap: a node's children are its neighbours that pass the bitset and,
+through each neighbour that does not, that neighbour's passing neighbours;
+rejected rows are never scored; the walk starts from random passing rows;
+each query brings its own bitset, so one search serves a batch of different
+filters (`--filtered-expansion two-hop`, `--filtered-samplings`,
+`--mixed-graph on` with `--mixed-groups on`).
+
+The tree matters more than the search. A simulation of the walk on the
+index files (exact answers, the graph as built) showed the bandwidth-4 tree
+above is close to structureless: local intrinsic dimension 23 (33-dim
+groups) and 48 (65-dim) against about 10 for the seed rows, and a
+32-neighbour overlap between neighbours of 0.04-0.08 against 0.35. Any walk
+on it needs thousands of expansions. `scale_export.py --kernel tangent
+--k 16 --bandwidth 1` keeps both figures (9.5 and 0.36), and the shard was
+rebuilt with it (37 groups x 46.5M rows, 952 GB, 25 minutes; the
+bandwidth-4 tree keeps only g0 and g19). On the seed rows a passing row's
+nearest neighbour passes 26-58% of the time against a 0.4-3.8% base rate,
+so real filters are clustered, as the tangent tree's are.
+
+Two groups (g0, g19), 4 GPUs, 2 copies, K 30-182, 200,000 requests, recall
+from 120 checked sub-queries:
+
+| Search | Peak Muse req/s | Recall mean / lowest | p99 |
+| --- | ---: | ---: | --- |
+| cuVS' filtered search (itopk 512, automatic iterations) | 10.6k | 0.53 / 0.00 | 16 ms at 8k/s |
+| two-hop, itopk 1024, 20 iterations, 8 samplings | 57.9k | 0.954 / 0.68 | 3.8 ms at 40k/s |
+| the same with `--mixed-graph on` | 58.3k | 0.954 / 0.68 | 2.7 ms at 40k/s |
+| FP8 scan | 283k | 0.999 / 0.97 | 4.2 ms at 120k/s |
+
+The whole 1/8 shard on 8 GPUs, 2 copies, `--mixed-graph on`, one worker
+kept loaded while the settings changed (10 s per point; itopk / 32 walkers
+a query). Every point ran the GPUs at 88-100%.
+
+| itopk, iterations, samplings | Lanes, batch | Peak Muse req/s | Recall mean / lowest | p99 at 60k/s | at 80k/s |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 1024, 20, 8 | 128, 32 | 114k | 0.929 / 0.43 | 4.0 ms | 6.0 ms |
+| 1536, 12, 8 | 128, 32 | 131k | 0.945 / 0.62 | 1.9 ms | 3.0 ms |
+| 1536, 16, 4 | 192, 64 | 147k | 0.944 / 0.46 | 3.5 ms | 7.3 ms |
+| **1536, 20, 4** | 192, 64 | **125k** | **0.957** / 0.70 | 5.4 ms | not held |
+| 1536, 20, 4 | 128, 32 | 114k | 0.957 / 0.67 | 3.3 ms | not held |
+| 1536, 16, 8 | 192, 64 | 119k | 0.961 / 0.82 | 4.3 ms | not held |
+| 1536, 20, 8 | 128, 32 | 95k | 0.970 / 0.83 | 7.2 ms | 22 ms |
+| 3072, 10, 4 | 128, 32 | 100k | 0.963 / 0.68 | 3.4 ms | 11 ms |
+
+At the 0.95 gate the shard serves about 115-125k Muse requests/s with a
+single-digit p99 at 60k/s; the earlier graph result was 21.4k at recall
+0.72 on the bandwidth-4 tree. More walkers buy recall more cheaply than
+more iterations; a thread-block size of 64 and the kernel variants tried on
+one GPU (fewer second-hop entries, skipping the second hop when the first
+finds enough) moved throughput and recall together. "Not held" points
+saturated in a 10-second open-loop run and are not rerun. The scan was not
+measured on the rebuilt shard: with graphs and codes both loaded, two copies
+did not fit beside the other tenants.
+
+The scan stays about 5 times faster for these filters (283k against 58k on
+the two groups): the search kernel spends about 21 us of a GPU per query,
+the scan about 3, because a filter passing under 4% leaves it under 2M rows
+to score once per batch. The walk's cost does not grow with the filter, the
+scan's does, so wider filters and unfiltered searches are the graph's.
+
 ## Reproducing
 
 Build: `BUILDER_ARGS=--scan-only benchmarks/ann/scale_pipeline.sh OUT 4715 4 fp8`
