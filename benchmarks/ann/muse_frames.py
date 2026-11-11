@@ -196,7 +196,10 @@ def check(args):
     for line in open(args.frames + '.check.jsonl'):
         for spec in json.loads(line):
             size = struct.unpack('<I', stream.read(4))[0]
-            status, body = call(sock, stream.read(size))
+            frame_bytes = stream.read(size)
+            if args.only_table and spec['table'] not in args.only_table.split(','):
+                continue
+            status, body = call(sock, frame_bytes)
             if status:
                 raise SystemExit(f'status {status} for {spec["table"]}')
             count, route, _ = struct.unpack('<IIQ', body[:16])
@@ -253,6 +256,7 @@ def main():
     c.add_argument('--port', type=int, default=7700)
     c.add_argument('--token-file', required=True)
     c.add_argument('--verbose', action='store_true', help='one line per checked sub-request')
+    c.add_argument('--only-table', help='comma-separated tables: check only their sub-requests (a worker with a subset loaded)')
     args = parser.parse_args()
     emit(args) if args.command == 'emit' else check(args)
 

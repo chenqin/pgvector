@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100, 0, 0, 0, 0, 0, 0};
 int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;

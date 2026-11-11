@@ -1448,14 +1448,22 @@ Lane(void *argument)
 					Job		   *next = other->next;
 					FilterEntry *entry = other->filter;
 
+					/*
+					 * --mixed-graph: one graph search takes the jobs of one
+					 * index whatever their filters, and a filter another lane
+					 * works on costs it nothing extra.
+					 */
 					if (entry && entry != owns && other->kind == batch[0]->kind &&
+						(!AnnIndexConfig.mixed_graph ||
+						 (other->kind == JOB_INDEX && strcmp(other->index.name, batch[0]->index.name) == 0)) &&
 						bytes + JobBytes(other) <= service->options.max_batch_bytes)
 					{
 						uint32_t	e = 0;
 
 						while (e < nextras && extras[e] != entry)
 							e++;
-						if (e == nextras && (entry->active || nextras == ANN_MIXED_FILTERS))
+						if (e == nextras &&
+							((entry->active && !AnnIndexConfig.mixed_graph) || nextras == ANN_MIXED_FILTERS))
 						{
 							other = next;
 							continue;
@@ -4080,8 +4088,8 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	 * Scheduler shards: one per 24 lanes unless told. With one, every reader
 	 * and lane met on one mutex (see Scheduler: 45% of lane samples waited
 	 * for it at a million searches a second); with many, lanes take work
-	 * sooner and batches shrink. 96 lanes on the Muse mix held a 50 ms p99
-	 * to 110k requests/s with 1 shard, 150k with 4 and 140k with 12.
+	 * sooner and batches shrink. 96 lanes on the Muse mix held a 50 ms p99 to
+	 * 110k requests/s with 1 shard, 150k with 4 and 140k with 12.
 	 */
 	service.nschedulers = options->scheduler_shards ? options->scheduler_shards : options->lanes / 24;
 	if (service.nschedulers > options->lanes)

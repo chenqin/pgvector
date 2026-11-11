@@ -287,6 +287,24 @@ typedef struct AnnIndexOptions
 	int			scan_skip_tail; /* --scan-skip-tail: FP8 matrix scans leave
 								 * out a last 16-dimension block holding one
 								 * coordinate (dims % 16 == 1) */
+	int			cagra_pitch_off;	/* --cagra-pitch off: search CAGRA rows at
+									 * their own dimensions (one launch per
+									 * query when rows are padded) */
+	int			widen_off;		/* --widen-short off: no second search of
+								 * short graph answers */
+	int			filtered_expansion; /* --filtered-expansion two-hop: bitset
+									 * CAGRA scores, keeps and expands only
+									 * rows the filter passes, reaching
+									 * through each rejected neighbour to its
+									 * own; needs a cuVS that has it */
+	uint32_t	filtered_samplings; /* --filtered-samplings: random start rows
+									 * drawn per start slot of a bitset CAGRA
+									 * search, the nearest kept; 0 for cuVS'
+									 * own 1 */
+	int			mixed_graph;	/* --mixed-graph on: a batch's queries over
+								 * different filters of an index share one
+								 * two-hop graph search, each with its own
+								 * bitset */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */

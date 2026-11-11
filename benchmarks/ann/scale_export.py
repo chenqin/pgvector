@@ -10,10 +10,23 @@ turns into a worker index:
   synthetic document is the same document across groups; keys stay sorted.
 - attributes and multi-valued columns (pg_ids) are the seed row's, so every
   filter keeps the share of rows it matches.
-- vectors are sampled around the seed row's (a kernel density estimate):
-  moved by BANDWIDTH times the distance to its K-th nearest seed neighbour, in
-  a random direction, renormalized to unit length; a trailing cosine-as-L2
-  coordinate is recomputed from the group's augment_norm.
+- vectors are sampled around the seed row's (a kernel density estimate),
+  renormalized to unit length; a trailing cosine-as-L2 coordinate is
+  recomputed from the group's augment_norm. --kernel picks the sample:
+  shell (the default) moves a copy by BANDWIDTH times the distance to its
+  K-th nearest seed neighbour in a random direction; tangent moves it by a
+  random Gaussian mix of the offsets to its K nearest seed neighbours, scaled
+  by BANDWIDTH / sqrt(K), so copies stay in the directions the seed's
+  neighbours lie in.
+
+The shell kernel does not keep the seed's local structure at a large factor,
+which graph searches depend on (scans do not). On a 33-dim group whose seed
+has local intrinsic dimension 10 and a 32-neighbour overlap of 0.35 between
+neighbours, shell at bandwidth 4 gave dimension 23 and overlap 0.08 (every
+row about equally far from every other), and at 0.5 each seed's copies are
+nearer to each other than to anything else. --kernel tangent --k 16
+--bandwidth 1 kept both (9.5 and 0.36). Use it for anything that walks a
+graph.
 
     python3 benchmarks/ann/scale_export.py --seed-root SEED/build/seg_ads \\
         --groups groups.json --factor 100 --out /data/scale100/export
@@ -36,15 +49,20 @@ import numpy as np
 BUFFER = 16 << 20   # bytes of output buffered per file: seed-sized pieces become few large writes
 
 
-def knn_distance(x, k, chunk=2048):
+def knn(x, k, chunk=2048):
+    """Each row's k nearest other rows, nearest first, and the distance to the k-th."""
     sq = (x * x).sum(1)
     out = np.empty(len(x), dtype=np.float32)
+    nearest = np.empty((len(x), k), dtype=np.int64)
     for i in range(0, len(x), chunk):
         d2 = sq[i:i + chunk, None] + sq[None, :] - 2 * x[i:i + chunk] @ x.T
         np.maximum(d2, 0, out=d2)
         d2[np.arange(len(d2)), np.arange(i, i + len(d2))] = np.inf
-        out[i:i + chunk] = np.sqrt(np.partition(d2, k - 1, axis=1)[:, k - 1])
-    return out
+        part = np.argpartition(d2, k - 1, axis=1)[:, :k]
+        order = np.argsort(np.take_along_axis(d2, part, 1), axis=1)
+        nearest[i:i + chunk] = np.take_along_axis(part, order, 1)
+        out[i:i + chunk] = np.sqrt(np.take_along_axis(d2, nearest[i:i + chunk, -1:], 1)[:, 0])
+    return nearest, out
 
 
 def manifest(path):
@@ -65,7 +83,12 @@ def scale(args, group):
     vectors = np.fromfile(os.path.join(src, 'vectors.f32'), dtype='<f4').reshape(rows, dims)
     rng = np.random.default_rng(args.seed + int(table.lstrip('g') or 0))
     base = vectors[:, :dim]
-    radius = args.bandwidth * knn_distance(base, args.k)
+    nearest, kth = knn(base, args.k)
+    if args.kernel == 'tangent':
+        offsets = base[nearest] - base[:, None, :]      # [rows, k, dim]
+        weight = np.float32(args.bandwidth / np.sqrt(args.k))
+    else:
+        radius = args.bandwidth * kth
     try:
         os.makedirs(dst, exist_ok=False)
     except FileExistsError:
@@ -81,8 +104,12 @@ def scale(args, group):
             if j == 0:
                 out.write(vectors.data)
                 continue
-            step = rng.standard_normal(base.shape).astype(np.float32)
-            step *= (radius / np.linalg.norm(step, axis=1))[:, None]
+            if args.kernel == 'tangent':
+                mix = rng.standard_normal((rows, args.k), dtype=np.float32) * weight
+                step = np.einsum('rk,rkd->rd', mix, offsets)
+            else:
+                step = rng.standard_normal(base.shape).astype(np.float32)
+                step *= (radius / np.linalg.norm(step, axis=1))[:, None]
             moved = base + step
             moved /= np.linalg.norm(moved, axis=1)[:, None]
             synthetic[:, :dim] = moved
@@ -131,7 +158,9 @@ def main():
     parser.add_argument('--factor', type=int, required=True)
     parser.add_argument('--out', required=True)
     parser.add_argument('--source-schema', default='seg_ads_scaled')
-    parser.add_argument('--k', type=int, default=5)
+    parser.add_argument('--kernel', choices=('shell', 'tangent'), default='shell',
+                        help='how a copy is moved from its seed row (see above)')
+    parser.add_argument('--k', type=int, default=5, help='seed neighbours the kernel uses')
     parser.add_argument('--bandwidth', type=float, default=0.5)
     parser.add_argument('--key-stride', type=int, default=100000)
     parser.add_argument('--jobs', type=int, default=16)

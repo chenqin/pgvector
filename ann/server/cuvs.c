@@ -18,6 +18,7 @@
 #include <cuvs/neighbors/brute_force.h>
 #include <cuvs/neighbors/cagra.h>
 #include <cuvs/selection/select_k.h>
+#include <cuvs/version_config.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -385,9 +386,11 @@ Build(AnnIndex *index, uint64_t generation, uint32_t rows,
 	status = ANN_BACKEND_ERROR;
 	cuvsSetLogLevel(CUVS_LOG_LEVEL_OFF);
 	CuvsCall(cuvsVersionGet(&major, &minor, &patch));
-	if (major != 26 || minor != 10)
+	/* The cuVS whose headers this was built with (26.10, or 27.02 from main). */
+	if (major != CUVS_VERSION_MAJOR || minor != CUVS_VERSION_MINOR)
 	{
-		fprintf(stderr, "cuVS: expected 26.10, found %u.%u.%u\n", major, minor, patch);
+		fprintf(stderr, "cuVS: expected %d.%02d, found %u.%u.%u\n", CUVS_VERSION_MAJOR,
+				CUVS_VERSION_MINOR, major, minor, patch);
 		status = ANN_UNSUPPORTED;
 		goto done;
 	}
@@ -570,6 +573,10 @@ typedef struct AnnCuvsShard
 	cuvsResources_t resources;	/* load-time owner of the index memory */
 	cuvsCagraIndex_t index;
 	cuvsDataset_t dataset;
+	cuvsDataset_t pitchView;	/* the dataset's padded rows viewed as
+								 * pitch-wide vectors, searched instead */
+	int64_t		queryWidth;		/* query row width the index takes: its
+								 * dimensions, or the pitch with pitchView */
 	const void *rows;			/* device view of the CAGRA dataset */
 	int64_t    *keys;			/* device copy of the shard's sorted keys */
 	int64_t		stride;			/* elements between rows */
@@ -624,6 +631,9 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t cagra_fp16_queries;	/* FP16 graph distances used
 												 * without rescoring */
 	atomic_uint_fast64_t graph_cpu_rerank_candidates;
+	atomic_uint_fast64_t widened_jobs;	/* short graph answers searched again */
+	atomic_uint_fast64_t mixed_graph_jobs;	/* graph jobs searched with their
+											 * own bitset among other filters' */
 	atomic_uint_fast64_t cost_queries[4];
 	atomic_uint_fast64_t gpu_predicates;	/* uncached predicates evaluated
 											 * on a device */
@@ -641,6 +651,9 @@ static _Thread_local uint32_t laneCopy;
 /* -1 uses deployment defaults; 0/1 is a batch-local calibrated decision. */
 static _Thread_local int laneRerank = -1;
 static _Thread_local uint32_t laneProfileItopk;
+
+/* SearchShards filters each job by its own bitsets (SearchFilteredMixedGraph). */
+static _Thread_local int laneMixed;
 static _Thread_local uint32_t laneProfileSlack;
 static _Alignas(64)
 AnnReplicaRouter replicaRouter;
@@ -730,7 +743,7 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"residual_masked\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"residual_masked\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"widened_jobs\":%llu,\"mixed_graph_jobs\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
@@ -743,6 +756,8 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp32_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cagra_fp16_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->graph_cpu_rerank_candidates, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->widened_jobs, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->mixed_graph_jobs, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[0], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[1], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[2], memory_order_relaxed),
@@ -798,6 +813,8 @@ typedef struct AnnCuvsDevice
 	uint32_t   *neighbors;
 	float	   *distances;
 	uint32_t   *bitset;
+	void	  **bitsetPointers; /* a mixed batch's bitset per query */
+	size_t		bitsetPointerCount;
 	uint32_t   *hostNeighbors;	/* pinned */
 	float	   *hostDistances;	/* pinned */
 	int64_t    *gatherKeys;		/* gather scan: filter keys of one shard */
@@ -1095,6 +1112,53 @@ LoadShard(void *argument)
 		if (view.deleter)
 			view.deleter(&view);
 	}
+	shard->queryWidth = dims;
+
+	/*
+	 * cuVS 26.10 searches one query per launch when a dataset's row pitch
+	 * differs from its dimensions: search_main_core copies the queries to the
+	 * pitch, and its kernels address query j at j * dims, so it calls the
+	 * plan once per query. FP16 rows are padded to 16 bytes, so every
+	 * dimension count but a multiple of 8 (65 and 33 here: pitch 72 and 40)
+	 * ran a batch of 32 as 32 search_multi_cta and 32 top-k launches, one
+	 * after another on the lane's stream. The padded rows, read as vectors of
+	 * the pitch's width with the padding zeroed, give the same L2 and
+	 * inner-product distances and make the pitch equal the dimensions, so a
+	 * batch is one launch; queries are then zero-padded to the pitch.
+	 */
+	if (!AnnIndexConfig.cagra_pitch_off && shard->rows && shard->stride > dims)
+	{
+		size_t		unit = args->state->fp16 ? 2 : 4;
+		int64_t		shape[2] = {size, shard->stride};
+		int64_t		wide = 0;
+		DLManagedTensor rows = Tensor((void *) shard->rows, kDLCUDA, shard->device, kDLFloat, 2, shape);
+		cudaStream_t stream;
+
+		rows.dl_tensor.dtype.bits = (uint8_t) (unit * 8);
+		if (cuvsStreamGet(shard->resources, &stream) == CUVS_SUCCESS &&
+			cudaMemset2DAsync((char *) shard->rows + (size_t) dims * unit, (size_t) shard->stride * unit, 0,
+							  (size_t) (shard->stride - dims) * unit, (size_t) size, stream) == cudaSuccess &&
+			cuvsStreamSync(shard->resources) == CUVS_SUCCESS &&
+			cuvsDatasetMakePaddedView(shard->resources, &rows, &shard->pitchView) == CUVS_SUCCESS &&
+			cuvsCagraUpdateDataset(shard->resources, shard->pitchView, shard->index) == CUVS_SUCCESS &&
+			cuvsStreamSync(shard->resources) == CUVS_SUCCESS &&
+			cuvsCagraIndexGetDims(shard->index, &wide) == CUVS_SUCCESS && wide == shard->stride)
+		{
+			shard->queryWidth = shard->stride;
+			fprintf(stderr, "cuVS: %s: %lld-dimension rows searched at pitch %lld\n", path,
+					(long long) dims, (long long) shard->stride);
+		}
+		else
+		{
+			const char *message = cuvsGetLastErrorText();
+
+			fprintf(stderr, "cuVS: %s: searching %lld-dimension rows at pitch %lld failed (%s); one launch per query\n",
+					path, (long long) dims, (long long) shard->stride, message ? message : "no message");
+			(void) cudaGetLastError();
+			if (wide != 0 && wide != dims)
+				return NULL;	/* rebound to the view, yet unusable */
+		}
+	}
 keys:
 	if (cudaMalloc((void **) &shard->keys, (size_t) args->file->shards[args->shard].rows * sizeof(int64_t)) != cudaSuccess ||
 		cudaMemcpy(shard->keys, args->file->keys + args->file->shards[args->shard].first,
@@ -1232,6 +1296,8 @@ DestroyIndexState(AnnCuvsIndex *state)
 			(void) cudaFree((void *) shard->rerank);
 		if (shard->index)
 			(void) cuvsCagraIndexDestroy(shard->index);
+		if (shard->pitchView)
+			(void) cuvsDatasetDestroy(shard->pitchView);
 		if (shard->dataset)
 			(void) cuvsDatasetDestroy(shard->dataset);
 		if (shard->resources)
@@ -2177,6 +2243,8 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->gpu_rerank_candidates, 0);
 	atomic_init(&state->cagra_fp32_queries, 0);
 	atomic_init(&state->graph_cpu_rerank_candidates, 0);
+	atomic_init(&state->widened_jobs, 0);
+	atomic_init(&state->mixed_graph_jobs, 0);
 	atomic_init(&state->cagra_fp16_queries, 0);
 	for (int mode = 0; mode < 4; mode++)
 		atomic_init(&state->cost_queries[mode], 0);
@@ -2424,22 +2492,26 @@ QueryTensor(void *data, int device, int half, int64_t *shape)
 	return tensor;
 }
 
-/* Copy queries to the device, converting to FP16 for half datasets. */
+/*
+ * Copy queries to the device, converting to FP16 for half datasets, as rows
+ * of width elements (zero past dims).
+ */
 static int
 UploadQueries(AnnCuvsDevice *lane, const AnnIndexJob *const *jobs, uint32_t m, uint32_t dims,
-			  int half, cudaStream_t stream, void *host)
+			  uint32_t width, int half, cudaStream_t stream, void *host)
 {
 	size_t		unit = half ? 2 : 4;
 
+	memset(host, 0, (size_t) m * width * unit);
 	for (uint32_t j = 0; j < m; j++)
 		for (uint32_t d = 0; d < dims; d++)
 		{
 			if (half)
-				((uint16_t *) host)[(size_t) j * dims + d] = AnnIndexHalf(jobs[j]->query[d]);
+				((uint16_t *) host)[(size_t) j * width + d] = AnnIndexHalf(jobs[j]->query[d]);
 			else
-				((float *) host)[(size_t) j * dims + d] = jobs[j]->query[d];
+				((float *) host)[(size_t) j * width + d] = jobs[j]->query[d];
 		}
-	return cudaMemcpyAsync(lane->queries, host, (size_t) m * dims * unit, cudaMemcpyHostToDevice,
+	return cudaMemcpyAsync(lane->queries, host, (size_t) m * width * unit, cudaMemcpyHostToDevice,
 						   stream) == cudaSuccess;
 }
 
@@ -2465,8 +2537,9 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 {
 	uint32_t	dims = file->dimensions;
 	size_t		unit = state->fp16 ? 2 : 4;
-	void	   *host = malloc((size_t) m * dims * unit);
-	int			uploaded[ANN_CUVS_MAX_DEVICES] = {0};
+	uint32_t	widest = dims;
+	void	   *host;
+	uint32_t	uploaded[ANN_CUVS_MAX_DEVICES] = {0};	/* query width there */
 	int			exactUploaded[ANN_CUVS_MAX_DEVICES] = {0};
 	int			exactGpu[ANN_INDEX_MAX_SHARDS] = {0};
 
@@ -2479,13 +2552,20 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 	size_t		bitsetWords[ANN_CUVS_MAX_DEVICES] = {0};
 	AnnCuvsShard *shards;
 	uint32_t	copy;
-	int			ok = host != NULL;
+	int			ok = 1;
+	int			mixed = bitsets != NULL && laneMixed;
+	void	  **pointers = mixed ? malloc(sizeof(void *) * m) : NULL;
 
 	if (exactHost)
 		for (uint32_t j = 0; j < m; j++)
 			memcpy(exactHost + (size_t) j * dims, jobs[j]->query, dims * sizeof(float));
 	copy = laneCopy;
 	shards = state->shards + (size_t) copy * state->nshards;
+	for (uint32_t s = 0; s < state->nshards; s++)
+		if (shards[s].queryWidth > widest)
+			widest = (uint32_t) shards[s].queryWidth;
+	host = malloc((size_t) m * widest * unit);
+	ok = host != NULL && (!mixed || pointers != NULL);
 
 	/*
 	 * Each shard gets m * k result slots, and its own bitset slot, in its
@@ -2500,16 +2580,17 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		if (!useShard[s])
 			continue;
 		perDevice[device] += (size_t) m * k;
-		if (bitsets)
+		if (bitsets && !mixed)
 			bitsetWords[device] += ((size_t) file->shards[s].rows + 31) / 32;
 	}
 	for (uint32_t s = 0; ok && s < state->nshards; s++)
 	{
 		AnnCuvsShard *shard = &shards[s];
 		size_t		words = ((size_t) file->shards[s].rows + 31) / 32;
+		uint32_t	width = shard->queryWidth > dims ? (uint32_t) shard->queryWidth : dims;
 		AnnCuvsDevice *lane;
 		cudaStream_t stream;
-		int64_t		queryShape[2] = {m, dims};
+		int64_t		queryShape[2] = {m, width};
 		int64_t		resultShape[2] = {m, k};
 		int64_t		bitsetShape[1] = {(int64_t) words};
 		DLManagedTensor queries,
@@ -2520,18 +2601,22 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 
 		if (!useShard[s])
 			continue;
-		lane = LaneDevice(shard->device, (size_t) m * dims * unit, perDevice[shard->device],
+		lane = LaneDevice(shard->device, (size_t) m * widest * unit, perDevice[shard->device],
 						  bitsets ? bitsetWords[shard->device] : 1);
 		if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS)
 		{
 			ok = 0;
 			break;
 		}
-		if (!uploaded[shard->device] &&
-			!(uploaded[shard->device] = UploadQueries(lane, jobs, m, dims, state->fp16, stream, host)))
+		/* Stream order keeps an earlier shard's search ahead of a re-upload. */
+		if (uploaded[shard->device] != width)
 		{
-			ok = 0;
-			break;
+			if (!UploadQueries(lane, jobs, m, dims, width, state->fp16, stream, host))
+			{
+				ok = 0;
+				break;
+			}
+			uploaded[shard->device] = width;
 		}
 		lane->params->itopk_size = itopk > laneProfileItopk ? itopk : laneProfileItopk;
 		lane->params->persistent = AnnIndexConfig.persistent != 0;
@@ -2550,6 +2635,30 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				lane->params->search_width = AnnIndexConfig.filtered_width;
 			lane->params->max_iterations = AnnIndexConfig.filtered_iterations;
 		}
+#ifdef CUVS_CAGRA_HAS_FILTER_EXPANSION
+		lane->params->filter_expansion = CUVS_CAGRA_FILTER_SCORE_ALL;
+		lane->params->num_random_samplings = 1;
+		lane->params->filtering_rate = 0;
+		lane->params->query_bitsets = 0;
+		if (bitsets)
+		{
+			double		passing = (double) jobs[0]->nfilter / (double) file->rows;
+
+			if (AnnIndexConfig.filtered_expansion)
+				lane->params->filter_expansion = CUVS_CAGRA_FILTER_PASSING_TWO_HOP;
+			if (AnnIndexConfig.filtered_samplings)
+				lane->params->num_random_samplings = AnnIndexConfig.filtered_samplings;
+
+			/*
+			 * The share of rows the filter removes, which cuVS otherwise
+			 * counts from the bitset in every search (a read of all of it and
+			 * two waits on the stream). One shard holds every row, so the
+			 * job's count is the shard's.
+			 */
+			if (!mixed && state->nshards == 1 && jobs[0]->nexclude == 0 && jobs[0]->nfilter > 0 && passing < 1.0)
+				lane->params->filtering_rate = (float) (1.0 - passing < 0.999 ? 1.0 - passing : 0.999);
+		}
+#endif
 		if (lane->params->algo != MULTI_CTA && lane->params->itopk_size > 512)
 		{
 			/*
@@ -2565,7 +2674,34 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		queries = QueryTensor(lane->queries, shard->device, state->fp16, queryShape);
 		neighbors = Tensor(lane->neighbors + slot[s], kDLCUDA, shard->device, kDLUInt, 2, resultShape);
 		distances = Tensor(lane->distances + slot[s], kDLCUDA, shard->device, kDLFloat, 2, resultShape);
-		if (bitsets && deviceBitsets && deviceBitsets[(size_t) copy * state->nshards + s])
+		if (mixed)
+		{
+#ifdef CUVS_CAGRA_HAS_FILTER_EXPANSION
+			/*
+			 * Each query's own bitset, already on this shard's device: cuVS
+			 * takes their addresses as an array there, and the filter's
+			 * tensor only says that the search is filtered.
+			 */
+			for (uint32_t j = 0; j < m; j++)
+				pointers[j] = jobs[j]->deviceBitsets[(size_t) copy * state->nshards + s];
+			if (!GrowDevice((void **) &lane->bitsetPointers, &lane->bitsetPointerCount, m, sizeof(void *),
+							256, stream) ||
+				cudaMemcpyAsync(lane->bitsetPointers, pointers, sizeof(void *) * m, cudaMemcpyHostToDevice,
+								stream) != cudaSuccess)
+			{
+				ok = 0;
+				break;
+			}
+			lane->params->query_bitsets = (uintptr_t) lane->bitsetPointers;
+			mask = Tensor(pointers[0], kDLCUDA, shard->device, kDLUInt, 1, bitsetShape);
+			filter.type = BITSET;
+			filter.addr = (uintptr_t) &mask;
+#else
+			ok = 0;
+			break;
+#endif
+		}
+		else if (bitsets && deviceBitsets && deviceBitsets[(size_t) copy * state->nshards + s])
 		{
 			/* Cached on this shard's device when the bitmap was pushed. */
 			mask = Tensor(deviceBitsets[(size_t) copy * state->nshards + s], kDLCUDA, shard->device,
@@ -2648,7 +2784,8 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 
 			counts[j * state->nshards + s] = useShard[s] ?
 				ShardHits(file, s, laneDevices[shards[s].device].hostNeighbors + slot[s] + (size_t) j * k,
-						  k, jobs[j]->query, bitsets ? bitsets[s] : NULL, hits, (native || exactGpu[s]) ?
+						  k, jobs[j]->query, mixed ? jobs[j]->bitsets[s] : bitsets ? bitsets[s] : NULL, hits,
+						  (native || exactGpu[s]) ?
 						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL, !exactGpu[s]) : 0;
 			if (!native && !exactGpu[s])
 				(void) atomic_fetch_add_explicit(&state->graph_cpu_rerank_candidates, counts[j * state->nshards + s], memory_order_relaxed);
@@ -2663,6 +2800,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				(void) atomic_fetch_add_explicit(&state->gpu_rerank_candidates, (uint64_t) m * k, memory_order_relaxed);
 	free(exactHost);
 	free(host);
+	free(pointers);
 	return ok;
 }
 
@@ -2721,45 +2859,75 @@ SortedDistinct(const int64_t *positions, const float *distances, uint32_t n)
  * the filter allows. Replying short makes PostgreSQL finish the search itself,
  * scanning every eligible row on the CPU (hundreds of milliseconds at a million
  * rows). Search again first, with twice the candidate list (cuVS allows
- * ANN_CAGRA_MAX_ITOPK), and keep the longer answer.
+ * ANN_CAGRA_MAX_ITOPK), and keep the longer answer. The short jobs of one
+ * batch search again together: one launch, where one per job cost a full
+ * single-query search each (3 of a narrow filter's batch of 32 came back
+ * short).
  */
 static void
-WidenShortJob(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job, uint32_t itopk,
-			  uint32_t **bitsets, void *const *deviceBitsets, uint64_t eligible)
+WidenShortJobs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m, uint32_t itopk,
+			   uint32_t **bitsets, void *const *deviceBitsets, uint64_t eligible)
 {
-	uint32_t	k = job->k;
 	uint32_t	wider = itopk * 2 > ANN_CAGRA_MAX_ITOPK ? ANN_CAGRA_MAX_ITOPK : itopk * 2;
-	const AnnIndexJob *jobs[1] = {job};
+	const AnnIndexJob **shortJobs;
 	int			useShard[ANN_INDEX_MAX_SHARDS];
-	uint32_t	counts[ANN_INDEX_MAX_SHARDS] = {0};
+	uint32_t   *counts;
 	AnnIndexHit *lists;
 	AnnIndexHit *previous;
-	uint32_t	before = job->nresults;
+	uint32_t	n = 0,
+				k = 0;
 
-	if (job->status != ANN_OK || before >= k || before >= eligible || wider <= itopk)
+	if (wider <= itopk || AnnIndexConfig.widen_off || m == 0)
 		return;
-	lists = malloc(sizeof(AnnIndexHit) * (size_t) k * state->nshards);
-	previous = malloc(sizeof(AnnIndexHit) * (size_t) (before ? before : 1));
-	if (lists == NULL || previous == NULL)
+	shortJobs = malloc(sizeof(*shortJobs) * m);
+	if (shortJobs == NULL)
+		return;
+	for (uint32_t j = 0; j < m; j++)
+		if (jobs[j]->status == ANN_OK && jobs[j]->nresults < jobs[j]->k && jobs[j]->nresults < eligible)
+		{
+			shortJobs[n++] = jobs[j];
+			if (jobs[j]->k > k)
+				k = jobs[j]->k;
+		}
+	if (n == 0)
+	{
+		free(shortJobs);
+		return;
+	}
+	(void) atomic_fetch_add_explicit(&state->widened_jobs, n, memory_order_relaxed);
+	lists = malloc(sizeof(AnnIndexHit) * (size_t) n * k * state->nshards);
+	counts = calloc((size_t) n * state->nshards, sizeof(uint32_t));
+	previous = malloc(sizeof(AnnIndexHit) * (size_t) n * k);
+	if (lists == NULL || counts == NULL || previous == NULL)
 	{
 		free(lists);
+		free(counts);
 		free(previous);
+		free(shortJobs);
 		return;
 	}
-	memcpy(previous, job->results, sizeof(AnnIndexHit) * before);
+	for (uint32_t j = 0; j < n; j++)
+		memcpy(previous + (size_t) j * k, shortJobs[j]->results, sizeof(AnnIndexHit) * shortJobs[j]->nresults);
 	for (uint32_t s = 0; s < state->nshards; s++)
 		useShard[s] = 1;
-	if (SearchShards(file, state, jobs, 1, k, wider, bitsets, deviceBitsets, useShard, lists, counts))
-	{
-		MergeJob(job, lists, counts, state->nshards, k);
-		if (job->nresults < before)
+	if (SearchShards(file, state, shortJobs, n, k, wider, bitsets, deviceBitsets, useShard, lists, counts))
+		for (uint32_t j = 0; j < n; j++)
 		{
-			memcpy(job->results, previous, sizeof(AnnIndexHit) * before);
-			job->nresults = before;
+			AnnIndexJob *job = (AnnIndexJob *) shortJobs[j];
+			uint32_t	before = job->nresults;
+
+			MergeJob(job, lists + (size_t) j * state->nshards * k, counts + (size_t) j * state->nshards,
+					 state->nshards, k);
+			if (job->nresults < before)
+			{
+				memcpy(job->results, previous + (size_t) j * k, sizeof(AnnIndexHit) * before);
+				job->nresults = before;
+			}
 		}
-	}
 	free(lists);
+	free(counts);
 	free(previous);
+	free(shortJobs);
 }
 
 /*
@@ -4289,7 +4457,7 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 		else
 		{
 			MergeJob(job, graphLists, graphCounts, state->nshards, selected);
-			WidenShortJob(file, state, job, itopk, bitsets, job->deviceBitsets, job->nfilter);
+			WidenShortJobs(file, state, &job, 1, itopk, bitsets, job->deviceBitsets, job->nfilter);
 			job->route = ANN_ROUTE_FILTERED;
 		}
 		free(graphLists);
@@ -4443,13 +4611,15 @@ SearchUnfiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jo
 			jobs[j]->status = ANN_BACKEND_ERROR;
 	}
 	else
+	{
 		for (uint32_t j = 0; j < m; j++)
 		{
 			MergeJob(jobs[j], lists + (size_t) j * state->nshards * k, counts + (size_t) j * state->nshards,
 					 state->nshards, k);
-			WidenShortJob(file, state, jobs[j], itopk, NULL, NULL, file->rows);
 			jobs[j]->route = ANN_ROUTE_ANN;
 		}
+		WidenShortJobs(file, state, jobs, m, itopk, NULL, NULL, file->rows);
+	}
 	free(lists);
 	free(counts);
 }
@@ -4502,13 +4672,96 @@ SearchFilteredGroupGraph(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndex
 			jobs[j]->status = ANN_BACKEND_ERROR;
 	}
 	else
+	{
 		for (uint32_t j = 0; j < m; j++)
 		{
 			MergeJob(jobs[j], lists + (size_t) j * state->nshards * k, counts + (size_t) j * state->nshards,
 					 state->nshards, k);
-			WidenShortJob(file, state, jobs[j], itopk, bitsets, jobs[0]->deviceBitsets, jobs[0]->nfilter);
 			jobs[j]->route = ANN_ROUTE_FILTERED;
 		}
+		WidenShortJobs(file, state, jobs, m, itopk, bitsets, jobs[0]->deviceBitsets, jobs[0]->nfilter);
+	}
+	free(lists);
+	free(counts);
+}
+
+/*
+ * --mixed-graph: whether a filtered job can join a graph search that takes
+ * each query's own bitset. The bitset must already be on the lane's copy's
+ * device, and no scan route may want the job.
+ */
+static int
+MixedGraphJob(const AnnIndexFile *file, const AnnCuvsIndex *state, const AnnIndexJob *job, int copy)
+{
+#ifdef CUVS_CAGRA_HAS_FILTER_EXPANSION
+	uint64_t	n = job->nfilter;
+
+	(void) file;
+	return AnnIndexConfig.filtered_expansion && state->nshards == 1 && !state->scanOnly &&
+		AnnIndexCostProfile == NULL && job->bitsets != NULL && job->deviceBitsets != NULL &&
+		(copy < 0 || job->deviceBitsets[(size_t) copy * state->nshards] != NULL) && job->nexclude == 0 &&
+		n > AnnIndexConfig.exact_limit && n > AnnIndexConfig.gather_limit &&
+		n > AnnIndexConfig.bitset_gather_limit && n > AnnIndexConfig.group_gather_limit &&
+		FilteredCandidates(job->k) <= ANN_CAGRA_MAX_ITOPK &&
+		!((job->filter != NULL || job->ordinals != NULL) && ScanPreferred(state, job->k, n));
+#else
+	(void) file;
+	(void) state;
+	(void) job;
+	(void) copy;
+	return 0;
+#endif
+}
+
+/*
+ * Two-hop filtered CAGRA for m jobs over different filters: one submission,
+ * each query walking the rows its own bitset passes. The walk's cost does
+ * not depend on which filter a neighbouring query has, so jobs need not wait
+ * for company with the same one.
+ */
+static void
+SearchFilteredMixedGraph(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
+{
+	uint32_t	k = 0;
+	uint32_t	itopk;
+	int			useShard[ANN_INDEX_MAX_SHARDS];
+	uint32_t   *bitsets[ANN_INDEX_MAX_SHARDS];
+	AnnIndexHit *lists;
+	uint32_t   *counts;
+	int			ok;
+
+	for (uint32_t j = 0; j < m; j++)
+		if (jobs[j]->k > k)
+			k = jobs[j]->k;
+	k = FilteredCandidates(k);
+	for (uint32_t s = 0; s < state->nshards; s++)
+	{
+		useShard[s] = 1;
+		bitsets[s] = jobs[0]->bitsets[s];
+	}
+	itopk = RoundTopK(k) > AnnIndexConfig.itopk ? RoundTopK(k) : AnnIndexConfig.itopk;
+	if (AnnIndexConfig.filtered_itopk > itopk)
+		itopk = AnnIndexConfig.filtered_itopk;
+	lists = malloc(sizeof(AnnIndexHit) * (size_t) m * state->nshards * k);
+	counts = calloc((size_t) m * state->nshards, sizeof(uint32_t));
+	laneMixed = 1;
+	ok = lists != NULL && counts != NULL &&
+		SearchShards(file, state, (const AnnIndexJob *const *) jobs, m, k, itopk, bitsets, NULL, useShard, lists,
+					 counts);
+	laneMixed = 0;
+	for (uint32_t j = 0; j < m; j++)
+	{
+		if (!ok)
+		{
+			jobs[j]->status = ANN_BACKEND_ERROR;
+			continue;
+		}
+		MergeJob(jobs[j], lists + (size_t) j * state->nshards * k, counts + (size_t) j * state->nshards,
+				 state->nshards, k);
+		jobs[j]->route = ANN_ROUTE_FILTERED;
+	}
+	if (ok)
+		(void) atomic_fetch_add_explicit(&state->mixed_graph_jobs, m, memory_order_relaxed);
 	free(lists);
 	free(counts);
 }
@@ -6868,6 +7121,34 @@ SearchIndex(AnnIndexJob *jobs, uint32_t count)
 				rows += n;
 			}
 			MixedFlush(file, state, mixed, where, nm, filtered);
+		}
+
+		/*
+		 * --mixed-graph: the filtered jobs the graph serves search together
+		 * whatever their filters, each query with its own bitset.
+		 */
+		if (AnnIndexConfig.mixed_graph && state && f > 1)
+		{
+			uint32_t	g = 0;
+
+			for (uint32_t a = 0; a < f; a++)
+				g += filtered[a] != NULL && MixedGraphJob(file, state, filtered[a], -1);
+			if (g > 1)
+			{
+				uint64_t	started = ReplicaNow();
+				uint32_t	copy = ReplicaAcquire(state, g, started);
+
+				g = 0;
+				for (uint32_t a = 0; a < f; a++)
+					if (filtered[a] && MixedGraphJob(file, state, filtered[a], (int) copy))
+					{
+						members[g++] = filtered[a];
+						filtered[a] = NULL;
+					}
+				if (g)
+					SearchFilteredMixedGraph(file, state, members, g);
+				ReplicaRelease(state, copy, members, g, started);
+			}
 		}
 
 		/* Same-filter jobs, as the lane queued them, share one search. */
