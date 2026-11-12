@@ -334,20 +334,59 @@ groups loaded, no errors, GPUs 83-100% busy at the peak):
 | **128** | **145k** | 0.950 / 0.54 | 4.3 ms | 5.0 ms | 6.0 ms | 8.0 ms | 14.7 ms |
 | 160 | 146k | 0.954 / 0.68 | 5.5 ms | 6.6 ms | 7.6 ms | 9.8 ms | 15.8 ms |
 
-Recall differs between runs by what the walkers' random starts found, and
-18 iterations sit on the gate: 20 gave 0.957-0.958 at about 8% less peak.
-At the 0.95 gate the shard serves about 145k Muse requests/s and holds a
-p99 under 16 ms to 130k/s; the earlier graph result was 21.4k at recall
+The 120 checked sub-queries above cover 28 of the 37 groups, so recall was
+measured again on 300 requests (1,732 sub-queries with rows to find, every
+group) whose query vectors are drawn like the load file's, from rows of the
+bandwidth-4 distribution: those sit as far from the item rows as the six
+captured queries do (nearest seed row at 0.95 against 0.77-1.17), where
+vectors drawn from the tangent tree's own rows sit on top of them (0.44)
+and score 0.02-0.03 higher. Exact answers come from the index files; each
+setting was measured twice and agreed to 0.001. A sweep of 64 settings at
+128 lanes and block size 64 (24-96 walkers, 8-39 iterations, 2-8
+samplings) brackets the gate from both sides:
+
+| itopk, iterations, samplings | Recall | Peak Muse req/s | p99 at 105k/s | 120k |
+| --- | ---: | ---: | ---: | ---: |
+| 1024, 10, 4 | 0.873 | 275k | 4.1 ms | 5.8 ms |
+| 1280, 14, 4 | 0.932 | 197k | 4.1 ms | 5.5 ms |
+| 1536, 12, 4 | 0.939 | 180k | 4.0 ms | 5.0 ms |
+| 1536, 14, 4 | 0.949 | 164k | 4.7 ms | 5.4 ms |
+| 1408, 16, 4 | 0.950 | 164k | 4.9 ms | 5.8 ms |
+| 1536, 18, 2 | 0.953 | 160k | 4.5 ms | 5.6 ms |
+| 1536, 16, 4 | 0.956 | 150k | 5.4 ms | 6.9 ms |
+| 1536, 18, 4 | 0.961 | 137k | 6.4 ms | 9.9 ms |
+| 2048, 18, 4 | 0.974 | 97k | not held | not held |
+
+About 10k requests/s buy 0.005 of recall around the gate; 24 or 32 walkers
+run at 250-280k and stop at 0.78-0.91. Every setting leaves a few queries
+near 0.1. The two settings at the gate, run with the released worker and
+flags (60 s closed loop, 30 s per rate, GPUs 85-100% busy at the peak):
+
+| itopk, iterations, samplings | Recall | Peak Muse req/s | p99 at 60k/s | 105k | 120k | 135k | 150k |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **1536, 18, 2** | 0.953 | **170k** | 3.6 ms | 4.5 ms | 7.0 ms | 8.4 ms | 23.8 ms |
+| 1408, 16, 4 | 0.950 | 172k | 3.9 ms | 5.0 ms | 5.6 ms | 7.6 ms | 15.5 ms |
+
+The FP8 scan on the same shard (the tree's files hard-linked under
+manifests without a graph, 2 copies, 96 lanes, slack 300%) peaked at 388k
+Muse requests/s with recall 0.998 / 0.973 and a p99 of 21 ms at 100k/s, 27
+at 200k and 47 at 350k: about 2.3 times the graph's peak, and three to five
+times its p99 below 135k/s, where the scan waits to fill same-filter
+batches and the graph search does not.
+
+At the 0.95 gate the shard serves about 170k Muse requests/s and holds a
+p99 under 25 ms to 150k/s; the earlier graph result was 21.4k at recall
 0.72 on the bandwidth-4 tree. More walkers buy recall more cheaply than
 more iterations; a thread-block size of 64 and the kernel variants tried on
 one GPU (fewer second-hop entries, skipping the second hop when the first
 finds enough) moved throughput and recall together. "Not held" points
-saturated in a 10-second open-loop run and are not rerun. The scan was not
-measured on the rebuilt shard: with graphs and codes both loaded, two copies
-did not fit beside the other tenants.
+saturated in a 10-second open-loop run and are not rerun. With graphs and codes both loaded,
+two copies did not fit beside the other tenants, so the scan below ran on a
+graph-free view of the same files.
 
-The scan stays about 5 times faster for these filters (283k against 58k on
-the two groups): the search kernel spends about 21 us of a GPU per query,
+The scan stays 2.3 times faster at the peak for these filters (388k against
+170k on the shard; 283k against 58k on the two groups before the settings
+were tuned): the search kernel spends about 21 us of a GPU per query,
 the scan about 3, because a filter passing under 4% leaves it under 2M rows
 to score once per batch. The walk's cost does not grow with the filter, the
 scan's does, so wider filters and unfiltered searches are the graph's.
