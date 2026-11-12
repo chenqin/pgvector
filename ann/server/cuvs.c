@@ -2656,11 +2656,22 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			 * The share of rows the filter removes, which cuVS otherwise
 			 * counts from the bitset in every search (a read of all of it and
 			 * two waits on the stream). One shard holds every row, so the
-			 * job's count is the shard's.
+			 * job's count is the shard's. A key list's count is of the keys
+			 * sent, some of which may be missing from the index: cuVS counts
+			 * the bitset for those.
 			 */
-			if (!mixed && state->nshards == 1 && jobs[0]->nexclude == 0 && jobs[0]->nfilter > 0 && passing < 1.0)
+			if (!mixed && state->nshards == 1 && jobs[0]->nexclude == 0 && jobs[0]->nfilter > 0 && passing < 1.0 &&
+				(jobs[0]->ordinals != NULL || jobs[0]->bitsets != NULL))
 				lane->params->filtering_rate = (float) (1.0 - passing < 0.999 ? 1.0 - passing : 0.999);
 		}
+		/*
+		 * Only cuVS' multi-CTA search walks through passing rows or takes a
+		 * bitset per query, and cuVS resolves AUTO to it for these. Decide
+		 * here, so that the single-CTA limit below does not cut their itopk.
+		 */
+		if (bitsets && (mixed || (lane->params->filter_expansion == CUVS_CAGRA_FILTER_PASSING_TWO_HOP &&
+								  lane->params->algo == AUTO && !lane->params->persistent)))
+			lane->params->algo = MULTI_CTA;
 #endif
 		if (lane->params->algo != MULTI_CTA && lane->params->itopk_size > 512)
 		{
@@ -2729,6 +2740,11 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		if (cuvsCagraSearch(lane->resources, lane->params, shard->index, &queries, &neighbors,
 							&distances, filter) != CUVS_SUCCESS)
 		{
+			static atomic_flag reported = ATOMIC_FLAG_INIT;
+
+			/* cuVS' own log is off; say once why searches fail. */
+			if (!atomic_flag_test_and_set(&reported))
+				fprintf(stderr, "cuVS: CAGRA search failed: %s\n", cuvsGetLastErrorText());
 			ok = 0;
 			break;
 		}

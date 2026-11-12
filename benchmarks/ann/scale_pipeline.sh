@@ -31,6 +31,7 @@
 #   SEED_ROOT    directory of <group>/index seed directories
 #   GROUPS_JSON  group catalog, a JSON list of {stem, table, dimension, augment}
 #   EXPORTER, BUILDER  scale_export.py and build_cuvs_index.py
+#   EXPORTER_ARGS      extra scale_export.py arguments (e.g. --kernel tangent --k 16 --bandwidth 1)
 #   ENV_SH       sourced first, for a python3 with numpy, cupy and cuvs
 #   GPUS         GPU indexes to use, e.g. "2 3 4 5" (default: every GPU of nvidia-smi)
 #   MIN_FREE_GB  refuse to start a group with less free disk than this (default 50)
@@ -101,7 +102,7 @@ one_group() {
   [ ! -e "$OUT_ROOT/$t" ] || { note "$t: removing the incomplete index an earlier run left"; rm -rf "$OUT_ROOT/$t"; }
   start=$(now_ms)
   python3 -I "$EXPORTER" --seed-root "$SEED_ROOT" --groups "$GROUPS_JSON" --factor "$FACTOR" \
-    --out "$EXPORT_ROOT" --only "$t" --jobs 1 > "$LOG_DIR/$t.export.log" 2>&1 & child=$!
+    --out "$EXPORT_ROOT" --only "$t" --jobs 1 ${EXPORTER_ARGS:-} > "$LOG_DIR/$t.export.log" 2>&1 & child=$!
   wait $child || { note "$t FAILED in export after $(seconds $(( $(now_ms) - start )))s: see $LOG_DIR/$t.export.log"; return 1; }
   export_ms=$(( $(now_ms) - start )); start=$(now_ms)
   if [ "$gpu" != all ]; then

@@ -296,7 +296,7 @@ GPUs 85-100% busy at the peak):
 | FP8 scan | 388k | 2.33M | 0.998 / 0.97 | 21 ms (100k) | 24 ms (150k) | 47 ms (350k) |
 | cuVS' own filtered search | 21.4k | 128k | 0.72 / 0.34 | saturated | | |
 
-The last row is the earlier result on the bandwidth-4 tree. On the tangent
+The last row is the earlier result on the bandwidth-4 tree, after the worker began searching padded FP16 rows as one launch per batch (`--cagra-pitch`, which doubled the 10.9k reported above). On the tangent
 tree it was measured on two groups only (g0 and g19, 4 GPUs): 10.6k Muse
 requests/s at recall 0.53, against 283k at 0.999 for the scan.
 
@@ -443,7 +443,9 @@ the 8-leaf fan-out or `pg_ids` filtering.
 
 Build: `BUILDER_ARGS=--scan-only benchmarks/ann/scale_pipeline.sh OUT 4715 4 fp8`
 (the seed index directories and the group catalog as its environment
-describes). Load: `benchmarks/ann/muse_direct.c` compiled with
+describes). The tangent tree of the graph results adds
+`EXPORTER_ARGS="--kernel tangent --k 16 --bandwidth 1"` and leaves out
+`--scan-only`. Load: `benchmarks/ann/muse_direct.c` compiled with
 `cc -O2 -std=c11 -pthread`; `benchmarks/ann/ann_profile.sh LABEL SECONDS`
 profiles a window (GPU utilisation, kernel stage times, gdb stack
 sampling, lock waits, server counters). The host's `~/b200dev/wk.sh NAME

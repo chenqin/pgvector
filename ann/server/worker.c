@@ -597,7 +597,19 @@ main(int argc, char **argv)
 		else if (strcmp(argv[i], "--filtered-samplings") == 0)
 			AnnIndexConfig.filtered_samplings = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--filtered-block-size") == 0)
-			AnnIndexConfig.filtered_block = (uint32_t) strtoul(value, NULL, 10);
+		{
+			char	   *end;
+			unsigned long block = strtoul(value, &end, 10);
+
+			/* The thread block sizes cuVS' CAGRA search accepts. */
+			if (value[0] == '\0' || value[0] == '-' || *end ||
+				(block != 0 && block != 64 && block != 128 && block != 256 && block != 512 && block != 1024))
+			{
+				fprintf(stderr, "--filtered-block-size takes 0, 64, 128, 256, 512 or 1024\n");
+				return 2;
+			}
+			AnnIndexConfig.filtered_block = (uint32_t) block;
+		}
 		else if (strcmp(argv[i], "--mixed-graph") == 0)
 			AnnIndexConfig.mixed_graph = strcmp(value, "on") == 0;
 		else if (strcmp(argv[i], "--predicate-cache") == 0)

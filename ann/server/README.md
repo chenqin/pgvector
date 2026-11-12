@@ -1,6 +1,6 @@
 # ANN server
 
-The ANN server is the worker PostgreSQL sends vector searches to: `ann-worker` (CPU, no dependencies) and `ann-worker-cuvs` (NVIDIA GPUs through cuVS 26.10). It loads index directories built by the [index builder](../builder/README.md) and answers searches over a Unix socket, TCP or RDMA. It can run on the database host or on separate GPU nodes.
+The ANN server is the worker PostgreSQL sends vector searches to: `ann-worker` (CPU, no dependencies) and `ann-worker-cuvs` (NVIDIA GPUs through cuVS 26.10 or 27.02). It loads index directories built by the [index builder](../builder/README.md) and answers searches over a Unix socket, TCP or RDMA. It can run on the database host or on separate GPU nodes.
 
 | Interface | Document |
 | --- | --- |
@@ -31,7 +31,7 @@ make -C ann/server USE_CUVS=1 CUVS_PREFIX=... CUDA_HOME=...
 sudo make -C ann/server install PREFIX=/usr/local        # ann-worker, and ann-worker-cuvs if built
 ```
 
-`install` copies the binaries to `$(DESTDIR)$(PREFIX)/bin`. `ann-worker-cuvs` needs the cuVS 26.10 and CUDA runtime libraries at run time (`LD_LIBRARY_PATH` for pip installs) and optionally `libnvrtc.so` for the GPU gather scan.
+`install` copies the binaries to `$(DESTDIR)$(PREFIX)/bin`. `ann-worker-cuvs` needs the cuVS and CUDA runtime libraries it was built against at run time (`LD_LIBRARY_PATH` for pip installs) and optionally `libnvrtc.so` for the GPU gather scan.
 
 ```sh
 # A GPU node serving PostgreSQL hosts on the network
@@ -128,7 +128,7 @@ make -C ann/server CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -pedantic -fsan
 
 ## cuVS integration
 
-`cuvs.c` is compiled and validated against cuVS 26.10 on NVIDIA B200 GPUs (`make -C ann/server check-cuvs`):
+`cuvs.c` is compiled and validated against cuVS 26.10, and against 27.02 from the `chenqin/cuvs` fork's `main`, on NVIDIA B200 GPUs (`make -C ann/server check-cuvs`):
 
 - **Gathered search** serves the [pipelined CustomScan](../../docs/ann-worker-pipeline.md) with exact GPU brute force.
 - **Loaded indexes** serve sharded CAGRA search across all GPUs, with bitset filters and an exact route for selective filters ([guide](../../docs/ann-cuvs-index.md)).

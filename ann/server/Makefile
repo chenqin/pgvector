@@ -85,7 +85,7 @@ CUVS_CPP_DIRS = $(wildcard $(CUVS_PREFIX)/../libraft/include/rapids $(CUVS_PREFI
 CUVS_CPP_FALLBACK_DIRS = $(wildcard $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/libcudacxx $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/cub $(CUVS_PREFIX)/../cupy/_core/include/cupy/_cccl/thrust)
 
 select_batch.o: select_batch.cpp select_batch.h
-	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
+	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 or 27.02 installation' >&2; exit 1; }
 	$(CXX) $(CXXFLAGS) -O2 -std=c++20 -I"$(CUVS_PREFIX)/include" $(addprefix -I,$(CUVS_CPP_DIRS)) -I"$(CUDA_HOME)/include" $(addprefix -I,$(CUVS_CPP_FALLBACK_DIRS)) $(CPPFLAGS) $(CUVS_CXXFLAGS) -c select_batch.cpp -o $@
 
 # JIT-LTO filter UDF search for FP32 CAGRA (experimental; see
@@ -99,10 +99,10 @@ cagra_udf.o: cagra_udf.cpp cagra_udf.h udf.h
 cagra-udf-probe: ../../benchmarks/ann/cagra_udf_probe.c cagra_udf.o udf.c udf.h $(COMMON)/filter.c $(COMMON)/filter.h
 	$(CC) -O3 -std=gnu11 -fopenmp -Wall -I. -I$(COMMON) -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) ../../benchmarks/ann/cagra_udf_probe.c udf.c $(COMMON)/filter.c cagra_udf.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lm -o $@
 
-# Requires cuVS 26.10 C/C++ SDKs, RAFT/RMM/CCCL, DLPack and CUDA runtime headers.
+# Requires cuVS 26.10 or 27.02 C/C++ SDKs, RAFT/RMM/CCCL, DLPack and CUDA runtime headers.
 # A different executable keeps the dependency-free CPU build reproducible.
 ann-worker-cuvs: $(WORKER_DEPS) cuvs.c replica.h nvrtc.c nvrtc.h blackwell.c blackwell.h select_batch.o select_batch.h
-	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
+	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 or 27.02 installation' >&2; exit 1; }
 	$(CC) $(CFLAGS) -pthread -DANN_USE_CUVS -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) $(WORKER_SRCS) cuvs.c nvrtc.c blackwell.c select_batch.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) $(WORKER_LIBS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lcuda -ldl -lm -o $@
 
 check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests ann-canonical-tests ann-filter-tests ann-predicate-tests
