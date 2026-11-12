@@ -378,6 +378,40 @@ Not covered: K 300-1000 with the two-hop search; filters passing under
 request, so the spread over groups and the filters' popularity are the
 generator's.
 
+Building the filter into the graph was simulated and not pursued
+(2026-11-12): the walk at the chosen setting, on the index files of g0 and
+g19, over their 86 checked sub-queries. The tangent tree gives every copy
+of a seed row that row's `pg_ids`, so its labels follow its neighbourhoods
+by construction, and the simulation cannot settle the question for real
+rows (on the seed rows a passing row's nearest neighbour passes 26-58% of
+the time, as above). On the tree:
+
+- 75-84% of a passing row's 32 graph neighbours already pass its filter,
+  and of the 16 nearest rows that share a `pg_id` with a row, its graph row
+  already holds all but 1.2-1.4.
+- A graph with 16 of each row's 32 edges replaced by those rows (stitched
+  per-label graphs, as Filtered-DiskANN builds) scored 0.964 on the wide
+  filters of both groups against 0.958 and 0.973 for the graph as built,
+  and 0.981 against 0.983 on the narrow filter, with 8-16% fewer graph
+  rows read.
+- Entry points kept per `pg_id` (fixed rows of every value a filter lists)
+  scored 0.89-0.95 on the wide filters against 0.96-0.97 for the random
+  passing rows the search draws, while scoring up to three times as many
+  rows in all.
+- Start rows chosen with knowledge of the query (the nearest of 32,768
+  random passing rows, their cost not counted) lift a 10-iteration walk
+  from 0.87-0.94 to 0.94-0.98, against 0.96-0.98 for 18 iterations. Only a
+  start that depends on the query, found at search time, could collect
+  that; it is not tried.
+
+The fork's `main` has changed since these measurements (2026-11-12: the
+parameters in its Python, Rust, Go and Java bindings, documentation, tests,
+and fixes from review; with the default walk a filtered search runs cuVS'
+own device code again). The released worker binary with that library on g0
+and g19 (4 GPUs, 2 copies) peaks at 78.5k Muse requests/s against 76.5k
+with the library the table was measured with, at the same recall on g0
+(0.97-0.98). The full shard was not measured again.
+
 ## Related reading
 
 Pinterest Engineering posts on the serving stack this test stands in for.
