@@ -286,64 +286,45 @@ bandwidth-4 tree keeps only g0 and g19). On the seed rows a passing row's
 nearest neighbour passes 26-58% of the time against a 0.4-3.8% base rate,
 so real filters are clustered, as the tangent tree's are.
 
-Two groups (g0, g19), 4 GPUs, 2 copies, K 30-182, 200,000 requests, recall
-from 120 checked sub-queries:
+The 1/8 shard on 8 GPUs, 2 copies, K 30-182, 200,000 requests, the
+released worker (60 s closed loop, 30 s per rate, all 37 groups, no errors,
+GPUs 85-100% busy at the peak):
 
-| Search | Peak Muse req/s | Recall mean / lowest | p99 |
-| --- | ---: | ---: | --- |
-| cuVS' filtered search (itopk 512, automatic iterations) | 10.6k | 0.53 / 0.00 | 16 ms at 8k/s |
-| two-hop, itopk 1024, 20 iterations, 8 samplings | 57.9k | 0.954 / 0.68 | 3.8 ms at 40k/s |
-| the same with `--mixed-graph on` | 58.3k | 0.954 / 0.68 | 2.7 ms at 40k/s |
-| FP8 scan | 283k | 0.999 / 0.97 | 4.2 ms at 120k/s |
-
-The whole 1/8 shard on 8 GPUs, 2 copies, `--mixed-graph on`, one worker
-kept loaded while the settings changed (10 s per point; itopk / 32 walkers
-a query). Every point ran the GPUs at 88-100%.
-
-| itopk, iterations, samplings | Lanes, batch | Peak Muse req/s | Recall mean / lowest | p99 at 60k/s | at 80k/s |
-| --- | --- | ---: | ---: | ---: | ---: |
-| 1024, 20, 8 | 128, 32 | 114k | 0.929 / 0.43 | 4.0 ms | 6.0 ms |
-| 1536, 12, 8 | 128, 32 | 131k | 0.945 / 0.62 | 1.9 ms | 3.0 ms |
-| 1536, 16, 4 | 192, 64 | 147k | 0.944 / 0.46 | 3.5 ms | 7.3 ms |
-| **1536, 20, 4** | 192, 64 | **125k** | **0.957** / 0.70 | 5.4 ms | not held |
-| 1536, 20, 4 | 128, 32 | 114k | 0.957 / 0.67 | 3.3 ms | not held |
-| 1536, 16, 8 | 192, 64 | 119k | 0.961 / 0.82 | 4.3 ms | not held |
-| 1536, 20, 8 | 128, 32 | 95k | 0.970 / 0.83 | 7.2 ms | 22 ms |
-| 3072, 10, 4 | 128, 32 | 100k | 0.963 / 0.68 | 3.4 ms | 11 ms |
-
-A second pass around the best point, 20 s closed loop and 15 s per rate, 192
-lanes and batch 64 (256 lanes peaked the same with a higher p99 at every
-rate):
-
-| itopk, iterations, samplings, block size | Peak Muse req/s | Recall | p99 at 60k/s | 75k | 90k | 105k |
+| Search | Peak Muse req/s | ANN queries/s | Recall mean / lowest | p99 at 105k/s | 135k | 150k |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **1536, 18, 4, 64** | **139k** | **0.951** | 7.2 ms | 7.9 ms | 8.8 ms | **10.3 ms** |
-| 1536, 20, 4, 64 | 128k | 0.957 | 8.0 ms | 8.9 ms | 10.2 ms | 12.5 ms |
-| 1536, 18, 4, automatic | 136k | 0.951 | 4.1 ms | 11.7 ms | 21.9 ms | 28.6 ms |
-| 1536, 16, 8, automatic | 120k | 0.961 | 4.3 ms | 13.4 ms | 26.1 ms | 38.4 ms |
-| 1536, 16, 4, automatic | 149k | 0.944 | 3.4 ms | 4.8 ms | 15.3 ms | 21.3 ms |
+| **two-hop graph search** | **170k** | 1.02M | 0.953 / 0.14 | 4.5 ms | 8.4 ms | 23.8 ms |
+| FP8 scan | 388k | 2.33M | 0.998 / 0.97 | 21 ms (100k) | 24 ms (150k) | 47 ms (350k) |
+| cuVS' own filtered search | 21.4k | 128k | 0.72 / 0.34 | saturated | | |
 
-`--filtered-block-size 64` keeps the p99 flat under load. The released
-worker with its flags (itopk 1536, 18 iterations, 4 samplings, block size
-64, batch 64, `--mixed-graph on`; 60 s closed loop, 30 s per rate, all 37
-groups loaded, no errors, GPUs 83-100% busy at the peak):
+The last row is the earlier result on the bandwidth-4 tree. On the tangent
+tree it was measured on two groups only (g0 and g19, 4 GPUs): 10.6k Muse
+requests/s at recall 0.53, against 283k at 0.999 for the scan.
 
-| Lanes | Peak Muse req/s | Recall mean / lowest | p99 at 60k/s | 90k | 105k | 120k | 130k |
-| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| 96 | 137k | 0.952 / 0.62 | 3.1 ms | 4.3 ms | 5.6 ms | 9.0 ms | 31 ms |
-| **128** | **145k** | 0.950 / 0.54 | 4.3 ms | 5.0 ms | 6.0 ms | 8.0 ms | 14.7 ms |
-| 160 | 146k | 0.954 / 0.68 | 5.5 ms | 6.6 ms | 7.6 ms | 9.8 ms | 15.8 ms |
+```
+--filtered-expansion two-hop --filtered-itopk 1536 --filtered-iterations 18
+--filtered-samplings 2 --filtered-block-size 64 --mixed-groups on --mixed-graph on
+--lanes 128 --max-batch 64 --replicate 2 --memory-pool 95
+```
 
-The 120 checked sub-queries above cover 28 of the 37 groups, so recall was
-measured again on 300 requests (1,732 sub-queries with rows to find, every
-group) whose query vectors are drawn like the load file's, from rows of the
-bandwidth-4 distribution: those sit as far from the item rows as the six
-captured queries do (nearest seed row at 0.95 against 0.77-1.17), where
-vectors drawn from the tangent tree's own rows sit on top of them (0.44)
-and score 0.02-0.03 higher. Exact answers come from the index files; each
-setting was measured twice and agreed to 0.001. A sweep of 64 settings at
-128 lanes and block size 64 (24-96 walkers, 8-39 iterations, 2-8
-samplings) brackets the gate from both sides:
+itopk / 32 walkers search each query (48 here), each for the given number
+of iterations, starting from the nearest of `--filtered-samplings` random
+passing rows per slot.
+
+Recall is from 300 checked requests: 1,732 sub-queries with rows to find,
+over every group, exact answers from the index files, each setting measured
+twice and agreeing to 0.001. Their query vectors are drawn like the load
+file's, from rows of the bandwidth-4 distribution, which sit as far from
+the item rows as the six captured queries do (nearest seed row at 0.95
+against 0.77-1.17); vectors drawn from the tangent tree's own rows sit on
+top of them (0.44) and score 0.02-0.03 higher. The 120 sub-queries used
+elsewhere in this document cover 28 groups and gave 0.950 for a setting
+that scores 0.961 here.
+
+How the setting was chosen. One worker stayed loaded while the settings
+changed (128 lanes, block size 64, 30 s closed loop and 20 s per rate a
+point): 64 settings from 24 to 96 walkers, 8 to 39 iterations and 2 to 8
+samplings, then all 108 combinations of 1 to 3 samplings, 40 to 64 walkers
+and 14 to 24 iterations with 10 points in between.
 
 | itopk, iterations, samplings | Recall | Peak Muse req/s | p99 at 105k/s | 120k |
 | --- | ---: | ---: | ---: | ---: |
@@ -357,39 +338,45 @@ samplings) brackets the gate from both sides:
 | 1536, 18, 4 | 0.961 | 137k | 6.4 ms | 9.9 ms |
 | 2048, 18, 4 | 0.974 | 97k | not held | not held |
 
-About 10k requests/s buy 0.005 of recall around the gate; 24 or 32 walkers
-run at 250-280k and stop at 0.78-0.91. Every setting leaves a few queries
-near 0.1. The two settings at the gate, run with the released worker and
-flags (60 s closed loop, 30 s per rate, GPUs 85-100% busy at the peak):
+About 10k requests/s buy 0.005 of recall around the gate. Of the 118
+settings of the second pass 83 reached 0.948 and the best of them peaked at
+162-170k whatever the mix of walkers, iterations and samplings; 24 or 32
+walkers run at 250-280k and stop at 0.78-0.91. More walkers buy recall more
+cheaply than more iterations, and 2 samplings instead of 4 cost 0.008 of
+recall for 17% of throughput. Every setting leaves a few queries near 0.1,
+where no walker started in the right cluster. The released worker measures
+a little above the tuning runs (170k against 160k for the chosen setting;
+1408, 16, 4 gave 172k at 0.950, exactly on the gate).
 
-| itopk, iterations, samplings | Recall | Peak Muse req/s | p99 at 60k/s | 105k | 120k | 135k | 150k |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| **1536, 18, 2** | 0.953 | **170k** | 3.6 ms | 4.5 ms | 7.0 ms | 8.4 ms | 23.8 ms |
-| 1408, 16, 4 | 0.950 | 172k | 3.9 ms | 5.0 ms | 5.6 ms | 7.6 ms | 15.5 ms |
+Lanes, batch and block size at the chosen setting, released worker:
 
-The FP8 scan on the same shard (the tree's files hard-linked under
-manifests without a graph, 2 copies, 96 lanes, slack 300%) peaked at 388k
-Muse requests/s with recall 0.998 / 0.973 and a p99 of 21 ms at 100k/s, 27
-at 200k and 47 at 350k: about 2.3 times the graph's peak, and three to five
-times its p99 below 135k/s, where the scan waits to fill same-filter
-batches and the graph search does not.
+| Lanes, batch | Peak Muse req/s | p99 at 105k/s | 135k | 150k |
+| --- | ---: | ---: | ---: | ---: |
+| **128, 64** | **170k** | 4.5 ms | 8.4 ms | 23.8 ms |
+| 160, 64 | 167k | 6.2 ms | 9.0 ms | 23.2 ms |
+| 192, 64 | 169k | 8.0 ms | 11.1 ms | 24.4 ms |
+| 128, 32 | 156k | 4.6 ms | 8.1 ms | 40.7 ms |
 
-At the 0.95 gate the shard serves about 170k Muse requests/s and holds a
-p99 under 25 ms to 150k/s; the earlier graph result was 21.4k at recall
-0.72 on the bandwidth-4 tree. More walkers buy recall more cheaply than
-more iterations; a thread-block size of 64 and the kernel variants tried on
-one GPU (fewer second-hop entries, skipping the second hop when the first
-finds enough) moved throughput and recall together. "Not held" points
-saturated in a 10-second open-loop run and are not rerun. With graphs and codes both loaded,
-two copies did not fit beside the other tenants, so the scan below ran on a
-graph-free view of the same files.
+`--filtered-block-size 64` keeps the p99 flat under load (10 ms against 29
+at 105k/s with cuVS' own choice, at the same peak, measured with 4
+samplings and 192 lanes). Kernel variants tried on one GPU, fewer
+second-hop entries and skipping the second hop when the first finds enough,
+moved throughput and recall together.
 
-The scan stays 2.3 times faster at the peak for these filters (388k against
-170k on the shard; 283k against 58k on the two groups before the settings
-were tuned): the search kernel spends about 21 us of a GPU per query,
-the scan about 3, because a filter passing under 4% leaves it under 2M rows
-to score once per batch. The walk's cost does not grow with the filter, the
-scan's does, so wider filters and unfiltered searches are the graph's.
+The FP8 scan ran on a graph-free view of the same files (hard links under
+manifests without a graph, 2 copies, 96 lanes, slack 300%): with graphs and
+codes both loaded, two copies do not fit beside the other tenants. It
+peaks at 2.3 times the graph search and its p99 is three to five times
+higher below 135k/s, where it waits to fill same-filter batches and the
+graph search does not. The scan scores every row a filter passes, once per
+batch, and a filter passing under 4% leaves it under 2M rows; the walk's
+cost does not grow with the filter, so wider filters and unfiltered
+searches are the graph's. Where the two cross is not measured.
+
+Not covered: K 300-1000 with the two-hop search; filters passing under
+0.4%; any filter but a `pg_ids` list. The requests derive from one captured
+request, so the spread over groups and the filters' popularity are the
+generator's.
 
 ## Related reading
 
