@@ -391,6 +391,33 @@ the scan about 3, because a filter passing under 4% leaves it under 2M rows
 to score once per batch. The walk's cost does not grow with the filter, the
 scan's does, so wider filters and unfiltered searches are the graph's.
 
+## Related reading
+
+Pinterest Engineering posts on the serving stack this test stands in for.
+They were located by search and read in summary only; none describes Muse,
+the 8-leaf fan-out or `pg_ids` filtering.
+
+- [Beyond Two Towers: Re-architecting the Serving Stack for Next-Gen Ads Lightweight Ranking Models (Part 1)](https://medium.com/pinterest-engineering/beyond-two-towers-re-architecting-the-serving-stack-for-next-gen-ads-lightweight-ranking-models-1992f2b76cbb):
+  the earlier stack streamed scores for about 100K documents from the GPU
+  to the CPU, which dropped 99% of them after filtering; filtering and
+  top-k moved onto the GPU. The same idea as the scan and the two-hop
+  search here: apply the filter before paying for the row.
+- [GPU-Serving Two-Tower Models for Lightweight Ads Engagement Prediction](https://medium.com/pinterest-engineering/gpu-serving-two-tower-models-for-lightweight-ads-engagement-prediction-5a0ffb442f3b):
+  GPU serving for the lightweight ranking stage the test's rankers belong
+  to.
+- [Unlocking Efficient Ad Retrieval: Offline Approximate Nearest Neighbors in Pinterest Ads](https://medium.com/pinterest-engineering/unlocking-efficient-ad-retrieval-offline-approximate-nearest-neighbors-in-pinterest-ads-6fccc131ac14):
+  online ANN growing expensive with the ad inventory, and the move from
+  HNSW to IVF for a larger index. The captured request asks for IVF indexes
+  throughout.
+- [Ads Candidate Generation using Behavioral Sequence Modeling](https://medium.com/pinterest-engineering/ads-candidate-generation-using-behavioral-sequence-modeling-f9077ee1325d):
+  candidate generators fetch a top-K by ANN, are capped to a quota and
+  blended, the over-fetch behind K 300-1000 here.
+- [How we scaled the size of Pinterest's ad corpus by 60x](https://medium.com/pinterest-engineering/how-we-scaled-the-size-of-pinterests-ad-corpus-by-60x-d6d5bfa6bf16)
+  and [Redesigning Pinterest's Ad Serving Systems with Zero Downtime (part 2)](https://medium.com/pinterest-engineering/redesigning-pinterests-ad-serving-systems-with-zero-downtime-part-2-3e607bbba9f0):
+  corpus size and the ad serving stack around retrieval.
+- [Manas: A high performing customized search system](https://medium.com/pinterest-engineering/manas-a-high-performing-customized-search-system-cf189f6ca40f):
+  the search platform's leaf and root serving.
+
 ## Reproducing
 
 Build: `BUILDER_ARGS=--scan-only benchmarks/ann/scale_pipeline.sh OUT 4715 4 fp8`
