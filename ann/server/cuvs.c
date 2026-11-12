@@ -2694,6 +2694,8 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				break;
 			}
 			lane->params->query_bitsets = (uintptr_t) lane->bitsetPointers;
+			/* Only cuVS' multi-CTA search reads a bitset per query. */
+			lane->params->algo = MULTI_CTA;
 			mask = Tensor(pointers[0], kDLCUDA, shard->device, kDLUInt, 1, bitsetShape);
 			filter.type = BITSET;
 			filter.addr = (uintptr_t) &mask;
