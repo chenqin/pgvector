@@ -133,8 +133,13 @@ typedef struct AnnIndexBitmap
 	uint64_t	used;			/* last use, for predicate eviction */
 	int			references;
 	struct AnnIndexBitmap *next;
-	int			uploadDeferred; /* --gpu-predicates: not on the devices until
-								 * looked up again (atomic) */
+	int			uploadDeferred; /* --gpu-predicates: 1 not on the devices until
+								 * looked up again, 2 being uploaded, 0
+								 * neither (atomic) */
+	uint64_t	expandLimit;	/* BuildBitmap's: a rebuilt copy keeps the
+								 * same forms */
+	int			columnsOnly;	/* a predicate result read from attribute
+								 * columns alone (no BITMAP leaf) */
 } AnnIndexBitmap;
 
 /*
@@ -143,6 +148,12 @@ typedef struct AnnIndexBitmap
  * and searches copy them per query); release frees those copies.
  */
 typedef struct AnnIndexFile AnnIndexFile;
+
+/*
+ * Loaded indexes proven to hold the same filter inputs (--shared-predicate-mb);
+ * opaque.
+ */
+typedef struct AnnIndexRowSet AnnIndexRowSet;
 
 typedef struct AnnIndexBitmapHooks
 {
@@ -196,6 +207,15 @@ struct AnnIndexFile
 								 * (atomic; added under the scheduler's mutex) */
 	uint32_t   *deleted;		/* tombstones: a bit per ordinal, set only */
 	uint64_t	ndeleted;		/* bits set (atomic reads) */
+	pthread_mutex_t deleteMutex;	/* one AnnIndexDelete at a time; taken
+									 * before bitmapMutex */
+	uint64_t	deleteGeneration;	/* bumped by each delete that adds rows,
+									 * under both mutexes (atomic reads) */
+	uint64_t	predicatePatched;	/* entries a delete replaced by a copy
+									 * without its rows */
+	uint64_t	predicateDropped;	/* entries a delete flushed */
+	uint64_t	predicateRaced; /* results re-masked before caching: a
+								 * delete ran during their evaluation */
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
 	uint16_t   *halfVectors;	/* FP16 copy for --rescore fp16, else NULL */
@@ -204,6 +224,22 @@ struct AnnIndexFile
 	void	   *device;			/* backend-owned device state */
 	int32_t		references;		/* __atomic: the registry's and every
 								 * holder's; the index is destroyed at zero */
+	AnnIndexRowSet *rowSet;		/* the row set whose results it shares, or
+								 * NULL (atomic; set under bitmapMutex) */
+	AnnIndexRowSet *rowSetHeld; /* the one it joined, kept until destroyed */
+	uint64_t	remapGeneration;	/* bumped once by each AnnIndexRemap
+									 * that changes the arrays, under
+									 * attributeLock (exclusive) and
+									 * bitmapMutex (atomic reads) */
+
+	/*
+	 * Held shared by every reader of the attribute arrays that AnnIndexRemap
+	 * swaps (postings, keys, ordinals, nvalues, column, remap) that does not
+	 * hold bitmapMutex, for one whole evaluation, canonicalisation or lookup;
+	 * AnnIndexRemap holds it exclusive across the swap. Taken before
+	 * bitmapMutex, never while holding it, and never twice by one thread.
+	 */
+	pthread_rwlock_t attributeLock;
 };
 
 /* Worker-wide tuning shared by index backends; set once before serving. */
@@ -308,6 +344,17 @@ typedef struct AnnIndexOptions
 	uint32_t	filtered_block; /* --filtered-block-size: threads per cuVS
 								 * thread block of a bitset CAGRA search
 								 * (64, 128, 256); 0 lets cuVS choose */
+	int			delete_patch_off;	/* --delete-patch off: a delete drops the
+									 * cached predicate results instead of
+									 * patching those holding its rows */
+	uint32_t	delete_patch_rows;	/* --delete-patch-rows: deletes of more
+									 * rows drop instead */
+	uint32_t	delete_patch_entries;	/* --delete-patch-entries: most entries
+										 * one delete patches; it drops the
+										 * rest it hits */
+	uint64_t	shared_predicate_bytes; /* --shared-predicate-mb: host memory
+										 * for the results a row set shares;
+										 * 0 forms no row sets */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */
@@ -361,11 +408,23 @@ AnnStatus	AnnIndexDictionary(AnnIndexFile *file, const char *attribute, unsigned
 /*
  * Tombstones: rows deleted from a frozen index's table, by key, until the
  * index is rebuilt without them. Searches never return them: predicate
- * results leave them out (cached results are dropped when rows are
- * deleted), and hits of every route are checked. Keys the index doesn't
- * hold are ignored. *added counts the rows newly deleted.
+ * results leave them out, and hits of every route are checked. A cached
+ * predicate result read from attribute columns alone that holds deleted
+ * rows is replaced by a copy without them (--delete-patch; device copies
+ * are uploaded again at its next lookup); other cached results that may
+ * hold them are dropped. Snapshot results keep tombstoned rows by design,
+ * so those read from attribute columns alone stay as they are. Keys the
+ * index doesn't hold are ignored. *added counts the rows newly deleted.
  */
 AnnStatus	AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t *added);
+
+#ifdef ANN_INDEX_TEST_HOOKS
+/*
+ * C tests only (not built into the worker): AnnIndexDelete calls it after
+ * collecting the entries it patches, before patching them.
+ */
+extern void (*AnnIndexDeleteHeldHook) (AnnIndexFile *file, uint64_t nheld);
+#endif
 
 static inline int
 AnnIndexIsDeleted(const AnnIndexFile *file, uint64_t ordinal)
@@ -385,7 +444,8 @@ extern void (*AnnIndexDeviceDestroy) (void *device);
  * --gpu-predicates keeps a new predicate result off the devices until it is
  * looked up again: a predicate searched once is served by its lane copying
  * the rows itself, instead of every copy of the index receiving them. The
- * lookup uploads it (once) before searching.
+ * lookup uploads it (once) before searching; lookups meanwhile return at
+ * once, and the device pointers are published before the flag reads 0.
  */
 void		AnnIndexBitmapUploadDeferred(AnnIndexFile *file, AnnIndexBitmap *bitmap);
 
@@ -399,12 +459,45 @@ extern int	(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *p
 
 /*
  * Evaluate a predicate program (ann/common/filter.h) over the index's attribute
- * columns and cached bitmaps into words ((rows + 31) / 32 of them).
- * Returns an ANN_FILTER_* code.
+ * columns and cached bitmaps into words ((rows + 31) / 32 of them), less
+ * tombstoned rows unless snapshot. Returns an ANN_FILTER_* code. how gets
+ * the delete generation the tombstones were read at (AnnIndexPredicatePut
+ * checks it), whether the program reads only attribute columns, and whether
+ * its rows were copied from a result its row set kept instead of evaluated,
+ * and the remap generation read before it (AnnIndexPredicatePut checks it).
  */
+typedef struct AnnIndexEvaluation
+{
+	uint64_t	generation;
+	int			columnsOnly;
+	int			shared;
+	uint64_t	remapGeneration;	/* file->remapGeneration before any array
+									 * was read; a caller that read the index
+									 * earlier (canonical form) puts back the
+									 * one it read then */
+} AnnIndexEvaluation;
+
 void		AnnIndexBitmapWords(const AnnIndexFile *file, const AnnIndexBitmap *bitmap, uint32_t *words);
 int			AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
-							 uint32_t *words, uint64_t *count, int snapshot);
+							 uint32_t *words, uint64_t *count, int snapshot, AnnIndexEvaluation *how);
+
+/*
+ * Tests only: the mock backend sets them to wait after the host evaluator
+ * has read the index's arrays, before the result is used
+ * (ANN_MOCK_GPU_EVALUATED_US), and after AnnIndexCanonical has read them,
+ * before anything else does (ANN_MOCK_GPU_CANONICAL_US). Both run outside
+ * attributeLock, so a remap can land in the wait. NULL in every other
+ * worker.
+ */
+extern void (*AnnIndexEvaluatedHook) (AnnIndexFile *file);
+extern void (*AnnIndexCanonicalHook) (AnnIndexFile *file);
+
+/*
+ * Whether an AnnIndexRemap changed the index's arrays since remapGeneration
+ * was read, checked under bitmapMutex: 0 means every read section between
+ * that read and this call read the arrays that generation names.
+ */
+int			AnnIndexRemappedSince(AnnIndexFile *file, uint64_t remapGeneration);
 
 /*
  * The program's canonical form over this index's columns (canonical.h):
@@ -416,7 +509,10 @@ int			AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t
 /*
  * AnnFilterCanonicalSplit over this index's columns, and the rows of a base
  * entry that its exclusions remove: sorted global ordinals, a subset of
- * base->ordinals (malloc'd; NULL with *n = 0 when none).
+ * base->ordinals (malloc'd; NULL with *n = 0 when none). remapGeneration
+ * is file->remapGeneration read before the split: if a remap changed the
+ * arrays since, the exclusions' value positions are not this index's, and
+ * ANN_STALE is returned.
  */
 int			AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, size_t size, uint64_t maxExcluded,
 								   unsigned char **base, size_t *baseSize, AnnFilterExclusion *exclusions,
@@ -428,9 +524,9 @@ int			AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, s
  * when out of memory (the job's status is then ANN_NOMEM).
  */
 int			AnnIndexJobDropExcluded(AnnIndexJob *job);
-AnnStatus	AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base,
-								 const AnnFilterExclusion *exclusions, uint32_t nexclusions, uint64_t **rows,
-								 uint32_t *n);
+AnnStatus	AnnIndexExcludedRows(AnnIndexFile *file, const AnnIndexBitmap *base,
+								 const AnnFilterExclusion *exclusions, uint32_t nexclusions,
+								 uint64_t remapGeneration, uint64_t **rows, uint32_t *n);
 
 /*
  * Cache a predicate's result under its id like a pushed bitmap. Predicate
@@ -438,16 +534,48 @@ AnnStatus	AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *b
  * memory, predicate_device_bytes of device memory, and optionally at most
  * predicate_cache entries): past it, the least recently used ones are
  * dropped down to 90% of the budget. Pushed bitmaps are never dropped.
+ *
+ * generation is the one AnnIndexEvaluate read the tombstones at, or
+ * UINT64_MAX for a result that leaves tombstones in (snapshot). If a delete
+ * ran since, a copy of words is masked with the current tombstones before it
+ * is cached, so no cached result holds a deleted row.
+ *
+ * remapGeneration is the AnnIndexEvaluation's. If a remap changed the
+ * index's arrays since, nothing is cached and ANN_STALE is returned: the
+ * rows may have been read with either codes, or both.
  */
 AnnStatus	AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
-								 uint64_t expandLimit, AnnIndexBitmap **result);
+								 uint64_t expandLimit, uint64_t generation, uint64_t remapGeneration,
+								 int columnsOnly, AnnIndexBitmap **result);
 
 /* Totals over loaded indexes, for the stats reply. */
-void		AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *deviceBytes,
-								   uint64_t *evictions);
+typedef struct AnnIndexPredicateTotals
+{
+	uint64_t	entries;
+	uint64_t	bytes;
+	uint64_t	deviceBytes;
+	uint64_t	evictions;
+	uint64_t	patched;		/* entries deletes replaced */
+	uint64_t	dropped;		/* entries deletes flushed */
+	uint64_t	raced;			/* results re-masked before caching */
+	uint64_t	sharedEntries;	/* results row sets keep */
+	uint64_t	sharedBytes;	/* host memory they hold */
+} AnnIndexPredicateTotals;
 
-/* Registry of loaded indexes; lookups take a reference released by Put. */
+void		AnnIndexPredicateStats(AnnIndexPredicateTotals *totals);
+
+/*
+ * Registry of loaded indexes; lookups take a reference released by Put. With
+ * --shared-predicate-mb, registering also looks for a row set to join on a
+ * background thread.
+ */
 AnnStatus	AnnIndexRegister(AnnIndexFile *file);
+
+/*
+ * Whose evaluations of a program are interchangeable: the index's row set,
+ * or the index itself. Single flight of evaluations is keyed by it.
+ */
+const void *AnnIndexFilterIdentity(const AnnIndexFile *file);
 AnnIndexFile *AnnIndexGet(const char *name);
 void		AnnIndexPut(AnnIndexFile *file);
 void		AnnIndexPutCount(AnnIndexFile *file, uint32_t count);

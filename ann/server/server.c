@@ -242,13 +242,22 @@ typedef struct Service
 	uint64_t	failed;
 	uint64_t	merged;			/* index jobs answered from an identical job's
 								 * search in their batch (atomic) */
-	uint64_t	predicate_hits; /* operation 22 programs found cached */
+	uint64_t	predicate_hits; /* operation 22 programs found cached, by
+								 * readers */
 	uint64_t	predicate_evaluations;
 	uint64_t	predicate_eval_us;	/* time spent evaluating them */
+	uint64_t	predicate_build_us; /* the part of it building and caching
+									 * their entries */
 	uint64_t	predicate_canonical;	/* lookups under a rewritten program */
 	uint64_t	predicate_transient;	/* first sightings served uncached */
 	uint64_t	predicate_residual; /* searches over a base entry with masked
 									 * rows (--residual-masks) */
+	uint64_t	predicate_resolved; /* frames handed to a resolver */
+	uint64_t	predicate_inline;	/* searches whose reader evaluated their
+									 * predicate with resolvers on (a stored
+									 * bitmap's program, or the queue full) */
+	uint64_t	predicate_shared;	/* evaluations whose rows were copied
+									 * from a result their row set kept */
 	AnnRdma    *rdma;
 
 	/*
@@ -289,6 +298,7 @@ AnnServeDefaultOptions(AnnServeOptions *options)
 	options->readers = 64;
 	options->merge_duplicates = 0;
 	options->scheduler_shards = 0;
+	options->predicate_resolvers = 0;
 }
 
 static void
@@ -493,15 +503,21 @@ HitCompare(const void *a, const void *b)
 
 /*
  * ANN_PREDICATE_ATTRIBUTES: each hit's attribute values (int32, the
- * index's attribute order), read from the mapped columns by ordinal.
+ * index's attribute order), read from the mapped columns by ordinal. Each
+ * column pointer is read once (AnnIndexRemap swaps it, keeping the old
+ * one), so a reply holds one side of any remap per attribute.
  */
 static void
 HitAttributes(const AnnIndexFile *file, const AnnIndexHit *hits, uint32_t nhits, int32_t *out)
 {
+	const int32_t *columns[ANN_INDEX_MAX_ATTRIBUTES];
+
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		columns[a] = __atomic_load_n(&file->attributes[a].column, __ATOMIC_ACQUIRE);
 	for (uint32_t i = 0; i < nhits; i++)
 		for (uint32_t a = 0; a < file->nattributes; a++)
-			out[(size_t) i * file->nattributes + a] = hits[i].ordinal < file->rows && file->attributes[a].column ?
-				file->attributes[a].column[hits[i].ordinal] : INT32_MIN;
+			out[(size_t) i * file->nattributes + a] = hits[i].ordinal < file->rows && columns[a] ?
+				columns[a][hits[i].ordinal] : INT32_MIN;
 }
 
 /* One reply for a matrix of queries, preserving query and distance order. */
@@ -1819,9 +1835,10 @@ EnqueueMany(Service *service, Connection *connection, Job **jobs, uint32_t count
 }
 
 /*
- * Queue a pool reader's deferred jobs, grouped by shard: one lock per shard
- * the round touches. A job the budget
- * refuses is answered ANN_OVERLOADED here, as its submitter would have.
+ * Queue a pool reader's or resolver's deferred jobs, grouped by shard: one
+ * lock per shard the round touches. A job the budget refuses is answered
+ * ANN_OVERLOADED here, as its submitter would have: an operation 25 part
+ * through its composite, which replies once all its parts have answered.
  */
 static void
 EnqueueDeferred(Service *service)
@@ -1840,7 +1857,10 @@ EnqueueDeferred(Service *service)
 
 		if (admitted[i])
 			continue;
-		SendReply(job->connection, job->rdma, job->operation, job->request, ANN_OVERLOADED, NULL, 0);
+		if (job->composite)
+			CompositeAnswer(job->composite, job->compositePart, 0, ANN_OVERLOADED, NULL, 0, 0, NULL);
+		else
+			SendReply(job->connection, job->rdma, job->operation, job->request, ANN_OVERLOADED, NULL, 0);
 		if (job->bitmap)
 			AnnIndexBitmapRelease(job->bitmapFile, job->bitmap);
 		if (job->bitmapFile)
@@ -1904,8 +1924,16 @@ static AnnStatus SubmitBitmapJob(Service *service, Connection *connection, int r
 								 unsigned char *payload, uint32_t size, AnnIndexFile *file,
 								 AnnIndexBitmap *bitmap, const char *name, uint32_t dimensions,
 								 uint32_t k, size_t offset, uint16_t operation, uint32_t flags);
-static AnnStatus PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned char *program,
-								 uint32_t size, AnnIndexBitmap **result, int snapshot);
+
+/* How PredicateBitmap treats a miss. */
+#define RESOLVE_HERE 0			/* evaluate it (or wait for its evaluation) */
+#define RESOLVE_HAND_OFF 1		/* return ANN_PENDING: a resolver takes the
+								 * frame */
+#define RESOLVE_INLINE 2		/* as RESOLVE_HERE, on a reader although
+								 * resolvers are on: counted */
+static AnnStatus PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode,
+								 const unsigned char *program, uint32_t size, AnnIndexBitmap **result,
+								 int snapshot);
 
 static AnnStatus
 SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operation, uint64_t request,
@@ -1957,7 +1985,7 @@ SubmitIndex(Service *service, Connection *connection, int rdma, uint16_t operati
 			return ANN_STALE;
 		/* Legacy searches must honor the same tombstones as operation 22. */
 		if (__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) > 0)
-			status = PredicateBitmap(service, file, 0, &all, 1, &bitmap, 0);
+			status = PredicateBitmap(service, file, 0, RESOLVE_HERE, &all, 1, &bitmap, 0);
 		if (status == ANN_OK)
 			status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, bitmap,
 									 name, dimensions, k, offset, operation, 0);
@@ -2642,25 +2670,76 @@ MicrosecondsSince(const struct timespec *start)
  */
 static AnnStatus PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program,
 								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot,
-								   int transient);
+								   int transient, uint64_t remapGeneration);
+
+/*
+ * --predicate-resolvers: a search whose predicate misses the cache is not
+ * evaluated on its reader, which would hold every other frame of the
+ * reader's connections for the evaluation, but handed whole (payload, index
+ * lease, a connection reference) to a pool of resolver threads, which submit
+ * it as the reader would have after a hit. Programs that read a stored
+ * bitmap stay on the reader: a later frame of the same connection may
+ * replace that bitmap, and the search must see the one before it.
+ */
+typedef struct Resolve
+{
+	struct Resolve *next;
+	Connection *connection;		/* referenced */
+	AnnIndexFile *file;			/* the reader's AnnIndexGet lease */
+	Composite  *composite;		/* operation 25 part, or NULL */
+	unsigned char *payload;		/* an operation 22 or 30 payload */
+	uint64_t	request;
+	uint64_t	arrived;		/* frameArrived, for traces */
+	uint32_t	size;
+	uint32_t	part;			/* submittingPart */
+	uint16_t	operation;		/* ANN_OP_INDEX_SEARCH_PREDICATE or _BATCH */
+	int			rdma;
+	uint64_t	remapGeneration;	/* the frame's, captured on its reader */
+} Resolve;
+
+#define ANN_RESOLVERS_MAX 192	/* each may hold a slot of evaluating[] */
+#define ANN_RESOLVE_QUEUE_PER_THREAD 64
+static pthread_mutex_t resolveMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t resolveCondition = PTHREAD_COND_INITIALIZER;
+static Resolve *resolveHead;
+static Resolve *resolveTail;
+static uint32_t resolveQueued;	/* written under resolveMutex, atomically:
+								 * readers read it without it */
+static uint32_t resolveLimit;	/* queued frames before readers evaluate
+								 * themselves; 0 without resolvers */
+static _Thread_local int resolverThread;	/* this thread is a resolver */
+static _Thread_local int resolveInline; /* a hand-off failed: evaluate here */
+static _Thread_local uint64_t resolvingRemap;	/* the frame's remapGeneration */
+static _Thread_local uint64_t searchRemap;	/* the remapGeneration of the
+											 * frame PredicateSearchBitmap
+											 * looks up; HandOff carries it */
+static _Thread_local int evaluatedInline;	/* the frame's predicate ran
+											 * RESOLVE_INLINE: counted once */
+static _Thread_local int searchLookup;	/* in PredicateSearchBitmap, which
+										 * counts the hits below */
+static _Thread_local uint32_t foundCached;	/* the frame's lookups found
+											 * cached */
 
 /*
  * Programs being evaluated: a search that misses the cache while another
  * thread evaluates the same program waits for its result instead of
  * evaluating it again, so a burst of new predicates costs one evaluation
- * each.
+ * each. Evaluations of programs a row set may share are keyed by
+ * AnnIndexFilterIdentity, so indexes of one row set wait for each other's
+ * (and then copy the result it kept); other evaluations, and uploads, by the
+ * index.
  */
 #define ANN_EVALUATING_MAX 256
 static pthread_mutex_t evaluatingMutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t evaluatingDone = PTHREAD_COND_INITIALIZER;
 static struct
 {
-	const AnnIndexFile *file;
+	const void *file;
 	uint64_t	id;
 }			evaluating[ANN_EVALUATING_MAX];
 
 static int
-Evaluating(const AnnIndexFile *file, uint64_t id)
+Evaluating(const void *file, uint64_t id)
 {
 	for (int i = 0; i < ANN_EVALUATING_MAX; i++)
 		if (evaluating[i].file == file && evaluating[i].id == id)
@@ -2691,11 +2770,12 @@ SeenBefore(const AnnIndexFile *file, uint64_t id)
  * admit: searches follow --predicate-admission; precomputed and internal
  * programs are always cached. With --canonical-predicates the program is
  * looked up and evaluated in its canonical form, so equivalent predicates
- * share one entry.
+ * share one entry. mode: RESOLVE_HAND_OFF returns ANN_PENDING on a miss,
+ * with nothing referenced.
  */
 static AnnStatus
-PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned char *program, uint32_t size,
-				AnnIndexBitmap **result, int snapshot)
+PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const unsigned char *program,
+				uint32_t size, AnnIndexBitmap **result, int snapshot)
 {
 	unsigned char *canonical = NULL;
 	size_t		canonicalSize = 0;
@@ -2703,48 +2783,145 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned 
 	size_t		nwords = ((size_t) file->rows + 31) / 32;
 	int			slot = -1;
 	int			transient;
+	const void *identity;
+	int			shareable;
+	int			waited = 0;
 	AnnStatus	status;
+
+	/*
+	 * Before the canonical form reads the index's arrays (a search's, before
+	 * anything of its frame read them): a remap since makes a hit or an
+	 * evaluation stale, since the program was written or canonicalised
+	 * against other arrays (here and PredicateEvaluate).
+	 */
+	uint64_t	remapGeneration = searchLookup ? searchRemap :
+		__atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE);
 
 	if (AnnIndexConfig.canonical_predicates &&
 		AnnIndexCanonical(file, program, size, &canonical, &canonicalSize))
 	{
 		program = canonical;
 		size = (uint32_t) canonicalSize;
-		(void) __atomic_fetch_add(&service->predicate_canonical, 1, __ATOMIC_RELAXED);
+		/* A handed-off frame was counted by its reader. */
+		if (!resolverThread)
+			(void) __atomic_fetch_add(&service->predicate_canonical, 1, __ATOMIC_RELAXED);
 	}
 	id = AnnFilterHash(program, size);
+	/* What a row set may share (AnnIndexEvaluate): the rest is the index's. */
+	shareable = size > 1 && !AnnFilterUsesBitmap(program, size);
 	for (;;)
 	{
 		if ((*result = AnnIndexBitmapGet(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE)) != NULL)
 		{
-			if (__atomic_load_n(&(*result)->uploadDeferred, __ATOMIC_ACQUIRE))
+			int			deferred;
+
+			/*
+			 * An entry cached after a remap (none survive one) holds rows
+			 * of the new arrays, which this program was not read against.
+			 */
+			if (__atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE) != remapGeneration)
+			{
+				AnnIndexBitmapRelease(file, *result);
+				*result = NULL;
+				free(canonical);
+				return ANN_STALE;
+			}
+			deferred = __atomic_load_n(&(*result)->uploadDeferred, __ATOMIC_ACQUIRE);
+
+			if (deferred && mode == RESOLVE_HAND_OFF)
+			{
+				/* Uploading, or waiting for it, would hold the reader too. */
+				AnnIndexBitmapRelease(file, *result);
+				*result = NULL;
+				free(canonical);
+				return ANN_PENDING;
+			}
+			if (deferred && resolverThread)
+			{
+				int			upload = -1;
+
+				/*
+				 * One upload, under the program's slot: twins wait for it as
+				 * for an evaluation, then search with its device copies.
+				 */
+				(void) pthread_mutex_lock(&evaluatingMutex);
+				if (Evaluating(file, id) >= 0)
+				{
+					while (Evaluating(file, id) >= 0)
+						(void) pthread_cond_wait(&evaluatingDone, &evaluatingMutex);
+					(void) pthread_mutex_unlock(&evaluatingMutex);
+					AnnIndexBitmapRelease(file, *result);
+					*result = NULL;
+					continue;
+				}
+				for (int i = 0; i < ANN_EVALUATING_MAX && upload < 0; i++)
+					if (evaluating[i].file == NULL)
+					{
+						evaluating[i].file = file;
+						evaluating[i].id = id;
+						upload = i;
+					}
+				(void) pthread_mutex_unlock(&evaluatingMutex);
 				AnnIndexBitmapUploadDeferred(file, *result);
-			/* Not under a scheduler mutex: every search would contend for it. */
-			(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
+				if (upload >= 0)
+				{
+					(void) pthread_mutex_lock(&evaluatingMutex);
+					evaluating[upload].file = NULL;
+					(void) pthread_cond_broadcast(&evaluatingDone);
+					(void) pthread_mutex_unlock(&evaluatingMutex);
+				}
+			}
+			else if (deferred)
+				AnnIndexBitmapUploadDeferred(file, *result);
+
+			/*
+			 * Not under a scheduler mutex: every search would contend for
+			 * it. A search's hits are counted by the thread that completes
+			 * its frame (PredicateSearchBitmap): a reader that hands the
+			 * frame off leaves them to the resolver, which looks again.
+			 */
+			if (searchLookup)
+				foundCached++;
+			else
+				(void) __atomic_fetch_add(&service->predicate_hits, 1, __ATOMIC_RELAXED);
 			free(canonical);
 			return ANN_OK;
 		}
+		if (mode == RESOLVE_HAND_OFF)
+		{
+			free(canonical);
+			return ANN_PENDING;
+		}
+		/*
+		 * After waiting for another index of the row set, this index's own
+		 * copy and build need not wait for the other indexes' builds.
+		 */
+		identity = waited || !shareable ? (const void *) file : AnnIndexFilterIdentity(file);
 		(void) pthread_mutex_lock(&evaluatingMutex);
-		if (Evaluating(file, id) >= 0)
+		if (Evaluating(file, id) >= 0 || Evaluating(identity, id) >= 0)
 		{
 			/* Someone else is on it: wait, then look in the cache again. */
-			while (Evaluating(file, id) >= 0)
+			while (Evaluating(file, id) >= 0 || Evaluating(identity, id) >= 0)
 				(void) pthread_cond_wait(&evaluatingDone, &evaluatingMutex);
 			(void) pthread_mutex_unlock(&evaluatingMutex);
+			waited = 1;
 			continue;
 		}
 		for (int i = 0; i < ANN_EVALUATING_MAX && slot < 0; i++)
 			if (evaluating[i].file == NULL)
 			{
-				evaluating[i].file = file;
+				evaluating[i].file = identity;
 				evaluating[i].id = id;
 				slot = i;
 			}
 		(void) pthread_mutex_unlock(&evaluatingMutex);
 		break;					/* evaluate (unclaimed if every slot is busy) */
 	}
+	if (mode == RESOLVE_INLINE)
+		evaluatedInline = 1;
 	transient = admit && AnnIndexConfig.predicate_admission == ANN_ADMIT_SECOND && !SeenBefore(file, id);
-	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot, transient);
+	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot, transient,
+							   remapGeneration);
 	if (slot >= 0)
 	{
 		(void) pthread_mutex_lock(&evaluatingMutex);
@@ -2758,18 +2935,21 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, const unsigned 
 
 static AnnStatus
 PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
-				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot, int transient)
+				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot, int transient,
+				  uint64_t remapGeneration)
 {
 	uint32_t   *words;
 	uint64_t	count;
 	int			code;
 	AnnStatus	status;
+	AnnIndexEvaluation how;
 	struct timespec start;
+	struct timespec built;
 
 	if ((words = malloc(nwords * 4 + 4)) == NULL)
 		return ANN_NOMEM;
 	(void) clock_gettime(CLOCK_MONOTONIC, &start);
-	code = AnnIndexEvaluate(file, program, size, words, &count, snapshot);
+	code = AnnIndexEvaluate(file, program, size, words, &count, snapshot, &how);
 	if (code != ANN_FILTER_OK)
 	{
 		free(words);
@@ -2778,11 +2958,24 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	}
 
 	/*
+	 * A remap since the caller read the generation (another connection's
+	 * operation 28, or, for a handed-off frame, a later frame of its own):
+	 * the evaluation read other arrays than the ones the program was written
+	 * or canonicalised against. The search answers stale, as one arriving
+	 * before the index was loaded would, and nothing is cached; the
+	 * evaluation still counts.
+	 */
+	how.remapGeneration = remapGeneration;
+
+	/*
 	 * Keep rows for every filter a scan may take; see SubmitCached. An index
 	 * without graphs scans every filter, however broad.
 	 */
 	/* The entry comes back referenced: an eviction meanwhile can't lose it. */
-	if (transient)
+	(void) clock_gettime(CLOCK_MONOTONIC, &built);
+	if (transient && AnnIndexRemappedSince(file, remapGeneration))
+		status = ANN_STALE;
+	else if (transient)
 	{
 		status = AnnIndexBitmapTransient(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words,
 										 nwords, file->device == NULL || file->scanOnly ? UINT64_MAX :
@@ -2792,9 +2985,13 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	else
 		status = AnnIndexPredicatePut(file, id, snapshot ? ANN_BITMAP_SNAPSHOT : ANN_BITMAP_PREDICATE, words,
 									  nwords, file->device == NULL || file->scanOnly ? UINT64_MAX :
-									  PredicateGatherLimit(file), result);
+									  PredicateGatherLimit(file), snapshot ? UINT64_MAX : how.generation,
+									  how.remapGeneration, how.columnsOnly, result);
 	free(words);
+	(void) __atomic_fetch_add(&service->predicate_build_us, MicrosecondsSince(&built), __ATOMIC_RELAXED);
 	(void) __atomic_fetch_add(&service->predicate_evaluations, 1, __ATOMIC_RELAXED);
+	if (how.shared)
+		(void) __atomic_fetch_add(&service->predicate_shared, 1, __ATOMIC_RELAXED);
 	(void) __atomic_fetch_add(&service->predicate_eval_us, MicrosecondsSince(&start), __ATOMIC_RELAXED);
 	if (status != ANN_OK)
 		return status;
@@ -2817,7 +3014,7 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
  * predicate is evaluated as usual.
  */
 static AnnStatus
-PredicateSearchBitmap(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
+PredicateSearchLookup(Service *service, AnnIndexFile *file, int mode, const unsigned char *program, uint32_t size,
 					  uint32_t k, int snapshot, AnnIndexBitmap **result, uint64_t **exclude, uint32_t *nexclude)
 {
 	*exclude = NULL;
@@ -2832,16 +3029,20 @@ PredicateSearchBitmap(Service *service, AnnIndexFile *file, const unsigned char 
 		if (AnnIndexCanonicalSplit(file, program, size, ANN_RESIDUAL_MAX_ROWS, &base, &baseSize, exclusions,
 								   &nexclusions))
 		{
-			AnnStatus	status = PredicateBitmap(service, file, 1, base, (uint32_t) baseSize, result, snapshot);
+			AnnStatus	status = PredicateBitmap(service, file, 1, mode, base, (uint32_t) baseSize, result,
+												 snapshot);
 
 			free(base);
+			if (status == ANN_PENDING)
+				return status;
 			if (status == ANN_OK)
 			{
 				const AnnIndexBitmap *entry = *result;
 
 				if (entry->ordinals && entry->count > AnnIndexConfig.exact_limit &&
 					entry->count <= AnnIndexConfig.group_gather_limit &&
-					AnnIndexExcludedRows(file, entry, exclusions, nexclusions, exclude, nexclude) == ANN_OK &&
+					AnnIndexExcludedRows(file, entry, exclusions, nexclusions, searchRemap, exclude,
+										 nexclude) == ANN_OK &&
 					entry->count - *nexclude >= (uint64_t) k + AnnIndexConfig.quant_slack)
 				{
 					(void) __atomic_fetch_add(&service->predicate_residual, 1, __ATOMIC_RELAXED);
@@ -2855,15 +3056,93 @@ PredicateSearchBitmap(Service *service, AnnIndexFile *file, const unsigned char 
 			}
 		}
 	}
-	return PredicateBitmap(service, file, 1, program, size, result, snapshot);
+	return PredicateBitmap(service, file, 1, mode, program, size, result, snapshot);
 }
+
+/*
+ * predicate_inline counts frames: the base and the whole program may both
+ * miss. predicate_hits counts the lookups that found their entry, as
+ * without resolvers (a residual base found and not taken, then the whole
+ * program found, is two), on the thread that completes the frame: not on a
+ * reader that hands it off (ANN_PENDING), even after finding the base or an
+ * entry not uploaded yet, since the resolver looks them up again.
+ */
+static AnnStatus
+PredicateSearchBitmap(Service *service, AnnIndexFile *file, int mode, const unsigned char *program, uint32_t size,
+					  uint32_t k, int snapshot, AnnIndexBitmap **result, uint64_t **exclude, uint32_t *nexclude)
+{
+	AnnStatus	status;
+
+	evaluatedInline = 0;
+	foundCached = 0;
+	searchLookup = 1;
+	/* A handed-off frame's, from its reader; else before the split reads. */
+	searchRemap = resolverThread ? resolvingRemap : __atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE);
+	status = PredicateSearchLookup(service, file, mode, program, size, k, snapshot, result, exclude, nexclude);
+	searchLookup = 0;
+	if (evaluatedInline)
+		(void) __atomic_fetch_add(&service->predicate_inline, 1, __ATOMIC_RELAXED);
+	if (foundCached && status != ANN_PENDING)
+		(void) __atomic_fetch_add(&service->predicate_hits, foundCached, __ATOMIC_RELAXED);
+	evaluatedInline = 0;
+	foundCached = 0;
+	return status;
+}
+
+/*
+ * How a search's predicate misses are evaluated: on a reader with resolvers,
+ * handed off, unless the program reads a stored bitmap or the queue is
+ * full. A remap (operation 28) of the index, from a later frame of the same
+ * connection or from another, cannot tear an evaluation (AnnIndexRemap
+ * waits for every read section of the arrays); a frame whose lookup or
+ * evaluation runs after a remap it was not read against answers stale and
+ * caches nothing, its generation being the one its reader read before the
+ * hand-off (PredicateBitmap, PredicateEvaluate).
+ */
+static int
+ResolveMode(const unsigned char *program, uint32_t size)
+{
+	if (resolveLimit == 0 || resolverThread)
+		return RESOLVE_HERE;
+	if (resolveInline || AnnFilterUsesBitmap(program, size) ||
+		__atomic_load_n(&resolveQueued, __ATOMIC_RELAXED) >= resolveLimit)
+		return RESOLVE_INLINE;
+	return RESOLVE_HAND_OFF;
+}
+
+/*
+ * On a resolver: whether the index a frame leased was unloaded or replaced
+ * while the frame waited. Backends find a job's index by name when they
+ * search it, so a job queued now would run on the index loaded under that
+ * name; the frame gets what it would have got arriving after the unload.
+ * (A remap since the hand-off is caught by the lookup itself: it compares
+ * the frame's generation, PredicateBitmap. One after the lookup changes
+ * nothing the frame read.)
+ */
+static int
+Stale(AnnIndexFile *file)
+{
+	AnnIndexFile *other;
+
+	if (!resolverThread)
+		return 0;
+	if ((other = AnnIndexGet(file->name)) != NULL)
+		AnnIndexPut(other);
+	return other != file;
+}
+
+static AnnStatus HandOff(Service *service, uint16_t operation, Connection *connection, int rdma,
+						 uint64_t request, unsigned char *payload, uint32_t size, AnnIndexFile *file);
+static AnnStatus SubmitPredicateFile(Service *service, Connection *connection, int rdma, uint64_t request,
+									 unsigned char *payload, uint32_t size, AnnIndexFile *file);
+static AnnStatus SubmitBatchFile(Service *service, Connection *connection, int rdma, uint64_t request,
+								 unsigned char *payload, uint32_t size, AnnIndexFile *file);
 
 static AnnStatus
 SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t request,
 				unsigned char *payload, uint32_t size)
 {
 	AnnIndexFile *file;
-	AnnIndexBitmap *bitmap;
 	char		name[ANN_INDEX_NAME_MAX + 1];
 	uint32_t	nameLength,
 				dimensions,
@@ -2871,9 +3150,6 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 				flags,
 				programLength;
 	size_t		offset;
-	AnnStatus	status;
-	uint64_t   *exclude = NULL;
-	uint32_t	nexclude = 0;
 
 	if (service->backend->search_index == NULL)
 		return ANN_UNSUPPORTED;
@@ -2902,6 +3178,32 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 		AnnIndexPut(file);
 		return ANN_STALE;
 	}
+	return SubmitPredicateFile(service, connection, rdma, request, payload, size, file);
+}
+
+/*
+ * The rest of SubmitPredicate, on a checked payload and its index's lease,
+ * which this consumes; on a resolver, the frame a reader handed off.
+ */
+static AnnStatus
+SubmitPredicateFile(Service *service, Connection *connection, int rdma, uint64_t request,
+					unsigned char *payload, uint32_t size, AnnIndexFile *file)
+{
+	AnnIndexBitmap *bitmap;
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint32_t	nameLength = (uint32_t) Read(payload, 4);
+	size_t		offset = 4 + nameLength;
+	uint32_t	dimensions = (uint32_t) Read(payload + offset, 4);
+	uint32_t	k = (uint32_t) Read(payload + offset + 4, 4);
+	uint32_t	flags = (uint32_t) Read(payload + offset + 8, 4);
+	uint32_t	programLength = (uint32_t) Read(payload + offset + 12, 4);
+	AnnStatus	status;
+	uint64_t   *exclude = NULL;
+	uint32_t	nexclude = 0;
+
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
+	offset += 16;
 
 	/*
 	 * A program matching every row is a plain ANN search. With tombstones, it
@@ -2916,13 +3218,23 @@ SubmitPredicate(Service *service, Connection *connection, int rdma, uint64_t req
 		uint64_t	deleted = __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE);
 
 		submittingWanted = deleted ? k : 0;
-		status = SubmitBitmapJob(service, connection, rdma, request, payload, size, file, NULL, name,
-								 dimensions, (uint32_t) (k + deleted), offset + programLength,
-								 ANN_OP_INDEX_SEARCH_PREDICATE, flags);
+		status = Stale(file) ? ANN_STALE :
+			SubmitBitmapJob(service, connection, rdma, request, payload, size, file, NULL, name,
+							dimensions, (uint32_t) (k + deleted), offset + programLength,
+							ANN_OP_INDEX_SEARCH_PREDICATE, flags);
 		submittingWanted = 0;
 	}
-	else if ((status = PredicateSearchBitmap(service, file, payload + offset, programLength, k, 0, &bitmap,
-											 &exclude, &nexclude)) == ANN_OK)
+	else if ((status = PredicateSearchBitmap(service, file, ResolveMode(payload + offset, programLength),
+											 payload + offset, programLength, k, 0, &bitmap, &exclude,
+											 &nexclude)) == ANN_PENDING)
+		return HandOff(service, ANN_OP_INDEX_SEARCH_PREDICATE, connection, rdma, request, payload, size, file);
+	else if (status == ANN_OK && Stale(file))
+	{
+		AnnIndexBitmapRelease(file, bitmap);
+		free(exclude);
+		status = ANN_STALE;
+	}
+	else if (status == ANN_OK)
 	{
 		submittingExclude = exclude;
 		submittingNexclude = nexclude;
@@ -3049,8 +3361,6 @@ static AnnStatus
 SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request,
 			unsigned char *payload, uint32_t size, uint64_t generation)
 {
-	uint64_t   *exclude = NULL;
-	uint32_t	nexclude = 0;
 	uint32_t	nameLength,
 				dimensions,
 				k,
@@ -3059,14 +3369,8 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 				parts;
 	size_t		common,
 				queries;
-	Composite  *composite;
 	AnnIndexFile *file;
-	AnnIndexBitmap *bitmap = NULL;
-	AnnStatus	status;
 	char		name[ANN_INDEX_NAME_MAX + 1];
-	uint32_t	searchK;
-	uint64_t	deleted;
-	Job		   *deferred[64];	/* parts is at most 64 */
 
 	if (size < 4 || (nameLength = (uint32_t) Read(payload, 4)) == 0 ||
 		nameLength > ANN_INDEX_NAME_MAX || (uint64_t) size < 24 + (uint64_t) nameLength ||
@@ -3100,6 +3404,37 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 		AnnIndexPut(file);
 		return ANN_GENERATION;
 	}
+	return SubmitBatchFile(service, connection, rdma, request, payload, size, file);
+}
+
+/*
+ * The rest of SubmitBatch, on a checked payload and its index's lease, which
+ * this consumes; on a resolver, the frame a reader handed off.
+ */
+static AnnStatus
+SubmitBatchFile(Service *service, Connection *connection, int rdma, uint64_t request,
+				unsigned char *payload, uint32_t size, AnnIndexFile *file)
+{
+	uint64_t   *exclude = NULL;
+	uint32_t	nexclude = 0;
+	uint32_t	nameLength = (uint32_t) Read(payload, 4);
+	size_t		common = 4 + nameLength;
+	uint32_t	dimensions = (uint32_t) Read(payload + common, 4);
+	uint32_t	k = (uint32_t) Read(payload + common + 4, 4);
+	uint32_t	flags = (uint32_t) Read(payload + common + 8, 4);
+	uint32_t	programLength = (uint32_t) Read(payload + common + 12, 4);
+	uint32_t	parts = (uint32_t) Read(payload + common + 16, 4);
+	size_t		queries = common + 20 + (size_t) programLength;
+	Composite  *composite;
+	AnnIndexBitmap *bitmap = NULL;
+	AnnStatus	status;
+	char		name[ANN_INDEX_NAME_MAX + 1];
+	uint32_t	searchK;
+	uint64_t	deleted;
+	Job		   *deferred[64];	/* parts is at most 64 */
+
+	memcpy(name, payload + 4, nameLength);
+	name[nameLength] = '\0';
 	searchK = k;
 	deleted = (flags & ANN_PREDICATE_SNAPSHOT) ? 0 :
 		__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE);
@@ -3107,12 +3442,24 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 		(uint64_t) k + deleted <=
 		(service->backend->max_k < 10000 ? service->backend->max_k : 10000))
 		searchK += (uint32_t) deleted;
-	else if ((status = PredicateSearchBitmap(service, file, payload + common + 20, programLength, k,
+	else if ((status = PredicateSearchBitmap(service, file,
+											 ResolveMode(payload + common + 20, programLength),
+											 payload + common + 20, programLength, k,
 											 (flags & ANN_PREDICATE_SNAPSHOT) != 0, &bitmap, &exclude,
-											 &nexclude)) != ANN_OK)
+											 &nexclude)) == ANN_PENDING)
+		return HandOff(service, ANN_OP_INDEX_SEARCH_BATCH, connection, rdma, request, payload, size, file);
+	else if (status != ANN_OK)
 	{
 		AnnIndexPut(file);
 		return status;
+	}
+	if (Stale(file))
+	{
+		if (bitmap)
+			AnnIndexBitmapRelease(file, bitmap);
+		free(exclude);
+		AnnIndexPut(file);
+		return ANN_STALE;
 	}
 	composite = calloc(1, sizeof(*composite));
 	if (composite == NULL)
@@ -3221,6 +3568,123 @@ SubmitBatch(Service *service, Connection *connection, int rdma, uint64_t request
 }
 
 /*
+ * Queue a frame whose predicate missed for a resolver; it takes over the
+ * payload and the lease, and a connection reference of its own. Without
+ * memory for that, the frame is resolved here, as without resolvers.
+ */
+static AnnStatus
+HandOff(Service *service, uint16_t operation, Connection *connection, int rdma, uint64_t request,
+		unsigned char *payload, uint32_t size, AnnIndexFile *file)
+{
+	Resolve    *item = malloc(sizeof(*item));
+	AnnStatus	status;
+
+	if (item == NULL)
+	{
+		resolveInline = 1;
+		status = operation == ANN_OP_INDEX_SEARCH_BATCH ?
+			SubmitBatchFile(service, connection, rdma, request, payload, size, file) :
+			SubmitPredicateFile(service, connection, rdma, request, payload, size, file);
+		resolveInline = 0;
+		return status;
+	}
+	item->next = NULL;
+	item->connection = connection;
+	item->file = file;
+	item->composite = submittingComposite;
+	item->payload = payload;
+	item->request = request;
+	item->arrived = frameArrived;
+	item->size = size;
+	item->part = submittingPart;
+	item->operation = operation;
+	item->rdma = rdma;
+	/*
+	 * Read on the reader before its lookup read the arrays, so before any
+	 * remap from the connection's next frames.
+	 */
+	item->remapGeneration = searchRemap;
+	(void) pthread_mutex_lock(&connection->mutex);
+	connection->references++;
+	(void) pthread_mutex_unlock(&connection->mutex);
+	(void) pthread_mutex_lock(&resolveMutex);
+	if (resolveTail)
+		resolveTail->next = item;
+	else
+		resolveHead = item;
+	resolveTail = item;
+	(void) __atomic_add_fetch(&resolveQueued, 1, __ATOMIC_RELAXED);
+	(void) pthread_cond_signal(&resolveCondition);
+	(void) pthread_mutex_unlock(&resolveMutex);
+	(void) __atomic_fetch_add(&service->predicate_resolved, 1, __ATOMIC_RELAXED);
+	return ANN_PENDING;
+}
+
+/*
+ * Submit a handed-off frame as its reader would have after a hit, and
+ * answer it as ServeFrame, RdmaFrame or SubmitCollection would have if it
+ * fails.
+ */
+static void
+ResolveOne(Service *service, Resolve *item)
+{
+	AnnStatus	status;
+
+	submittingComposite = item->composite;
+	submittingPart = item->part;
+	frameArrived = item->arrived;
+	resolvingRemap = item->remapGeneration;
+	status = item->operation == ANN_OP_INDEX_SEARCH_BATCH ?
+		SubmitBatchFile(service, item->connection, item->rdma, item->request, item->payload, item->size,
+						item->file) :
+		SubmitPredicateFile(service, item->connection, item->rdma, item->request, item->payload, item->size,
+							item->file);
+	submittingComposite = NULL;
+	submittingPart = 0;
+	if (status != ANN_PENDING)
+	{
+		if (item->composite)
+			CompositeAnswer(item->composite, item->part, 0, status, NULL, 0, 0, NULL);
+		else
+			SendReply(item->connection, item->rdma, item->operation, item->request, status, NULL, 0);
+		free(item->payload);
+	}
+	Release(item->connection);
+	free(item);
+}
+
+/*
+ * A --predicate-resolvers thread: evaluates the predicates of handed-off
+ * frames one at a time. A program another thread is evaluating waits for
+ * that evaluation, as on a reader. The jobs go out after each frame.
+ */
+static void *
+Resolver(void *argument)
+{
+	Service    *service = argument;
+	Job		   *deferred[ANN_READER_DEFERRED];
+
+	readerDeferred = deferred;
+	resolverThread = 1;
+	for (;;)
+	{
+		Resolve    *item;
+
+		(void) pthread_mutex_lock(&resolveMutex);
+		while (resolveHead == NULL)
+			(void) pthread_cond_wait(&resolveCondition, &resolveMutex);
+		item = resolveHead;
+		if ((resolveHead = item->next) == NULL)
+			resolveTail = NULL;
+		(void) __atomic_sub_fetch(&resolveQueued, 1, __ATOMIC_RELAXED);
+		(void) pthread_mutex_unlock(&resolveMutex);
+		ResolveOne(service, item);
+		EnqueueDeferred(service);
+	}
+	return NULL;
+}
+
+/*
  * Predicate evaluation payload: u32 name length, name, then the program.
  * Reply: u64 eligible rows, then the bitmap as u32 words. Comparing it with
  * PostgreSQL's evaluation from its frozen pages proves both agree.
@@ -3247,7 +3711,8 @@ EvaluatePredicate(Service *service, const unsigned char *payload, uint32_t size,
 	name[nameLength] = '\0';
 	if ((file = AnnIndexGet(name)) == NULL)
 		return ANN_STALE;
-	status = PredicateBitmap(service, file, 0, payload + 4 + nameLength, size - 4 - nameLength, &bitmap, 0);
+	status = PredicateBitmap(service, file, 0, RESOLVE_HERE, payload + 4 + nameLength, size - 4 - nameLength,
+							 &bitmap, 0);
 	if (status == ANN_OK)
 	{
 		nwords = ((size_t) file->rows + 31) / 32;
@@ -3685,12 +4150,9 @@ ServeFrame(Service *service, Connection *connection)
 	}
 	else if (operation == 0 || operation == ANN_OP_STATS)
 	{
-		char		message[1024];
+		char		message[2048];
 		int			size;
-		uint64_t	predicateEntries = 0,
-					predicateBytes = 0,
-					predicateDeviceBytes = 0,
-					predicateEvictions = 0;
+		AnnIndexPredicateTotals predicates;
 
 		uint64_t	rdmaFrames = 0,
 					rdmaFallbacks = 0;
@@ -3711,9 +4173,9 @@ ServeFrame(Service *service, Connection *connection)
 		if (service->rdma)
 			AnnRdmaStats(service->rdma, &rdmaFrames, &rdmaFallbacks, &rdmaLanes);
 		(void) rdmaFrames;
+		memset(&predicates, 0, sizeof(predicates));
 		if (operation == ANN_OP_STATS)
-			AnnIndexPredicateStats(&predicateEntries, &predicateBytes, &predicateDeviceBytes,
-								   &predicateEvictions);
+			AnnIndexPredicateStats(&predicates);
 
 		/*
 		 * The scheduler's counters, summed over its shards, one lock at a
@@ -3754,7 +4216,10 @@ ServeFrame(Service *service, Connection *connection)
 							"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
 							"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
 							"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_residual\":%llu,"
-							"\"merged\":%llu}",
+							"\"predicate_build_us\":%llu,\"predicate_patched\":%llu,\"predicate_dropped\":%llu,"
+							"\"predicate_raced\":%llu,\"predicate_resolved\":%llu,\"predicate_inline\":%llu,"
+							"\"predicate_shared\":%llu,\"predicate_shared_entries\":%llu,"
+							"\"predicate_shared_bytes\":%llu,\"merged\":%llu}",
 							(unsigned long long) total.jobs, (unsigned long long) total.batches,
 							(unsigned long long) total.max_batch, (unsigned long long) total.rows,
 							(unsigned long long) total.rejected, (unsigned long long) total.rejected_index,
@@ -3769,12 +4234,20 @@ ServeFrame(Service *service, Connection *connection)
 							(unsigned long long) service->predicate_hits,
 							(unsigned long long) service->predicate_evaluations,
 							(unsigned long long) service->predicate_eval_us,
-							(unsigned long long) predicateEntries, (unsigned long long) predicateBytes,
-							(unsigned long long) predicateDeviceBytes,
-							(unsigned long long) predicateEvictions,
+							(unsigned long long) predicates.entries, (unsigned long long) predicates.bytes,
+							(unsigned long long) predicates.deviceBytes,
+							(unsigned long long) predicates.evictions,
 							(unsigned long long) __atomic_load_n(&service->predicate_canonical, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->predicate_residual, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->predicate_build_us, __ATOMIC_RELAXED),
+							(unsigned long long) predicates.patched, (unsigned long long) predicates.dropped,
+							(unsigned long long) predicates.raced,
+							(unsigned long long) __atomic_load_n(&service->predicate_resolved, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->predicate_inline, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->predicate_shared, __ATOMIC_RELAXED),
+							(unsigned long long) predicates.sharedEntries,
+							(unsigned long long) predicates.sharedBytes,
 							(unsigned long long) __atomic_load_n(&service->merged, __ATOMIC_RELAXED));
 		Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 			  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);
@@ -4207,6 +4680,17 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 #else
 	service.options.readers = 0;	/* epoll only: a thread per connection */
 #endif
+	if (service.options.predicate_resolvers > ANN_RESOLVERS_MAX)
+		service.options.predicate_resolvers = ANN_RESOLVERS_MAX;
+	for (uint32_t i = 0; i < service.options.predicate_resolvers; i++)
+	{
+		pthread_t	resolver;
+
+		if (pthread_create(&resolver, NULL, Resolver, &service) != 0)
+			return 1;
+		(void) pthread_detach(resolver);
+	}
+	resolveLimit = service.options.predicate_resolvers * ANN_RESOLVE_QUEUE_PER_THREAD;
 	if (options->rdma)
 	{
 		char		error[512];

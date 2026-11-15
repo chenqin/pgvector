@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import shlex
 import socket
 import struct
 import subprocess
@@ -21,7 +22,9 @@ class Server:
     def __init__(self, *args, env=None, executable=WORKER):
         self.directory = tempfile.TemporaryDirectory()
         self.path = os.path.join(self.directory.name, 'ann.sock')
-        self.process = subprocess.Popen([executable, '--listen', self.path, *args],
+        # ANN_WORKER_EXTRA_FLAGS: flags for every worker the tests start; a test's own come later and win.
+        extra = shlex.split(os.environ.get('ANN_WORKER_EXTRA_FLAGS', ''))
+        self.process = subprocess.Popen([executable, '--listen', self.path, *extra, *args],
                                         stderr=subprocess.PIPE, env={**os.environ, **(env or {})})
         deadline = time.monotonic() + 5
         while not os.path.exists(self.path):

@@ -67,6 +67,9 @@ typedef struct AnnServeOptions
 	uint32_t	scheduler_shards;	/* queues with their own lock, filters and
 									 * lanes; 0 for one per 24 lanes, 1 for a
 									 * single queue */
+	uint32_t	predicate_resolvers;	/* threads that evaluate predicates
+										 * readers miss; 0 to evaluate them on
+										 * the readers */
 } AnnServeOptions;
 
 void		AnnServeDefaultOptions(AnnServeOptions *options);

@@ -46,6 +46,12 @@ ann-udf-tests: ../../test/ann/udf_test.c udf.c udf.h $(COMMON)/filter.c $(COMMON
 ann-canonical-tests: ../../test/ann/canonical_test.c canonical.c canonical.h $(COMMON)/filter.c $(COMMON)/filter.h
 	$(CC) $(CFLAGS) -I. ../../test/ann/canonical_test.c canonical.c $(COMMON)/filter.c -lm -o $@
 
+ann-filter-tests: ../../test/ann/filter_test.c $(COMMON)/filter.c $(COMMON)/filter.h
+	$(CC) $(CFLAGS) -I. ../../test/ann/filter_test.c $(COMMON)/filter.c -lm -o $@
+
+ann-predicate-tests: ../../test/ann/predicate_cache_test.c indexfile.c indexfile.h backend.h $(COMMON)/filter.c $(COMMON)/filter.h canonical.c canonical.h
+	$(CC) $(CFLAGS) -pthread -DANN_INDEX_TEST_HOOKS -I. ../../test/ann/predicate_cache_test.c indexfile.c $(COMMON)/filter.c canonical.c -lm -o $@
+
 ann-cost-tests: ../../test/ann/cost_test.c $(COMMON)/cost.h
 	$(CC) $(CFLAGS) -I. ../../test/ann/cost_test.c -lm -o $@
 
@@ -99,8 +105,10 @@ ann-worker-cuvs: $(WORKER_DEPS) cuvs.c replica.h nvrtc.c nvrtc.h blackwell.c bla
 	@test -n "$(CUVS_PREFIX)" || { echo 'Set CUVS_PREFIX to the cuVS 26.10 installation' >&2; exit 1; }
 	$(CC) $(CFLAGS) -pthread -DANN_USE_CUVS -I"$(CUVS_PREFIX)/include" -I"$(CUDA_HOME)/include" $(CPPFLAGS) $(WORKER_SRCS) cuvs.c nvrtc.c blackwell.c select_batch.o -L"$(CUVS_PREFIX)/lib" -L"$(CUVS_PREFIX)/lib64" -L"$(CUDA_HOME)/lib64" $(LDFLAGS) $(WORKER_LIBS) -lcuvs_c -lcuvs -lstdc++ -lcudart -lcuda -ldl -lm -o $@
 
-check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests ann-canonical-tests
+check: ann-worker ann-batch-tests ann-replica-tests ann-cost-tests ann-udf-tests ann-canonical-tests ann-filter-tests ann-predicate-tests
 	./ann-cost-tests
+	./ann-filter-tests
+	./ann-predicate-tests
 	./ann-udf-tests
 	./ann-canonical-tests
 	./ann-replica-tests
@@ -147,8 +155,8 @@ clean:
 	rm -f ann-batch-bench
 	rm -rf ann-batch-bench.dSYM
 	rm -rf ann-batch-tests.dSYM
-	rm -f ann-canonical-tests ann-worker-cuvs select_batch.o cagra_udf.o cagra-udf-probe
-	rm -rf ann-worker.dSYM
+	rm -f ann-canonical-tests ann-filter-tests ann-predicate-tests ann-worker-cuvs select_batch.o cagra_udf.o cagra-udf-probe
+	rm -rf ann-worker.dSYM ann-filter-tests.dSYM ann-predicate-tests.dSYM
 	rm -rf ann-worker-cuvs.dSYM
 
 .PHONY: all check check-cuvs check-postgres clean

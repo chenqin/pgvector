@@ -18,7 +18,7 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100, 0, 0, 0, 0, 0, 0, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 64, 0};
 int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;
@@ -162,6 +162,177 @@ typedef struct Entry
 
 static pthread_rwlock_t registryLock = PTHREAD_RWLOCK_INITIALIZER;
 static Entry *registry;
+
+/*
+ * Row sets: loaded indexes whose filter inputs are equal evaluate every
+ * program that reads attribute columns alone to the same rows, so such a
+ * result, tombstones not applied, is kept once for all of them; each member
+ * copies it and masks its own tombstones. Members and the files' row set
+ * pointers change under rowSetMutex (and each file's bitmapMutex, which a
+ * remap holds); compares run one at a time.
+ */
+typedef struct RawResult
+{
+	uint64_t	id;				/* AnnFilterHash of the program */
+	unsigned char *program;		/* its bytes: an id alone is a 64-bit hash */
+	size_t		size;
+	uint64_t	count;
+	uint32_t   *words;
+	size_t		bytes;
+	uint64_t	used;
+	int			references;		/* the cache's while listed, and each
+								 * copier's */
+} RawResult;
+
+#define ANN_ROW_SET_RESULTS 256
+
+struct AnnIndexRowSet
+{
+	pthread_mutex_t mutex;		/* the results, and leaving by a remap */
+	uint32_t	members;		/* files holding it (rowSetHeld) */
+	uint32_t	attached;		/* members whose rowSet is it, under mutex:
+								 * results are kept only while two are */
+	RawResult  *results[ANN_ROW_SET_RESULTS];
+	uint32_t	nresults;
+	uint64_t	bytes;
+	uint64_t	clock;
+};
+
+/* Over every row set, for the stats reply (atomic). */
+static uint64_t rowSetEntries;
+static uint64_t rowSetBytes;
+
+static void
+FreeRaw(RawResult *raw)
+{
+	free(raw->program);
+	free(raw->words);
+	free(raw);
+}
+
+/* Drop the cache's reference to results[i]; under the row set's mutex. */
+static void
+UnlistRaw(AnnIndexRowSet *set, uint32_t i)
+{
+	RawResult  *raw = set->results[i];
+
+	set->results[i] = set->results[--set->nresults];
+	set->bytes -= raw->bytes;
+	(void) __atomic_sub_fetch(&rowSetEntries, 1, __ATOMIC_RELAXED);
+	(void) __atomic_sub_fetch(&rowSetBytes, raw->bytes, __ATOMIC_RELAXED);
+	if (--raw->references == 0)
+		FreeRaw(raw);
+}
+
+/* A referenced result of program while file is still a member, or NULL. */
+static RawResult *
+RowSetGet(AnnIndexRowSet *set, const AnnIndexFile *file, uint64_t id, const unsigned char *program,
+		  size_t size)
+{
+	RawResult  *found = NULL;
+
+	(void) pthread_mutex_lock(&set->mutex);
+	for (uint32_t i = 0; i < set->nresults && __atomic_load_n(&file->rowSet, __ATOMIC_ACQUIRE) == set; i++)
+	{
+		RawResult  *raw = set->results[i];
+
+		if (raw->id == id && raw->size == size && memcmp(raw->program, program, size) == 0)
+		{
+			raw->references++;
+			raw->used = ++set->clock;
+			found = raw;
+			break;
+		}
+	}
+	(void) pthread_mutex_unlock(&set->mutex);
+	return found;
+}
+
+static void
+RowSetRelease(AnnIndexRowSet *set, RawResult *raw)
+{
+	int			last;
+
+	(void) pthread_mutex_lock(&set->mutex);
+	last = --raw->references == 0;
+	(void) pthread_mutex_unlock(&set->mutex);
+	if (last)
+		FreeRaw(raw);
+}
+
+/*
+ * Keep a copy of a result file evaluated, dropping the least recently used
+ * ones past --shared-predicate-mb. Not when file left the row set meanwhile
+ * (a remap leaves before it changes the arrays, so a result kept here was
+ * evaluated over the arrays every member holds), nor while no other member
+ * is attached to copy it (results kept before stay for the one left).
+ */
+static void
+RowSetPut(AnnIndexRowSet *set, const AnnIndexFile *file, uint64_t id, const unsigned char *program,
+		  size_t size, const uint32_t *words, uint64_t count)
+{
+	size_t		bytes = ((size_t) file->rows + 31) / 32 * 4;
+	RawResult  *raw;
+	int			keep = 1;
+	uint32_t	attached;
+
+	(void) pthread_mutex_lock(&set->mutex);
+	attached = set->attached;
+	(void) pthread_mutex_unlock(&set->mutex);
+	if (attached < 2 || bytes > AnnIndexConfig.shared_predicate_bytes ||
+		(raw = calloc(1, sizeof(*raw))) == NULL)
+		return;
+	raw->program = malloc(size);
+	raw->words = malloc(bytes + 4);
+	if (raw->program == NULL || raw->words == NULL)
+	{
+		FreeRaw(raw);
+		return;
+	}
+	memcpy(raw->program, program, size);
+	memcpy(raw->words, words, bytes);
+	raw->id = id;
+	raw->size = size;
+	raw->count = count;
+	raw->bytes = bytes;
+	raw->references = 1;
+	(void) pthread_mutex_lock(&set->mutex);
+	if (__atomic_load_n(&file->rowSet, __ATOMIC_ACQUIRE) != set || set->attached < 2)
+		keep = 0;
+	for (uint32_t i = 0; keep && i < set->nresults; i++)
+		if (set->results[i]->id == id && set->results[i]->size == size &&
+			memcmp(set->results[i]->program, program, size) == 0)
+			keep = 0;			/* another member's, kept meanwhile */
+	while (keep && set->nresults > 0 &&
+		   (set->nresults == ANN_ROW_SET_RESULTS || set->bytes + bytes > AnnIndexConfig.shared_predicate_bytes))
+	{
+		uint32_t	oldest = 0;
+
+		for (uint32_t i = 1; i < set->nresults; i++)
+			if (set->results[i]->used < set->results[oldest]->used)
+				oldest = i;
+		UnlistRaw(set, oldest);
+	}
+	if (keep)
+	{
+		raw->used = ++set->clock;
+		set->results[set->nresults++] = raw;
+		set->bytes += bytes;
+		(void) __atomic_add_fetch(&rowSetEntries, 1, __ATOMIC_RELAXED);
+		(void) __atomic_add_fetch(&rowSetBytes, bytes, __ATOMIC_RELAXED);
+	}
+	(void) pthread_mutex_unlock(&set->mutex);
+	if (!keep)
+		FreeRaw(raw);
+}
+
+const void *
+AnnIndexFilterIdentity(const AnnIndexFile *file)
+{
+	const AnnIndexRowSet *set = __atomic_load_n(&file->rowSet, __ATOMIC_ACQUIRE);
+
+	return set ? (const void *) set : (const void *) file;
+}
 
 void		(*AnnIndexDeviceDestroy) (void *device) = NULL;
 
@@ -747,18 +918,46 @@ AnnIndexRemap(AnnIndexFile *file, const char *name, const int32_t *map, uint32_t
 	for (uint32_t i = 0; i < count; i++)
 		if (map[i] < 0)
 			return ANN_INVALID;
+
+	/*
+	 * The common answers first, without the write lock, so that a repeated
+	 * or refused remap does not wait for a busy index's readers. Both are
+	 * checked again under the locks.
+	 */
+	{
+		const int32_t *done = __atomic_load_n(&attribute->remap, __ATOMIC_ACQUIRE);
+		int			cached;
+
+		if (done)
+			return memcmp(done, map, sizeof(int32_t) * count) == 0 ? ANN_OK : ANN_INVALID;
+		(void) pthread_mutex_lock(&file->bitmapMutex);
+		cached = file->predicateEntries > 0;
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		if (cached)
+			return ANN_INVALID;
+	}
+
+	/*
+	 * Exclusive: no evaluation, canonicalisation or lookup reads the arrays
+	 * while they change (each holds the lock shared), so each reads them
+	 * whole from one side of the remap. Before bitmapMutex, which those
+	 * readers may take inside (SourceBitmap).
+	 */
+	(void) pthread_rwlock_wrlock(&file->attributeLock);
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	if (attribute->remap)
 	{
 		/* Done before: the same map again is fine, another one isn't. */
 		status = memcmp(attribute->remap, map, sizeof(int32_t) * count) == 0 ? ANN_OK : ANN_INVALID;
 		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		(void) pthread_rwlock_unlock(&file->attributeLock);
 		return status;
 	}
 	if (file->predicateEntries > 0)
 	{
 		/* Cached results hold rows selected by the old codes. */
 		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		(void) pthread_rwlock_unlock(&file->attributeLock);
 		return ANN_INVALID;
 	}
 	column = malloc(sizeof(int32_t) * (file->rows ? file->rows : 1));
@@ -778,13 +977,30 @@ AnnIndexRemap(AnnIndexFile *file, const char *name, const int32_t *map, uint32_t
 		free(column);
 		free(copy);
 		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		(void) pthread_rwlock_unlock(&file->attributeLock);
 		return status;
 	}
 	memcpy(copy, map, sizeof(int32_t) * count);
 
 	/*
-	 * Evaluations that started before see the old arrays whole: they stay
-	 * allocated until the index is destroyed.
+	 * Leave the row set before the arrays change: a result its members share
+	 * is only kept from an evaluation that finished while this index was a
+	 * member (RowSetPut).
+	 */
+	if (file->rowSet)
+	{
+		AnnIndexRowSet *set = file->rowSet;
+
+		(void) pthread_mutex_lock(&set->mutex);
+		__atomic_store_n(&file->rowSet, NULL, __ATOMIC_RELEASE);
+		set->attached--;
+		(void) pthread_mutex_unlock(&set->mutex);
+	}
+
+	/*
+	 * Kept until the index is destroyed: pointers into them outlive the read
+	 * sections (AnnIndexMatch's results, which jobs search with, and the
+	 * arrays a row-set compare took under bitmapMutex in ReadInputs).
 	 */
 	attribute->oldPostings = attribute->postings;
 	attribute->oldKeys = attribute->keys;
@@ -796,17 +1012,42 @@ AnnIndexRemap(AnnIndexFile *file, const char *name, const int32_t *map, uint32_t
 	attribute->ordinals = rebuilt.ordinals;
 	attribute->nvalues = rebuilt.nvalues;
 	__atomic_store_n(&attribute->postings, rebuilt.postings, __ATOMIC_RELEASE);
-	attribute->remap = copy;
+	__atomic_store_n(&attribute->remap, copy, __ATOMIC_RELEASE);
+
+	/*
+	 * One bump, inside the exclusive section: a reader that read the
+	 * generation before it read the old arrays, or the new ones and now
+	 * sees it changed; either way a result whose arrays may differ from the
+	 * generation its caller captured is not cached (AnnIndexPredicatePut)
+	 * and answers stale.
+	 */
+	(void) __atomic_add_fetch(&file->remapGeneration, 1, __ATOMIC_ACQ_REL);
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	(void) pthread_rwlock_unlock(&file->attributeLock);
 	return ANN_OK;
 }
 
-/* Every text attribute rewritten into a collection's dictionary. */
+int
+AnnIndexRemappedSince(AnnIndexFile *file, uint64_t remapGeneration)
+{
+	int			changed;
+
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	changed = file->remapGeneration != remapGeneration;
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	return changed;
+}
+
+/*
+ * Every text attribute rewritten into a collection's dictionary. remap is
+ * set once, under attributeLock and bitmapMutex; this tests it without
+ * either (an atomic load), so the answer may be out of date at once.
+ */
 int
 AnnIndexRemapped(const AnnIndexFile *file)
 {
 	for (uint32_t a = 0; a < file->nattributes; a++)
-		if (file->attributes[a].starts && file->attributes[a].remap == NULL)
+		if (file->attributes[a].starts && __atomic_load_n(&file->attributes[a].remap, __ATOMIC_ACQUIRE) == NULL)
 			return 0;
 	return 1;
 }
@@ -842,6 +1083,12 @@ AnnIndexMatch(const AnnIndexFile *file, const char *name, const int32_t *values,
 			attribute = &file->attributes[a];
 	if (attribute == NULL || nvalues > ANN_INDEX_MAX_VALUES)
 		return ANN_INVALID;
+
+	/*
+	 * The lookups read one side of any remap whole; what they return points
+	 * into arrays a remap keeps, so it is used after the lock.
+	 */
+	(void) pthread_rwlock_rdlock(&((AnnIndexFile *) file)->attributeLock);
 	for (uint32_t i = 0; i < nvalues; i++)
 	{
 		uint32_t	v = FindValue(attribute, values[i]);
@@ -858,13 +1105,17 @@ AnnIndexMatch(const AnnIndexFile *file, const char *name, const int32_t *values,
 		}
 	}
 	if (nfound == 0)
+	{
+		(void) pthread_rwlock_unlock(&((AnnIndexFile *) file)->attributeLock);
 		return ANN_OK;
+	}
 	if (nfound == 1)
 	{
 		*keys = attribute->keys + found[0]->offset;
 		*ordinals = attribute->ordinals + found[0]->offset;
 		*count = found[0]->count;
 		*bitsets = found[0]->bitsets;
+		(void) pthread_rwlock_unlock(&((AnnIndexFile *) file)->attributeLock);
 		return ANN_OK;
 	}
 
@@ -873,6 +1124,7 @@ AnnIndexMatch(const AnnIndexFile *file, const char *name, const int32_t *values,
 	mergedOrdinals = malloc(sizeof(uint64_t) * total);
 	if (mergedKeys == NULL || mergedOrdinals == NULL)
 	{
+		(void) pthread_rwlock_unlock(&((AnnIndexFile *) file)->attributeLock);
 		free(mergedKeys);
 		free(mergedOrdinals);
 		return ANN_NOMEM;
@@ -883,6 +1135,7 @@ AnnIndexMatch(const AnnIndexFile *file, const char *name, const int32_t *values,
 		memcpy(mergedOrdinals + total, attribute->ordinals + found[j]->offset, sizeof(uint64_t) * found[j]->count);
 		total += found[j]->count;
 	}
+	(void) pthread_rwlock_unlock(&((AnnIndexFile *) file)->attributeLock);
 	qsort(mergedOrdinals, total, sizeof(uint64_t), OrdinalCompare);
 	if (attribute->multi)
 	{
@@ -985,6 +1238,7 @@ BuildBitmap(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, si
 	}
 	bitmap->id = id;
 	bitmap->kind = kind;
+	bitmap->expandLimit = expandLimit;
 	memcpy(bitmap->words, words, nwords * 4);
 	if (file->rows % 32)
 		bitmap->words[nwords - 1] &= (UINT32_C(1) << (file->rows % 32)) - 1;
@@ -1084,13 +1338,39 @@ AnnIndexBitmapTransient(AnnIndexFile *file, uint64_t id, int kind, const uint32_
 	return status;
 }
 
+/*
+ * Link a built entry into the cache, unlinking any entry with its id and
+ * kind, which is returned for the caller to release after unlocking; under
+ * bitmapMutex.
+ */
+static AnnIndexBitmap *
+LinkBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
+{
+	AnnIndexBitmap **link;
+	AnnIndexBitmap *old = NULL;
+	uint64_t	bucket = bitmap->id % ANN_INDEX_BITMAP_BUCKETS;
+
+	for (link = &file->bitmaps[bucket]; *link; link = &(*link)->next)
+		if ((*link)->id == bitmap->id && (*link)->kind == bitmap->kind)
+		{
+			old = *link;
+			*link = old->next;
+			Account(file, old, -1);
+			break;
+		}
+	bitmap->used = ++file->clock;
+	bitmap->next = file->bitmaps[bucket];
+	file->bitmaps[bucket] = bitmap;
+	Account(file, bitmap, 1);
+	return old;
+}
+
 AnnStatus
 AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
 				  uint64_t expandLimit, AnnIndexBitmap **result)
 {
 	AnnIndexBitmap *bitmap;
-	AnnIndexBitmap **link;
-	AnnIndexBitmap *old = NULL;
+	AnnIndexBitmap *old;
 	AnnStatus	status;
 
 	if (result)
@@ -1099,18 +1379,7 @@ AnnIndexBitmapPut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *wor
 		return status;
 	bitmap->references = result ? 2 : 1;	/* the cache's, and the caller's */
 	(void) pthread_mutex_lock(&file->bitmapMutex);
-	for (link = &file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
-		if ((*link)->id == id && (*link)->kind == kind)
-		{
-			old = *link;
-			*link = old->next;
-			Account(file, old, -1);
-			break;
-		}
-	bitmap->used = ++file->clock;
-	bitmap->next = file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS];
-	file->bitmaps[id % ANN_INDEX_BITMAP_BUCKETS] = bitmap;
-	Account(file, bitmap, 1);
+	old = LinkBitmap(file, bitmap);
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 	if (old)
 		AnnIndexBitmapRelease(file, old);
@@ -1124,9 +1393,17 @@ AnnIndexBitmapUploadDeferred(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 {
 	AnnIndexBitmap copy;
 	int			linked = 0;
+	int			deferred = 1;
 
-	if (!__atomic_exchange_n(&bitmap->uploadDeferred, 0, __ATOMIC_ACQ_REL) || AnnIndexBitmapDevice.upload == NULL ||
-		file->device == NULL)
+	if (AnnIndexBitmapDevice.upload == NULL || file->device == NULL)
+	{
+		(void) __atomic_compare_exchange_n(&bitmap->uploadDeferred, &deferred, 0, 0, __ATOMIC_ACQ_REL,
+										   __ATOMIC_ACQUIRE);
+		return;
+	}
+	/* 1 to 2 claims the upload: other threads find 2 and go on without it. */
+	if (!__atomic_compare_exchange_n(&bitmap->uploadDeferred, &deferred, 2, 0, __ATOMIC_ACQ_REL,
+									 __ATOMIC_ACQUIRE))
 		return;
 
 	/*
@@ -1152,6 +1429,8 @@ AnnIndexBitmapUploadDeferred(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 		if (bitmap->kind != ANN_BITMAP_PUSHED)
 			file->predicateDeviceBytes += copy.deviceBytes;
 	}
+	/* After the pointers: a thread that reads 0 submits with the copies. */
+	__atomic_store_n(&bitmap->uploadDeferred, 0, __ATOMIC_RELEASE);
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
 }
 
@@ -1252,13 +1531,178 @@ OrdinalOf(const AnnIndexFile *file, int64_t key)
 	return low < file->rows && file->keys[low] == key ? (int64_t) low : -1;
 }
 
+/* Clear tombstoned rows from words ((rows + 31) / 32 of them); returns how many were set. */
+static uint64_t
+MaskDeleted(const AnnIndexFile *file, uint32_t *words)
+{
+	const uint32_t *deleted = __atomic_load_n(&file->deleted, __ATOMIC_ACQUIRE);
+	uint64_t	removed = 0;
+
+	for (size_t w = 0; deleted && w < ((size_t) file->rows + 31) / 32; w++)
+	{
+		uint32_t	gone = words[w] & __atomic_load_n(&deleted[w], __ATOMIC_RELAXED);
+
+		removed += (uint64_t) __builtin_popcount(gone);
+		words[w] &= ~gone;
+	}
+	return removed;
+}
+
+/* How many of gone (sorted ordinals) a cached predicate entry holds. */
+static uint64_t
+EntryHits(const AnnIndexBitmap *entry, const uint64_t *gone, uint64_t ngone)
+{
+	uint64_t	hits = 0;
+
+	for (uint64_t g = 0; g < ngone; g++)
+	{
+		uint64_t	low = 0;
+		uint64_t	high = entry->count;
+
+		if (entry->words)
+		{
+			hits += (entry->words[gone[g] / 32] >> (gone[g] % 32)) & 1;
+			continue;
+		}
+		while (low < high)
+		{
+			uint64_t	middle = low + (high - low) / 2;
+
+			if (entry->ordinals[middle] < gone[g])
+				low = middle + 1;
+			else
+				high = middle;
+		}
+		hits += low < entry->count && entry->ordinals[low] == gone[g];
+	}
+	return hits;
+}
+
+/*
+ * A cached predicate entry without the rows of gone (sorted ordinals, hits of
+ * them in it): what BuildBitmap builds from the entry's rows less those,
+ * without device copies; its next lookup uploads them.
+ */
+static AnnStatus
+PatchBitmap(AnnIndexFile *file, const AnnIndexBitmap *entry, const uint64_t *gone, uint64_t ngone,
+			uint64_t hits, AnnIndexBitmap **out)
+{
+	AnnIndexBitmap *bitmap;
+
+	if (entry->words)
+	{
+		size_t		nwords = ((size_t) file->rows + 31) / 32;
+		uint32_t   *words = malloc(nwords * 4);
+		AnnStatus	status;
+
+		if (words == NULL)
+			return ANN_NOMEM;
+		memcpy(words, entry->words, nwords * 4);
+		for (uint64_t g = 0; g < ngone; g++)
+			words[gone[g] / 32] &= ~(UINT32_C(1) << (gone[g] % 32));
+		status = BuildBitmap(file, entry->id, entry->kind, words, nwords, entry->expandLimit, 1, &bitmap);
+		free(words);
+		if (status != ANN_OK)
+			return status;
+	}
+	else
+	{
+		/*
+		 * Rows only. BuildBitmap kept them as count <= expandLimit and dropped
+		 * the bitmap as count < rows / 64 and count <= bitset_gather_limit:
+		 * fewer rows keep all three, so it would build this form again.
+		 */
+		uint64_t	n = 0;
+		uint64_t	g = 0;
+
+		if ((bitmap = calloc(1, sizeof(*bitmap))) == NULL ||
+			(bitmap->ordinals = malloc(sizeof(uint64_t) * (entry->count - hits ? entry->count - hits : 1))) == NULL)
+		{
+			free(bitmap);
+			return ANN_NOMEM;
+		}
+		bitmap->id = entry->id;
+		bitmap->kind = entry->kind;
+		bitmap->expandLimit = entry->expandLimit;
+		for (uint64_t i = 0; i < entry->count; i++)
+		{
+			while (g < ngone && gone[g] < entry->ordinals[i])
+				g++;
+			if (g == ngone || gone[g] != entry->ordinals[i])
+				bitmap->ordinals[n++] = entry->ordinals[i];
+		}
+		bitmap->count = n;
+		bitmap->hostBytes = BitmapBytes(file, bitmap);
+	}
+	bitmap->columnsOnly = entry->columnsOnly;
+	bitmap->uploadDeferred = AnnIndexConfig.device_bitmaps && AnnIndexBitmapDevice.upload && file->device;
+	*out = bitmap;
+	return ANN_OK;
+}
+
+/*
+ * Swap a held cache entry for its patch (NULL: drop it), unless it was
+ * evicted or replaced meanwhile; then let go of the delete's reference.
+ */
+static void
+ReplaceHeld(AnnIndexFile *file, AnnIndexBitmap *entry, AnnIndexBitmap *patch)
+{
+	AnnIndexBitmap **link;
+	int			unlinked = 0;
+
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	for (link = &file->bitmaps[entry->id % ANN_INDEX_BITMAP_BUCKETS]; *link; link = &(*link)->next)
+		if (*link == entry)
+		{
+			Account(file, entry, -1);
+			if (patch)
+			{
+				patch->references = 1;
+				patch->used = entry->used;
+				patch->next = entry->next;
+				*link = patch;
+				Account(file, patch, 1);
+				file->predicatePatched++;
+			}
+			else
+			{
+				*link = entry->next;
+				file->predicateDropped++;
+			}
+			unlinked = 1;
+			break;
+		}
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	if (patch && !unlinked)
+		FreeBitmap(file, patch);
+	AnnIndexBitmapReleaseCount(file, entry, 1 + unlinked);
+}
+
+#ifdef ANN_INDEX_TEST_HOOKS
+void		(*AnnIndexDeleteHeldHook) (AnnIndexFile *file, uint64_t nheld) = NULL;
+#endif
+
+/*
+ * Deletes take deleteMutex, then bitmapMutex to set their bits and bump the
+ * delete generation, so a predicate result cached under bitmapMutex at the
+ * generation its tombstones were read at holds no deleted row
+ * (AnnIndexPredicatePut). Holding deleteMutex while patching keeps a second
+ * delete from patching the same entries without the first one's rows.
+ */
 AnnStatus
 AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t *added)
 {
-	AnnIndexBitmap **victims = NULL;
-	uint64_t	nvictims = 0;
+	AnnIndexBitmap *victims = NULL;
+	AnnIndexBitmap **held = NULL;
+	uint64_t	nheld = 0;
+	uint64_t   *gone = NULL;
+	uint64_t	ngone = 0;
+	uint64_t	patches = 0;
 
 	*added = 0;
+	(void) pthread_mutex_lock(&file->deleteMutex);
+	if (!AnnIndexConfig.delete_patch_off)
+		gone = malloc(sizeof(uint64_t) * (count ? count : 1));
 	(void) pthread_mutex_lock(&file->bitmapMutex);
 	if (file->deleted == NULL)
 	{
@@ -1267,6 +1711,8 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 		if (deleted == NULL)
 		{
 			(void) pthread_mutex_unlock(&file->bitmapMutex);
+			(void) pthread_mutex_unlock(&file->deleteMutex);
+			free(gone);
 			return ANN_NOMEM;
 		}
 		__atomic_store_n(&file->deleted, deleted, __ATOMIC_RELEASE);
@@ -1282,45 +1728,124 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 		if (__atomic_fetch_or(&file->deleted[ordinal / 32], bit, __ATOMIC_RELAXED) & bit)
 			continue;
 		(*added)++;
+		if (gone)
+			gone[ngone++] = (uint64_t) ordinal;
 	}
 	__atomic_add_fetch(&file->ndeleted, *added, __ATOMIC_RELEASE);
+	if (*added > 0)
+		__atomic_store_n(&file->deleteGeneration, file->deleteGeneration + 1, __ATOMIC_RELEASE);
 
-	/* Cached predicate results may hold the rows just deleted: drop them. */
-	if (*added > 0 && file->predicateEntries > 0 &&
-		(victims = malloc(sizeof(*victims) * file->predicateEntries)) != NULL)
+	/*
+	 * Cached predicate results may hold the rows just deleted. Those read from
+	 * attribute columns alone are held, to be patched below, when the delete
+	 * is small enough; the others are dropped, chained through their next
+	 * fields, which unlinked entries no longer use. Snapshot results keep
+	 * tombstoned rows anyway; those read from attribute columns alone stay.
+	 * One that reads a pushed bitmap goes, so that, as before, it follows a
+	 * bitmap replaced since.
+	 */
+	if (*added > 0 && file->predicateEntries > 0 && gone && *added <= AnnIndexConfig.delete_patch_rows)
+		held = malloc(sizeof(*held) * file->predicateEntries);
+	for (uint32_t b = 0; *added > 0 && file->predicateEntries > 0 && b < ANN_INDEX_BITMAP_BUCKETS; b++)
 	{
-		for (uint32_t b = 0; b < ANN_INDEX_BITMAP_BUCKETS; b++)
+		for (AnnIndexBitmap **link = &file->bitmaps[b]; *link;)
 		{
-			for (AnnIndexBitmap **link = &file->bitmaps[b]; *link;)
-			{
-				if ((*link)->kind != ANN_BITMAP_PUSHED)
-				{
-					AnnIndexBitmap *victim = *link;
+			AnnIndexBitmap *victim = *link;
 
-					*link = victim->next;
-					Account(file, victim, -1);
-					victims[nvictims++] = victim;
-				}
-				else
-					link = &(*link)->next;
+			if (victim->kind == ANN_BITMAP_PUSHED ||
+				(victim->kind == ANN_BITMAP_SNAPSHOT && victim->columnsOnly))
+			{
+				link = &victim->next;
+				continue;
 			}
+			if (held && victim->columnsOnly && (victim->words || victim->ordinals))
+			{
+				victim->references++;
+				held[nheld++] = victim;
+				link = &victim->next;
+				continue;
+			}
+			*link = victim->next;
+			Account(file, victim, -1);
+			file->predicateDropped++;
+			victim->next = victims;
+			victims = victim;
 		}
 	}
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
-	for (uint64_t v = 0; v < nvictims; v++)
-		AnnIndexBitmapRelease(file, victims[v]);
-	free(victims);
+	while (victims)
+	{
+		AnnIndexBitmap *victim = victims;
+
+		victims = victim->next;
+		AnnIndexBitmapRelease(file, victim);
+	}
+#ifdef ANN_INDEX_TEST_HOOKS
+	if (AnnIndexDeleteHeldHook)
+		AnnIndexDeleteHeldHook(file, nheld);
+#endif
+
+	/*
+	 * Replace each held entry that has some of the rows by a copy without
+	 * them, up to --delete-patch-entries of them (the reader of this delete
+	 * waits for the copies); drop the rest that have some.
+	 */
+	if (nheld > 0)
+		qsort(gone, ngone, sizeof(uint64_t), OrdinalCompare);
+	for (uint64_t h = 0; h < nheld; h++)
+	{
+		AnnIndexBitmap *entry = held[h];
+		AnnIndexBitmap *patch = NULL;
+		uint64_t	hits = EntryHits(entry, gone, ngone);
+
+		if (hits == 0)
+		{
+			AnnIndexBitmapRelease(file, entry);
+			continue;
+		}
+		if (patches++ >= AnnIndexConfig.delete_patch_entries ||
+			PatchBitmap(file, entry, gone, ngone, hits, &patch) != ANN_OK)
+			patch = NULL;
+		ReplaceHeld(file, entry, patch);
+	}
+	(void) pthread_mutex_unlock(&file->deleteMutex);
+	free(held);
+	free(gone);
 	return ANN_OK;
 }
 
+void		(*AnnIndexEvaluatedHook) (AnnIndexFile *file) = NULL;
+void		(*AnnIndexCanonicalHook) (AnnIndexFile *file) = NULL;
+
 int
 AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
-				 uint32_t *words, uint64_t *count, int snapshot)
+				 uint32_t *words, uint64_t *count, int snapshot, AnnIndexEvaluation *how)
 {
 	AnnFilterSource source;
 	int			code;
-	const uint32_t *deleted = __atomic_load_n(&file->deleted, __ATOMIC_ACQUIRE);
+	AnnIndexRowSet *set;
+	RawResult  *raw = NULL;
+	uint64_t	id = 0;
 
+	/*
+	 * The generation first: the tombstones read after it hold at least that
+	 * generation's rows.
+	 */
+	how->generation = __atomic_load_n(&file->deleteGeneration, __ATOMIC_ACQUIRE);
+	how->remapGeneration = __atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE);
+	how->columnsOnly = !AnnFilterUsesBitmap(program, size);
+	how->shared = 0;
+
+	/*
+	 * A row set shares results of programs that read attribute columns alone
+	 * (pushed bitmaps are the index's own); one-step programs cost nothing.
+	 */
+	set = how->columnsOnly && size > 1 ? __atomic_load_n(&file->rowSet, __ATOMIC_ACQUIRE) : NULL;
+	if (set)
+	{
+		id = AnnFilterHash(program, size);
+		raw = RowSetGet(set, file, id, program, size);
+	}
 	memset(&source, 0, sizeof(source));
 	source.arg = file;
 	source.rows = file->rows;
@@ -1331,25 +1856,37 @@ AnnIndexEvaluate(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.postings = SourcePostings;
 	source.bitmap = SourceBitmap;
 	source.multi = SourceMulti;
-	if (AnnIndexConfig.gpu_predicates && AnnIndexDeviceEvaluate &&
-		AnnIndexDeviceEvaluate(file, program, size, words, count))
-		code = ANN_FILTER_OK;
-	else
-		code = AnnFilterEvaluate(&source, program, size, words, count);
-	if (code == ANN_FILTER_OK && deleted && !snapshot)
+	if (raw)
 	{
-		/* Tombstoned rows never qualify. */
-		uint64_t	removed = 0;
-
-		for (size_t w = 0; w < ((size_t) file->rows + 31) / 32; w++)
-		{
-			uint32_t	gone = words[w] & __atomic_load_n(&deleted[w], __ATOMIC_RELAXED);
-
-			removed += (uint64_t) __builtin_popcount(gone);
-			words[w] &= ~gone;
-		}
-		*count -= removed;
+		memcpy(words, raw->words, raw->bytes);
+		*count = raw->count;
+		RowSetRelease(set, raw);
+		how->shared = 1;
+		code = ANN_FILTER_OK;
 	}
+	else
+	{
+		int			host;
+
+		/*
+		 * One read section for the whole evaluation, device or host: its
+		 * reads come from one side of any remap. A device evaluator may
+		 * upload a column inside it (cuvs.c).
+		 */
+		(void) pthread_rwlock_rdlock(&file->attributeLock);
+		host = !(AnnIndexConfig.gpu_predicates && AnnIndexDeviceEvaluate &&
+				 AnnIndexDeviceEvaluate(file, program, size, words, count));
+		code = host ? AnnFilterEvaluate(&source, program, size, words, count) : ANN_FILTER_OK;
+		(void) pthread_rwlock_unlock(&file->attributeLock);
+		if (host && AnnIndexEvaluatedHook)
+			AnnIndexEvaluatedHook(file);
+	}
+	/* Kept before the tombstones: each member masks its own. */
+	if (set && !how->shared && code == ANN_FILTER_OK)
+		RowSetPut(set, file, id, program, size, words, *count);
+	/* Tombstoned rows never qualify. */
+	if (code == ANN_FILTER_OK && !snapshot)
+		*count -= MaskDeleted(file, words);
 	return code;
 }
 
@@ -1358,6 +1895,7 @@ AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,
 				  unsigned char **out, size_t *outSize)
 {
 	AnnFilterSource source;
+	int			done;
 
 	memset(&source, 0, sizeof(source));
 	source.arg = file;
@@ -1367,7 +1905,12 @@ AnnIndexCanonical(AnnIndexFile *file, const unsigned char *program, size_t size,
 	source.value = SourceValue;
 	source.start = SourceStart;
 	source.multi = SourceMulti;
-	return AnnFilterCanonical(&source, program, size, out, outSize);
+	(void) pthread_rwlock_rdlock(&file->attributeLock);
+	done = AnnFilterCanonical(&source, program, size, out, outSize);
+	(void) pthread_rwlock_unlock(&file->attributeLock);
+	if (AnnIndexCanonicalHook)
+		AnnIndexCanonicalHook(file);
+	return done;
 }
 
 int
@@ -1375,6 +1918,7 @@ AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, size_t 
 					   unsigned char **base, size_t *baseSize, AnnFilterExclusion *exclusions, uint32_t *nexclusions)
 {
 	AnnFilterSource source;
+	int			done;
 
 	memset(&source, 0, sizeof(source));
 	source.arg = file;
@@ -1384,7 +1928,10 @@ AnnIndexCanonicalSplit(AnnIndexFile *file, const unsigned char *program, size_t 
 	source.value = SourceValue;
 	source.start = SourceStart;
 	source.multi = SourceMulti;
-	return AnnFilterCanonicalSplit(&source, program, size, maxExcluded, base, baseSize, exclusions, nexclusions);
+	(void) pthread_rwlock_rdlock(&file->attributeLock);
+	done = AnnFilterCanonicalSplit(&source, program, size, maxExcluded, base, baseSize, exclusions, nexclusions);
+	(void) pthread_rwlock_unlock(&file->attributeLock);
+	return done;
 }
 
 int
@@ -1424,8 +1971,8 @@ AnnIndexJobDropExcluded(AnnIndexJob *job)
 }
 
 AnnStatus
-AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const AnnFilterExclusion *exclusions,
-					 uint32_t nexclusions, uint64_t **rows, uint32_t *n)
+AnnIndexExcludedRows(AnnIndexFile *file, const AnnIndexBitmap *base, const AnnFilterExclusion *exclusions,
+					 uint32_t nexclusions, uint64_t remapGeneration, uint64_t **rows, uint32_t *n)
 {
 	uint64_t	total = 0;
 	uint64_t	at = 0;
@@ -1437,12 +1984,26 @@ AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const
 	*n = 0;
 	if (base->ordinals == NULL)
 		return ANN_INVALID;
+
+	/*
+	 * The exclusions' value positions index the arrays the split read: a
+	 * remap since may have shortened them.
+	 */
+	(void) pthread_rwlock_rdlock(&file->attributeLock);
+	if (__atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE) != remapGeneration)
+	{
+		(void) pthread_rwlock_unlock(&file->attributeLock);
+		return ANN_STALE;
+	}
 	for (uint32_t e = 0; e < nexclusions; e++)
 	{
 		const AnnIndexAttribute *attribute = &file->attributes[exclusions[e].column];
 
 		if (attribute->multi)
+		{
+			(void) pthread_rwlock_unlock(&file->attributeLock);
 			return ANN_INVALID;
+		}
 		for (uint32_t r = 0; r < exclusions[e].nruns; r++)
 			for (uint64_t v = exclusions[e].lo[r]; v < exclusions[e].hi[r]; v++)
 			{
@@ -1451,9 +2012,15 @@ AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const
 			}
 	}
 	if (total == 0)
+	{
+		(void) pthread_rwlock_unlock(&file->attributeLock);
 		return ANN_OK;
+	}
 	if ((all = malloc(sizeof(uint64_t) * total)) == NULL)
+	{
+		(void) pthread_rwlock_unlock(&file->attributeLock);
 		return ANN_NOMEM;
+	}
 	for (uint32_t e = 0; e < nexclusions; e++)
 	{
 		const AnnIndexAttribute *attribute = &file->attributes[exclusions[e].column];
@@ -1466,6 +2033,7 @@ AnnIndexExcludedRows(const AnnIndexFile *file, const AnnIndexBitmap *base, const
 				at += attribute->postings[v].count;
 			}
 	}
+	(void) pthread_rwlock_unlock(&file->attributeLock);
 	/* One value's rows are sorted already; several need sorting. */
 	if (blocks > 1)
 		qsort(all, total, sizeof(uint64_t), OrdinalCompare);
@@ -1546,12 +2114,100 @@ OverBudget(const AnnIndexFile *file, uint64_t hostBudget, uint64_t deviceBudget,
 		(entryCap && file->predicateEntries > entries);
 }
 
+/*
+ * Build and link a predicate result whose tombstones were read at a delete
+ * generation (UINT64_MAX: not checked), with two references, the cache's and
+ * the caller's. Deletes bump the generation under bitmapMutex after setting
+ * their bits, so a result linked under it at its own generation holds no
+ * deleted row. Otherwise a delete ran since: with deleteMutex held no other
+ * can, so a copy masked with the tombstones as they are now is built and
+ * linked instead (tombstones are only ever set, so masking again is enough).
+ *
+ * A remap that changed the index's arrays since remapGeneration was read
+ * (AnnIndexRemap bumps it once, under attributeLock and bitmapMutex) means
+ * the words may hold rows read with other arrays than the ones the caller's
+ * program was written or canonicalised against: nothing is linked, and
+ * ANN_STALE returned. Linked under the mutex at
+ * an unchanged generation, the result keeps later remaps out (they are
+ * refused while results are cached).
+ */
+static AnnStatus
+CachePredicate(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords,
+			   uint64_t expandLimit, uint64_t generation, uint64_t remapGeneration, int columnsOnly,
+			   AnnIndexBitmap **out)
+{
+	AnnIndexBitmap *bitmap = NULL;
+	AnnIndexBitmap *old = NULL;
+	uint32_t   *copy;
+	AnnStatus	status;
+
+	if (generation == UINT64_MAX || generation == __atomic_load_n(&file->deleteGeneration, __ATOMIC_ACQUIRE))
+	{
+		if ((status = BuildBitmap(file, id, kind, words, nwords, expandLimit, 0, &bitmap)) != ANN_OK)
+			return status;
+		bitmap->columnsOnly = columnsOnly;
+		bitmap->references = 2;
+		(void) pthread_mutex_lock(&file->bitmapMutex);
+		if (remapGeneration != file->remapGeneration)
+		{
+			(void) pthread_mutex_unlock(&file->bitmapMutex);
+			FreeBitmap(file, bitmap);
+			return ANN_STALE;
+		}
+		if (generation == UINT64_MAX || generation == file->deleteGeneration)
+		{
+			old = LinkBitmap(file, bitmap);
+			(void) pthread_mutex_unlock(&file->bitmapMutex);
+			if (old)
+				AnnIndexBitmapRelease(file, old);
+			*out = bitmap;
+			return ANN_OK;
+		}
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		FreeBitmap(file, bitmap);
+		bitmap = NULL;
+	}
+
+	if (nwords != ((size_t) file->rows + 31) / 32)
+		return ANN_INVALID;
+	if ((copy = malloc(nwords * 4)) == NULL)
+		return ANN_NOMEM;
+	memcpy(copy, words, nwords * 4);
+	(void) pthread_mutex_lock(&file->deleteMutex);
+	(void) MaskDeleted(file, copy);
+	status = BuildBitmap(file, id, kind, copy, nwords, expandLimit, 0, &bitmap);
+	if (status == ANN_OK)
+	{
+		bitmap->columnsOnly = columnsOnly;
+		bitmap->references = 2;
+		(void) pthread_mutex_lock(&file->bitmapMutex);
+		if (remapGeneration != file->remapGeneration)
+			status = ANN_STALE;
+		else
+		{
+			old = LinkBitmap(file, bitmap);
+			file->predicateRaced++;
+		}
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+		if (status != ANN_OK)
+			FreeBitmap(file, bitmap);
+	}
+	(void) pthread_mutex_unlock(&file->deleteMutex);
+	free(copy);
+	if (old)
+		AnnIndexBitmapRelease(file, old);
+	if (status == ANN_OK)
+		*out = bitmap;
+	return status;
+}
+
 AnnStatus
 AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, size_t nwords, uint64_t expandLimit,
-					 AnnIndexBitmap **result)
+					 uint64_t generation, uint64_t remapGeneration, int columnsOnly, AnnIndexBitmap **result)
 {
 	AnnIndexBitmap *kept = NULL;
-	AnnStatus	status = AnnIndexBitmapPut(file, id, kind, words, nwords, expandLimit, &kept);
+	AnnStatus	status = CachePredicate(file, id, kind, words, nwords, expandLimit, generation, remapGeneration,
+										columnsOnly, &kept);
 	uint64_t	hostBudget = PredicateHostBudget();
 	uint64_t	deviceBudget = AnnIndexConfig.predicate_device_bytes;
 	uint64_t	entryCap = AnnIndexConfig.predicate_cache;
@@ -1601,22 +2257,27 @@ AnnIndexPredicatePut(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *
 }
 
 void
-AnnIndexPredicateStats(uint64_t *entries, uint64_t *bytes, uint64_t *deviceBytes, uint64_t *evictions)
+AnnIndexPredicateStats(AnnIndexPredicateTotals *totals)
 {
-	*entries = *bytes = *deviceBytes = *evictions = 0;
+	memset(totals, 0, sizeof(*totals));
 	(void) pthread_rwlock_rdlock(&registryLock);
 	for (Entry *entry = registry; entry; entry = entry->next)
 	{
 		AnnIndexFile *file = entry->file;
 
 		(void) pthread_mutex_lock(&file->bitmapMutex);
-		*entries += file->predicateEntries;
-		*bytes += file->predicateBytes;
-		*deviceBytes += file->predicateDeviceBytes;
-		*evictions += file->predicateEvictions;
+		totals->entries += file->predicateEntries;
+		totals->bytes += file->predicateBytes;
+		totals->deviceBytes += file->predicateDeviceBytes;
+		totals->evictions += file->predicateEvictions;
+		totals->patched += file->predicatePatched;
+		totals->dropped += file->predicateDropped;
+		totals->raced += file->predicateRaced;
 		(void) pthread_mutex_unlock(&file->bitmapMutex);
 	}
 	(void) pthread_rwlock_unlock(&registryLock);
+	totals->sharedEntries = __atomic_load_n(&rowSetEntries, __ATOMIC_RELAXED);
+	totals->sharedBytes = __atomic_load_n(&rowSetBytes, __ATOMIC_RELAXED);
 }
 
 AnnIndexBitmap *
@@ -1781,6 +2442,8 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 	if (file == NULL)
 		return ANN_NOMEM;
 	(void) pthread_mutex_init(&file->bitmapMutex, NULL);
+	(void) pthread_mutex_init(&file->deleteMutex, NULL);
+	(void) pthread_rwlock_init(&file->attributeLock, NULL);
 	strcpy(file->name, name);
 	strcpy(file->directory, directory);
 	warmBytes = 0;
@@ -1945,13 +2608,260 @@ AnnIndexFileClose(AnnIndexFile *file)
 			FreeBitmap(file, bitmap);
 		}
 	(void) pthread_mutex_destroy(&file->bitmapMutex);
+	(void) pthread_mutex_destroy(&file->deleteMutex);
+	(void) pthread_rwlock_destroy(&file->attributeLock);
 	free(file);
+}
+
+static pthread_mutex_t rowSetMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t compareMutex = PTHREAD_MUTEX_INITIALIZER;
+
+#define ANN_ROW_SET_CANDIDATES 64
+
+/* What a predicate evaluation reads of an index, taken under its bitmapMutex. */
+typedef struct FilterInputs
+{
+	struct
+	{
+		const AnnIndexPosting *postings;
+		const uint64_t *ordinals;
+		uint32_t	nvalues;
+		uint64_t	npostings;
+	}			attributes[ANN_INDEX_MAX_ATTRIBUTES];
+} FilterInputs;
+
+/* Under the file's attributeLock or bitmapMutex (AnnIndexRemap holds both). */
+static int
+Remapped(const AnnIndexFile *file)
+{
+	for (uint32_t a = 0; a < file->nattributes; a++)
+		if (file->attributes[a].remap)
+			return 1;
+	return 0;
+}
+
+/* The arrays as they are now; 0 once remapped. */
+static int
+ReadInputs(AnnIndexFile *file, FilterInputs *inputs)
+{
+	int			remapped;
+
+	(void) pthread_mutex_lock(&file->bitmapMutex);
+	remapped = Remapped(file);
+	for (uint32_t a = 0; !remapped && a < file->nattributes; a++)
+	{
+		inputs->attributes[a].postings = file->attributes[a].postings;
+		inputs->attributes[a].ordinals = file->attributes[a].ordinals;
+		inputs->attributes[a].nvalues = file->attributes[a].nvalues;
+		inputs->attributes[a].npostings = file->attributes[a].npostings;
+	}
+	(void) pthread_mutex_unlock(&file->bitmapMutex);
+	return !remapped;
+}
+
+/*
+ * The cheap gate: sizes, names and kinds; a's sizes as ReadInputs took them
+ * (not remapped then), b's under its attributeLock. JoinMatch checks again
+ * under each file's bitmapMutex that neither was remapped since.
+ */
+static int
+SameShape(const AnnIndexFile *a, const FilterInputs *ia, AnnIndexFile *b)
+{
+	int			same;
+
+	if (a->rows != b->rows || a->nattributes != b->nattributes)
+		return 0;
+	(void) pthread_rwlock_rdlock(&b->attributeLock);
+	same = !Remapped(b);
+	for (uint32_t i = 0; same && i < a->nattributes; i++)
+		same = strcmp(a->attributes[i].name, b->attributes[i].name) == 0 &&
+			a->attributes[i].multi == b->attributes[i].multi &&
+			ia->attributes[i].nvalues == b->attributes[i].nvalues &&
+			ia->attributes[i].npostings == b->attributes[i].npostings;
+	(void) pthread_rwlock_unlock(&b->attributeLock);
+	return same;
+}
+
+/* Every key and posting; the first difference ends it. */
+static int
+SameInputs(const AnnIndexFile *a, const FilterInputs *ia, const AnnIndexFile *b, const FilterInputs *ib)
+{
+	if (a->rows > 0 && memcmp(a->keys, b->keys, sizeof(int64_t) * a->rows) != 0)
+		return 0;
+	for (uint32_t i = 0; i < a->nattributes; i++)
+	{
+		if (ia->attributes[i].nvalues != ib->attributes[i].nvalues ||
+			ia->attributes[i].npostings != ib->attributes[i].npostings)
+			return 0;
+		for (uint32_t v = 0; v < ia->attributes[i].nvalues; v++)
+			if (ia->attributes[i].postings[v].value != ib->attributes[i].postings[v].value ||
+				ia->attributes[i].postings[v].offset != ib->attributes[i].postings[v].offset ||
+				ia->attributes[i].postings[v].count != ib->attributes[i].postings[v].count)
+				return 0;
+		if (ia->attributes[i].npostings > 0 &&
+			memcmp(ia->attributes[i].ordinals, ib->attributes[i].ordinals,
+				   sizeof(uint64_t) * ia->attributes[i].npostings) != 0)
+			return 0;
+	}
+	return 1;
+}
+
+/*
+ * Put file in match's row set, creating it if match has none. Under each
+ * file's bitmapMutex, so a remap (which leaves its row set) either comes
+ * first and is seen, or comes after: the arrays compared were the ones a
+ * remap had not changed.
+ */
+static int
+JoinMatch(AnnIndexFile *file, AnnIndexFile *match)
+{
+	AnnIndexRowSet *set;
+	int			joined = 0;
+
+	(void) pthread_mutex_lock(&rowSetMutex);
+	(void) pthread_mutex_lock(&match->bitmapMutex);
+	set = match->rowSet;
+	if (set == NULL && match->rowSetHeld == NULL && !Remapped(match) &&
+		(set = calloc(1, sizeof(*set))) != NULL)
+	{
+		(void) pthread_mutex_init(&set->mutex, NULL);
+		set->members = 1;
+		set->attached = 1;
+		match->rowSetHeld = set;
+		__atomic_store_n(&match->rowSet, set, __ATOMIC_RELEASE);
+	}
+	(void) pthread_mutex_unlock(&match->bitmapMutex);
+	if (set)
+	{
+		(void) pthread_mutex_lock(&file->bitmapMutex);
+		if (file->rowSetHeld == NULL && !Remapped(file))
+		{
+			set->members++;
+			file->rowSetHeld = set;
+			(void) pthread_mutex_lock(&set->mutex);
+			set->attached++;
+			__atomic_store_n(&file->rowSet, set, __ATOMIC_RELEASE);
+			(void) pthread_mutex_unlock(&set->mutex);
+			joined = 1;
+		}
+		(void) pthread_mutex_unlock(&file->bitmapMutex);
+	}
+	(void) pthread_mutex_unlock(&rowSetMutex);
+	return joined;
+}
+
+/* A destroyed file leaves the row set it joined (detaching, unless a remap did). */
+static void
+ReleaseRowSet(AnnIndexFile *file)
+{
+	AnnIndexRowSet *set = file->rowSetHeld;
+	int			last;
+
+	if (set == NULL)
+		return;
+	if (file->rowSet)
+	{
+		(void) pthread_mutex_lock(&set->mutex);
+		__atomic_store_n(&file->rowSet, NULL, __ATOMIC_RELEASE);
+		set->attached--;
+		(void) pthread_mutex_unlock(&set->mutex);
+	}
+	(void) pthread_mutex_lock(&rowSetMutex);
+	last = --set->members == 0;
+	(void) pthread_mutex_unlock(&rowSetMutex);
+	if (last)
+	{
+		/* No member is left to hold a result. */
+		while (set->nresults > 0)
+			UnlistRaw(set, 0);
+		(void) pthread_mutex_destroy(&set->mutex);
+		free(set);
+	}
+}
+
+/*
+ * Find a loaded index with the same filter inputs as file (rows, keys,
+ * attribute names and kinds in order, posting values, offsets, counts and
+ * ordinals; neither remapped) and join its row set, creating one when it has
+ * none. Returns 1 when file is in a row set. Reads every key and posting of a
+ * matching pair, so it runs off the load path.
+ */
+static int
+JoinRowSet(AnnIndexFile *file)
+{
+	AnnIndexFile *candidates[ANN_ROW_SET_CANDIDATES];
+	uint32_t	ncandidates = 0;
+	AnnIndexFile *match = NULL;
+	FilterInputs mine;
+	FilterInputs theirs;
+	double		start = Now();
+	int			joined = 0;
+
+	(void) pthread_mutex_lock(&compareMutex);
+
+	/* Joined meanwhile, as another index's match. */
+	if (__atomic_load_n(&file->rowSet, __ATOMIC_ACQUIRE) != NULL || !ReadInputs(file, &mine))
+	{
+		(void) pthread_mutex_unlock(&compareMutex);
+		return __atomic_load_n(&file->rowSet, __ATOMIC_ACQUIRE) != NULL;
+	}
+
+	/* One member of each row set is enough: its members are equal. */
+	(void) pthread_rwlock_rdlock(&registryLock);
+	for (Entry *entry = registry; entry && ncandidates < ANN_ROW_SET_CANDIDATES; entry = entry->next)
+	{
+		AnnIndexFile *other = entry->file;
+		AnnIndexRowSet *set = __atomic_load_n(&other->rowSet, __ATOMIC_ACQUIRE);
+		int			seen = 0;
+
+		if (other == file || !SameShape(file, &mine, other))
+			continue;
+		for (uint32_t c = 0; set && c < ncandidates; c++)
+			seen |= __atomic_load_n(&candidates[c]->rowSet, __ATOMIC_ACQUIRE) == set;
+		if (seen)
+			continue;
+		(void) __atomic_add_fetch(&other->references, 1, __ATOMIC_ACQ_REL);
+		candidates[ncandidates++] = other;
+	}
+	(void) pthread_rwlock_unlock(&registryLock);
+
+	for (uint32_t c = 0; c < ncandidates && !joined; c++)
+		if (ReadInputs(candidates[c], &theirs) && SameInputs(file, &mine, candidates[c], &theirs) &&
+			JoinMatch(file, candidates[c]))
+		{
+			match = candidates[c];
+			joined = 1;
+		}
+	(void) pthread_mutex_unlock(&compareMutex);
+	if (joined)
+		fprintf(stderr, "ann index %s: filter results shared with %s (%.1f s)\n", file->name, match->name,
+				Now() - start);
+	else if (ncandidates > 0)
+		fprintf(stderr, "ann index %s: filter results not shared: %u indexes of its shape differ (%.1f s)\n",
+				file->name, ncandidates, Now() - start);
+	for (uint32_t c = 0; c < ncandidates; c++)
+		AnnIndexPut(candidates[c]);
+	return joined;
+}
+
+static void *
+JoinThread(void *argument)
+{
+	AnnIndexFile *file = argument;
+
+	(void) JoinRowSet(file);
+	AnnIndexPut(file);
+	return NULL;
 }
 
 /* Names are unique; to replace an index, load the new one under another name and unload the old one. */
 AnnStatus
 AnnIndexRegister(AnnIndexFile *file)
 {
+	int			join = AnnIndexConfig.shared_predicate_bytes > 0 && file->nattributes > 0;
+	pthread_attr_t attributes;
+	pthread_t	thread;
+
 	Entry	   *entry;
 
 	(void) pthread_rwlock_wrlock(&registryLock);
@@ -1968,10 +2878,28 @@ AnnIndexRegister(AnnIndexFile *file)
 		return ANN_NOMEM;
 	}
 	entry->file = file;
-	__atomic_store_n(&file->references, 1, __ATOMIC_RELEASE);	/* the registry's */
+	/* The registry's, and the joining thread's: an unload may come first. */
+	__atomic_store_n(&file->references, join ? 2 : 1, __ATOMIC_RELEASE);
 	entry->next = registry;
 	registry = entry;
 	(void) pthread_rwlock_unlock(&registryLock);
+
+	/*
+	 * Registered first, so of two indexes loaded together the one compared
+	 * second sees the first. The index serves searches meanwhile, unshared.
+	 */
+	if (join)
+	{
+		if (pthread_attr_init(&attributes) != 0)
+			AnnIndexPut(file);
+		else
+		{
+			(void) pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+			if (pthread_create(&thread, &attributes, JoinThread, file) != 0)
+				AnnIndexPut(file);
+			(void) pthread_attr_destroy(&attributes);
+		}
+	}
 	return ANN_OK;
 }
 
@@ -2010,6 +2938,7 @@ AnnIndexHoldCount(AnnIndexFile *file, uint32_t count)
 static void
 Destroy(AnnIndexFile *file)
 {
+	ReleaseRowSet(file);
 	free(file->deleted);
 	if (file->device && AnnIndexDeviceDestroy)
 		AnnIndexDeviceDestroy(file->device);

@@ -38,6 +38,9 @@ class NativeBatchTests(unittest.TestCase):
     def test_selection_positions_are_unique(self):
         self.scenario('positions')
 
+    def test_upload_deferred_states(self):
+        self.scenario('upload-deferred')
+
 
 if __name__ == '__main__':
     unittest.main()

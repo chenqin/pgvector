@@ -164,6 +164,70 @@ typedef struct Run
 } Run;
 
 /*
+ * Sort ordinals ascending: a least-significant-digit radix sort in three
+ * passes of 11 bits, so a long list costs a few passes over memory instead
+ * of n log n compares through a function pointer. A pass whose digit is the
+ * same for every ordinal is skipped. Small lists, and a list whose scratch
+ * cannot be allocated, use qsort; the order is the same either way.
+ */
+#define SORT_RADIX_BITS 11
+#define SORT_RADIX_SIZE (1 << SORT_RADIX_BITS)
+#define SORT_RADIX_MIN 64
+
+static void
+SortOrdinals(Evaluator *e, uint32_t *list, uint64_t n)
+{
+	uint32_t   *scratch;
+	uint32_t   *counts;
+	uint32_t   *from = list;
+	uint32_t   *to;
+
+	if (n < SORT_RADIX_MIN || n > UINT32_MAX)
+	{
+		qsort(list, n, sizeof(uint32_t), OrdinalCompare);
+		return;
+	}
+	if ((scratch = Alloc(e, (n + 3 * SORT_RADIX_SIZE) * sizeof(uint32_t))) == NULL)
+	{
+		/* No new failure: fall back to the compare sort. */
+		e->error = ANN_FILTER_OK;
+		qsort(list, n, sizeof(uint32_t), OrdinalCompare);
+		return;
+	}
+	counts = scratch + n;
+	to = scratch;
+	memset(counts, 0, 3 * SORT_RADIX_SIZE * sizeof(uint32_t));
+	for (uint64_t i = 0; i < n; i++)
+		for (int pass = 0; pass < 3; pass++)
+			counts[pass * SORT_RADIX_SIZE + ((list[i] >> (pass * SORT_RADIX_BITS)) & (SORT_RADIX_SIZE - 1))]++;
+	for (int pass = 0; pass < 3; pass++)
+	{
+		uint32_t   *count = counts + pass * SORT_RADIX_SIZE;
+		uint32_t	shift = pass * SORT_RADIX_BITS;
+		uint32_t	sum = 0;
+		uint32_t   *swap;
+
+		if (count[(from[0] >> shift) & (SORT_RADIX_SIZE - 1)] == n)
+			continue;
+		for (int d = 0; d < SORT_RADIX_SIZE; d++)
+		{
+			uint32_t	c = count[d];
+
+			count[d] = sum;
+			sum += c;
+		}
+		for (uint64_t i = 0; i < n; i++)
+			to[count[(from[i] >> shift) & (SORT_RADIX_SIZE - 1)]++] = from[i];
+		swap = from;
+		from = to;
+		to = swap;
+	}
+	if (from != list)
+		memcpy(list, from, n * sizeof(uint32_t));
+	Release(e, scratch);
+}
+
+/*
  * Union of postings runs: a sorted list when small, else bits. Runs of a
  * multi-valued column can share rows, so its lists are deduplicated.
  */
@@ -195,7 +259,7 @@ FromRuns(Evaluator *e, int column, const Run *runs, uint32_t nruns, int sorted, 
 		out->n = total;
 		if (nruns > 1 || !sorted)
 		{
-			qsort(out->list, total, sizeof(uint32_t), OrdinalCompare);
+			SortOrdinals(e, out->list, total);
 			if (multi && total > 1)
 			{
 				out->n = 1;
@@ -611,6 +675,24 @@ AnnFilterEvaluate(const AnnFilterSource *source, const unsigned char *program, s
 	while (depth > 0)
 		FreeSet(&e, &stack[--depth]);
 	return ok ? ANN_FILTER_OK : (e.error ? e.error : ANN_FILTER_SOURCE_ERROR);
+}
+
+int
+AnnFilterUsesBitmap(const unsigned char *program, size_t size)
+{
+	size_t		offset = 0;
+
+	while (offset < size)
+	{
+		size_t		step = StepSize(program, size, offset);
+
+		if (step == 0)
+			return 0;
+		if (program[offset] == ANN_FILTER_BITMAP)
+			return 1;
+		offset += step;
+	}
+	return 0;
 }
 
 /* FNV-1a, seeded apart from PostgreSQL's filter-text ids. */

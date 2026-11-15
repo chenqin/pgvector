@@ -86,6 +86,12 @@ int			AnnFilterCheck(const unsigned char *program, size_t size);
 int			AnnFilterEvaluate(const AnnFilterSource *source, const unsigned char *program, size_t size,
 							  uint32_t *words, uint64_t *count);
 
+/*
+ * Whether a well-formed program reads a stored bitmap (a BITMAP leaf), so
+ * its rows depend on more than the attribute columns.
+ */
+int			AnnFilterUsesBitmap(const unsigned char *program, size_t size);
+
 /* Cache id of a program: the same text hashes the same on every host. */
 uint64_t	AnnFilterHash(const unsigned char *program, size_t size);
 

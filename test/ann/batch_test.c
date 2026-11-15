@@ -384,6 +384,96 @@ Positions(void)
 	}
 }
 
+/*
+ * A deferred upload: one thread uploads (1 to 2 to 0) while the others
+ * return at once, and whoever reads 0 after 2 also reads the published
+ * device pointers.
+ */
+static void *fakeDevice[1];
+static AnnIndexBitmap *uploading;
+static int	uploadCount;		/* atomic */
+static int	observing;			/* atomic */
+static int	observedUploading;	/* the observer read 2 */
+static int	observedEarly;		/* it read 0 after 2 with no pointers */
+
+static void
+FakeUpload(AnnIndexFile *file, AnnIndexBitmap *copy)
+{
+	(void) file;
+	assert(__atomic_load_n(&uploading->uploadDeferred, __ATOMIC_ACQUIRE) == 2);
+	(void) __atomic_fetch_add(&uploadCount, 1, __ATOMIC_RELAXED);
+	Sleep(50);
+	copy->device = fakeDevice;
+	copy->deviceBytes = 64;
+}
+
+static void *
+Upload(void *arg)
+{
+	AnnIndexBitmapUploadDeferred(arg, uploading);
+	return NULL;
+}
+
+static void *
+Observe(void *arg)
+{
+	(void) arg;
+	while (__atomic_load_n(&observing, __ATOMIC_ACQUIRE))
+	{
+		int			state = __atomic_load_n(&uploading->uploadDeferred, __ATOMIC_ACQUIRE);
+
+		if (state == 2)
+			observedUploading = 1;
+		else if (state == 0 && observedUploading &&
+				 __atomic_load_n(&uploading->device, __ATOMIC_ACQUIRE) != fakeDevice)
+			observedEarly = 1;
+	}
+	return NULL;
+}
+
+static void
+UploadDeferredStates(void)
+{
+	AnnIndexFile *file = calloc(1, sizeof(AnnIndexFile));
+	AnnIndexBitmap *bitmap = calloc(1, sizeof(AnnIndexBitmap));
+	pthread_t	threads[4];
+	pthread_t	observer;
+
+	assert(file != NULL && bitmap != NULL);
+	(void) pthread_mutex_init(&file->bitmapMutex, NULL);
+	(void) pthread_rwlock_init(&file->attributeLock, NULL);
+	file->device = fakeDevice;
+	bitmap->id = 5;
+	bitmap->kind = ANN_BITMAP_PREDICATE;
+	bitmap->references = 1;
+	bitmap->uploadDeferred = 1;
+	file->bitmaps[bitmap->id % ANN_INDEX_BITMAP_BUCKETS] = bitmap;
+	uploading = bitmap;
+	AnnIndexBitmapDevice.upload = FakeUpload;
+	observing = 1;
+	assert(!pthread_create(&observer, NULL, Observe, NULL));
+	for (int i = 0; i < 4; i++)
+		assert(!pthread_create(&threads[i], NULL, Upload, file));
+	for (int i = 0; i < 4; i++)
+		assert(!pthread_join(threads[i], NULL));
+	__atomic_store_n(&observing, 0, __ATOMIC_RELEASE);
+	assert(!pthread_join(observer, NULL));
+	assert(uploadCount == 1 && bitmap->uploadDeferred == 0 && bitmap->device == (void **) fakeDevice);
+	assert(file->bitmapDeviceBytes == 64 && file->predicateDeviceBytes == 64);
+	assert(observedUploading && !observedEarly);
+
+	/* Without devices the flag clears and nothing uploads. */
+	bitmap->uploadDeferred = 1;
+	file->device = NULL;
+	AnnIndexBitmapUploadDeferred(file, bitmap);
+	assert(uploadCount == 1 && bitmap->uploadDeferred == 0);
+	AnnIndexBitmapDevice.upload = NULL;
+	(void) pthread_mutex_destroy(&file->bitmapMutex);
+	(void) pthread_rwlock_destroy(&file->attributeLock);
+	free(bitmap);
+	free(file);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -405,6 +495,8 @@ main(int argc, char **argv)
 		Errors();
 	else if (!strcmp(argv[1], "positions"))
 		Positions();
+	else if (!strcmp(argv[1], "upload-deferred"))
+		UploadDeferredStates();
 	else
 		return 2;
 	puts("ok");

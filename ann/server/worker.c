@@ -305,6 +305,8 @@ main(int argc, char **argv)
 			serveOptions.lanes = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--readers") == 0)
 			serveOptions.readers = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--predicate-resolvers") == 0)
+			serveOptions.predicate_resolvers = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--merge-duplicates") == 0)
 			serveOptions.merge_duplicates = strcmp(value, "on") == 0;
 		else if (strcmp(argv[i], "--scheduler-shards") == 0)
@@ -424,6 +426,21 @@ main(int argc, char **argv)
 			}
 			AnnIndexConfig.residual_masks = strcmp(value, "on") == 0;
 		}
+		else if (strcmp(argv[i], "--delete-patch") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--delete-patch takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.delete_patch_off = strcmp(value, "off") == 0;
+		}
+		else if (strcmp(argv[i], "--delete-patch-rows") == 0)
+			AnnIndexConfig.delete_patch_rows = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--delete-patch-entries") == 0)
+			AnnIndexConfig.delete_patch_entries = (uint32_t) strtoul(value, NULL, 10);
+		else if (strcmp(argv[i], "--shared-predicate-mb") == 0)
+			AnnIndexConfig.shared_predicate_bytes = (uint64_t) strtoull(value, NULL, 10) << 20;
 		else if (strcmp(argv[i], "--canonical-predicates") == 0)
 		{
 			if (strcmp(value, "on") && strcmp(value, "off"))
@@ -763,7 +780,7 @@ main(int argc, char **argv)
 usage:
 #ifdef ANN_USE_CUVS
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu|cuvs] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
-			"[--lanes N] [--scheduler-shards N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
+			"[--lanes N] [--scheduler-shards N] [--readers N] [--predicate-resolvers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--filtered-block-size N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
@@ -771,14 +788,20 @@ usage:
 			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--residual-masks on|off] [--quantized-scan on|off] [--quant-slack N]\n"
 			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--scan-skip-tail on|off] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--scan-routes on|off] [--scan-max-k N]\n"
-			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
+			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]\n"
+			"  [--delete-patch on|off] [--delete-patch-rows N] [--delete-patch-entries N] [--shared-predicate-mb MB]]\n"
+			"--delete-patch (on by default): a delete replaces each cached predicate result holding its rows by a copy\n"
+			"  without them; patched entries are re-uploaded to the devices at their next lookup\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "
-			"[--lanes N] [--scheduler-shards N] [--readers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
+			"[--lanes N] [--scheduler-shards N] [--readers N] [--predicate-resolvers N] [--merge-duplicates on|off] [--filter-lanes N] [--active-lanes N] [--max-batch N] [--delay-us N] [--max-pending-mb N] [--index-pending-share PERCENT] [--trace FILE [--trace-sample N]]\n"
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--filtered-block-size N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--predicate-cache N]\n"
-			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]]\n"
+			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]\n"
+			"  [--delete-patch on|off] [--delete-patch-rows N] [--delete-patch-entries N] [--shared-predicate-mb MB]]\n"
+			"--delete-patch (on by default): a delete replaces each cached predicate result holding its rows by a copy\n"
+			"  without them; patched entries are re-uploaded to the devices at their next lookup\n"
 			"cuvs, hipvs, and fused-nvfp4 require vendor adapters\n");
 #endif
 	return 2;

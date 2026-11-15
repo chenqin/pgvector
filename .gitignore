@@ -31,6 +31,10 @@ cufile.log
 /ann/server/ann-cost-tests.dSYM/
 /ann/server/ann-canonical-tests
 /ann/server/ann-canonical-tests.dSYM/
+/ann/server/ann-filter-tests
+/ann/server/ann-filter-tests.dSYM/
+/ann/server/ann-predicate-tests
+/ann/server/ann-predicate-tests.dSYM/
 /ann/server/ann-udf-tests
 /ann/server/ann-udf-tests.dSYM/
 /ann/server/cagra-udf-probe
