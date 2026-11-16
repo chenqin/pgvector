@@ -133,8 +133,8 @@ typedef struct AnnIndexBitmap
 	uint64_t	used;			/* last use, for predicate eviction */
 	int			references;
 	struct AnnIndexBitmap *next;
-	int			uploadDeferred; /* --gpu-predicates: 1 not on the devices until
-								 * looked up again, 2 being uploaded, 0
+	int			uploadDeferred; /* --gpu-predicates: 1 not on the devices
+								 * until looked up again, 2 being uploaded, 0
 								 * neither (atomic) */
 	uint64_t	expandLimit;	/* BuildBitmap's: a rebuilt copy keeps the
 								 * same forms */
@@ -214,8 +214,8 @@ struct AnnIndexFile
 	uint64_t	predicatePatched;	/* entries a delete replaced by a copy
 									 * without its rows */
 	uint64_t	predicateDropped;	/* entries a delete flushed */
-	uint64_t	predicateRaced; /* results re-masked before caching: a
-								 * delete ran during their evaluation */
+	uint64_t	predicateRaced; /* results re-masked before caching: a delete
+								 * ran during their evaluation */
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
 	uint16_t   *halfVectors;	/* FP16 copy for --rescore fp16, else NULL */
@@ -227,10 +227,10 @@ struct AnnIndexFile
 	AnnIndexRowSet *rowSet;		/* the row set whose results it shares, or
 								 * NULL (atomic; set under bitmapMutex) */
 	AnnIndexRowSet *rowSetHeld; /* the one it joined, kept until destroyed */
-	uint64_t	remapGeneration;	/* bumped once by each AnnIndexRemap
-									 * that changes the arrays, under
-									 * attributeLock (exclusive) and
-									 * bitmapMutex (atomic reads) */
+	uint64_t	remapGeneration;	/* bumped once by each AnnIndexRemap that
+									 * changes the arrays, under attributeLock
+									 * (exclusive) and bitmapMutex (atomic
+									 * reads) */
 
 	/*
 	 * Held shared by every reader of the attribute arrays that AnnIndexRemap
@@ -342,19 +342,19 @@ typedef struct AnnIndexOptions
 								 * two-hop graph search, each with its own
 								 * bitset */
 	uint32_t	filtered_block; /* --filtered-block-size: threads per cuVS
-								 * thread block of a bitset CAGRA search
-								 * (64, 128, 256); 0 lets cuVS choose */
+								 * thread block of a bitset CAGRA search (64,
+								 * 128, 256); 0 lets cuVS choose */
 	int			delete_patch_off;	/* --delete-patch off: a delete drops the
 									 * cached predicate results instead of
 									 * patching those holding its rows */
 	uint32_t	delete_patch_rows;	/* --delete-patch-rows: deletes of more
 									 * rows drop instead */
-	uint32_t	delete_patch_entries;	/* --delete-patch-entries: most entries
-										 * one delete patches; it drops the
-										 * rest it hits */
+	uint32_t	delete_patch_entries;	/* --delete-patch-entries: most
+										 * entries one delete patches; it
+										 * drops the rest it hits */
 	uint64_t	shared_predicate_bytes; /* --shared-predicate-mb: host memory
-										 * for the results a row set shares;
-										 * 0 forms no row sets */
+										 * for the results a row set shares; 0
+										 * forms no row sets */
 } AnnIndexOptions;
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */

@@ -2,6 +2,8 @@
  * Resident CAGRA and gathered searches share loaded shard data and
  * per-lane streams; grouped gathers can score, select and rerank matrices.
  */
+#define _GNU_SOURCE
+
 #include "backend.h"
 #include "indexfile.h"
 #include "nvrtc.h"

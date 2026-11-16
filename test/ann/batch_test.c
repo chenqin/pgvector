@@ -107,7 +107,7 @@ Idle(AnnBatcher *batcher)
 }
 
 static void
-Batch(void)
+Batch		(void)
 {
 	AnnBatchOptions options;
 	AnnBatcher *batcher;
@@ -480,7 +480,8 @@ main(int argc, char **argv)
 	if (argc != 2)
 		return 2;
 	if (!strcmp(argv[1], "batch"))
-		Batch();
+		Batch		();
+
 	else if (!strcmp(argv[1], "admission"))
 		Admission();
 	else if (!strcmp(argv[1], "deadlines"))

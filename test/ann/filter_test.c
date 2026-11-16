@@ -269,7 +269,7 @@ NoteHigh(int c, int32_t value)
  * scratch refused.
  */
 static int
-Run(uint32_t rows_, int domain_, int singleDomain_, int nprograms, unsigned seed)
+Run			(uint32_t rows_, int domain_, int singleDomain_, int nprograms, unsigned seed)
 {
 	Pair	   *pairs;
 	uint64_t	npairs = 0;
@@ -340,7 +340,7 @@ Run(uint32_t rows_, int domain_, int singleDomain_, int nprograms, unsigned seed
 
 	for (int t = 0; t < nprograms; t++)
 	{
-		Program		p = {.b = malloc(1 << 16), .n = 0};
+		Program		p = {.b = malloc(1 << 16),.n = 0};
 		uint64_t	count = 0,
 					countAgain = 0,
 					expected = 0;
@@ -371,7 +371,10 @@ Run(uint32_t rows_, int domain_, int singleDomain_, int nprograms, unsigned seed
 			return 1;
 		}
 
-		/* Again with the sort's scratch refused: the same code, words and count. */
+		/*
+		 * Again with the sort's scratch refused: the same code, words and
+		 * count.
+		 */
 		source.alloc = RefuseScratch;
 		lastSize = 0;
 		code = AnnFilterEvaluate(&source, p.b, p.n, again, &countAgain);
@@ -415,8 +418,8 @@ main(void)
 	 * Past 2^22 rows the third digit varies: values are spread wider there,
 	 * so lists of several runs stay under rows / 64 and hold those rows.
 	 */
-	if (Run(100003, 500, 100, 400, 7) != 0 ||
-		Run(4194319, 20000, 4000, 100, 11) != 0)
+	if (Run (100003, 500, 100, 400, 7) != 0 ||
+		Run (4194319, 20000, 4000, 100, 11) != 0)
 		return 1;
 	return 0;
 }

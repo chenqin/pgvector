@@ -256,8 +256,8 @@ typedef struct Service
 	uint64_t	predicate_inline;	/* searches whose reader evaluated their
 									 * predicate with resolvers on (a stored
 									 * bitmap's program, or the queue full) */
-	uint64_t	predicate_shared;	/* evaluations whose rows were copied
-									 * from a result their row set kept */
+	uint64_t	predicate_shared;	/* evaluations whose rows were copied from
+									 * a result their row set kept */
 	AnnRdma    *rdma;
 
 	/*
@@ -2816,8 +2816,8 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 			int			deferred;
 
 			/*
-			 * An entry cached after a remap (none survive one) holds rows
-			 * of the new arrays, which this program was not read against.
+			 * An entry cached after a remap (none survive one) holds rows of
+			 * the new arrays, which this program was not read against.
 			 */
 			if (__atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE) != remapGeneration)
 			{
@@ -2875,10 +2875,10 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 				AnnIndexBitmapUploadDeferred(file, *result);
 
 			/*
-			 * Not under a scheduler mutex: every search would contend for
-			 * it. A search's hits are counted by the thread that completes
-			 * its frame (PredicateSearchBitmap): a reader that hands the
-			 * frame off leaves them to the resolver, which looks again.
+			 * Not under a scheduler mutex: every search would contend for it.
+			 * A search's hits are counted by the thread that completes its
+			 * frame (PredicateSearchBitmap): a reader that hands the frame
+			 * off leaves them to the resolver, which looks again.
 			 */
 			if (searchLookup)
 				foundCached++;
@@ -2892,6 +2892,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 			free(canonical);
 			return ANN_PENDING;
 		}
+
 		/*
 		 * After waiting for another index of the row set, this index's own
 		 * copy and build need not wait for the other indexes' builds.
@@ -3599,6 +3600,7 @@ HandOff(Service *service, uint16_t operation, Connection *connection, int rdma, 
 	item->part = submittingPart;
 	item->operation = operation;
 	item->rdma = rdma;
+
 	/*
 	 * Read on the reader before its lookup read the arrays, so before any
 	 * remap from the connection's next frames.

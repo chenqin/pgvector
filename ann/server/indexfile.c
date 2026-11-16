@@ -180,8 +180,7 @@ typedef struct RawResult
 	uint32_t   *words;
 	size_t		bytes;
 	uint64_t	used;
-	int			references;		/* the cache's while listed, and each
-								 * copier's */
+	int			references;		/* the cache's while listed, and each copier's */
 } RawResult;
 
 #define ANN_ROW_SET_RESULTS 256
@@ -920,8 +919,8 @@ AnnIndexRemap(AnnIndexFile *file, const char *name, const int32_t *map, uint32_t
 			return ANN_INVALID;
 
 	/*
-	 * The common answers first, without the write lock, so that a repeated
-	 * or refused remap does not wait for a busy index's readers. Both are
+	 * The common answers first, without the write lock, so that a repeated or
+	 * refused remap does not wait for a busy index's readers. Both are
 	 * checked again under the locks.
 	 */
 	{
@@ -1016,10 +1015,10 @@ AnnIndexRemap(AnnIndexFile *file, const char *name, const int32_t *map, uint32_t
 
 	/*
 	 * One bump, inside the exclusive section: a reader that read the
-	 * generation before it read the old arrays, or the new ones and now
-	 * sees it changed; either way a result whose arrays may differ from the
-	 * generation its caller captured is not cached (AnnIndexPredicatePut)
-	 * and answers stale.
+	 * generation before it read the old arrays, or the new ones and now sees
+	 * it changed; either way a result whose arrays may differ from the
+	 * generation its caller captured is not cached (AnnIndexPredicatePut) and
+	 * answers stale.
 	 */
 	(void) __atomic_add_fetch(&file->remapGeneration, 1, __ATOMIC_ACQ_REL);
 	(void) pthread_mutex_unlock(&file->bitmapMutex);
@@ -1608,9 +1607,10 @@ PatchBitmap(AnnIndexFile *file, const AnnIndexBitmap *entry, const uint64_t *gon
 	else
 	{
 		/*
-		 * Rows only. BuildBitmap kept them as count <= expandLimit and dropped
-		 * the bitmap as count < rows / 64 and count <= bitset_gather_limit:
-		 * fewer rows keep all three, so it would build this form again.
+		 * Rows only. BuildBitmap kept them as count <= expandLimit and
+		 * dropped the bitmap as count < rows / 64 and count <=
+		 * bitset_gather_limit: fewer rows keep all three, so it would build
+		 * this form again.
 		 */
 		uint64_t	n = 0;
 		uint64_t	g = 0;
@@ -1736,13 +1736,13 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 		__atomic_store_n(&file->deleteGeneration, file->deleteGeneration + 1, __ATOMIC_RELEASE);
 
 	/*
-	 * Cached predicate results may hold the rows just deleted. Those read from
-	 * attribute columns alone are held, to be patched below, when the delete
-	 * is small enough; the others are dropped, chained through their next
-	 * fields, which unlinked entries no longer use. Snapshot results keep
-	 * tombstoned rows anyway; those read from attribute columns alone stay.
-	 * One that reads a pushed bitmap goes, so that, as before, it follows a
-	 * bitmap replaced since.
+	 * Cached predicate results may hold the rows just deleted. Those read
+	 * from attribute columns alone are held, to be patched below, when the
+	 * delete is small enough; the others are dropped, chained through their
+	 * next fields, which unlinked entries no longer use. Snapshot results
+	 * keep tombstoned rows anyway; those read from attribute columns alone
+	 * stay. One that reads a pushed bitmap goes, so that, as before, it
+	 * follows a bitmap replaced since.
 	 */
 	if (*added > 0 && file->predicateEntries > 0 && gone && *added <= AnnIndexConfig.delete_patch_rows)
 		held = malloc(sizeof(*held) * file->predicateEntries);

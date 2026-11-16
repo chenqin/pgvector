@@ -1,3 +1,5 @@
+#define _GNU_SOURCE
+
 #include "backend.h"
 #include "batching.h"
 #include "server.h"

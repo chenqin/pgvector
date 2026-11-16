@@ -77,7 +77,7 @@ Key(uint64_t row)
 }
 
 static int32_t
-Group(uint64_t row)
+Group		(uint64_t row)
 {
 	return (int32_t) (row % GROUPS);
 }
@@ -110,7 +110,8 @@ WriteIndex(void)
 		keys[i] = Key(i);
 		vectors[i * DIMENSIONS] = (float) i;
 		vectors[i * DIMENSIONS + 1] = 1;
-		groups[i] = Group(i);
+		groups[i] = Group (i);
+
 		buckets[i] = (int32_t) (i % BUCKETS);
 	}
 	WriteFile("keys.i64", keys, sizeof(keys));
@@ -230,7 +231,11 @@ TestRacedPut(void)
 	CHECK(result->count == count - 1 && !Holds(result, 10) && Holds(result, 17));
 	CHECK(file->predicateRaced == 2);
 	CHECK(AnnIndexBitmapGet(file, 2, ANN_BITMAP_PREDICATE) == result);
-	/* The discarded build's device copy was freed; the linked one has its own. */
+
+	/*
+	 * The discarded build's device copy was freed; the linked one has its
+	 * own.
+	 */
 	CHECK(uploads == 2 && releases == 1 && result->device != NULL);
 	AnnIndexBitmapReleaseCount(file, result, 2);
 
@@ -395,7 +400,7 @@ TestPatchMatchesEvaluation(void)
 		{30, 'a', 0, {4, 0}, 1, UINT64_MAX},	/* dense */
 		{31, 'b', 0, {41, 0}, 1, UINT64_MAX},	/* sparse */
 		{32, 'a', 1, {1, 0}, 1, UINT64_MAX},	/* negated */
-		{33, 'a', 0, {6, 0}, 1, 0},			/* expand limit set below */
+		{33, 'a', 0, {6, 0}, 1, 0}, /* expand limit set below */
 		{34, 'b', 0, {7, 8}, 2, UINT64_MAX},	/* 100 rows, then under 78 */
 	};
 	unsigned char programs[5][32];
@@ -435,7 +440,7 @@ TestPatchMatchesEvaluation(void)
 	rows[nrows++] = 141;
 	for (uint64_t row = 2000, four = 0, six = 0; four < 3 || six < 3; row++)
 		if (row % BUCKETS != 7 && row % BUCKETS != 8 &&
-			((Group(row) == 4 && four++ < 3) || (Group(row) == 6 && six++ < 3)))
+			((Group (row) == 4 && four++ < 3) ||(Group (row) == 6 && six++ < 3)))
 			rows[nrows++] = row;
 	{
 		int64_t		keys[64];
@@ -461,8 +466,9 @@ TestPatchBounds(void)
 {
 	unsigned char program[32];
 	int32_t		values[3] = {70, 71, 72};
-	uint64_t	group1[3] = {470, 71, 372};	/* b = 70, 71, 72 in group 1, which
-											 * no other cached entry reads */
+	uint64_t	group1[3] = {470, 71, 372}; /* b = 70, 71, 72 in group 1,
+											 * which no other cached entry
+											 * reads */
 	uint64_t	patches;
 	uint64_t	dropped;
 	int64_t		keys[3];
@@ -556,7 +562,7 @@ TestConcurrentDeletes(void)
 	for (int t = 0; t < 2; t++)
 		for (int i = 0; i < 2; i++)
 		{
-			CHECK(Group(rows[t][i]) == 0 && !AnnIndexIsDeleted(file, rows[t][i]));
+			CHECK(Group (rows[t][i]) == 0 && !AnnIndexIsDeleted(file, rows[t][i]));
 			deletes[t].keys[i] = Key(rows[t][i]);
 		}
 	entry = Cache(50, program, size, UINT64_MAX);

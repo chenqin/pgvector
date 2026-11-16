@@ -9,6 +9,8 @@
  * compiled once per device with NVRTC and only on compute capability 10.x
  * or 12.x.
  */
+#define _GNU_SOURCE
+
 #include "blackwell.h"
 #include "nvrtc.h"
 
