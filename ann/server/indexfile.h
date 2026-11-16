@@ -216,6 +216,12 @@ struct AnnIndexFile
 	uint64_t	predicateDropped;	/* entries a delete flushed */
 	uint64_t	predicateRaced; /* results re-masked before caching: a delete
 								 * ran during their evaluation */
+	uint64_t	predicateUnpatchable;	/* of the dropped: read a pushed
+										 * bitmap, or the delete was too large */
+	uint64_t	predicateCapped;	/* of the dropped: past
+									 * --delete-patch-entries */
+	uint64_t	predicatePatchFailed;	/* of the dropped: no memory */
+	uint64_t	predicatePatchUs;	/* time deletes spent building patches */
 	const int64_t *keys;		/* mapped */
 	const float *vectors;		/* mapped */
 	uint16_t   *halfVectors;	/* FP16 copy for --rescore fp16, else NULL */
@@ -558,6 +564,10 @@ typedef struct AnnIndexPredicateTotals
 	uint64_t	patched;		/* entries deletes replaced */
 	uint64_t	dropped;		/* entries deletes flushed */
 	uint64_t	raced;			/* results re-masked before caching */
+	uint64_t	unpatchable;	/* dropped entries, by reason */
+	uint64_t	capped;
+	uint64_t	patchFailed;
+	uint64_t	patchUs;		/* time deletes spent building patches */
 	uint64_t	sharedEntries;	/* results row sets keep */
 	uint64_t	sharedBytes;	/* host memory they hold */
 } AnnIndexPredicateTotals;

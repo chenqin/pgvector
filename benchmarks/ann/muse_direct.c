@@ -2,7 +2,7 @@
  * Muse-shaped load straight to an ANN server over TCP, without PostgreSQL.
  *
  *   muse_direct HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP]
- *               [--processes N] [--rate R] [--epoll]
+ *               [--processes N] [--rate R] [--epoll] [--unique-share F]
  *
  * FRAMES is written by benchmarks/ann/muse_stress.py --emit-ann: u32
  * requests, u32 sub-requests per request, then per sub-request a u32 size
@@ -57,6 +57,14 @@
  * core can do adds its own queueing to the latencies: give it enough
  * --processes. Connections are still made with blocking calls, by up to 256
  * short-lived threads per process, before the run starts.
+ *
+ * --unique-share F sends a fraction F (0 to 1) of all sub-requests with a
+ * filter no earlier search used: the first OVERLAP leaf of the frame's
+ * program lists one more value, a negative id no row holds, different for
+ * every such send. The rows that pass are the same, but the program bytes
+ * differ, so the server cannot answer from its filter cache: F is the share
+ * of filter-cache misses the run adds. Frames whose program does not start
+ * with an OVERLAP leaf are sent as they are.
  *
  * JSON: "request_ms" percentiles and "max_ms" over the measured requests;
  * "subrequest_ms" by position of the sub-request within the request, from
@@ -159,6 +167,13 @@ static char token[256];
 static size_t tokenSize;
 static unsigned char **frames;	/* [request * subs + sub] */
 static uint32_t *frameSizes;
+static double uniqueShare;		/* --unique-share */
+static unsigned char **uniqueFrames;	/* frames with one more value, or NULL */
+static uint32_t *uniqueSizes;
+static uint32_t *uniqueSlots;	/* offset of the added value */
+static uint32_t uniqueMax;		/* largest unique frame */
+static atomic_uint_fast64_t uniqueSends;
+static atomic_uint_fast32_t uniqueCounter;
 static uint32_t nrequests,
 			nsubs;
 static struct sockaddr_storage server;
@@ -210,6 +225,92 @@ static uint32_t
 Read32(const unsigned char *p)
 {
 	return (uint32_t) p[0] | (uint32_t) p[1] << 8 | (uint32_t) p[2] << 16 | (uint32_t) p[3] << 24;
+}
+
+static void
+Write32(unsigned char *p, uint32_t v)
+{
+	p[0] = (unsigned char) v;
+	p[1] = (unsigned char) (v >> 8);
+	p[2] = (unsigned char) (v >> 16);
+	p[3] = (unsigned char) (v >> 24);
+}
+
+/*
+ * The unique variant of frame i (--unique-share): its first OVERLAP leaf
+ * with room for one more value, and the payload and program sizes grown to
+ * match. A frame of another shape gets none.
+ */
+static void
+BuildUnique(size_t i)
+{
+	const unsigned char *f = frames[i];
+	uint32_t	size = frameSizes[i];
+	uint32_t	at = 32,
+				name,
+				program,
+				leaf,
+				count,
+				end;
+	unsigned char *u;
+
+	uniqueFrames[i] = NULL;
+	if (size < at + 4 || Read32(f + 24) != size - 32)
+		return;
+	name = Read32(f + at);
+	at += 4 + name;
+	if (size < at + 16)
+		return;
+	program = Read32(f + at + 12);
+	leaf = at + 16;
+	if (size < leaf + program || program < 3 || f[leaf] != 10)
+		return;
+	at = leaf + 2 + f[leaf + 1] + 1;
+	if (at + 4 > leaf + program)
+		return;
+	count = Read32(f + at);
+	end = at + 4 + 4 * count;
+	if (end > leaf + program || (u = malloc(size + 4)) == NULL)
+		return;
+	memcpy(u, f, end);
+	memcpy(u + end + 4, f + end, size - end);
+	Write32(u + 24, size + 4 - 32);
+	Write32(u + leaf - 4, program + 4);
+	Write32(u + at, count + 1);
+	uniqueFrames[i] = u;
+	uniqueSizes[i] = size + 4;
+	uniqueSlots[i] = end;
+	if (size + 4 > uniqueMax)
+		uniqueMax = size + 4;
+}
+
+/*
+ * What to send for frame i: the frame, or with --unique-share and on the
+ * share's schedule, its unique variant in buffer (uniqueMax bytes) with a
+ * fresh value.
+ */
+static const unsigned char *
+FrameToSend(size_t i, uint32_t *size, unsigned char *buffer)
+{
+	uint64_t	n;
+	uint32_t	tag;
+	int32_t		value;
+
+	if (uniqueShare > 0 && buffer != NULL && uniqueFrames[i] != NULL)
+	{
+		n = atomic_fetch_add(&uniqueSends, 1);
+		if ((uint64_t) ((double) (n + 1) * uniqueShare) != (uint64_t) ((double) n * uniqueShare))
+		{
+			tag = ((uint32_t) (getpid() & 0x7f) << 24) | (atomic_fetch_add(&uniqueCounter, 1) & 0xffffff);
+			value = -(int32_t) tag - 2;
+			memcpy(buffer, uniqueFrames[i], uniqueSizes[i]);
+			Write32(buffer + uniqueSlots[i], (uint32_t) value);
+			*size = uniqueSizes[i];
+			return buffer;
+		}
+	}
+	*size = frameSizes[i];
+	return frames[i];
 }
 
 /* Reports the run's first failure and ends this process; the parent ends the others. */
@@ -481,6 +582,7 @@ Client(void *arg)
 	struct pollfd polls[MAX_SUBS];
 	Inbox		inbox[MAX_SUBS];
 	uint64_t	arrival[MAX_SUBS];
+	unsigned char *unique[MAX_SUBS] = {0};
 	uint32_t   *series = calloc(seconds, sizeof(*series));
 	uint64_t	start,
 				measureFrom,
@@ -498,6 +600,9 @@ Client(void *arg)
 
 	if (series == NULL)
 		Fatal(1, "out of memory");
+	for (uint32_t s = 0; uniqueShare > 0 && s < nsubs; s++)
+		if ((unique[s] = malloc(uniqueMax ? uniqueMax : 1)) == NULL)
+			Fatal(1, "out of memory");
 	for (uint32_t s = 0; s < nsubs; s++)
 	{
 		fds[s] = Connect(client * nsubs + s, &seed);
@@ -567,7 +672,10 @@ Client(void *arg)
 		}
 		for (uint32_t s = 0; s < nsubs; s++)
 		{
-			if (!Transfer(fds[s], frames[(size_t) r * nsubs + s], frameSizes[(size_t) r * nsubs + s], 1))
+			uint32_t	size;
+			const unsigned char *data = FrameToSend((size_t) r * nsubs + s, &size, unique[s]);
+
+			if (!Transfer(fds[s], (unsigned char *) data, size, 1))
 				Fatal(2, "connection to %s:%s broke while sending: %s", host, port,
 					  errno ? strerror(errno) : "closed by the server");
 			polls[s].fd = fds[s];
@@ -688,6 +796,7 @@ typedef struct EpollConnection
 	int			waiting;		/* a reply is outstanding */
 	int			writing;		/* registered for EPOLLOUT too */
 	const unsigned char *out;	/* what of the frame is still to send */
+	unsigned char *unique;		/* --unique-share frame buffer */
 	size_t		outLeft;
 	size_t		have;			/* bytes of the reply read */
 	size_t		need;			/* its size; 0 until the header is read */
@@ -818,8 +927,13 @@ EpollLaunch(uint32_t c, uint64_t now)
 	{
 		EpollConnection *connection = &epollConnections[(size_t) c * nsubs + s];
 
-		connection->out = frames[(size_t) client->r * nsubs + s];
-		connection->outLeft = frameSizes[(size_t) client->r * nsubs + s];
+		uint32_t	size;
+
+		if (uniqueShare > 0 && connection->unique == NULL &&
+			(connection->unique = malloc(uniqueMax ? uniqueMax : 1)) == NULL)
+			Fatal(1, "out of memory");
+		connection->out = FrameToSend((size_t) client->r * nsubs + s, &size, connection->unique);
+		connection->outLeft = size;
 		connection->have = 0;
 		connection->need = 0;
 		connection->waiting = 1;
@@ -1209,7 +1323,7 @@ Reaped(pid_t pid, int status, int running)
 static int
 Usage(const char *program)
 {
-	fprintf(stderr, "usage: %s HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP] [--processes N] [--rate R] [--epoll]\n", program);
+	fprintf(stderr, "usage: %s HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP] [--processes N] [--rate R] [--epoll] [--unique-share F]\n", program);
 	return 1;
 }
 
@@ -1252,6 +1366,8 @@ main(int argc, char **argv)
 			processes = (unsigned) atoi(argv[option + 1]);
 		else if (option + 1 < argc && strcmp(argv[option], "--rate") == 0)
 			rate = atof(argv[option + 1]);
+		else if (option + 1 < argc && strcmp(argv[option], "--unique-share") == 0)
+			uniqueShare = atof(argv[option + 1]);
 		else
 			return Usage(argv[0]);
 		option += 2;
@@ -1261,7 +1377,8 @@ main(int argc, char **argv)
 		return fprintf(stderr, "muse_direct: --epoll needs Linux (epoll and timerfd); "
 					   "run without it for a thread per client\n"), 1;
 #endif
-	if (seconds == 0 || clients == 0 || processes == 0 || processes > clients || rate < 0)
+	if (seconds == 0 || clients == 0 || processes == 0 || processes > clients || rate < 0 || uniqueShare < 0 ||
+		uniqueShare > 1)
 		return fprintf(stderr, "muse_direct: SECONDS, CLIENTS and --processes must be positive, "
 					   "--processes at most CLIENTS, --rate not negative\n"), 1;
 	if (rate > 0)
@@ -1298,6 +1415,24 @@ main(int argc, char **argv)
 			return fprintf(stderr, "short %s\n", argv[4]), 1;
 	}
 	fclose(file);
+	if (uniqueShare > 0)
+	{
+		size_t		n = (size_t) nrequests * nsubs;
+		size_t		built = 0;
+
+		uniqueFrames = calloc(n, sizeof(*uniqueFrames));
+		uniqueSizes = calloc(n, sizeof(*uniqueSizes));
+		uniqueSlots = calloc(n, sizeof(*uniqueSlots));
+		if (uniqueFrames == NULL || uniqueSizes == NULL || uniqueSlots == NULL)
+			return fprintf(stderr, "out of memory\n"), 1;
+		for (size_t i = 0; i < n; i++)
+		{
+			BuildUnique(i);
+			built += uniqueFrames[i] != NULL;
+		}
+		if (built == 0)
+			return fprintf(stderr, "muse_direct: --unique-share: no frame starts with an OVERLAP leaf\n"), 1;
+	}
 
 	/* Resolve once; every connection of every process uses the address. */
 	hints.ai_family = AF_UNSPEC;

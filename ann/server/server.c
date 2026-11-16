@@ -4078,6 +4078,98 @@ DictionaryOperation(uint16_t operation, const unsigned char *payload, uint32_t l
  * Reads one frame from a connection and serves it (or queues its job). 0 when
  * the connection is done: closed, broken, or a protocol error.
  */
+
+/*
+ * Deletes (operation 29) run on these threads, not on the reader that read
+ * them: patching the cached filters a delete touches takes tens of
+ * milliseconds and up to most of a second, and every connection the reader
+ * serves would wait that long. Measured on the Muse shard at 150,000
+ * requests a second with 24 deletes a second: p99 409 ms with deletes on
+ * the readers, all of it before the searches were read. The reply goes out
+ * when the delete is done, so a client that waits for it, as every client
+ * does, sees its searches after the delete as before.
+ */
+typedef struct DeleteItem
+{
+	struct DeleteItem *next;
+	Connection *connection;
+	AnnIndexFile *file;
+	int64_t    *keys;
+	uint32_t	count;
+	uint64_t	request;
+} DeleteItem;
+
+#define ANN_DELETERS 4
+static pthread_mutex_t deleteQueueMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t deleteQueueCondition = PTHREAD_COND_INITIALIZER;
+static DeleteItem *deleteHead;
+static DeleteItem *deleteTail;
+static int	deleters;			/* started; 0: readers delete themselves */
+
+static void
+DeleteOne(DeleteItem *item)
+{
+	unsigned char answer[16];
+	uint64_t	added = 0;
+	AnnStatus	status = AnnIndexDelete(item->file, item->keys, item->count, &added);
+
+	Write(answer, added, 8);
+	Write(answer + 8, __atomic_load_n(&item->file->ndeleted, __ATOMIC_ACQUIRE), 8);
+	AnnIndexPut(item->file);
+	Reply(item->connection, ANN_OP_DELETE_KEYS, item->request, status, answer, status == ANN_OK ? 16 : 0);
+}
+
+static void *
+Deleter(void *argument)
+{
+	(void) argument;
+	for (;;)
+	{
+		DeleteItem *item;
+
+		(void) pthread_mutex_lock(&deleteQueueMutex);
+		while (deleteHead == NULL)
+			(void) pthread_cond_wait(&deleteQueueCondition, &deleteQueueMutex);
+		item = deleteHead;
+		if ((deleteHead = item->next) == NULL)
+			deleteTail = NULL;
+		(void) pthread_mutex_unlock(&deleteQueueMutex);
+		DeleteOne(item);
+		Release(item->connection);
+		free(item->keys);
+		free(item);
+	}
+	return NULL;
+}
+
+/* Queue a delete for a deleter; 0 when there is none or no memory. */
+static int
+QueueDelete(Connection *connection, uint64_t request, AnnIndexFile *file, int64_t *keys, uint32_t count)
+{
+	DeleteItem *item;
+
+	if (!deleters || (item = malloc(sizeof(*item))) == NULL)
+		return 0;
+	item->next = NULL;
+	item->connection = connection;
+	item->file = file;
+	item->keys = keys;
+	item->count = count;
+	item->request = request;
+	(void) pthread_mutex_lock(&connection->mutex);
+	connection->references++;
+	(void) pthread_mutex_unlock(&connection->mutex);
+	(void) pthread_mutex_lock(&deleteQueueMutex);
+	if (deleteTail)
+		deleteTail->next = item;
+	else
+		deleteHead = item;
+	deleteTail = item;
+	(void) pthread_cond_signal(&deleteQueueCondition);
+	(void) pthread_mutex_unlock(&deleteQueueMutex);
+	return 1;
+}
+
 static int
 ServeFrame(Service *service, Connection *connection)
 {
@@ -4221,7 +4313,9 @@ ServeFrame(Service *service, Connection *connection)
 							"\"predicate_build_us\":%llu,\"predicate_patched\":%llu,\"predicate_dropped\":%llu,"
 							"\"predicate_raced\":%llu,\"predicate_resolved\":%llu,\"predicate_inline\":%llu,"
 							"\"predicate_shared\":%llu,\"predicate_shared_entries\":%llu,"
-							"\"predicate_shared_bytes\":%llu,\"merged\":%llu}",
+							"\"predicate_shared_bytes\":%llu,\"predicate_drop_unpatchable\":%llu,"
+							"\"predicate_drop_capped\":%llu,\"predicate_drop_failed\":%llu,"
+							"\"predicate_patch_us\":%llu,\"merged\":%llu}",
 							(unsigned long long) total.jobs, (unsigned long long) total.batches,
 							(unsigned long long) total.max_batch, (unsigned long long) total.rows,
 							(unsigned long long) total.rejected, (unsigned long long) total.rejected_index,
@@ -4250,6 +4344,8 @@ ServeFrame(Service *service, Connection *connection)
 							(unsigned long long) __atomic_load_n(&service->predicate_shared, __ATOMIC_RELAXED),
 							(unsigned long long) predicates.sharedEntries,
 							(unsigned long long) predicates.sharedBytes,
+							(unsigned long long) predicates.unpatchable, (unsigned long long) predicates.capped,
+							(unsigned long long) predicates.patchFailed, (unsigned long long) predicates.patchUs,
 							(unsigned long long) __atomic_load_n(&service->merged, __ATOMIC_RELAXED));
 		Reply(connection, operation, request, ANN_OK, (unsigned char *) message,
 			  size > 0 && (size_t) size < sizeof(message) ? (size_t) size : 0);
@@ -4376,6 +4472,7 @@ ServeFrame(Service *service, Connection *connection)
 		unsigned char answer[16];
 		AnnIndexFile *file = NULL;
 		uint64_t	added = 0;
+		int			queued = 0;
 
 		if (nameLength == 0 || nameLength > ANN_INDEX_NAME_MAX || (uint64_t) length < 8 + (uint64_t) nameLength ||
 			(uint64_t) length != 8 + (uint64_t) nameLength +
@@ -4396,14 +4493,20 @@ ServeFrame(Service *service, Connection *connection)
 			{
 				for (uint32_t i = 0; i < count; i++)
 					keys[i] = (int64_t) Read(payload + 8 + nameLength + (size_t) i * 8, 8);
-				status = AnnIndexDelete(file, keys, count, &added);
-				Write(answer, added, 8);
-				Write(answer + 8, __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE), 8);
-				AnnIndexPut(file);
+				if ((queued = QueueDelete(connection, request, file, keys, count)) != 0)
+					keys = NULL;	/* the deleter's now, and the reply */
+				else
+				{
+					status = AnnIndexDelete(file, keys, count, &added);
+					Write(answer, added, 8);
+					Write(answer + 8, __atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE), 8);
+					AnnIndexPut(file);
+				}
 			}
 			free(keys);
 		}
-		Reply(connection, operation, request, status, answer, status == ANN_OK ? 16 : 0);
+		if (!queued)
+			Reply(connection, operation, request, status, answer, status == ANN_OK ? 16 : 0);
 	}
 	else if (operation == ANN_OP_DICTIONARY || operation == ANN_OP_REMAP)
 	{
@@ -4693,6 +4796,15 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 		(void) pthread_detach(resolver);
 	}
 	resolveLimit = service.options.predicate_resolvers * ANN_RESOLVE_QUEUE_PER_THREAD;
+	for (int i = 0; i < ANN_DELETERS; i++)
+	{
+		pthread_t	deleter;
+
+		if (pthread_create(&deleter, NULL, Deleter, NULL) != 0)
+			break;
+		(void) pthread_detach(deleter);
+		deleters++;
+	}
 	if (options->rdma)
 	{
 		char		error[512];

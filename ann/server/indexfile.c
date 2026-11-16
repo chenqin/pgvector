@@ -1698,6 +1698,7 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 	uint64_t   *gone = NULL;
 	uint64_t	ngone = 0;
 	uint64_t	patches = 0;
+	struct timespec patchStart;
 
 	*added = 0;
 	(void) pthread_mutex_lock(&file->deleteMutex);
@@ -1768,6 +1769,7 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 			*link = victim->next;
 			Account(file, victim, -1);
 			file->predicateDropped++;
+			file->predicateUnpatchable++;
 			victim->next = victims;
 			victims = victim;
 		}
@@ -1791,7 +1793,10 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 	 * waits for the copies); drop the rest that have some.
 	 */
 	if (nheld > 0)
+	{
 		qsort(gone, ngone, sizeof(uint64_t), OrdinalCompare);
+		(void) clock_gettime(CLOCK_MONOTONIC, &patchStart);
+	}
 	for (uint64_t h = 0; h < nheld; h++)
 	{
 		AnnIndexBitmap *entry = held[h];
@@ -1803,10 +1808,26 @@ AnnIndexDelete(AnnIndexFile *file, const int64_t *keys, uint32_t count, uint64_t
 			AnnIndexBitmapRelease(file, entry);
 			continue;
 		}
-		if (patches++ >= AnnIndexConfig.delete_patch_entries ||
-			PatchBitmap(file, entry, gone, ngone, hits, &patch) != ANN_OK)
+		if (patches++ >= AnnIndexConfig.delete_patch_entries)
+		{
+			(void) __atomic_add_fetch(&file->predicateCapped, 1, __ATOMIC_RELAXED);
 			patch = NULL;
+		}
+		else if (PatchBitmap(file, entry, gone, ngone, hits, &patch) != ANN_OK)
+		{
+			(void) __atomic_add_fetch(&file->predicatePatchFailed, 1, __ATOMIC_RELAXED);
+			patch = NULL;
+		}
 		ReplaceHeld(file, entry, patch);
+	}
+	if (nheld > 0)
+	{
+		struct timespec now;
+
+		(void) clock_gettime(CLOCK_MONOTONIC, &now);
+		(void) __atomic_add_fetch(&file->predicatePatchUs,
+								  (uint64_t) ((now.tv_sec - patchStart.tv_sec) * 1000000 +
+											  (now.tv_nsec - patchStart.tv_nsec) / 1000), __ATOMIC_RELAXED);
 	}
 	(void) pthread_mutex_unlock(&file->deleteMutex);
 	free(held);
@@ -2273,6 +2294,10 @@ AnnIndexPredicateStats(AnnIndexPredicateTotals *totals)
 		totals->patched += file->predicatePatched;
 		totals->dropped += file->predicateDropped;
 		totals->raced += file->predicateRaced;
+		totals->unpatchable += file->predicateUnpatchable;
+		totals->capped += __atomic_load_n(&file->predicateCapped, __ATOMIC_RELAXED);
+		totals->patchFailed += __atomic_load_n(&file->predicatePatchFailed, __ATOMIC_RELAXED);
+		totals->patchUs += __atomic_load_n(&file->predicatePatchUs, __ATOMIC_RELAXED);
 		(void) pthread_mutex_unlock(&file->bitmapMutex);
 	}
 	(void) pthread_rwlock_unlock(&registryLock);
