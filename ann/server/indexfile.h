@@ -28,8 +28,9 @@
 #define ANN_INDEX_MAX_VALUES 64
 
 /*
- * Optional quantized copy of the vectors for Blackwell scans (manifest line
- * "quant nvfp4" or "quant fp8"), next to the exact vectors.f32:
+ * Optional quantized copy of the vectors for GPU scans (manifest line
+ * "quant nvfp4", which the cuVS worker's Blackwell module scans, or "quant
+ * fp8", which cuVS' CAGRA filtered scan does), next to the exact vectors.f32:
  *
  *   nvfp4: vectors.nvfp4  rows x blocks x 8 bytes, two E2M1 values per byte
  *                         (even dimension in the low nibble), blocks = dims/16
@@ -274,7 +275,8 @@ typedef struct AnnIndexOptions
 									 * up to it keep their rows */
 	uint32_t	index_copies;	/* most GPU copies any loaded index has; set
 								 * by the backend, read by the scheduler */
-	int			quantized_scan; /* scan quantized copies on Blackwell GPUs */
+	int			quantized_scan; /* scan quantized copies: NVFP4 on Blackwell
+								 * GPUs, FP8 on cuVS' scan */
 	uint32_t	quant_slack;	/* extra candidates re-scored in FP32 */
 	uint32_t	predicate_cache;	/* most predicate results per index, 0 for
 									 * no cap */
@@ -326,8 +328,8 @@ typedef struct AnnIndexOptions
 	uint32_t	shard_topk_share;	/* --shard-topk-share: percent of k each
 									 * shard of a split index returns to the
 									 * merge (at least 128); 100 for all */
-	int			scan_skip_tail; /* --scan-skip-tail: FP8 matrix scans leave
-								 * out a last 16-dimension block holding one
+	int			scan_skip_tail; /* --scan-skip-tail: cuVS' FP8 scan leaves out
+								 * a last 16-dimension block holding one
 								 * coordinate (dims % 16 == 1) */
 	int			cagra_pitch_off;	/* --cagra-pitch off: search CAGRA rows at
 									 * their own dimensions (one launch per
@@ -376,14 +378,16 @@ typedef struct AnnIndexOptions
 
 /*
  * Re-scoring of a quantized scan's candidates at k > 24: from the FP32 rows in
- * host memory (the default), not at all (the scan's distances), from an FP16
- * copy in host memory (half the RAM), or on the GPU from an FP8 copy made at
- * load. The last two leave the FP32 rows unlocked.
+ * host memory (the default), not at all (the scan's distances), or from an
+ * FP16 copy in host memory (half the RAM), which leaves the FP32 rows
+ * unlocked. cuVS' FP8 scan always re-scores its candidates from the FP16
+ * rows on the GPU: off and fp16 keep those distances, and fp32 adds the FP32
+ * re-score of the final k that --fp16-exact asks for. (fp8-gpu, a GPU
+ * re-score from an FP8 copy, went with the worker's own FP8 scan.)
  */
 #define ANN_RESCORE_FP32 0
 #define ANN_RESCORE_OFF 1
 #define ANN_RESCORE_FP16 2
-#define ANN_RESCORE_FP8_GPU 3
 
 extern AnnIndexOptions AnnIndexConfig;
 extern AnnCostProfile *AnnIndexCostProfile;

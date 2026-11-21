@@ -444,8 +444,9 @@ class IndexWorkerTests(unittest.TestCase):
             self.assertEqual(self.call(connection, frame(STATS, 7))[2], 0)
 
     def test_quantized_copy_is_validated_and_exact_on_cpu(self):
-        # The CPU worker maps a quantized copy (for Blackwell scans on cuVS
-        # workers) but keeps answering exactly from vectors.f32.
+        # The CPU worker maps a quantized copy (on cuVS workers, FP8 for
+        # cuVS' CAGRA filtered scan, NVFP4 for the Blackwell module) but
+        # keeps answering exactly from vectors.f32.
         path, keys, vectors = self.fixture(shards=3)
         blocks = (5 + 15) // 16
         files = {'nvfp4': {'vectors.nvfp4': 600 * blocks * 8, 'scales.e4m3': 600 * blocks, 'rowscale.f32': 600 * 4},

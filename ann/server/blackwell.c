@@ -1,13 +1,14 @@
 /*
- * Blackwell scan module: quantized gather scans for the cuVS worker.
+ * Blackwell scan module: NVFP4 gather scans for the cuVS worker, and grouped
+ * scans of FP16 and FP32 CAGRA datasets read in place.
  *
  * Eight threads score one listed row, each taking 16-dimension chunks with
- * one 8-byte (NVFP4) or 16-byte (FP8) load and, for NVFP4, one block-scale
- * decode, so a warp scores four rows. That reads 4 or 8 bits per dimension
- * where the cuVS backend's gather kernel reads 16 or 32. Decoding uses Blackwell's conversion instructions, which
+ * one 8-byte load and one block-scale decode, so a warp scores four rows.
+ * That reads 4 bits per dimension where the cuVS backend's gather kernel
+ * reads 16 or 32. Decoding uses Blackwell's conversion instructions, which
  * need an architecture-specific target (sm_100a, sm_120a); the module is
  * compiled once per device with NVRTC and only on compute capability 10.x
- * or 12.x.
+ * or 12.x. FP8 copies are scanned by cuVS' CAGRA filtered scan (cuvs.c).
  */
 #define _GNU_SOURCE
 
@@ -21,7 +22,6 @@
 #pragma GCC diagnostic pop
 #include <cuda_runtime_api.h>
 #include <pthread.h>
-#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -103,35 +103,6 @@ static const char *const BlackwellSource[] = {
 	"  s = group_sum(s);\n"
 	"  return row == 0xffffffffu ? __int_as_float(0x7f800000) : s;\n"
 	"}\n",
-	"__device__ __forceinline__ float score8(const unsigned char *data, const float *rowScales, unsigned rowBytes,\n"
-	"    unsigned row, const float *query, int dims, int t)\n"
-	"{\n"
-	"  float s = 0.0f;\n"
-	"  if (row != 0xffffffffu)\n"
-	"  {\n"
-	"    const uint4 *v = (const uint4 *) (data + (unsigned long long) row * rowBytes);\n"
-	"    float scale = rowScales[row];\n"
-	"    for (unsigned c = t; c < rowBytes / 16; c += GROUP)\n"
-	"    {\n"
-	"      uint4 w = v[c];\n"
-	"      unsigned int words[4] = {w.x, w.y, w.z, w.w};\n"
-	"      int d = c * 16;\n"
-	"      float x0, x1;\n"
-	"      if (d + 16 <= dims)\n"
-	"        for (int b = 0; b < 8; b++) { e4m3x2((unsigned short) (words[b >> 1] >> (16 * (b & 1))), x0, x1); ACC(x0, x1, d + 2 * b); }\n"
-	"      else\n"
-	"        for (int b = 0; b < 8; b++)\n"
-	"        {\n"
-	"          e4m3x2((unsigned short) (words[b >> 1] >> (16 * (b & 1))), x0, x1);\n"
-	"          int e = d + 2 * b;\n"
-	"          if (e < dims) { float t0 = x0 * scale - query[e]; s += t0 * t0; }\n"
-	"          if (e + 1 < dims) { float t1 = x1 * scale - query[e + 1]; s += t1 * t1; }\n"
-	"        }\n"
-	"    }\n"
-	"  }\n"
-	"  s = group_sum(s);\n"
-	"  return row == 0xffffffffu ? __int_as_float(0x7f800000) : s;\n"
-	"}\n"
 	"/* Score every listed row (UINT32_MAX scores +inf); GROUP threads a row, no early exit. */\n"
 	"extern \"C\" __global__ void score_nvfp4(const unsigned char *data, const unsigned char *scales,\n"
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
@@ -154,13 +125,6 @@ static const char *const BlackwellSource[] = {
 	"  if (i < n) while (hi - lo > 1) { int mid = (lo + hi) / 2; if (offsets[mid] <= i) lo = mid; else hi = mid; }\n"
 	"  float s = score4(data, scales, rowScales, rowBytes, blocks, i < n ? rows[i] : 0xffffffffu,\n"
 	"                   queries + (unsigned long long) lo * dims, dims, threadIdx.x % GROUP);\n"
-	"  if (threadIdx.x % GROUP == 0 && i < n) out[i] = s;\n"
-	"}\n"
-	"extern \"C\" __global__ void score_fp8(const unsigned char *data, const float *rowScales,\n"
-	"    unsigned rowBytes, const unsigned *rows, unsigned n, const float *query, int dims, float *out)\n"
-	"{\n"
-	"  unsigned i = (blockIdx.x * blockDim.x + threadIdx.x) / GROUP;\n"
-	"  float s = score8(data, rowScales, rowBytes, i < n ? rows[i] : 0xffffffffu, query, dims, threadIdx.x % GROUP);\n"
 	"  if (threadIdx.x % GROUP == 0 && i < n) out[i] = s;\n"
 	"}\n",
 	"",
@@ -219,8 +183,7 @@ static const char *const BlackwellSource[] = {
 	"    threshold = fminf(threshold, __uint_as_float(*shared));\n"
 	"    unsigned i = base + group;\n"
 	"    unsigned row = i < end ? rows[i] : 0xffffffffu;\n"
-	"    float s = QUANT == 1 ? score4(data, scales, rowScales, rowBytes, blocks, row, query, dims, t)\n"
-	"                         : score8(data, rowScales, rowBytes, row, query, dims, t);\n"
+	"    float s = score4(data, scales, rowScales, rowBytes, blocks, row, query, dims, t);\n"
 	"    bool pass = t == 0 && row != 0xffffffffu && s < threshold;\n"
 	"    if (__ballot_sync(0xffffffffu, pass))\n"
 	"    {\n"
@@ -257,11 +220,7 @@ static const char *const BlackwellSource[] = {
 	"    const float *rowScales, unsigned rowBytes, unsigned blocks, const unsigned *rows, unsigned n,\n"
 	"    unsigned perBlock, const float *query, int dims, float *partD, unsigned *partR, unsigned *counter,\n"
 	"    float *outD, unsigned *outR)\n"
-	"{ search<1>(data, scales, rowScales, rowBytes, blocks, rows, n, perBlock, query, dims, partD, partR, counter, outD, outR); }\n"
-	"extern \"C\" __global__ void search_fp8(const unsigned char *data, const float *rowScales, unsigned rowBytes,\n"
-	"    const unsigned *rows, unsigned n, unsigned perBlock, const float *query, int dims, float *partD,\n"
-	"    unsigned *partR, unsigned *counter, float *outD, unsigned *outR)\n"
-	"{ search<2>(data, 0, rowScales, rowBytes, 0, rows, n, perBlock, query, dims, partD, partR, counter, outD, outR); }\n",
+	"{ search<1>(data, scales, rowScales, rowBytes, blocks, rows, n, perBlock, query, dims, partD, partR, counter, outD, outR); }\n",
 	"",
 	"/* Packed half2 helpers through PTX, so no CUDA headers are needed. */\n"
 	"__device__ __forceinline__ unsigned hmul2(unsigned a, unsigned b)\n"
@@ -293,8 +252,8 @@ static const char *const BlackwellSource[] = {
 	" * written as a [queries][rows] matrix for a batched top-k selection. Each\n"
 	" * warp takes 16 rows at a time, loads their quantized bytes and block\n"
 	" * scales up front, and multiplies them against every query with\n"
-	" * mma.sync (FP16 in, FP32 out): the FP4 and FP8 conversion instructions\n"
-	" * yield the A fragments directly (a half2 is two neighbouring dimensions\n"
+	" * mma.sync (FP16 in, FP32 out): the FP4 conversion instruction yields\n"
+	" * the A fragments directly (a half2 is two neighbouring dimensions\n"
 	" * of one row), block scales are folded into them, and the B fragments\n"
 	" * are two 32-bit loads of the half queries in shared memory, per tile of\n"
 	" * 8 queries: a row's loads and conversions are shared by NT tiles (16,\n"
@@ -467,19 +426,6 @@ static const char *const BlackwellSource[] = {
 	"            }\n"
 	"        }\n"
 	"      }\n"
-	"      else\n"
-	"      {\n"
-	"        const uint4 *p0 = (const uint4 *) (data + (unsigned long long) r0 * rowBytes) + seg;\n"
-	"        const uint4 *p1 = (const uint4 *) (data + (unsigned long long) r1 * rowBytes) + seg;\n"
-	"#pragma unroll\n"
-	"        for (int k = 0; k < KSEG; k++)\n"
-	"          if (seg + k < blocks)\n"
-	"          {\n"
-	"            uint4 x0 = p0[k], x1 = p1[k];\n"
-	"            w0[k].x = t < 2 ? x0.x : x0.y; w0[k].y = t < 2 ? x0.z : x0.w;\n"
-	"            w1[k].x = t < 2 ? x1.x : x1.y; w1[k].y = t < 2 ? x1.z : x1.w;\n"
-	"          }\n"
-	"      }\n"
 	"#pragma unroll\n"
 	"      for (int k = 0; k < KSEG; k++)\n"
 	"      {\n"
@@ -496,12 +442,7 @@ static const char *const BlackwellSource[] = {
 	"          int sh = FUSED == 1 ? 0 : 8 * t;\n"
 	"          a0 = hmul2(e2m1pair(w0[k].x >> sh), sc0); a2 = hmul2(e2m1pair(w0[k].y >> sh), sc0);\n"
 	"          a1 = hmul2(e2m1pair(w1[k].x >> sh), sc1); a3 = hmul2(e2m1pair(w1[k].y >> sh), sc1);\n"
-	"        }\n"
-	"        else if (QUANT == 2)\n",
-	"        {\n"
-	"          a0 = e4m3pair(w0[k].x >> (16 * (t & 1))); a2 = e4m3pair(w0[k].y >> (16 * (t & 1)));\n"
-	"          a1 = e4m3pair(w1[k].x >> (16 * (t & 1))); a3 = e4m3pair(w1[k].y >> (16 * (t & 1)));\n"
-	"        }\n"
+	"        }\n",
 	"        else\n"
 	"        { a0 = w0[k].x; a2 = w0[k].y; a1 = w1[k].x; a3 = w1[k].y; }\n"
 	"        /* Dimensions past dims (a dataset's padding) count for nothing. */\n"
@@ -597,7 +538,6 @@ static const char *const BlackwellSource[] = {
 	"{ score_mma<QUANT, NT, 1>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, candD, bounds, \\\n"
 	"    candR, counts, cap, ROWNORM_ARG); }\n"
 	"MMA(score_mma_nvfp4, 1, 2) MMA(score_mma_nvfp4_32, 1, 4) MMA(score_mma_nvfp4_64, 1, 8)\n"
-	"MMA(score_mma_fp8, 2, 2) MMA(score_mma_fp8_32, 2, 4) MMA(score_mma_fp8_64, 2, 8)\n"
 	"MMA(score_mma_half, 3, 2) MMA(score_mma_half_32, 3, 4) MMA(score_mma_half_64, 3, 8)\n"
 	"MMA(score_mma_float, 4, 2) MMA(score_mma_float_32, 4, 4) MMA(score_mma_float_64, 4, 8)\n"
 	"FUSE(fuse_mma_nvfp4, 1, 2, FUSE_BOUNDS) FUSE(fuse_mma_nvfp4_32, 1, 4, FUSE_BOUNDS)\n"
@@ -609,7 +549,6 @@ static const char *const BlackwellSource[] = {
 	"    float *candD, unsigned *candR, unsigned *counts, unsigned cap ROWNORM_PARAM)\n"
 	"{ score_mma<1, 8, 1, 128>(data, scales, rowScales, rowBytes, blocks, rows, n, queries, nq, dims, candD, bounds,\n"
 	"    candR, counts, cap, ROWNORM_ARG); }\n"
-	"FUSE(fuse_mma_fp8, 2, 2, ) FUSE(fuse_mma_fp8_32, 2, 4, ) FUSE(fuse_mma_fp8_64, 2, 8, )\n"
 	"FUSE(fuse_mma_half, 3, 2, ) FUSE(fuse_mma_half_32, 3, 4, ) FUSE(fuse_mma_half_64, 3, 8, )\n"
 	"FUSE(fuse_mma_float, 4, 2, ) FUSE(fuse_mma_float_32, 4, 4, ) FUSE(fuse_mma_float_64, 4, 8, )\n"
 	"extern \"C\" __global__ void row_norm_nvfp4(const unsigned char *data, const unsigned char *scales,\n"
@@ -698,12 +637,12 @@ typedef struct BlackwellModule
 	CUmodule	module;
 	CUfunction	nvfp4;
 	CUfunction	nvfp4Segments;	/* score_nvfp4_seg */
-	CUfunction	fp8;
 	CUfunction	searchNvfp4;
-	CUfunction	searchFp8;
 	CUfunction	mma[4][3];		/* [format - 1][tiles]: score matrix of up to
-								 * 16, 32 or 64 queries from NVFP4, FP8, FP16
-								 * or FP32 rows */
+								 * 16, 32 or 64 queries from NVFP4, FP16 or
+								 * FP32 rows; [1] (FP8, which cuVS scans)
+								 * stays NULL, so the others keep their quant
+								 * index */
 	CUfunction	fuse128;		/* fuse_mma_nvfp4_64 at 128 dimensions */
 	CUfunction	fuse[4][3];		/* the same, appending only rows under a bound
 								 * to candidate lists */
@@ -832,16 +771,17 @@ JoinSource(void)
 /*
  * The tensor-core scan in three widths per format: 2, 4 or 8 tiles of 8
  * queries. The wider ones keep their queries in up to 128 KB of shared
- * memory, past the 48 KB a launch gets without opting in.
+ * memory, past the 48 KB a launch gets without opting in. Formats sit at
+ * their quant value less one; FP8's has no kernels.
  */
 static int
 LoadScoreFunctions(BlackwellModule *module, size_t optin)
 {
-	static const char *const formats[] = {"nvfp4", "fp8", "half", "float"};
+	static const char *const formats[] = {"nvfp4", NULL, "half", "float"};
 	static const char *const widths[] = {"", "_32", "_64"};
 
 	for (int f = 0; f < 4; f++)
-		for (int w = 0; w < 3; w++)
+		for (int w = 0; formats[f] && w < 3; w++)
 		{
 			char		name[64];
 			CUfunction *functions[] = {&module->mma[f][w], &module->fuse[f][w]};
@@ -929,9 +869,7 @@ AnnBlackwellReady(int device)
 		failed = "module load";
 	else if (cuModuleGetFunction(&module->nvfp4, module->module, "score_nvfp4") != CUDA_SUCCESS ||
 			 cuModuleGetFunction(&module->nvfp4Segments, module->module, "score_nvfp4_seg") != CUDA_SUCCESS ||
-			 cuModuleGetFunction(&module->fp8, module->module, "score_fp8") != CUDA_SUCCESS ||
-			 cuModuleGetFunction(&module->searchNvfp4, module->module, "search_nvfp4") != CUDA_SUCCESS ||
-			 cuModuleGetFunction(&module->searchFp8, module->module, "search_fp8") != CUDA_SUCCESS)
+			 cuModuleGetFunction(&module->searchNvfp4, module->module, "search_nvfp4") != CUDA_SUCCESS)
 		failed = "scan kernels";
 	else if (!LoadScoreFunctions(module, (size_t) optin))
 		failed = "grouped kernels";
@@ -962,10 +900,10 @@ AnnBlackwellReady(int device)
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	{
 		/* Register arrays indexed by an unrolled loop must not spill. */
-		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_fp8", "score_mma_nvfp4_64",
-		"fuse_mma_nvfp4_64", "fuse_mma_nvfp4_64_d128"};
-		CUfunction	functions[] = {module->searchNvfp4, module->mma[0][0], module->mma[1][0], module->mma[0][2],
-		module->fuse[0][2], module->fuse128};
+		const char *names[] = {"search_nvfp4", "score_mma_nvfp4", "score_mma_nvfp4_64", "fuse_mma_nvfp4_64",
+		"fuse_mma_nvfp4_64_d128"};
+		CUfunction	functions[] = {module->searchNvfp4, module->mma[0][0], module->mma[0][2], module->fuse[0][2],
+		module->fuse128};
 
 		for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++)
 		{
@@ -1019,105 +957,6 @@ AnnBlackwellView(const void *dataset, int64_t stride, int half, uint32_t dims, i
 	return 1;
 }
 
-/* E4M3 (OCP FN: no infinities, 448 the largest) nearest to a value. */
-static uint8_t
-E4m3(float value)
-{
-	uint8_t		sign = value < 0 ? 0x80 : 0;
-	float		magnitude = fabsf(value);
-	int			exponent;
-	float		fraction;
-
-	if (!(magnitude > 0))
-		return sign;
-	if (magnitude >= 448.0f)
-		return sign | 0x7e;
-	fraction = frexpf(magnitude, &exponent);	/* magnitude = fraction *
-												 * 2^exponent, fraction in
-												 * [0.5, 1) */
-	if (exponent + 6 >= 1)
-	{
-		int			biased = exponent + 6;
-		int			mantissa = (int) nearbyintf((2.0f * fraction - 1.0f) * 8.0f);
-
-		if (mantissa == 8)
-		{
-			mantissa = 0;
-			biased++;
-		}
-		if (biased > 15 || (biased == 15 && mantissa == 7))
-			return sign | 0x7e;
-		return sign | (uint8_t) (biased << 3 | mantissa);
-	}
-	{
-		/*
-		 * Subnormals are multiples of 2^-9; eight of them make the smallest
-		 * normal.
-		 */
-		int			units = (int) nearbyintf(magnitude * 512.0f);
-
-		return sign | (uint8_t) (units >= 8 ? 0x08 : units);
-	}
-}
-
-int
-AnnBlackwellUploadFp8(const float *vectors, uint64_t rows, uint32_t dims, int device, AnnBlackwellShard *out)
-{
-	uint32_t	rowBytes = (dims + 15) / 16 * 16;
-	const uint64_t chunk = 65536;
-	uint8_t    *codes = NULL;
-	float	   *scales = NULL;
-	int			ok;
-
-	memset(out, 0, sizeof(*out));
-	if (rows == 0 || !AnnBlackwellReady(device) || cudaSetDevice(device) != cudaSuccess)
-		return 0;
-	codes = malloc(chunk * rowBytes);
-	scales = malloc(chunk * sizeof(float));
-	ok = codes != NULL && scales != NULL &&
-		cudaMalloc((void **) &out->data, rows * rowBytes) == cudaSuccess &&
-		cudaMalloc((void **) &out->rowScales, rows * sizeof(float)) == cudaSuccess;
-	for (uint64_t first = 0; ok && first < rows; first += chunk)
-	{
-		uint64_t	count = rows - first < chunk ? rows - first : chunk;
-
-		/*
-		 * As build_cuvs_index.py --quantize fp8 writes them: a row scale of
-		 * max |x| / 448.
-		 */
-		for (uint64_t r = 0; r < count; r++)
-		{
-			const float *x = vectors + (first + r) * dims;
-			float		amax = 0;
-			float		scale;
-
-			for (uint32_t d = 0; d < dims; d++)
-				amax = fabsf(x[d]) > amax ? fabsf(x[d]) : amax;
-			scale = amax > 0 ? amax / 448.0f : 1.0f;
-			scales[r] = scale;
-			for (uint32_t d = 0; d < rowBytes; d++)
-				codes[r * rowBytes + d] = d < dims ? E4m3(x[d] / scale) : 0;
-		}
-		ok = cudaMemcpy(out->data + first * rowBytes, codes, count * rowBytes, cudaMemcpyHostToDevice) == cudaSuccess &&
-			cudaMemcpy(out->rowScales + first, scales, count * sizeof(float), cudaMemcpyHostToDevice) == cudaSuccess;
-	}
-	free(codes);
-	free(scales);
-	if (!ok)
-	{
-		fprintf(stderr, "Blackwell module: cannot make the FP8 re-scoring copy on device %d\n", device);
-		out->owned = 1;			/* free what was allocated */
-		AnnBlackwellFree(out);
-		return 0;
-	}
-	out->quant = ANN_QUANT_FP8;
-	out->owned = 1;
-	out->rowBytes = rowBytes;
-	out->blocks = rowBytes / 16;
-	out->bytes = rows * (rowBytes + sizeof(float));
-	return 1;
-}
-
 int
 AnnBlackwellUpload(const AnnIndexFile *file, uint32_t s, int device, AnnBlackwellShard *out)
 {
@@ -1127,7 +966,9 @@ AnnBlackwellUpload(const AnnIndexFile *file, uint32_t s, int device, AnnBlackwel
 	size_t		scaleBytes = file->quant == ANN_QUANT_NVFP4 ? rows * file->quantBlocks : 0;
 
 	memset(out, 0, sizeof(*out));
-	if (file->quant == ANN_QUANT_NONE || !AnnBlackwellReady(device) || cudaSetDevice(device) != cudaSuccess)
+
+	/* FP8 copies are cuVS' (cuvs.c): the module has no FP8 kernels. */
+	if (file->quant != ANN_QUANT_NVFP4 || !AnnBlackwellReady(device) || cudaSetDevice(device) != cudaSuccess)
 		return 0;
 	if (cudaMalloc((void **) &out->data, dataBytes) != cudaSuccess ||
 		cudaMemcpy(out->data, file->quantData + first * file->quantRowBytes, dataBytes,
@@ -1233,22 +1074,14 @@ AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32_t *ro
 
 	if (n == 0)
 		return 1;
-	if (shard->quant == ANN_QUANT_NONE || shard->quant >= ANN_BLACKWELL_HALF || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
+	if (shard->quant != ANN_QUANT_NVFP4 || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 ||
 		cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
 		return 0;
-	if (shard->quant == ANN_QUANT_NVFP4)
 	{
 		void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
 		&rowBytes, &blocks, (void *) &rows, &n, (void *) &query, &dims, &out};
 
 		return cuLaunchKernel(module->nvfp4, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0,
-							  (CUstream) stream, args, NULL) == CUDA_SUCCESS;
-	}
-	{
-		void	   *args[] = {(void *) &shard->data, (void *) &shard->rowScales, &rowBytes,
-		(void *) &rows, &n, (void *) &query, &dims, &out};
-
-		return cuLaunchKernel(module->fp8, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0,
 							  (CUstream) stream, args, NULL) == CUDA_SUCCESS;
 	}
 }
@@ -1339,25 +1172,6 @@ AnnBlackwellGroupLimit(int dims)
 	return 16 * qstride * 2 <= 45 * 1024 ? 16 : 1;
 }
 
-/*
- * The 16-dimension blocks an FP8 matrix scan reads of each row. With
- * --scan-skip-tail a last block holding a single coordinate is left out
- * (65 dimensions: 4 of 5 blocks, 33: 2 of 3): the cosine-as-L2 coordinate,
- * the same for every row of unit vectors, moves each of a query's distances
- * by one amount, so the candidates are the same and the scan a fifth or a
- * third shorter. The score matrix and the fused scan must agree (the cutoff
- * of one prunes the other), and the rerank reads every dimension.
- */
-static unsigned
-ScanBlocks(unsigned rowBytes, int dims)
-{
-	unsigned	blocks = rowBytes / 16;
-
-	if (AnnIndexConfig.scan_skip_tail && AnnIndexConfig.rescore != ANN_RESCORE_OFF && blocks > 1 && dims % 16 == 1)
-		blocks--;
-	return blocks;
-}
-
 int
 AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32_t *rows,
 						unsigned n, const float *queries, unsigned nq, int dims,
@@ -1379,9 +1193,7 @@ AnnBlackwellScoreMatrix(const AnnBlackwellShard *shard, int device, const uint32
 		return 0;
 	if (grid > (unsigned) module->sms * 4)
 		grid = (unsigned) module->sms * 4;
-	if (shard->quant == ANN_QUANT_FP8)
-		blocks = ScanBlocks(rowBytes, dims);
-	else if (shard->quant >= ANN_BLACKWELL_HALF)
+	if (shard->quant >= ANN_BLACKWELL_HALF)
 		blocks = ((unsigned) dims + 15) / 16;
 	return cuLaunchKernel(module->mma[shard->quant - 1][width], grid, 1, 1,
 						  ANN_BLACKWELL_BLOCK, 1, 1, shared, (CUstream) stream, args, NULL) == CUDA_SUCCESS;
@@ -1405,7 +1217,6 @@ AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_
 					   uint32_t *candR, uint32_t *counts, unsigned cap, void *stream)
 {
 	BlackwellModule *module = &modules[device];
-	unsigned	rowBytes = shard->rowBytes;
 	unsigned	blocks = shard->blocks;
 	int			count = (int) nq;
 	int			width = nq <= 16 ? 0 : nq <= 32 ? 1 : 2;
@@ -1425,9 +1236,7 @@ AnnBlackwellScoreBelow(const AnnBlackwellShard *shard, int device, const uint32_
 		return 0;
 	if (grid > (unsigned) module->sms * FuseGridPerSm(shard->quant))
 		grid = (unsigned) module->sms * FuseGridPerSm(shard->quant);
-	if (shard->quant == ANN_QUANT_FP8)
-		blocks = ScanBlocks(rowBytes, dims);
-	else if (shard->quant >= ANN_BLACKWELL_HALF)
+	if (shard->quant >= ANN_BLACKWELL_HALF)
 		blocks = ((unsigned) dims + 15) / 16;
 	return cuLaunchKernel(module->fuse128 && shard->quant == ANN_QUANT_NVFP4 && width == 2 && dims == 128 &&
 						  blocks == 8 ? module->fuse128 : module->fuse[shard->quant - 1][width], grid, 1, 1,
@@ -1460,7 +1269,6 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 	int			dimensions = dims,
 				count = (int) nq;
 	SearchSlot *sc;
-	CUfunction	function;
 
 	if (shard->quant == ANN_QUANT_NONE || atomic_load_explicit(&module->state, memory_order_acquire) <= 0 || n == 0 || nq == 0 ||
 		nq > (unsigned) AnnBlackwellGroupLimit(dims) || slot >= ANN_INDEX_MAX_SHARDS)
@@ -1480,27 +1288,14 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 	perBlock = (n + grid - 1) / grid;
 	if ((sc = GetSlot(device, slot, maxBlocks)) == NULL || cuCtxSetCurrent(module->context) != CUDA_SUCCESS)
 		return 0;
-	if (nq == 1 && shard->quant < ANN_BLACKWELL_HALF)
+	if (nq == 1 && shard->quant == ANN_QUANT_NVFP4)
 	{
-		function = shard->quant == ANN_QUANT_NVFP4 ? module->searchNvfp4 : module->searchFp8;
-		if (shard->quant == ANN_QUANT_NVFP4)
-		{
-			void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
-				&rowBytes, &blocks, (void *) &rows, &n, &perBlock, (void *) &queries, &dimensions, &sc->partD,
-			&sc->partR, &sc->counter, &sc->outD, &sc->outR};
+		void	   *args[] = {(void *) &shard->data, (void *) &shard->scales, (void *) &shard->rowScales,
+			&rowBytes, &blocks, (void *) &rows, &n, &perBlock, (void *) &queries, &dimensions, &sc->partD,
+		&sc->partR, &sc->counter, &sc->outD, &sc->outR};
 
-			if (cuLaunchKernel(function, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0, (CUstream) stream, args, NULL) != CUDA_SUCCESS)
-				return 0;
-		}
-		else
-		{
-			void	   *args[] = {(void *) &shard->data, (void *) &shard->rowScales, &rowBytes, (void *) &rows,
-				&n, &perBlock, (void *) &queries, &dimensions, &sc->partD, &sc->partR, &sc->counter, &sc->outD,
-			&sc->outR};
-
-			if (cuLaunchKernel(function, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0, (CUstream) stream, args, NULL) != CUDA_SUCCESS)
-				return 0;
-		}
+		if (cuLaunchKernel(module->searchNvfp4, grid, 1, 1, ANN_BLACKWELL_BLOCK, 1, 1, 0, (CUstream) stream, args, NULL) != CUDA_SUCCESS)
+			return 0;
 	}
 	else
 	{
@@ -1529,9 +1324,7 @@ AnnBlackwellSearch(const AnnBlackwellShard *shard, int device, unsigned slot, co
 		if (slices < 1)
 			slices = 1;
 		perSlice = (n + slices - 1) / slices;
-		if (shard->quant == ANN_QUANT_FP8)
-			blocks = rowBytes / 16;
-		else if (shard->quant >= ANN_BLACKWELL_HALF)
+		if (shard->quant >= ANN_BLACKWELL_HALF)
 			blocks = ((unsigned) dims + 15) / 16;
 		if (needed > sc->scoreCapacity)
 		{
@@ -1706,9 +1499,7 @@ AnnBlackwellCandidates(const AnnBlackwellShard *shard, int device, unsigned slot
 		sc->hostCounts = NULL;
 		return 0;
 	}
-	if (shard->quant == ANN_QUANT_FP8)
-		blocks = rowBytes / 16;
-	else if (shard->quant >= ANN_BLACKWELL_HALF)
+	if (shard->quant >= ANN_BLACKWELL_HALF)
 		blocks = ((unsigned) dims + 15) / 16;
 	sampleGrid = (sample + 127) / 128 < maxBlocks ? (sample + 127) / 128 : maxBlocks;
 	grid = (n + 127) / 128 < maxBlocks ? (n + 127) / 128 : maxBlocks;

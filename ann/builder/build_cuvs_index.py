@@ -13,9 +13,12 @@ ann_index_load(name, path); see docs/ann-cuvs-index.md.
 This is offline tooling: Python, NumPy, psycopg, CuPy and the cuVS Python
 package are needed here only, never on the query path. --no-cagra writes the
 manifest, keys and vectors only, for CPU-only testing. --scan-only with
---quantize writes the shards without graphs: the cuVS worker then holds only
-each shard's keys and quantized rows on the GPU and answers every search with
-the Blackwell module's scan, re-scored in FP32 from the host's vectors.
+--quantize writes the shards without graphs, and any --dtype: the cuVS worker
+answers every search of such an index by scanning each shard's rows. With
+fp8 it gives each shard a cuVS index without a graph (the shard's rows in
+FP16, converted from vectors.f32 at load, with the FP8 copy attached) and
+serves it with cuVS' CAGRA filtered scan; with nvfp4 the worker's Blackwell
+module scans it (compute capability 10.x or 12.x GPUs).
 
 --attribute COLUMN (repeatable) also writes attr-COLUMN.i32, one int32 per
 row in key order, so the worker can resolve "COLUMN IN (values)" filters
@@ -40,13 +43,20 @@ shard unless --shards says otherwise. The generation is a hash of the
 members' generations, and each member is recorded on a "# member" line.
 Members' integer[] elements are concatenated and their row offsets rebased.
 
---quantize nvfp4|fp8 also writes a quantized copy of the vectors for the
-worker's Blackwell module, which scores filtered rows from it on compute
-capability 10.x GPUs and re-scores candidates from vectors.f32:
-  nvfp4  vectors.nvfp4 (two E2M1 per byte, even dimension in the low
-         nibble), scales.e4m3 (one E4M3 scale per 16 dimensions) and
-         rowscale.f32 (one FP32 scale per row): value = e2m1 * scale * row
-  fp8    vectors.e4m3 (dims rounded up to 16, zero padded) and rowscale.f32
+--quantize fp8|nvfp4 also writes a quantized copy of the vectors, which the
+cuVS worker's filtered scans score eligible rows from:
+  fp8    for cuVS' CAGRA filtered scan, which re-scores its candidates from
+         the shard's FP16 rows; graph builds therefore need --dtype float16
+         (scan-only builds take any dtype). vectors.e4m3 (dims rounded up to
+         16, zero padded) and rowscale.f32 (one FP32 scale per row): value =
+         e4m3 * row, row = the row's largest magnitude / 448 (1 for a zero
+         row), each code the nearest E4M3 value, ties to the smaller one
+  nvfp4  for the worker's Blackwell module (compute capability 10.x or
+         12.x GPUs), which re-scores its candidates from vectors.f32 or an
+         FP16 dataset. vectors.nvfp4 (two E2M1 per byte, even dimension in
+         the low nibble), scales.e4m3 (one E4M3 scale per 16 dimensions)
+         and rowscale.f32 (one FP32 scale per row):
+         value = e2m1 * scale * row
 """
 
 import argparse
@@ -386,20 +396,27 @@ def main():
     parser.add_argument('--out', required=True, help='new or empty output directory')
     parser.add_argument('--shards', type=int, default=0, help='default: number of visible GPUs')
     parser.add_argument('--dtype', choices=['float32', 'float16'], default='float32',
-                        help='CAGRA dataset precision; float16 halves GPU memory traffic')
+                        help='CAGRA dataset precision; float16 halves GPU memory traffic '
+                             '(graph builds with --quantize fp8 need it)')
     parser.add_argument('--graph-degree', type=int, default=32)
     parser.add_argument('--intermediate-graph-degree', type=int, default=64)
     parser.add_argument('--limit', type=int, help='export at most this many rows (testing)')
     parser.add_argument('--attribute', action='append', default=[],
                         help='integer column the worker can filter on (repeatable)')
     parser.add_argument('--quantize', choices=['nvfp4', 'fp8'],
-                        help='also write a quantized copy for the worker\'s Blackwell scans')
+                        help='also write a quantized copy: fp8 for cuVS\' CAGRA filtered scan (graph builds need '
+                             '--dtype float16), nvfp4 for the worker\'s Blackwell module')
     parser.add_argument('--no-cagra', action='store_true', help='write keys/vectors only (CPU tests)')
     parser.add_argument('--scan-only', action='store_true',
                         help='shards without CAGRA graphs, served by quantized scans (needs --quantize)')
     args = parser.parse_args()
     if args.scan_only and not args.quantize:
         parser.error('--scan-only needs --quantize')
+    # cuVS' filtered scan re-scores FP8 candidates from the CAGRA index's own FP16 dataset, so an FP8
+    # copy beside FP32 graphs would never be scanned. Scan-only shards get FP16 rows at load.
+    if args.quantize == 'fp8' and args.dtype != 'float16' and not (args.scan_only or args.no_cagra):
+        parser.error('--quantize fp8 needs --dtype float16 for CAGRA shards: cuVS\' CAGRA filtered scan '
+                     're-scores its candidates from an FP16 dataset (or use --scan-only)')
 
     if args.from_export:
         if args.dsn or args.table or args.attribute or args.limit:

@@ -23,10 +23,13 @@
 #    output, and what is left.
 #
 # Requirements on the node: the cuVS SDK environment in ANN_HANDOFF_CUVS_ENV
-# (exports CUVS_PREFIX, CUDA_HOME, CPPFLAGS, LDFLAGS), rdma-core, a PostgreSQL
-# install whose cluster (ANN_HANDOFF_PGDATA, at ANN_HANDOFF_PGHOST and
-# ANN_HANDOFF_PGPORT) the current user can use as a superuser, and Python
-# with psycopg, numpy, cupy, and cuvs (see docs/ann-cuvs-index.md).
+# (exports CUVS_PREFIX, CUDA_HOME, CPPFLAGS, LDFLAGS; CUVS_PREFIX is an
+# install of a source build of the chenqin/cuvs fork's main, as the worker
+# needs CUVS_CAGRA_HAS_FILTERED_SCAN 2 or later, which no pip cuVS has),
+# rdma-core, a PostgreSQL install whose cluster (ANN_HANDOFF_PGDATA, at
+# ANN_HANDOFF_PGHOST and ANN_HANDOFF_PGPORT) the current user can use as a
+# superuser, and Python with psycopg, numpy, cupy, and cuvs (see
+# docs/ann-cuvs-index.md).
 set -u
 
 : "${ANN_HANDOFF_DIR:=$HOME/annenv/handoff}"

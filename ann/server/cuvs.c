@@ -21,6 +21,7 @@
 #include <cuvs/neighbors/cagra.h>
 #include <cuvs/selection/select_k.h>
 #include <cuvs/version_config.h>
+#include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -31,6 +32,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+/*
+ * FP8 scans run as cuVS' CAGRA filtered scan: the worker builds only against
+ * chenqin/cuvs main, whose cagra.h has cuvsCagraUpdateScanCodes, the
+ * CUVS_CAGRA_FILTERED_ROUTE_* routes, the ROW_LIST filter and the scan_*
+ * search parameters (scan_skip_last_block, scan_retry, scan_full_selection).
+ */
+#if !defined(CUVS_CAGRA_HAS_FILTERED_SCAN) || CUVS_CAGRA_HAS_FILTERED_SCAN < 2
+#error "the cuVS worker needs chenqin/cuvs main with CAGRA's FP8 filtered scan (CUVS_CAGRA_HAS_FILTERED_SCAN 2)"
+#endif
 
 typedef struct AnnCuvsState
 {
@@ -588,8 +599,21 @@ typedef struct AnnCuvsShard
 	int64_t		rerankStride;
 	size_t		rerankBytes;	/* owned bytes, zero when reusing FP32 CAGRA
 								 * rows */
-	AnnBlackwellShard quant;	/* quantized rows for Blackwell scans */
-	AnnBlackwellShard rescore;	/* FP8 rows for --rescore fp8-gpu */
+	AnnBlackwellShard quant;	/* NVFP4 rows, or the dataset read in place,
+								 * for Blackwell scans */
+	int			scanAttached;	/* scanCodes are attached to index for cuVS'
+								 * FP8 filtered scan */
+	int			scanSkipLast;	/* --scan-skip-tail: the scan leaves out the
+								 * codes' last 16-dimension block */
+	uint8_t    *scanCodes;		/* the shard's FP8 rows on its device, for
+								 * cuVS (not the Blackwell module's copy) */
+	float	   *scanScales;		/* and their row scales */
+	size_t		scanBytes;		/* device memory those two hold */
+	void	   *scanRows;		/* scan-only: the FP16 rows of the graph-free
+								 * index, queryWidth elements apart */
+	size_t		scanRowBytes;
+	const uint32_t *allRows;	/* scan-only: rows 0, 1, 2, ... of the shard
+								 * on its device (in AnnCuvsIndex.allRows) */
 } AnnCuvsShard;
 
 /*
@@ -613,12 +637,17 @@ typedef struct AnnCuvsIndex
 	uint32_t	nshards;
 	uint32_t	copies;
 	int			fp16;
-	int			quantized;		/* every shard copy has its quantized rows */
+	int			quantized;		/* every shard copy has its NVFP4 rows */
 	int			grouped;		/* every shard copy can be scored in groups */
 	int			scanOnly;		/* no CAGRA graphs: every search scans the
 								 * quantized rows */
-	int			rescoreGpu;		/* every shard copy has its FP8 re-scoring
-								 * rows */
+	int			cuvsScan;		/* every shard copy has its FP8 codes
+								 * attached, and cuVS' filtered scan serves
+								 * the index's FP8 scans */
+	uint32_t   *allRows[ANN_CUVS_MAX_DEVICES];	/* scan-only: 0, 1, 2, ... on
+												 * each device, as many as its
+												 * longest shard there */
+	size_t		allRowsBytes[ANN_CUVS_MAX_DEVICES];
 	AnnCuvsShard *shards;
 	AnnCuvsRoute routing[ANN_CUVS_MAX_DEVICES];
 	atomic_uint_fast64_t matrix_queries;
@@ -636,6 +665,13 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t widened_jobs;	/* short graph answers searched again */
 	atomic_uint_fast64_t mixed_graph_jobs;	/* graph jobs searched with their
 											 * own bitset among other filters' */
+	atomic_uint_fast64_t cuvs_scan_queries; /* jobs cuVS' FP8 filtered scan
+											 * served */
+	atomic_uint_fast64_t cuvs_scan_retries; /* of those, searched again
+											 * without the sampled cutoff */
+	atomic_uint cuvsScanFailures;	/* cuVS scan calls failed in a row */
+	atomic_int	cuvsScanDisabled;	/* set after ANN_CUVS_SCAN_MAX_FAILURES of
+									 * them: the fallbacks serve the scans */
 	atomic_uint_fast64_t cost_queries[4];
 	atomic_uint_fast64_t gpu_predicates;	/* uncached predicates evaluated
 											 * on a device */
@@ -656,6 +692,23 @@ static _Thread_local uint32_t laneProfileItopk;
 
 /* SearchShards filters each job by its own bitsets (SearchFilteredMixedGraph). */
 static _Thread_local int laneMixed;
+
+/*
+ * When not 0, SearchShards runs cuVS' FP8 filtered scan of each shard's row
+ * list (laneScanRows, laneScanCounts), keeping this many candidates a query,
+ * instead of a graph search (SearchScanCuvs).
+ */
+static _Thread_local uint32_t laneScanCandidates;
+static _Thread_local const uint32_t *laneScanRows[ANN_INDEX_MAX_SHARDS];
+static _Thread_local int64_t laneScanCounts[ANN_INDEX_MAX_SHARDS];
+
+/*
+ * The scan does not wait for its sampled cutoff's check: it flags the
+ * queries whose cutoff failed (laneDevices[].hostScanRetry, m per shard),
+ * which SearchScanCuvs searches again with laneScanFull, selecting from
+ * every row.
+ */
+static _Thread_local int laneScanFull;
 static _Thread_local uint32_t laneProfileSlack;
 static _Alignas(64)
 AnnReplicaRouter replicaRouter;
@@ -745,7 +798,7 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 
 	if (state == NULL)
 		return 0;
-	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"residual_masked\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"widened_jobs\":%llu,\"mixed_graph_jobs\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
+	written = snprintf(data, capacity, "{\"policy\":\"%s\",\"slack\":%u,\"copies\":%u,\"matrix_queries\":%llu,\"matrix_peak_score_bytes\":%llu,\"matrix_pruned_queries\":%llu,\"matrix_prune_fallbacks\":%llu,\"mixed_queries\":%llu,\"gpu_predicates\":%llu,\"residual_masked\":%llu,\"gpu_rerank_candidates\":%llu,\"cagra_fp32_queries\":%llu,\"cagra_fp16_queries\":%llu,\"graph_cpu_rerank_candidates\":%llu,\"widened_jobs\":%llu,\"mixed_graph_jobs\":%llu,\"cuvs_scan_queries\":%llu,\"cuvs_scan_retries\":%llu,\"cost_queries\":[%llu,%llu,%llu,%llu],\"replicas\":[",
 					   AnnIndexConfig.replica_routing ? "load" : "home", AnnIndexConfig.replica_load_slack, state->copies,
 					   (unsigned long long) atomic_load_explicit(&state->matrix_queries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->matrix_peak_score_bytes, memory_order_relaxed),
@@ -760,6 +813,8 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 					   (unsigned long long) atomic_load_explicit(&state->graph_cpu_rerank_candidates, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->widened_jobs, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->mixed_graph_jobs, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cuvs_scan_queries, memory_order_relaxed),
+					   (unsigned long long) atomic_load_explicit(&state->cuvs_scan_retries, memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[0], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[1], memory_order_relaxed),
 					   (unsigned long long) atomic_load_explicit(&state->cost_queries[2], memory_order_relaxed),
@@ -819,6 +874,11 @@ typedef struct AnnCuvsDevice
 	size_t		bitsetPointerCount;
 	uint32_t   *hostNeighbors;	/* pinned */
 	float	   *hostDistances;	/* pinned */
+	int64_t    *resultKeys;		/* keys of neighbors, gathered on the GPU */
+	int64_t    *hostResultKeys; /* pinned */
+	uint32_t   *scanRetry;		/* cuVS' scan: a flag per shard and query */
+	uint32_t   *hostScanRetry;	/* pinned */
+	size_t		scanRetryCount;
 	int64_t    *gatherKeys;		/* gather scan: filter keys of one shard */
 	uint32_t   *gatherRows;		/* their shard rows, UINT32_MAX if absent */
 	float	   *gatherScores;	/* squared distance per eligible row */
@@ -835,11 +895,6 @@ typedef struct AnnCuvsDevice
 								 * distances */
 	size_t		groupCapacity;
 	float	   *hostBest;		/* pinned: selected distances (--rescore off) */
-	uint32_t   *rescoreRows;	/* --rescore fp8-gpu: candidates' shard rows */
-	float	   *rescoreOut;		/* and their distances */
-	uint32_t   *hostRescoreRows;	/* pinned */
-	float	   *hostRescoreOut; /* pinned */
-	size_t		rescoreCapacity;
 	cudaEvent_t timing[4];		/* ANN_KERNEL_TIMING: candidate scan and copy
 								 * marks */
 	cudaEvent_t matrixTiming[6];	/* ANN_KERNEL_TIMING: matrix gather stages */
@@ -1032,9 +1087,255 @@ LaneDevice(int device, size_t queryBytes, size_t results, size_t bitsetWords)
 		have = hostCount;
 		if (!GrowPinned((void **) &lane->hostDistances, &have, count, sizeof(float), 0))
 			return NULL;
+		have = hostCount;
+		if (!GrowDevice((void **) &lane->resultKeys, &have, count, sizeof(int64_t), 0, stream))
+			return NULL;
+		have = hostCount;
+		if (!GrowPinned((void **) &lane->hostResultKeys, &have, count, sizeof(int64_t), 0))
+			return NULL;
 		lane->resultCount = have;
 	}
 	return lane;
+}
+
+/*
+ * cuVS' FP8 filtered scan takes indexes of at most 512 dimensions, k up to
+ * 4096, on devices of compute capability 8.9 or later. The worker checks
+ * these itself, so a search the scan would refuse takes another route
+ * without a failed cuVS call.
+ */
+#define ANN_CUVS_SCAN_MAX_DIMS 512
+#define ANN_CUVS_SCAN_MAX_K 4096
+#define ANN_CUVS_SCAN_MAX_FAILURES 8	/* failed cuVS scans in a row that
+										 * stop an index's cuVS scans */
+#define ANN_CUVS_SCAN_MIN_ARCH 89
+
+/*
+ * Whether the libcuvs_c this worker runs with has the scan API its headers
+ * declared (cuvsCagraUpdateScanCodes); set by the first LoadIndex.
+ */
+static int	cuvsScanLinked;
+
+/*
+ * Whether cuVS' CAGRA filtered scan serves an index's FP8 scans: every FP16
+ * graph shard and every graph-free one gets its FP8 codes attached. The
+ * worker has no FP8 scan of its own: cuVS scans FP16 rows only, so FP8 codes
+ * next to FP32 graphs get no scan at all (LoadIndex says so). NVFP4 and the
+ * in-place FP16 and FP32 scans are the Blackwell module's.
+ */
+static int
+CuvsScanIndex(const AnnIndexFile *file, const AnnCuvsIndex *state)
+{
+	return cuvsScanLinked && AnnIndexConfig.quantized_scan && file->quant == ANN_QUANT_FP8 &&
+		(state->scanOnly || state->fp16);
+}
+
+/*
+ * Free a shard's buffers for cuVS' scan, and with graphFree its graph-free
+ * index (scan-only shards). Codes attached to an index that stays must be
+ * detached first.
+ */
+static void
+FreeScanCodes(AnnCuvsShard *shard, int graphFree)
+{
+	if (graphFree && shard->index)
+		(void) cuvsCagraIndexDestroy(shard->index);
+	if (graphFree && shard->resources)
+		(void) cuvsResourcesDestroy(shard->resources);
+	if (graphFree)
+	{
+		shard->index = NULL;
+		shard->resources = 0;
+	}
+	if (shard->scanCodes)
+		(void) cudaFree(shard->scanCodes);
+	if (shard->scanScales)
+		(void) cudaFree(shard->scanScales);
+	if (shard->scanRows)
+		(void) cudaFree(shard->scanRows);
+	shard->scanCodes = NULL;
+	shard->scanScales = NULL;
+	shard->scanRows = NULL;
+	shard->scanBytes = 0;
+	shard->scanRowBytes = 0;
+	shard->scanAttached = 0;
+}
+
+/*
+ * A shard's slice of the FP8 copy (vectors.e4m3 and rowscale.f32) on the
+ * current device, copied as it is: the layout cuVS' scan reads, on any GPU
+ * it runs on, not only where the Blackwell module does. 0 on failure, with
+ * what was allocated left for FreeScanCodes.
+ */
+static int
+UploadScanCodes(const AnnIndexFile *file, uint32_t s, AnnCuvsShard *shard)
+{
+	uint64_t	first = file->shards[s].first;
+	size_t		rows = file->shards[s].rows;
+	size_t		codeBytes = rows * file->quantRowBytes;
+	void	   *codes = NULL;
+	void	   *scales = NULL;
+
+	if (cudaMalloc(&codes, codeBytes) != cudaSuccess)
+		codes = NULL;
+	else if (cudaMalloc(&scales, rows * sizeof(float)) != cudaSuccess)
+		scales = NULL;
+	shard->scanCodes = codes;
+	shard->scanScales = scales;
+	if (codes == NULL || scales == NULL ||
+		cudaMemcpy(codes, file->quantData + first * file->quantRowBytes, codeBytes,
+				   cudaMemcpyHostToDevice) != cudaSuccess ||
+		cudaMemcpy(scales, file->rowScales + first, rows * sizeof(float), cudaMemcpyHostToDevice) != cudaSuccess)
+		return 0;
+	shard->scanBytes = codeBytes + rows * sizeof(float);
+	return 1;
+}
+
+/*
+ * A scan-only shard as a CAGRA index without a graph: its rows in FP16 on
+ * the current device, converted from vectors.f32 and padded with zeros to a
+ * multiple of 8 dimensions, the row pitch cuVS gives FP16 datasets (graph
+ * shards are searched at that pitch too). cuVS' filtered scan re-scores its
+ * candidates from these rows, and no search walks a graph. 0 on failure,
+ * with what was made left for FreeScanCodes, and *message cuVS' error text
+ * when a cuVS call failed.
+ */
+static int
+GraphFreeIndex(const AnnIndexFile *file, uint32_t s, AnnCuvsShard *shard, const char **message)
+{
+	uint64_t	rows = file->shards[s].rows;
+	uint32_t	dims = file->dimensions;
+	uint32_t	pitch = (dims + 7) & ~7u;
+	const uint64_t chunk = 65536;
+	const float *from = file->vectors + file->shards[s].first * dims;
+	uint16_t   *staged = malloc(chunk * pitch * sizeof(uint16_t));
+	int64_t		shape[2] = {(int64_t) rows, (int64_t) pitch};
+	DLManagedTensor dataset;
+	int			ok = staged != NULL;
+
+	if (ok && cudaMalloc(&shard->scanRows, rows * pitch * sizeof(uint16_t)) != cudaSuccess)
+	{
+		shard->scanRows = NULL;
+		ok = 0;
+	}
+	for (uint64_t first = 0; ok && first < rows; first += chunk)
+	{
+		uint64_t	count = rows - first < chunk ? rows - first : chunk;
+
+		memset(staged, 0, count * pitch * sizeof(uint16_t));
+		for (uint64_t r = 0; ok && r < count; r++)
+			for (uint32_t d = 0; d < dims; d++)
+			{
+				float		x = from[(first + r) * dims + d];
+
+				/*
+				 * FP16 overflows to infinity past 65504, and cuVS drops a row
+				 * whose re-scored distance is not finite: such a shard keeps
+				 * the host's exact scan.
+				 */
+				if (!(fabsf(x) <= 65504.0f))
+				{
+					*message = "a coordinate is outside the FP16 range";
+					ok = 0;
+					break;
+				}
+				staged[r * pitch + d] = AnnIndexHalf(x);
+			}
+		ok = ok && cudaMemcpy((uint16_t *) shard->scanRows + first * pitch, staged,
+							  count * pitch * sizeof(uint16_t), cudaMemcpyHostToDevice) == cudaSuccess;
+	}
+	free(staged);
+	if (!ok)
+		return 0;
+	shard->scanRowBytes = rows * pitch * sizeof(uint16_t);
+
+	/*
+	 * A contiguous rows x pitch tensor: cuVS makes it the padded dataset of
+	 * an index of pitch dimensions, as the graph shards' pitch views are.
+	 */
+	dataset = Tensor(shard->scanRows, kDLCUDA, shard->device, kDLFloat, 2, shape);
+	dataset.dl_tensor.dtype.bits = 16;
+	if (cuvsResourcesCreate(&shard->resources) != CUVS_SUCCESS)
+		shard->resources = 0;
+	else if (cuvsCagraIndexCreate(&shard->index) != CUVS_SUCCESS)
+		shard->index = NULL;
+	if (shard->resources == 0 || shard->index == NULL ||
+		cuvsCagraIndexFromArgs(shard->resources, L2Expanded, NULL, &dataset, shard->index) != CUVS_SUCCESS ||
+		cuvsStreamSync(shard->resources) != CUVS_SUCCESS)
+	{
+		*message = cuvsGetLastErrorText();
+		return 0;
+	}
+	shard->queryWidth = pitch;
+	return 1;
+}
+
+/*
+ * A shard's FP8 codes on its device (the current one), attached to its
+ * CAGRA index for cuVS' filtered scan; a scan-only shard first gets a
+ * graph-free index over FP16 rows. Index files are L2 only (the manifest
+ * takes no other metric), as the scan is. A shard the scan cannot serve
+ * keeps none of it and says why: its index's filtered searches then walk
+ * the graph, or score exactly on the host when it has none.
+ */
+static void
+AttachScanCodes(const AnnIndexFile *file, const AnnCuvsIndex *state, uint32_t s, AnnCuvsShard *shard)
+{
+	uint64_t	rows = file->shards[s].rows;
+	int64_t		width = state->scanOnly ? (int64_t) ((file->dimensions + 7) & ~7u) : shard->queryWidth;
+	int64_t		codeShape[2] = {(int64_t) rows, (int64_t) file->quantRowBytes};
+	int64_t		scaleShape[1] = {(int64_t) rows};
+	DLManagedTensor codes;
+	DLManagedTensor scales;
+	int			major = 0,
+				minor = 0;
+	const char *failed = NULL;
+	const char *message = NULL;
+
+	if (cudaDeviceGetAttribute(&major, cudaDevAttrComputeCapabilityMajor, shard->device) != cudaSuccess ||
+		cudaDeviceGetAttribute(&minor, cudaDevAttrComputeCapabilityMinor, shard->device) != cudaSuccess ||
+		major * 10 + minor < ANN_CUVS_SCAN_MIN_ARCH)
+		failed = "its device is older than compute capability 8.9";
+	else if (width > ANN_CUVS_SCAN_MAX_DIMS)
+		failed = "its rows are wider than the scan's 512 dimensions";
+	else if (!state->scanOnly && (shard->index == NULL || shard->rows == NULL))
+		failed = "its CAGRA dataset is not in device memory";
+	else if (!UploadScanCodes(file, s, shard))
+		failed = "its FP8 codes could not be copied to the device";
+	else if (state->scanOnly && !GraphFreeIndex(file, s, shard, &message))
+		failed = "its graph-free FP16 index could not be made";
+	else
+	{
+		codes = Tensor(shard->scanCodes, kDLCUDA, shard->device, kDLUInt, 2, codeShape);
+		codes.dl_tensor.dtype.bits = 8;
+		scales = Tensor(shard->scanScales, kDLCUDA, shard->device, kDLFloat, 1, scaleShape);
+		if (cuvsCagraUpdateScanCodes(shard->resources, &codes, &scales, shard->index) != CUVS_SUCCESS)
+		{
+			failed = "cuVS did not take its codes";
+			message = cuvsGetLastErrorText();
+		}
+	}
+	if (failed)
+	{
+		fprintf(stderr, "cuVS: index %s shard %u on device %d: no FP8 filtered scan, as %s%s%s%s; %s\n",
+				file->name, s, shard->device, failed, message ? " (" : "", message ? message : "",
+				message ? ")" : "", state->scanOnly ? "its searches score exactly on the host" :
+				"its filtered searches take the graph");
+		FreeScanCodes(shard, state->scanOnly);
+		(void) cudaGetLastError();
+		return;
+	}
+	shard->scanAttached = 1;
+
+	/*
+	 * --scan-skip-tail: a last 16-dimension block holding one coordinate (the
+	 * cosine-as-L2 one, the same for every row of unit vectors, moves each of
+	 * a query's distances by one amount) is left out of the FP8 scores, so
+	 * the candidates are the same and the scan a fifth (65 dimensions) or a
+	 * third (33) shorter; the FP16 re-score reads every dimension.
+	 */
+	shard->scanSkipLast = AnnIndexConfig.scan_skip_tail && AnnIndexConfig.rescore != ANN_RESCORE_OFF &&
+		file->quantRowBytes / 16 > 1 && file->dimensions % 16 == 1;
 }
 
 typedef struct LoadArgs
@@ -1174,26 +1475,34 @@ keys:
 	}
 
 	/*
-	 * On Blackwell GPUs the gather scan reads the quantized copy instead: 4
-	 * or 8 bits per dimension rather than 16 or 32.
+	 * Scans read the quantized copy instead: 4 or 8 bits per dimension rather
+	 * than 16 or 32. An FP8 copy goes to cuVS' filtered scan, on any GPU it
+	 * runs on; an NVFP4 copy goes to the Blackwell module on Blackwell GPUs.
 	 */
-	if (args->file->quant != ANN_QUANT_NONE && AnnIndexConfig.quantized_scan)
+	if (CuvsScanIndex(args->file, args->state))
+		AttachScanCodes(args->file, args->state, args->shard, shard);
+	else if (args->file->quant == ANN_QUANT_NVFP4 && AnnIndexConfig.quantized_scan)
 	{
 		if (!AnnBlackwellUpload(args->file, args->shard, shard->device, &shard->quant) && args->state->scanOnly)
 			return NULL;
 	}
 	else if (AnnIndexConfig.quantized_scan && shard->rows)
 	{
-		/* Grouped searches can read the FP16 or FP32 dataset in place. */
+		/*
+		 * Grouped searches can read the FP16 or FP32 dataset in place: an
+		 * index without a quantized copy, or with an FP8 copy next to FP32
+		 * graphs, which cuVS' scan does not read.
+		 */
 		(void) AnnBlackwellView(shard->rows, shard->stride, strcmp(args->file->dtype, "float16") == 0,
 								args->file->dimensions, shard->device, &shard->quant);
 	}
-	if (AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && AnnIndexConfig.quantized_scan)
-		(void) AnnBlackwellUploadFp8(args->file->vectors +
-									 (size_t) args->file->shards[args->shard].first * args->file->dimensions,
-									 args->file->shards[args->shard].rows, args->file->dimensions, shard->device,
-									 &shard->rescore);
-	if (AnnIndexConfig.gpu_rerank)
+
+	/*
+	 * Under cuVS' scan a scan-only shard without its graph-free index scores
+	 * on the host, which reads no rerank copy.
+	 */
+	if (AnnIndexConfig.gpu_rerank &&
+		!(args->state->scanOnly && CuvsScanIndex(args->file, args->state) && shard->scanRows == NULL))
 	{
 		if (strcmp(args->file->dtype, "float32") == 0 && shard->rows)
 		{
@@ -1207,12 +1516,23 @@ keys:
 			shard->rerankHalf = 1;
 			shard->rerankStride = shard->stride;
 		}
+		else if (shard->scanRows && !AnnIndexConfig.fp16_exact)
+		{
+			/*
+			 * A graph-free shard's FP16 rows, in place: the copy below would
+			 * hold the same rows twice.
+			 */
+			shard->rerank = shard->scanRows;
+			shard->rerankHalf = 1;
+			shard->rerankStride = shard->queryWidth;
+		}
 		else if (!AnnIndexConfig.fp16_exact)
 		{
 			/*
-			 * No dataset on the device (scan-only shards): an FP16 copy with
-			 * rows padded to a multiple of 8 dimensions, so the fused rerank
-			 * kernels' 16-byte loads apply, at half the bytes of FP32.
+			 * No dataset on the device (NVFP4 scan-only shards, which the
+			 * Blackwell module scans): an FP16 copy with rows padded to a
+			 * multiple of 8 dimensions, so the fused rerank kernels' 16-byte
+			 * loads apply, at half the bytes of FP32.
 			 */
 			uint64_t	rows = args->file->shards[args->shard].rows;
 			uint32_t	dims = args->file->dimensions;
@@ -1290,14 +1610,15 @@ DestroyIndexState(AnnCuvsIndex *state)
 		(void) cudaSetDevice(shard->device);
 		if (shard->quant.quant != ANN_QUANT_NONE)
 			AnnBlackwellFree(&shard->quant);
-		if (shard->rescore.quant != ANN_QUANT_NONE)
-			AnnBlackwellFree(&shard->rescore);
 		if (shard->keys)
 			(void) cudaFree(shard->keys);
 		if (shard->rerankBytes)
 			(void) cudaFree((void *) shard->rerank);
 		if (shard->index)
 			(void) cuvsCagraIndexDestroy(shard->index);
+		shard->index = NULL;
+		/* The index viewed these: they go after it. */
+		FreeScanCodes(shard, 0);
 		if (shard->pitchView)
 			(void) cuvsDatasetDestroy(shard->pitchView);
 		if (shard->dataset)
@@ -1305,6 +1626,12 @@ DestroyIndexState(AnnCuvsIndex *state)
 		if (shard->resources)
 			(void) cuvsResourcesDestroy(shard->resources);
 	}
+	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+		if (state->allRows[d])
+		{
+			(void) cudaSetDevice(d);
+			(void) cudaFree(state->allRows[d]);
+		}
 	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 		for (int a = 0; a < ANN_INDEX_MAX_ATTRIBUTES; a++)
 			if (state->predicateColumns[d][a])
@@ -1656,6 +1983,14 @@ static const char MaskKernelSource[] =
 "  if (t >= n) return;\n"
 "  long long r = rows[t];\n"
 "  out[t] = r >= 0 && (unsigned long long) r < shardRows ? keys[r] : -1;\n"
+"}\n"
+"extern \"C\" __global__ void gather_keys32(const long long *keys, const unsigned int *rows, long long *out,\n"
+"                                          unsigned int n, unsigned long long shardRows)\n"
+"{\n"
+"  unsigned int t = blockIdx.x * blockDim.x + threadIdx.x;\n"
+"  if (t >= n) return;\n"
+"  unsigned int r = rows[t];\n"
+"  out[t] = r < shardRows ? keys[r] : -1;\n"
 "}\n";
 
 typedef struct PredicateModule
@@ -1669,6 +2004,7 @@ typedef struct PredicateModule
 	CUfunction	expandWrite;
 	CUfunction	maskScores;
 	CUfunction	gatherKeys;
+	CUfunction	gatherKeys32;
 } PredicateModule;
 
 static PredicateModule predicateModules[ANN_CUVS_MAX_DEVICES];
@@ -1713,7 +2049,8 @@ PredicateKernels(int device)
 		cuModuleGetFunction(&module->expandScan, module->module, "expand_scan") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->expandWrite, module->module, "expand_write") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->maskScores, module->module, "mask_scores") != CUDA_SUCCESS ||
-		cuModuleGetFunction(&module->gatherKeys, module->module, "gather_keys") != CUDA_SUCCESS)
+		cuModuleGetFunction(&module->gatherKeys, module->module, "gather_keys") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->gatherKeys32, module->module, "gather_keys32") != CUDA_SUCCESS)
 		goto fail;
 	atomic_store_explicit(&module->state, 1, memory_order_release);
 	goto unlock;
@@ -2159,6 +2496,30 @@ GatherKeys(const AnnCuvsShard *shard, uint64_t shardRows, AnnCuvsDevice *lane, i
 	}
 }
 
+/*
+ * The keys of count CAGRA neighbours (shard rows, UINT32_MAX for none) into
+ * keys, -1 for none, from the shard's device keys on the lane's stream: the
+ * host then reads no key per hit. Returns 0 when the kernel is unavailable
+ * (the host reads the keys itself).
+ */
+static int
+GatherNeighborKeys(const AnnCuvsShard *shard, uint64_t shardRows, const uint32_t *neighbors, int64_t *keys,
+				   int device, cudaStream_t stream, uint32_t count)
+{
+	PredicateModule *module;
+	unsigned long long rows = shardRows;
+
+	if (shard->keys == NULL || count == 0 || (module = PredicateKernels(device)) == NULL)
+		return 0;
+	{
+		void	   *args[] = {(void *) &shard->keys, &neighbors, &keys, &count, &rows};
+
+		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->gatherKeys32, (count + 255) / 256, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   args, NULL) == CUDA_SUCCESS;
+	}
+}
+
 /* Whether ordinal is one of the job's excluded rows: one binary search. */
 static int
 IsExcluded(const AnnIndexJob *job, uint64_t ordinal)
@@ -2176,6 +2537,136 @@ IsExcluded(const AnnIndexJob *job, uint64_t ordinal)
 			b = mid;
 	}
 	return a < job->nexclude && job->exclude[a] == ordinal;
+}
+
+/*
+ * Scan-only indexes: each device's all-rows list, 0, 1, 2, ... as long as
+ * its longest shard, which every shard there reads a prefix of for
+ * unfiltered searches and filters passing all its rows. It is made once at
+ * load and only read after, so every lane shares it. Without one a device's
+ * whole-shard filters copy their rows per search, and unfiltered searches
+ * score exactly on the host.
+ */
+static void
+AllRowsLists(const AnnIndexFile *file, AnnCuvsIndex *state)
+{
+	uint32_t	total = state->nshards * state->copies;
+	uint64_t	longest[ANN_CUVS_MAX_DEVICES] = {0};
+	const uint64_t chunk = UINT64_C(1) << 20;
+	uint32_t   *staged = NULL;
+
+	for (uint32_t i = 0; i < total; i++)
+	{
+		uint64_t	rows = file->shards[i % state->nshards].rows;
+
+		if (state->shards[i].scanAttached && rows > longest[state->shards[i].device])
+			longest[state->shards[i].device] = rows;
+	}
+	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+	{
+		void	   *list = NULL;
+		int			ok;
+
+		if (longest[d] == 0)
+			continue;
+		if (staged == NULL && (staged = malloc(chunk * sizeof(uint32_t))) == NULL)
+			break;
+		if (cudaSetDevice(d) != cudaSuccess || cudaMalloc(&list, longest[d] * sizeof(uint32_t)) != cudaSuccess)
+			list = NULL;
+		ok = list != NULL;
+		for (uint64_t first = 0; ok && first < longest[d]; first += chunk)
+		{
+			uint64_t	count = longest[d] - first < chunk ? longest[d] - first : chunk;
+
+			for (uint64_t i = 0; i < count; i++)
+				staged[i] = (uint32_t) (first + i);
+			ok = cudaMemcpy((uint32_t *) list + first, staged, count * sizeof(uint32_t),
+							cudaMemcpyHostToDevice) == cudaSuccess;
+		}
+		if (!ok)
+		{
+			if (list)
+				(void) cudaFree(list);
+			(void) cudaGetLastError();
+			fprintf(stderr, "cuVS: index %s has no all-rows list on device %d: whole-shard filters copy their "
+					"rows per search there, and unfiltered searches score exactly on the host\n", file->name, d);
+			continue;
+		}
+		state->allRows[d] = list;
+		state->allRowsBytes[d] = longest[d] * sizeof(uint32_t);
+	}
+	free(staged);
+	for (uint32_t i = 0; i < total; i++)
+		if (state->shards[i].scanAttached)
+			state->shards[i].allRows = state->allRows[state->shards[i].device];
+}
+
+/*
+ * Once an FP8 index's shards are loaded: cuVS' filtered scan serves its FP8
+ * scans only when every shard copy has its codes attached. Otherwise the
+ * codes some shards hold are dropped again, and its filtered searches walk
+ * the graph (on a scan-only index, score exactly on the host). Says what the
+ * scan holds on each device: the codes, and on scan-only indexes the
+ * graph-free indexes' FP16 rows and the row lists.
+ */
+static void
+CuvsScanReady(AnnIndexFile *file, AnnCuvsIndex *state)
+{
+	uint32_t	total = state->nshards * state->copies;
+	size_t		codes[ANN_CUVS_MAX_DEVICES] = {0};
+	size_t		rows[ANN_CUVS_MAX_DEVICES] = {0};
+	size_t		bytes = 0;
+
+	state->cuvsScan = 1;
+	for (uint32_t i = 0; i < total; i++)
+		state->cuvsScan &= state->shards[i].scanAttached;
+	for (uint32_t i = 0; !state->cuvsScan && i < total; i++)
+	{
+		AnnCuvsShard *shard = &state->shards[i];
+
+		if (!shard->scanAttached)
+			continue;
+		(void) cudaSetDevice(shard->device);
+		if (state->scanOnly)
+		{
+			if (shard->rerank == shard->scanRows)
+			{
+				shard->rerank = NULL;
+				shard->rerankHalf = 0;
+			}
+			FreeScanCodes(shard, 1);
+		}
+		else if (cuvsCagraUpdateScanCodes(shard->resources, NULL, NULL, shard->index) == CUVS_SUCCESS)
+			FreeScanCodes(shard, 0);
+		else
+			shard->scanAttached = 0;	/* the index still views them: kept */
+	}
+	if (state->cuvsScan && state->scanOnly)
+		AllRowsLists(file, state);
+	for (uint32_t i = 0; i < total; i++)
+	{
+		codes[state->shards[i].device] += state->shards[i].scanBytes;
+		rows[state->shards[i].device] += state->shards[i].scanRowBytes;
+	}
+	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+	{
+		rows[d] += state->allRowsBytes[d];
+		bytes += codes[d] + rows[d];
+	}
+	file->quantActive = state->cuvsScan;
+	file->scanOnly = state->scanOnly;
+	fprintf(stderr, "cuVS: FP8 filtered scan for index %s %s (%.1f MB on the GPUs)\n", file->name,
+			state->cuvsScan ? "on" : state->scanOnly ?
+			"off: not every shard has its codes, so its searches score exactly on the host" :
+			"off: not every shard has its codes, so its filtered searches take the graph",
+			(double) bytes / 1048576.0);
+	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+		if (state->scanOnly && (codes[d] || rows[d]))
+			fprintf(stderr, "cuVS: index %s, device %d: %.1f MB of FP8 codes, %.1f MB of graph-free FP16 rows "
+					"and row lists\n", file->name, d, (double) codes[d] / 1048576.0, (double) rows[d] / 1048576.0);
+		else if (codes[d])
+			fprintf(stderr, "cuVS: index %s, device %d: %.1f MB of FP8 codes\n", file->name, d,
+					(double) codes[d] / 1048576.0);
 }
 
 /* The process-wide device memory resource, set up by the first load (LoadIndex). */
@@ -2247,6 +2738,10 @@ LoadIndex(const char *name, const char *directory)
 	atomic_init(&state->graph_cpu_rerank_candidates, 0);
 	atomic_init(&state->widened_jobs, 0);
 	atomic_init(&state->mixed_graph_jobs, 0);
+	atomic_init(&state->cuvs_scan_queries, 0);
+	atomic_init(&state->cuvs_scan_retries, 0);
+	atomic_init(&state->cuvsScanFailures, 0);
+	atomic_init(&state->cuvsScanDisabled, 0);
 	atomic_init(&state->cagra_fp16_queries, 0);
 	for (int mode = 0; mode < 4; mode++)
 		atomic_init(&state->cost_queries[mode], 0);
@@ -2271,7 +2766,7 @@ LoadIndex(const char *name, const char *directory)
 	if (status != ANN_OK)
 	{
 		fprintf(stderr, "cuVS: index %s mixes shards without graphs with CAGRA shards, or has no graphs "
-				"and no quantized copy for the Blackwell module to scan\n", name);
+				"and no quantized copy to scan\n", name);
 		free(state->shards);
 		free(state);
 		free(args);
@@ -2313,9 +2808,38 @@ LoadIndex(const char *name, const char *directory)
 												 (int) AnnIndexConfig.memory_pool, false) :
 				 cuvsRMMAsyncMemoryResourceEnable()) != CUVS_SUCCESS)
 				fprintf(stderr, "cuVS: memory resource unavailable on device %d\n", d);
+
+		/*
+		 * A libcuvs_c older than the headers this worker was built with (the
+		 * fork's earlier scan API, or a release) lacks the scan's entry
+		 * points, and its cuvsCagraSearchParams is shorter than the one this
+		 * worker fills on every search: no index may load against it.
+		 */
+		cuvsScanLinked = dlsym(RTLD_DEFAULT, "cuvsCagraUpdateScanCodes") != NULL;
+		if (!cuvsScanLinked)
+			fprintf(stderr, "cuVS: the libcuvs_c loaded has no cuvsCagraUpdateScanCodes: it is older than the "
+					"headers this worker was built with, so no index loads; install the matching cuVS\n");
 		memoryResourceReady = 1;
 	}
 	(void) pthread_mutex_unlock(&memoryResourceMutex);
+	if (!cuvsScanLinked)
+	{
+		free(state->shards);
+		free(state);
+		free(args);
+		free(threads);
+		AnnIndexFileClose(file);
+		return ANN_BACKEND_ERROR;
+	}
+
+	/*
+	 * cuVS' scan reads FP16 rows only, and the worker has no FP8 scan of its
+	 * own: FP8 codes next to FP32 graphs are not scanned.
+	 */
+	if (AnnIndexConfig.quantized_scan && file->quant == ANN_QUANT_FP8 && !state->scanOnly && !state->fp16)
+		fprintf(stderr, "cuVS: index %s has FP8 codes next to float32 CAGRA graphs, which cuVS' FP8 filtered scan "
+				"does not take: it gets no FP8 scan, and its filtered searches take the graph, the scans of its "
+				"FP32 dataset or the host (build it with --dtype float16 for cuVS' scan)\n", name);
 
 	/*
 	 * --replicate N: each index takes the next nshards * N devices in turn,
@@ -2360,7 +2884,9 @@ LoadIndex(const char *name, const char *directory)
 			fprintf(stderr, "Blackwell module: grouped %s searches for index %s read the dataset in place\n",
 					file->dtype, name);
 	}
-	if (status == ANN_OK && file->quant != ANN_QUANT_NONE && AnnIndexConfig.quantized_scan)
+	if (status == ANN_OK && CuvsScanIndex(file, state))
+		CuvsScanReady(file, state);
+	else if (status == ANN_OK && file->quant == ANN_QUANT_NVFP4 && AnnIndexConfig.quantized_scan)
 	{
 		size_t		bytes = 0;
 
@@ -2375,19 +2901,6 @@ LoadIndex(const char *name, const char *directory)
 		fprintf(stderr, "Blackwell module: %s gather scan for index %s %s (%.1f MB of quantized rows on the GPUs)\n",
 				AnnIndexQuantName(file->quant), name, state->quantized ? "on" : "off: not every GPU is ready",
 				(double) bytes / 1048576.0);
-	}
-	if (status == ANN_OK && AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && AnnIndexConfig.quantized_scan)
-	{
-		size_t		bytes = 0;
-
-		state->rescoreGpu = 1;
-		for (uint32_t s = 0; s < total; s++)
-		{
-			state->rescoreGpu &= state->shards[s].rescore.quant != ANN_QUANT_NONE;
-			bytes += state->shards[s].rescore.bytes;
-		}
-		fprintf(stderr, "Blackwell module: FP8 re-scoring rows for index %s %s (%.1f MB on the GPUs)\n", name,
-				state->rescoreGpu ? "on" : "off: not every GPU has them", (double) bytes / 1048576.0);
 	}
 	if (status == ANN_OK && state->copies > AnnIndexConfig.index_copies)
 		AnnIndexConfig.index_copies = state->copies;
@@ -2454,9 +2967,11 @@ PrefetchExactVector(const AnnIndexFile *file, uint64_t row)
  */
 static uint32_t
 ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint32_t n,
-		  const float *query, const uint32_t *bitset, AnnIndexHit *hits, const float *exact, int squared)
+		  const float *query, const uint32_t *bitset, AnnIndexHit *hits, const float *exact, int squared,
+		  const int64_t *keys)
 {
 	uint32_t	count = 0;
+	int			ordered = exact != NULL;
 
 	for (uint32_t i = 0; i < n; i++)
 	{
@@ -2471,16 +2986,38 @@ ShardHits(const AnnIndexFile *file, uint32_t s, const uint32_t *neighbors, uint3
 				PrefetchExactVector(file, file->shards[s].first + future);
 		}
 
+		AnnIndexHit hit;
+		uint32_t	at = count;
+
 		if (local >= file->shards[s].rows ||
 			(bitset && !(bitset[local / 32] & (UINT32_C(1) << (local % 32)))))
 			continue;
-		hits[count].key = file->keys[file->shards[s].first + local];
-		hits[count].ordinal = file->shards[s].first + local;
-		hits[count].distance = exact ? (squared ? sqrtf(exact[i] < 0 ? 0 : exact[i]) : exact[i]) :
+		hit.key = keys && keys[i] >= 0 ? keys[i] : file->keys[file->shards[s].first + local];
+		hit.ordinal = file->shards[s].first + local;
+		hit.distance = exact ? (squared ? sqrtf(exact[i] < 0 ? 0 : exact[i]) : exact[i]) :
 			ExactDistance(file, file->shards[s].first + local, query);
+
+		/*
+		 * cuVS returns each query's neighbours by distance, ties in no key
+		 * order: slide a hit into its run of equals instead of sorting the
+		 * list. Distances out of order (none expected) still get the sort.
+		 */
+		if (ordered && at && HitCompare(hits + at - 1, &hit) > 0)
+		{
+			if (hits[at - 1].distance == hit.distance)
+				while (at && hits[at - 1].distance == hit.distance && hits[at - 1].key > hit.key)
+				{
+					hits[at] = hits[at - 1];
+					at--;
+				}
+			else
+				ordered = 0;
+		}
+		hits[at] = hit;
 		count++;
 	}
-	qsort(hits, count, sizeof(*hits), HitCompare);
+	if (!ordered)
+		qsort(hits, count, sizeof(*hits), HitCompare);
 	return count;
 }
 
@@ -2538,15 +3075,25 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			 const int *useShard, AnnIndexHit *lists, uint32_t *counts)
 {
 	uint32_t	dims = file->dimensions;
-	size_t		unit = state->fp16 ? 2 : 4;
+
+	/* The searched rows: scan-only shards' graph-free indexes are FP16. */
+	int			half = state->fp16 || state->scanOnly;
+	size_t		unit = half ? 2 : 4;
 	uint32_t	widest = dims;
 	void	   *host;
 	uint32_t	uploaded[ANN_CUVS_MAX_DEVICES] = {0};	/* query width there */
 	int			exactUploaded[ANN_CUVS_MAX_DEVICES] = {0};
 	int			exactGpu[ANN_INDEX_MAX_SHARDS] = {0};
+	int			keyed[ANN_INDEX_MAX_SHARDS] = {0};
 
-	/* Graph distances are final unless --fp16-exact rescores FP16 graphs. */
-	int			native = !state->fp16 || !AnnIndexConfig.fp16_exact;
+	/*
+	 * Graph distances are final unless --fp16-exact rescores FP16 graphs.
+	 * cuVS' scan re-scores its candidates from the FP16 rows itself; its
+	 * results are rescored in FP32 only when --rescore fp32 (the default)
+	 * comes with --fp16-exact: --rescore off and fp16 keep its distances.
+	 */
+	int			native = !half || !AnnIndexConfig.fp16_exact ||
+		(laneScanCandidates && AnnIndexConfig.rescore != ANN_RESCORE_FP32);
 	float	   *exactHost = AnnIndexConfig.gpu_rerank && laneRerank != 0 && !native ? malloc((size_t) m * dims * sizeof(float)) : NULL;
 	size_t		slot[ANN_INDEX_MAX_SHARDS];
 	size_t		bitsetSlot[ANN_INDEX_MAX_SHARDS];
@@ -2595,10 +3142,12 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		int64_t		queryShape[2] = {m, width};
 		int64_t		resultShape[2] = {m, k};
 		int64_t		bitsetShape[1] = {(int64_t) words};
+		int64_t		rowShape[1] = {0};
 		DLManagedTensor queries,
 					neighbors,
 					distances,
-					mask;
+					mask,
+					rowList;
 		cuvsFilter	filter = {0, NO_FILTER};
 
 		if (!useShard[s])
@@ -2613,7 +3162,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		/* Stream order keeps an earlier shard's search ahead of a re-upload. */
 		if (uploaded[shard->device] != width)
 		{
-			if (!UploadQueries(lane, jobs, m, dims, width, state->fp16, stream, host))
+			if (!UploadQueries(lane, jobs, m, dims, width, half, stream, host))
 			{
 				ok = 0;
 				break;
@@ -2664,6 +3213,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				(jobs[0]->ordinals != NULL || jobs[0]->bitsets != NULL))
 				lane->params->filtering_rate = (float) (1.0 - passing < 0.999 ? 1.0 - passing : 0.999);
 		}
+
 		/*
 		 * Only cuVS' multi-CTA search walks through passing rows or takes a
 		 * bitset per query, and cuVS resolves AUTO to it for these. Decide
@@ -2685,7 +3235,7 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			else
 				lane->params->itopk_size = 512;
 		}
-		queries = QueryTensor(lane->queries, shard->device, state->fp16, queryShape);
+		queries = QueryTensor(lane->queries, shard->device, half, queryShape);
 		neighbors = Tensor(lane->neighbors + slot[s], kDLCUDA, shard->device, kDLUInt, 2, resultShape);
 		distances = Tensor(lane->distances + slot[s], kDLCUDA, shard->device, kDLFloat, 2, resultShape);
 		if (mixed)
@@ -2737,6 +3287,45 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			filter.type = BITSET;
 			filter.addr = (uintptr_t) &mask;
 		}
+
+		/*
+		 * The worker picks the route itself: the graph, unless SearchScanCuvs
+		 * asked for cuVS' scan of its row lists (cuVS' own AUTO would scan
+		 * narrow bitset searches of indexes with codes attached).
+		 */
+		lane->params->filtered_route = laneScanCandidates ? CUVS_CAGRA_FILTERED_ROUTE_SCAN :
+			CUVS_CAGRA_FILTERED_ROUTE_GRAPH;
+		lane->params->scan_candidates = laneScanCandidates;
+		lane->params->scan_skip_last_block = laneScanCandidates && shard->scanSkipLast;
+		lane->params->scan_retry = 0;
+		lane->params->scan_full_selection = laneScanCandidates && laneScanFull;
+		if (laneScanCandidates)
+		{
+			size_t		have = lane->scanRetryCount;
+			size_t		hostHave = lane->scanRetryCount;
+
+			if (!GrowDevice((void **) &lane->scanRetry, &have, (size_t) state->nshards * m, sizeof(uint32_t), 0,
+							stream) ||
+				!GrowPinned((void **) &lane->hostScanRetry, &hostHave, (size_t) state->nshards * m,
+							sizeof(uint32_t), 0))
+			{
+				/* A failed grow freed a buffer: nothing is held now. */
+				lane->scanRetryCount = 0;
+				ok = 0;
+				break;
+			}
+			lane->scanRetryCount = have < hostHave ? have : hostHave;
+			lane->params->scan_retry = (uintptr_t) (lane->scanRetry + (size_t) s * m);
+
+			/*
+			 * The shard's rows to scan, as cuVS' row-list filter: sorted,
+			 * each once, each below the shard's row count.
+			 */
+			rowShape[0] = laneScanCounts[s];
+			rowList = Tensor((void *) laneScanRows[s], kDLCUDA, shard->device, kDLUInt, 1, rowShape);
+			filter.type = ROW_LIST;
+			filter.addr = (uintptr_t) &rowList;
+		}
 		if (cuvsCagraSearch(lane->resources, lane->params, shard->index, &queries, &neighbors,
 							&distances, filter) != CUVS_SUCCESS)
 		{
@@ -2753,12 +3342,12 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 		 * FP32 CAGRA, and FP16 CAGRA unless --fp16-exact, already computed
 		 * the final distances; only exact FP16 needs reranking.
 		 */
-		if (state->fp16 && shard->rerank && laneRerank != 0 && exactHost)
+		if (half && shard->rerank && laneRerank != 0 && exactHost)
 		{
 			const float *exactQueries = lane->queries;
 			int			ready = 1;
 
-			if (state->fp16)
+			if (half)
 			{
 				ready = GrowDevice((void **) &lane->rerankQueries, &lane->rerankQueryCap,
 								   (size_t) m * dims, sizeof(float), 0, stream);
@@ -2793,6 +3382,24 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			ok = 0;
 			break;
 		}
+
+		/* The neighbours' keys, so the host reads none per hit. */
+		keyed[s] = GatherNeighborKeys(shard, file->shards[s].rows, lane->neighbors + slot[s],
+									  lane->resultKeys + slot[s], shard->device, stream, m * k);
+		if (keyed[s] &&
+			cudaMemcpyAsync(lane->hostResultKeys + slot[s], lane->resultKeys + slot[s],
+							(size_t) m * k * sizeof(int64_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+		{
+			ok = 0;
+			break;
+		}
+		if (laneScanCandidates &&
+			cudaMemcpyAsync(lane->hostScanRetry + (size_t) s * m, lane->scanRetry + (size_t) s * m,
+							(size_t) m * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) != cudaSuccess)
+		{
+			ok = 0;
+			break;
+		}
 	}
 	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
 		if (laneDevices[d].resources && perDevice[d] &&
@@ -2807,13 +3414,15 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 				ShardHits(file, s, laneDevices[shards[s].device].hostNeighbors + slot[s] + (size_t) j * k,
 						  k, jobs[j]->query, mixed ? jobs[j]->bitsets[s] : bitsets ? bitsets[s] : NULL, hits,
 						  (native || exactGpu[s]) ?
-						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL, !exactGpu[s]) : 0;
-			if (!native && !exactGpu[s])
+						  laneDevices[shards[s].device].hostDistances + slot[s] + (size_t) j * k : NULL, !exactGpu[s],
+						  keyed[s] ? laneDevices[shards[s].device].hostResultKeys + slot[s] + (size_t) j * k : NULL) : 0;
+			if (!native && !exactGpu[s] && !laneScanCandidates)
 				(void) atomic_fetch_add_explicit(&state->graph_cpu_rerank_candidates, counts[j * state->nshards + s], memory_order_relaxed);
 		}
-	if (ok && !state->fp16)
+	/* Graph searches only: cuvs_scan_queries counts the scan's. */
+	if (ok && !laneScanCandidates && !half)
 		(void) atomic_fetch_add_explicit(&state->cagra_fp32_queries, m, memory_order_relaxed);
-	else if (ok && native)
+	else if (ok && !laneScanCandidates && native)
 		(void) atomic_fetch_add_explicit(&state->cagra_fp16_queries, m, memory_order_relaxed);
 	if (ok)
 		for (uint32_t s = 0; s < state->nshards; s++)
@@ -3676,7 +4285,8 @@ static const char RerankSource[] =
 static uint32_t
 GatherSlack(const AnnCuvsIndex *state, uint32_t k)
 {
-	if (state->quantized)
+	/* cuVS' FP8 scan takes the same margin as the worker's quantized ones. */
+	if (state->quantized || state->cuvsScan)
 	{
 		uint32_t	slack = (uint32_t) ((uint64_t) k * AnnIndexConfig.slack_ratio / 100);
 
@@ -3946,32 +4556,6 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 }
 
 static atomic_ullong gatherRepairs;
-
-/* Lane buffers for re-scoring count candidates on the GPU (--rescore fp8-gpu). */
-static int
-RescoreBuffers(AnnCuvsDevice *lane, size_t count, cudaStream_t stream)
-{
-	size_t		old = lane->rescoreCapacity;
-	size_t		have;
-
-	if (count <= old)
-		return 1;
-	lane->rescoreCapacity = 0;
-	have = old;
-	if (!GrowDevice((void **) &lane->rescoreRows, &have, count, sizeof(uint32_t), ANN_LANE_RESULT_FLOOR, stream))
-		return LaneBufferFailure("re-scored rows", count);
-	have = old;
-	if (!GrowDevice((void **) &lane->rescoreOut, &have, count, sizeof(float), ANN_LANE_RESULT_FLOOR, stream))
-		return LaneBufferFailure("re-scored distances", count);
-	have = old;
-	if (!GrowPinned((void **) &lane->hostRescoreRows, &have, count, sizeof(uint32_t), ANN_LANE_RESULT_FLOOR))
-		return LaneBufferFailure("pinned re-scored rows", count);
-	have = old;
-	if (!GrowPinned((void **) &lane->hostRescoreOut, &have, count, sizeof(float), ANN_LANE_RESULT_FLOOR))
-		return LaneBufferFailure("pinned re-scored distances", count);
-	lane->rescoreCapacity = have;
-	return 1;
-}
 
 /* L2 distance from the FP16 copy (--rescore fp16). */
 static float
@@ -4374,14 +4958,15 @@ FilteredCandidates(uint32_t k)
 
 /*
  * Whether a search for k results over `rows` eligible rows runs as an exact
- * scan of those rows rather than a graph search. The scan reads the NVFP4 or
- * FP8 copy on the tensor cores and re-scores its candidates in FP32, so its
- * answer is exact where CAGRA's is approximate (recall@500 of 0.87 on a
- * million rows), and it has no limit near k = 1,024, where CAGRA's top-k
- * selection stops. It is the default on an index with a quantized copy on
- * every GPU; without one it still answers what only a scan can (k beyond
- * CAGRA's limit). Beyond --gather-limit rows the graph is cheaper, and
- * beyond --scan-max-k candidates the selection stops.
+ * scan of those rows rather than a graph search. The scan reads the NVFP4
+ * copy on the tensor cores (the FP8 codes on cuVS') and re-scores its
+ * candidates, so its answer is exact where CAGRA's is approximate
+ * (recall@500 of 0.87 on a million rows), and it has no limit near k =
+ * 1,024, where CAGRA's top-k selection stops. It is the default on an index
+ * with a quantized copy on every GPU, the Blackwell module's NVFP4 or cuVS'
+ * FP8 (codes attached to every shard); without one it still answers what
+ * only a scan can (k beyond CAGRA's limit). Beyond --gather-limit rows the
+ * graph is cheaper, and beyond --scan-max-k candidates the selection stops.
  */
 static int
 ScanPreferred(const AnnCuvsIndex *state, uint32_t k, uint64_t rows)
@@ -4395,7 +4980,7 @@ ScanPreferred(const AnnCuvsIndex *state, uint32_t k, uint64_t rows)
 		return 0;
 	if (RoundTopK(k) > ANN_CAGRA_MAX_ITOPK)
 		return 1;
-	return state->quantized != 0;
+	return state->quantized || state->cuvsScan;
 }
 
 static int
@@ -4406,11 +4991,14 @@ ScanPreferredIndex(const AnnIndexFile *file, uint32_t k)
 	int			scan = state != NULL && ScanPreferred(state, k, file->rows);
 
 	if (getenv("ANN_SCAN_DEBUG") && state != NULL)
-		fprintf(stderr, "scan route: k=%u rows=%llu quantized=%d fp16=%d off=%d max_k=%u gather_limit=%u -> %d\n", k,
-				(unsigned long long) file->rows, state->quantized, state->fp16, AnnIndexConfig.scan_off,
-				AnnIndexConfig.scan_max_k, AnnIndexConfig.gather_limit, scan);
+		fprintf(stderr, "scan route: k=%u rows=%llu quantized=%d cuvs=%d fp16=%d off=%d max_k=%u gather_limit=%u -> %d\n",
+				k, (unsigned long long) file->rows, state->quantized, state->cuvsScan, state->fp16,
+				AnnIndexConfig.scan_off, AnnIndexConfig.scan_max_k, AnnIndexConfig.gather_limit, scan);
 	return scan;
 }
+
+static int	SearchScanCuvs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m);
+static int	SearchScanCuvsJob(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job);
 
 static void
 SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
@@ -4448,8 +5036,13 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 			job->status = ANN_INVALID;
 			return;
 		}
-		/* Without graphs, what the scan cannot take is scored on the CPU. */
-		if (!(scan && job->nfilter > AnnIndexConfig.exact_limit && SearchGather(file, state, job)))
+
+		/*
+		 * Without graphs, what the scan cannot take (cuVS' of FP8 codes, the
+		 * Blackwell module's of NVFP4 ones) is scored on the CPU.
+		 */
+		if (!(scan && job->nfilter > AnnIndexConfig.exact_limit &&
+			  (SearchScanCuvsJob(file, state, job) || SearchGather(file, state, job))))
 		{
 			exactLimit = UINT64_MAX;
 			goto exact;
@@ -4494,7 +5087,12 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	if (job->nfilter > AnnIndexConfig.exact_limit &&
 		job->nfilter <= (job->bitsets && !scan ? AnnIndexConfig.bitset_gather_limit : AnnIndexConfig.gather_limit))
 	{
-		if (SearchGather(file, state, job))
+		/*
+		 * An FP8 index's rows scan on cuVS. The gather scan takes what cuVS
+		 * does not, on such an index from the FP16 or FP32 dataset (the
+		 * Blackwell module holds no FP8 copy).
+		 */
+		if (SearchScanCuvsJob(file, state, job) || SearchGather(file, state, job))
 			return;
 
 		/*
@@ -4610,11 +5208,20 @@ SearchUnfiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jo
 	if (state->scanOnly)
 	{
 		/*
-		 * Unfiltered frozen searches come as all-rows filters; others have no
-		 * graph to search.
+		 * No graph: on an FP8 index cuVS' scan reads every row, or the CPU
+		 * scores them where it cannot. Unfiltered frozen searches mostly come
+		 * as all-rows filters instead; the Blackwell module's NVFP4 scan has
+		 * no route for these.
 		 */
+		if (SearchScanCuvs(file, state, jobs, m))
+			return;
 		for (uint32_t j = 0; j < m; j++)
-			jobs[j]->status = ANN_INVALID;
+		{
+			if (CuvsScanIndex(file, state))
+				AnnIndexExact(file, jobs[j], NULL, 0);
+			else
+				jobs[j]->status = ANN_INVALID;
+		}
 		return;
 	}
 	for (uint32_t j = 0; j < m; j++)
@@ -6804,57 +7411,6 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 			}
 		}
 
-		/*
-		 * --rescore fp8-gpu: every candidate scored again on the GPU from the
-		 * FP8 rows.
-		 */
-		if (ok && AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && state->rescoreGpu)
-		{
-			int			used[ANN_CUVS_MAX_DEVICES] = {0};
-
-			for (uint32_t s = 0; ok && s < state->nshards; s++)
-			{
-				AnnCuvsDevice *lane = &laneDevices[shards[s].device];
-				uint32_t	eligible = (uint32_t) (start[s + 1] - start[s]);
-				cudaStream_t stream;
-
-				if (eligible == 0)
-					continue;
-				if (cudaSetDevice(shards[s].device) != cudaSuccess ||
-					cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
-					!RescoreBuffers(lane, (size_t) q * stride * state->nshards, stream))
-				{
-					ok = 0;
-					break;
-				}
-				for (uint32_t j = 0; j < q; j++)
-				{
-					size_t		at = ((size_t) j * state->nshards + s) * stride;
-
-					for (uint32_t i = 0; i < wanted[s]; i++)
-						lane->hostRescoreRows[at + i] = picked[at + i] >= 0 && (uint64_t) picked[at + i] < eligible ?
-							(uint32_t) (ordinals[start[s] + (uint64_t) picked[at + i]] - file->shards[s].first) :
-							UINT32_MAX;
-					if (cudaMemcpyAsync(lane->rescoreRows + at, lane->hostRescoreRows + at, wanted[s] * sizeof(uint32_t),
-										cudaMemcpyHostToDevice, stream) != cudaSuccess ||
-						!AnnBlackwellScore(&shards[s].rescore, shards[s].device, lane->rescoreRows + at, wanted[s],
-										   (const float *) lane->queries + (size_t) j * dims, (int) dims,
-										   lane->rescoreOut + at, stream) ||
-						cudaMemcpyAsync(lane->hostRescoreOut + at, lane->rescoreOut + at, wanted[s] * sizeof(float),
-										cudaMemcpyDeviceToHost, stream) != cudaSuccess)
-					{
-						fprintf(stderr, "Blackwell module: FP8 re-scoring failed on device %d\n", shards[s].device);
-						ok = 0;
-						break;
-					}
-				}
-				used[shards[s].device] = 1;
-			}
-			for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
-				if (used[d] && (cudaSetDevice(d) != cudaSuccess || !LaneSync(&laneDevices[d])))
-					ok = 0;
-		}
-
 		if (timed)
 			hostSelected = MonotonicMs();
 		/* The hits: candidates re-scored as --rescore says; rows are known. */
@@ -6892,8 +7448,6 @@ SearchGatherGroupLarge(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJo
 					row = ordinals[start[s] + (uint64_t) picked[at + i]];
 					if (AnnIndexConfig.rescore == ANN_RESCORE_OFF)
 						distance = sqrtf(fmaxf(pickedD[at + i], 0.0f));
-					else if (AnnIndexConfig.rescore == ANN_RESCORE_FP8_GPU && state->rescoreGpu)
-						distance = sqrtf(fmaxf(laneDevices[shards[s].device].hostRescoreOut[at + i], 0.0f));
 					else if (AnnIndexConfig.rescore == ANN_RESCORE_FP16 && file->halfVectors)
 						distance = HalfDistance(file, row, job->query);
 					else
@@ -7000,19 +7554,272 @@ CalibratedFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJ
 	return 1;
 }
 
+/*
+ * cuVS' CAGRA FP8 filtered scan for m jobs over one filter, or over every
+ * row (unfiltered jobs of a scan-only index), through the graph search's own
+ * call (SearchShards). Each shard gets its slice of the rows as a device row
+ * list: its all-rows list when the slice is all of it, the filter's cached
+ * rows, or rows copied once to the lane. cuVS scores those rows from the
+ * shard's FP8 codes, keeps k plus the slack, and re-scores them from the
+ * FP16 rows. Returns 0, with no result written, when the index or the jobs
+ * cannot take it (codes not attached on every shard, excluded rows, a key
+ * list, a k outside the scan's 1 to 4096); the caller then takes another
+ * route (the FP16 gather scan, the graph or the CPU): the worker has no FP8
+ * scan of its own.
+ */
+static int
+SearchScanCuvs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
+{
+	const uint64_t *ordinals = jobs[0]->ordinals;
+	uint64_t	start[ANN_INDEX_MAX_SHARDS + 1];
+	int			useShard[ANN_INDEX_MAX_SHARDS];
+	AnnCuvsShard *shards;
+	AnnIndexHit *lists;
+	uint32_t   *counts;
+	uint32_t	maxk = 0;
+	uint32_t	capacity;
+	int			retry = 0;
+	int			ok = 1;
+
+	if (!state->cuvsScan || m == 0 || atomic_load_explicit(&state->cuvsScanDisabled, memory_order_relaxed))
+		return 0;
+
+	/* A filter's rows, or every row of a scan-only index (no filter). */
+	if (ordinals == NULL ? jobs[0]->filtered || !state->scanOnly : jobs[0]->nfilter == 0)
+		return 0;
+	for (uint32_t j = 0; j < m; j++)
+	{
+		if (jobs[j]->nexclude)
+			return 0;
+		if (jobs[j]->k > maxk)
+			maxk = jobs[j]->k;
+
+		/*
+		 * cuVS takes the queries as FP16, which overflows to infinity past
+		 * 65504: such a batch takes the other routes.
+		 */
+		for (uint32_t d = 0; d < file->dimensions; d++)
+			if (!(fabsf(jobs[j]->query[d]) <= 65504.0f))
+				return 0;
+	}
+
+	/* Dimensions were checked when the codes were attached. */
+	if (maxk == 0 || maxk > ANN_CUVS_SCAN_MAX_K)
+		return 0;
+	capacity = maxk + GatherSlack(state, maxk);
+	if (capacity > ANN_CUVS_SCAN_MAX_K)
+		capacity = ANN_CUVS_SCAN_MAX_K;
+	shards = state->shards + (size_t) laneCopy * state->nshards;
+
+	/* Rows are sorted: split them at shard boundaries. */
+	start[0] = 0;
+	start[state->nshards] = ordinals ? jobs[0]->nfilter : file->rows;
+	for (uint32_t s = 1; s < state->nshards; s++)
+	{
+		uint64_t	low = start[s - 1],
+					high = start[state->nshards];
+
+		if (ordinals == NULL)
+		{
+			start[s] = file->shards[s].first;
+			continue;
+		}
+		while (low < high)
+		{
+			uint64_t	mid = low + (high - low) / 2;
+
+			if (ordinals[mid] < file->shards[s].first)
+				low = mid + 1;
+			else
+				high = mid;
+		}
+		start[s] = low;
+	}
+	lists = malloc(sizeof(AnnIndexHit) * (size_t) m * state->nshards * maxk);
+	counts = calloc((size_t) m * state->nshards, sizeof(uint32_t));
+	if (lists == NULL || counts == NULL)
+	{
+		free(lists);
+		free(counts);
+		return 0;
+	}
+	for (uint32_t s = 0; ok && s < state->nshards; s++)
+	{
+		uint64_t	n = start[s + 1] - start[s];
+		const uint32_t *rows = NULL;
+
+		useShard[s] = n > 0;
+		laneScanRows[s] = NULL;
+		laneScanCounts[s] = (int64_t) n;
+		if (n == 0)
+			continue;
+
+		/*
+		 * The rows on this shard's device: all of them (the shard's all-rows
+		 * list), the filter's cached ones, or copied once to the lane's.
+		 */
+		if (n == file->shards[s].rows && shards[s].allRows)
+			rows = shards[s].allRows;
+		else if (jobs[0]->deviceRows)
+			rows = jobs[0]->deviceRows[(size_t) laneCopy * state->nshards + s];
+		if (rows == NULL && ordinals == NULL)
+		{
+			ok = 0;
+			break;
+		}
+		if (rows == NULL)
+		{
+			AnnCuvsDevice *lane = LaneDevice(shards[s].device, 1, 1, 1);
+			cudaStream_t stream;
+			uint32_t   *staged;
+
+			if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
+				!GatherBuffers(lane, jobs[0]->nfilter, 1))
+			{
+				ok = 0;
+				break;
+			}
+			staged = (uint32_t *) (void *) (lane->hostKeys + start[s]);
+			for (uint64_t i = 0; i < n; i++)
+				staged[i] = (uint32_t) (ordinals[start[s] + i] - file->shards[s].first);
+			if (cudaMemcpyAsync(lane->gatherRows + start[s], staged, (size_t) n * sizeof(uint32_t),
+								cudaMemcpyHostToDevice, stream) != cudaSuccess)
+			{
+				ok = 0;
+				break;
+			}
+			rows = lane->gatherRows + start[s];
+		}
+		laneScanRows[s] = rows;
+	}
+	if (ok)
+	{
+		laneScanCandidates = capacity;
+		laneScanFull = 0;
+		ok = SearchShards(file, state, (const AnnIndexJob *const *) jobs, m, maxk, AnnIndexConfig.itopk, NULL,
+						  NULL, useShard, lists, counts);
+
+		/*
+		 * A query whose sampled cutoff kept too few or too many rows has
+		 * results that are not exact (rare: many equal distances): the batch
+		 * is searched again from every row, as the matrix gather's pruned
+		 * selection falls back.
+		 */
+		for (uint32_t s = 0; ok && !retry && s < state->nshards; s++)
+			if (useShard[s])
+			{
+				const uint32_t *flags = laneDevices[shards[s].device].hostScanRetry + (size_t) s * m;
+
+				for (uint32_t j = 0; j < m && !retry; j++)
+					retry = flags[j] != 0;
+			}
+		if (ok && retry)
+		{
+			memset(counts, 0, sizeof(uint32_t) * (size_t) m * state->nshards);
+			laneScanFull = 1;
+			ok = SearchShards(file, state, (const AnnIndexJob *const *) jobs, m, maxk, AnnIndexConfig.itopk,
+							  NULL, NULL, useShard, lists, counts);
+			laneScanFull = 0;
+			if (ok)
+				(void) atomic_fetch_add_explicit(&state->cuvs_scan_retries, m, memory_order_relaxed);
+		}
+
+		/* Later SearchShards calls of this lane walk the graph again. */
+		laneScanCandidates = 0;
+
+		/*
+		 * A cuVS build without kernels for this device takes the codes yet
+		 * fails every scan: after enough failures in a row the index stops
+		 * asking it, and its scans take the other routes.
+		 */
+		if (ok)
+		{
+			if (atomic_load_explicit(&state->cuvsScanFailures, memory_order_relaxed) != 0)
+				atomic_store_explicit(&state->cuvsScanFailures, 0, memory_order_relaxed);
+		}
+		else if (atomic_fetch_add_explicit(&state->cuvsScanFailures, 1, memory_order_relaxed) + 1 ==
+				 ANN_CUVS_SCAN_MAX_FAILURES)
+		{
+			atomic_store_explicit(&state->cuvsScanDisabled, 1, memory_order_relaxed);
+			fprintf(stderr, "cuVS: index %s: %d FP8 scans failed in a row (%s); its scans take the other routes\n",
+					file->name, ANN_CUVS_SCAN_MAX_FAILURES, cuvsGetLastErrorText() ? cuvsGetLastErrorText() : "no message");
+		}
+	}
+	if (ok)
+	{
+		for (uint32_t j = 0; j < m; j++)
+		{
+			MergeJob(jobs[j], lists + (size_t) j * state->nshards * maxk, counts + (size_t) j * state->nshards,
+					 state->nshards, maxk);
+			jobs[j]->route = ANN_ROUTE_EXACT;
+		}
+		(void) atomic_fetch_add_explicit(&state->cuvs_scan_queries, m, memory_order_relaxed);
+	}
+	free(lists);
+	free(counts);
+	return ok;
+}
+
+/*
+ * One job's FP8 scan on cuVS (SearchScanCuvs). A key list is first mapped to
+ * the index's rows on the host (AnnIndexOrdinals drops the keys the index
+ * does not hold): cuVS takes rows of the index, each once. Returns 0, with
+ * no result written, when cuVS does not take the job.
+ */
+static int
+SearchScanCuvsJob(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
+{
+	AnnIndexJob part;
+	AnnIndexJob *jobs[1] = {job};
+	uint64_t   *ordinals;
+	int			ok;
+
+	if (!state->cuvsScan || job->nexclude || job->k == 0 || job->k > ANN_CUVS_SCAN_MAX_K ||
+		(job->ordinals == NULL && job->filter == NULL))
+		return 0;
+	if (job->ordinals)
+		return SearchScanCuvs(file, state, jobs, 1);
+	ordinals = malloc(sizeof(uint64_t) * (job->nfilter ? job->nfilter : 1));
+	if (ordinals == NULL)
+		return 0;
+	part = *job;
+	part.nfilter = (uint32_t) AnnIndexOrdinals(file, job->filter, job->nfilter, ordinals);
+	part.ordinals = ordinals;
+	part.filter = NULL;
+	part.bitsets = NULL;
+	part.deviceBitsets = NULL;
+	part.deviceRows = NULL;
+	jobs[0] = &part;
+	ok = SearchScanCuvs(file, state, jobs, 1);
+	if (ok)
+	{
+		/* The results went to the job's own array. */
+		job->nresults = part.nresults;
+		job->status = part.status;
+		job->route = part.route;
+	}
+	free(ordinals);
+	return ok;
+}
+
 static void
 SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m)
 {
 	uint32_t	n = jobs[0]->nfilter;
+	uint32_t	k = 0;
 	int			excluding = 0;
 
 	/*
 	 * --residual-masks: jobs over a shared base with their own excluded rows
-	 * take the matrix gather, which masks them; any other route first gets
-	 * each job's own rows.
+	 * take the matrix gather, which masks them; any other route (cuVS' scan
+	 * among them) first gets each job's own rows.
 	 */
-	for (uint32_t j = 0; j < m && !excluding; j++)
-		excluding = jobs[j]->nexclude != 0;
+	for (uint32_t j = 0; j < m; j++)
+	{
+		excluding |= jobs[j]->nexclude != 0;
+		if (jobs[j]->k > k)
+			k = jobs[j]->k;
+	}
 	if (excluding)
 	{
 		if (AnnIndexConfig.matrix_gather && n > AnnIndexConfig.exact_limit &&
@@ -7033,12 +7840,27 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 
 	if (n > AnnIndexConfig.exact_limit && (n <= AnnIndexConfig.group_gather_limit || state->scanOnly))
 	{
+		/*
+		 * An FP8 index's rows scan on cuVS, at any k and whether or not
+		 * --matrix-gather is on.
+		 */
+		if (SearchScanCuvs(file, state, jobs, m))
+			return;
 		if (m > 1 && SearchGatherGroup(file, state, jobs, m))
 			return;
 		/* Scan-only shards rerank from their uploaded vectors like any other. */
 		if (AnnIndexConfig.matrix_gather && SearchGatherMatrix(file, state, jobs, m))
 			return;
 	}
+
+	/*
+	 * Past --group-gather-limit, cuVS' scan still takes what a scan is
+	 * preferred for, up to --gather-limit, as the worker's grouped large-k
+	 * scan below does.
+	 */
+	if (n > AnnIndexConfig.exact_limit && n > AnnIndexConfig.group_gather_limit && !state->scanOnly &&
+		ScanPreferred(state, k, n) && SearchScanCuvs(file, state, jobs, m))
+		return;
 	if (n > AnnIndexConfig.exact_limit && SearchGatherGroupLarge(file, state, jobs, m))
 		return;
 	if (m > 1 && jobs[0]->bitsets != NULL && n > AnnIndexConfig.bitset_gather_limit && !state->scanOnly &&

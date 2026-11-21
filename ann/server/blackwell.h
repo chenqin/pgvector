@@ -7,12 +7,15 @@
 
 /*
  * Blackwell (compute capability 10.x or 12.x) scan module for the cuVS
- * worker. It keeps an index's quantized copy (NVFP4 or FP8, see indexfile.h)
- * in each shard's GPU memory and scores filtered rows from it with kernels
- * compiled for sm_100a or sm_120a, which decode E2M1 and E4M3 with the hardware conversion
- * instructions (cvt.rn.f16x2.e2m1x2, cvt.rn.f16x2.e4m3x2). Callers select
- * k + slack candidates from those scores and re-score them in FP32, so
- * returned distances stay exact; graph search stays with cuVS CAGRA.
+ * worker. It keeps an index's NVFP4 copy (see indexfile.h) in each shard's
+ * GPU memory and scores filtered rows from it with kernels compiled for
+ * sm_100a or sm_120a, which decode E2M1 values and their E4M3 block scales
+ * with the hardware conversion instructions (cvt.rn.f16x2.e2m1x2,
+ * cvt.rn.f16x2.e4m3x2); grouped searches can also score a shard's FP16 or
+ * FP32 CAGRA dataset in place. Callers select k + slack candidates from
+ * those scores and re-score them in FP32, so returned distances stay exact;
+ * graph search stays with cuVS CAGRA, and FP8 copies go to cuVS' CAGRA
+ * filtered scan (cuvs.c): the module has no FP8 kernels.
  */
 /* Row formats the module scores, besides the quantized copies. */
 #define ANN_BLACKWELL_HALF 3	/* a CAGRA FP16 dataset, read in place */
@@ -20,8 +23,9 @@
 
 typedef struct AnnBlackwellShard
 {
-	int			quant;			/* ANN_QUANT_* or ANN_BLACKWELL_*, NONE when
-								 * not available */
+	int			quant;			/* ANN_QUANT_NVFP4 or ANN_BLACKWELL_*,
+								 * ANN_QUANT_NONE when not available (never
+								 * ANN_QUANT_FP8) */
 	int			owned;			/* data is the module's own copy */
 	uint8_t    *data;			/* the shard's rows on the device */
 	uint8_t    *scales;
@@ -41,13 +45,9 @@ int			AnnBlackwellReady(int device);
 int			AnnBlackwellFuseReady(const AnnBlackwellShard *shard);
 
 /*
- * An FP8 (E4M3, row-scaled) copy of FP32 rows on a device, made at load for
- * re-scoring candidates there (--rescore fp8-gpu); 0 on failure.
+ * Copy a shard's NVFP4 rows to the current device; 0 on failure, and for an
+ * index without an NVFP4 copy (FP8 codes go to cuVS, cuvs.c).
  */
-int			AnnBlackwellUploadFp8(const float *vectors, uint64_t rows, uint32_t dims, int device,
-								  AnnBlackwellShard *out);
-
-/* Copy a shard's quantized rows to the current device; 0 on failure. */
 int			AnnBlackwellUpload(const AnnIndexFile *file, uint32_t shard, int device, AnnBlackwellShard *out);
 
 /*
@@ -62,6 +62,7 @@ void		AnnBlackwellFree(AnnBlackwellShard *shard);
 /*
  * Squared L2 distance of each listed shard row (UINT32_MAX scores +inf) to
  * an FP32 device query, written to out, on a CUDA stream of that device.
+ * NVFP4 copies only.
  */
 int			AnnBlackwellScore(const AnnBlackwellShard *shard, int device, const uint32_t *rows, unsigned n,
 							  const float *query, int dims, float *out, void *stream);
