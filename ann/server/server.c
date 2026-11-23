@@ -2797,6 +2797,10 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 	const void *identity;
 	int			shareable;
 	int			waited = 0;
+	int			deferred = -1;	/* --device-transient: built in the lane,
+								 * unknown yet */
+	int			seen = 0;
+	int			seenKnown = 0;
 	AnnStatus	status;
 
 	/*
@@ -2905,6 +2909,27 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 		}
 
 		/*
+		 * --device-transient: a miss built in the searching lane is not
+		 * cached, so concurrent misses of the same filter gain nothing by
+		 * waiting for each other; with 5,000 filters a field such waits on
+		 * evaluatingMutex (and its broadcasts) held 64 readers in futex. Such
+		 * a miss claims no slot. Whether it is a first sighting is decided
+		 * once (SeenBefore marks the filter seen).
+		 */
+		if (deferred < 0)
+		{
+			deferred = admit && !snapshot && AnnIndexConfig.device_transient && AnnIndexDeviceDefer != NULL;
+			if (deferred && AnnIndexConfig.device_transient != ANN_DEFER_ALWAYS)
+			{
+				seen = AnnIndexConfig.predicate_admission == ANN_ADMIT_SECOND ? SeenBefore(file, id) : 1;
+				seenKnown = 1;
+				deferred = !seen;
+			}
+		}
+		if (deferred)
+			break;
+
+		/*
 		 * After waiting for another index of the row set, this index's own
 		 * copy and build need not wait for the other indexes' builds.
 		 */
@@ -2931,7 +2956,8 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 	}
 	if (mode == RESOLVE_INLINE)
 		evaluatedInline = 1;
-	transient = admit && AnnIndexConfig.predicate_admission == ANN_ADMIT_SECOND && !SeenBefore(file, id);
+	transient = admit && AnnIndexConfig.predicate_admission == ANN_ADMIT_SECOND &&
+		!(seenKnown ? seen : SeenBefore(file, id));
 	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot, transient,
 							   transient || (admit && AnnIndexConfig.device_transient == ANN_DEFER_ALWAYS),
 							   remapGeneration);

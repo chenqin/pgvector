@@ -6,9 +6,21 @@
  *   udf      BATCH queries per call, each with its own predicate, evaluated row by row in the walk by
  *            the JIT-LTO filter UDF of ann/server/udf.c (no bitset)
  *   udf1     one query per call with the UDF
+ *   udfv     as udf, with value bitsets: each multi-valued column's elements as dense 16-bit ids
+ *            (ranks among its distinct values), and each leaf's values as a bitset over those ids,
+ *            built on the host for the call, so a row test is the row's ids and one bit each
+ *   udfv1    one query per call with the value-bitset UDF
+ *   udfb     control: a UDF testing each query's device bitset (bitsetq's), one load a test, to
+ *            separate the cost of cuVS' UDF path from the predicate's
+ *   udfq     as udfp, with one 32-byte descriptor a query (its column's packed ids and offsets, its
+ *            value bitset) so a single-leaf program's test is three loads; others interpret as udfv
+ *   udfp     as udfv, each row's first eight ids packed into 16 bytes beside the row (one read a
+ *            test, as a bitset's); rows with more than eight take udfv's offsets
  *   build1   one query per call, its bitset built on the GPU for this call from device postings
  *            (postings_eval.cu), as a filter-cache miss would, then searched as bitset1
  *   buildq   BATCH queries per call, each bitset built for the call, then searched as bitsetq
+ *   buildc   as buildq, each bitset built by cuVS (cuvs::core::postings::evaluate, the worker's
+ *            build) from the same postings; programs of one VALUES or OVERLAP leaf only
  *
  * With a build mode, a check pass first builds every case's bitset on the GPU, compares it with the
  * host interpreter's bit for bit and reports the build time.
@@ -19,7 +31,7 @@
  *
  *   cagra_twohop_udf_probe INDEX_DIR CASES [--k K] [--batch B] [--reps R] [--threads T]
  *                          [--itopk N] [--iterations N] [--samplings N] [--width N] [--block N]
- *                          [--modes bitset1,bitsetq,udf,udf1,build1,buildq] [--no-recall]
+ *                          [--no-pitch] [--modes bitset1,bitsetq,udf,udf1,udfv,udfv1,udfp,udfb,udfq,build1,buildq,buildc] [--no-recall]
  *
  * CASES (benchmarks/ann/twohop_udf_cases.py): u32 count, u32 dims, then per case u32 k (unused:
  * --k sets k), u32 program length, the predicate program (ann/common/filter.h) and the FP32 query.
@@ -28,6 +40,7 @@
  */
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <cuvs/core/postings.hpp>
 #include <cuvs/neighbors/cagra.hpp>
 #include <cuvs/neighbors/common.hpp>
 #include <raft/core/bitset.hpp>
@@ -46,6 +59,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <sys/mman.h>
@@ -70,6 +84,231 @@ namespace cagra = cuvs::neighbors::cagra;
       exit(1);                                                                                     \
     }                                                                                              \
   } while (0)
+
+/*
+ * The value-bitset UDF (udfv): ann_predicate_udfv(query, row, params) over ann_udfv_params. Leaves
+ * on multi-valued columns read the row's dense ids (dense[column]) and test them against the
+ * leaf's aux: a bitset of ids in arena (VALUES, OVERLAP), an id interval (RANGE), or the NULL id.
+ * Other leaves, and the stack, are the interpreter's (ann/server/udf.c).
+ */
+static const char kUdfvSource[] = R"UDF(
+struct ann_udf_step {
+  unsigned char op, column, negate, multi;
+  int low, high;
+  unsigned int first, count;
+};
+struct ann_udfv_aux {
+  unsigned int a, b, null_id, kind;  /* kind 0: bitset arena[a, a + b); 1: ids [a, b) */
+};
+struct ann_udfv_params {
+  const int* columns[8];
+  const ann_udf_step* steps;
+  const int* values;
+  const unsigned int* starts;
+  unsigned long long row_base;
+  const unsigned int* offsets[8];
+  const unsigned short* dense[8];
+  const ann_udfv_aux* aux;
+  const unsigned int* arena;
+  const uint4* packed[8];  /* udfp: 8 ids a row, 0xffff past the last, 0xfffe first: overflow */
+};
+
+__device__ bool ann_udfv_among(const ann_udf_step& s, const int* values, int v)
+{
+  unsigned int lo = s.first, hi = s.first + s.count;
+  while (lo < hi) {
+    unsigned int mid = lo + (hi - lo) / 2;
+    if (values[mid] < v) lo = mid + 1; else hi = mid;
+  }
+  return lo < s.first + s.count && values[lo] == v;
+}
+
+__device__ bool ann_udfv_single(const ann_udf_step& s, const int* values, int v)
+{
+  const int null_value = (int)0x80000000;
+  bool match;
+  if (s.op == 3) match = v == null_value;
+  else if (v == null_value) return false;
+  else if (s.op == 2) match = s.low <= v && v <= s.high;
+  else match = ann_udfv_among(s, values, v);
+  return s.negate ? !match : match;
+}
+
+__device__ bool ann_udfv_multi(const ann_udf_step& s, const ann_udfv_aux& x, const unsigned int* arena,
+                               const unsigned short* ids, unsigned int begin, unsigned int end)
+{
+  const bool is_null = end - begin == 1 && (unsigned int)ids[begin] == x.null_id;
+  bool match = false;
+  if (s.op == 3) {
+    match = is_null;
+  } else if (is_null) {
+    return false;
+  } else if (x.kind == 1) {
+    for (unsigned int i = begin; i < end && !match; i++) match = ids[i] >= x.a && ids[i] < x.b;
+  } else {
+    for (unsigned int i = begin; i < end && !match; i++) {
+      unsigned int id = ids[i];
+      match = (id >> 5) < x.b && ((__ldg(arena + x.a + (id >> 5)) >> (id & 31)) & 1u);
+    }
+  }
+  return s.negate ? !match : match;
+}
+
+__device__ bool ann_udfv_test(const ann_udfv_aux& x, unsigned int id, const unsigned int* arena)
+{
+  if (x.kind == 1) return id >= x.a && id < x.b;
+  return (id >> 5) < x.b && ((__ldg(arena + x.a + (id >> 5)) >> (id & 31)) & 1u);
+}
+
+/* udfp: the row's packed ids; -1 when it has more than fit (take the offsets). */
+__device__ int ann_udfp_multi(const ann_udf_step& s, const ann_udfv_aux& x, const unsigned int* arena,
+                              const uint4* packed, unsigned long long row)
+{
+  const uint4 w = __ldg(packed + row);
+  const unsigned int words[4] = {w.x, w.y, w.z, w.w};
+  if ((w.x & 0xffffu) == 0xfffeu) return -1;
+  unsigned int n = 0;
+  bool match = false;
+  for (int k = 0; k < 8; k++) {
+    unsigned int id = (words[k >> 1] >> ((k & 1) * 16)) & 0xffffu;
+    if (id == 0xffffu) break;
+    n++;
+    if (!match && s.op != 3) match = ann_udfv_test(x, id, arena);
+  }
+  const bool is_null = n == 1 && (w.x & 0xffffu) == x.null_id;
+  if (s.op == 3) match = is_null;
+  else if (is_null) return 0;
+  return (s.negate ? !match : match) ? 1 : 0;
+}
+
+__device__ bool ann_udfv_leaf(const ann_udfv_params* p, unsigned int i, unsigned long long row)
+{
+  const ann_udf_step s = p->steps[i];
+  if (s.multi && p->packed[s.column]) {
+    const int r = ann_udfp_multi(s, p->aux[i], p->arena, p->packed[s.column], row);
+    if (r >= 0) return r == 1;
+  }
+  if (s.multi)
+    return ann_udfv_multi(s, p->aux[i], p->arena, p->dense[s.column], p->offsets[s.column][row],
+                          p->offsets[s.column][row + 1]);
+  return ann_udfv_single(s, p->values, p->columns[s.column][row]);
+}
+
+__device__ bool ann_predicate_udfv(uint32_t query_id, source_index_t source_id, void* filter_data)
+{
+  const ann_udfv_params* p = static_cast<const ann_udfv_params*>(filter_data);
+  const unsigned long long row = p->row_base + source_id;
+  const unsigned int first = p->starts[query_id], end = p->starts[query_id + 1];
+  if (end - first == 1) return ann_udfv_leaf(p, first, row);  /* one leaf: no stack */
+  unsigned long long stack = 0;
+  int depth = 0;
+  for (unsigned int i = first; i < end; i++) {
+    const unsigned char op = p->steps[i].op;
+    unsigned long long bit;
+    if (op == 5 || op == 6) {
+      unsigned long long b = (stack >> (depth - 1)) & 1ull, a = (stack >> (depth - 2)) & 1ull;
+      depth -= 2;
+      bit = op == 5 ? (a & b) : (a | b);
+    } else if (op == 7) {
+      bit = ((stack >> (depth - 1)) & 1ull) ^ 1ull;
+      depth--;
+    } else if (op == 8) {
+      bit = 1;
+    } else if (op == 9) {
+      bit = 0;
+    } else {
+      bit = ann_udfv_leaf(p, i, row) ? 1ull : 0ull;
+    }
+    stack = (stack & ~(1ull << depth)) | (bit << depth);
+    depth++;
+  }
+  return depth == 1 && (stack & 1ull);
+}
+)UDF";
+
+static const char kUdfbSource[] = R"UDF(
+__device__ bool ann_predicate_udfb(uint32_t query_id, source_index_t source_id, void* filter_data)
+{
+  const unsigned int* const* words = static_cast<const unsigned int* const*>(filter_data);
+  const unsigned int* w = words[query_id];
+  return (__ldg(w + (source_id >> 5)) >> (source_id & 31)) & 1u;
+}
+)UDF";
+
+/*
+ * udfq: a query's descriptor. kind 1: one leaf OVERLAP/VALUES on a multi-valued column, value bitset
+ * at bits[0, nwords); kind 0: interpret through generic (an ann_udfv_params) as udfv.
+ */
+static const char kUdfqSource[] = R"UDF(
+struct ann_udfq_desc {
+  const uint4* packed;
+  const unsigned int* bits;
+  const unsigned int* offsets;
+  const unsigned short* ids;
+  unsigned int nwords, kind, negate, null_id;
+  const void* generic;
+};
+)UDF";
+
+struct UdfqDesc {
+  const void* packed;
+  const uint32_t* bits;
+  const uint32_t* offsets;
+  const uint16_t* ids;
+  uint32_t nwords, kind, negate, null_id;
+  const void* generic;
+};
+static const char kUdfqPredicate[] = R"UDF(
+__device__ bool ann_udfq_bit(const ann_udfq_desc& d, unsigned int id)
+{
+  return (id >> 5) < d.nwords && ((__ldg(d.bits + (id >> 5)) >> (id & 31)) & 1u);
+}
+
+__device__ bool ann_predicate_udfq(uint32_t query_id, source_index_t source_id, void* filter_data)
+{
+  const ann_udfq_desc d = static_cast<const ann_udfq_desc*>(filter_data)[query_id];
+  if (d.kind == 0) return ann_predicate_udfv(query_id, source_id, const_cast<void*>(d.generic));
+  const uint4 w = __ldg(d.packed + source_id);
+  bool match = false;
+  unsigned int n = 0;
+  if ((w.x & 0xffffu) == 0xfffeu) {
+    const unsigned int b = d.offsets[source_id], e = d.offsets[source_id + 1];
+    n = e - b;
+    for (unsigned int i = b; i < e && !match; i++) match = ann_udfq_bit(d, d.ids[i]);
+    if (n == 1 && d.ids[b] == d.null_id) return false;
+  } else {
+    /* Every slot's test is issued unconditionally, so their loads overlap. */
+    const unsigned int words[4] = {w.x, w.y, w.z, w.w};
+    unsigned int hit = 0;
+#pragma unroll
+    for (int k = 0; k < 8; k++) {
+      const unsigned int id = (words[k >> 1] >> ((k & 1) * 16)) & 0xffffu;
+      const unsigned int valid = id != 0xffffu;
+      n += valid;
+      hit |= valid & (unsigned int)ann_udfq_bit(d, valid ? id : 0u);
+    }
+    match = hit != 0;
+    if (n == 1 && (w.x & 0xffffu) == d.null_id) return false;
+  }
+  return d.negate ? !match : match;
+}
+)UDF";
+
+struct UdfvAux {
+  uint32_t a, b, null_id, kind;
+};
+struct UdfvParams {
+  const int32_t* columns[ANN_UDF_MAX_COLUMNS];
+  const AnnUdfStep* steps;
+  const int32_t* values;
+  const uint32_t* starts;
+  uint64_t row_base;
+  const uint32_t* offsets[ANN_UDF_MAX_COLUMNS];
+  const uint16_t* dense[ANN_UDF_MAX_COLUMNS];
+  const UdfvAux* aux;
+  const uint32_t* arena;
+  const void* packed[ANN_UDF_MAX_COLUMNS];
+};
 
 static void fail(const std::string& why)
 {
@@ -160,6 +399,7 @@ int main(int argc, char** argv)
   int k = 300, batch = 32, reps = 3, threads = 1, itopk = 1536, iterations = 18, samplings = 2,
       width = 4, block = 64;
   bool recall = true;
+  bool pitch = true;
   std::string modes = "bitset1,bitsetq,udf,udf1";
   for (int i = 3; i < argc; i++) {
     std::string a = argv[i];
@@ -178,6 +418,7 @@ int main(int argc, char** argv)
     else if (a == "--block") block = next();
     else if (a == "--modes" && i + 1 < argc) modes = argv[++i];
     else if (a == "--no-recall") recall = false;
+    else if (a == "--no-pitch") pitch = false;
     else fail("unknown option " + a);
   }
 
@@ -318,11 +559,32 @@ int main(int argc, char** argv)
   double load_ms = now_ms() - t0;
   if (uint64_t(index.size()) != rows || uint32_t(index.dim()) != m.dims) fail("index shape");
 
+  /*
+   * cuVS searches one query per launch when the dataset's row pitch exceeds its dimensions (65
+   * dimensions at pitch 72 here). As the worker does (--cagra-pitch), view the padded rows as
+   * pitch-wide vectors with the padding zeroed and pad the queries: same distances, one launch a
+   * batch. --no-pitch keeps the per-query launches.
+   */
+  const uint32_t stride = uint32_t(dataset->view().data_const_view().stride(0));
+  const uint32_t qdim   = pitch ? stride : m.dims;
+  std::optional<cagra::device_padded_index<half>> wide;
+  if (pitch && stride > m.dims) {
+    half* rows_ptr = const_cast<half*>(dataset->view().data_const_view().data_handle());
+    CUDA(cudaMemset2D(rows_ptr + m.dims, size_t(stride) * sizeof(half), 0,
+                      size_t(stride - m.dims) * sizeof(half), rows));
+    auto wide_rows = cuvs::neighbors::make_device_padded_dataset_view(
+      load_res, raft::make_device_matrix_view<const half, int64_t>(rows_ptr, int64_t(rows), int64_t(stride)));
+    wide.emplace(load_res, cuvs::distance::DistanceType::L2Expanded, wide_rows,
+                 raft::make_const_mdspan(index.graph()));
+    load_res.sync_stream();
+  }
+  auto& searched = wide ? *wide : index;
+
   /* Device copies: queries as FP16, bitsets, compiled predicates. */
-  std::vector<half> hq(size_t(ncases) * m.dims);
+  std::vector<half> hq(size_t(ncases) * qdim, __float2half(0.0f));
   for (int i = 0; i < ncases; i++)
     for (uint32_t j = 0; j < m.dims; j++)
-      hq[size_t(i) * m.dims + j] = __float2half(cases[i].query[j]);
+      hq[size_t(i) * qdim + j] = __float2half(cases[i].query[j]);
   half* dq;
   CUDA(cudaMalloc(&dq, hq.size() * sizeof(half)));
   CUDA(cudaMemcpy(dq, hq.data(), hq.size() * sizeof(half), cudaMemcpyHostToDevice));
@@ -337,6 +599,97 @@ int main(int argc, char** argv)
   CUDA(cudaMalloc(&dvalues, std::max<size_t>(1, nvalues) * sizeof(int32_t)));
   CUDA(cudaMemcpy(dsteps, steps.data(), nsteps * sizeof(AnnUdfStep), cudaMemcpyHostToDevice));
   CUDA(cudaMemcpy(dvalues, values.data(), nvalues * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+  /* udfv: each multi-valued column's distinct values and its elements as dense 16-bit ids. */
+  const bool use_udfv = modes.find("udfv") != std::string::npos;
+  std::vector<std::vector<int32_t>> dict(ANN_UDF_MAX_COLUMNS);
+  UdfvParams udfv_template;
+  memset(&udfv_template, 0, sizeof(udfv_template));
+  double dense_ms = 0;
+  std::vector<const void*> packed_columns(ANN_UDF_MAX_COLUMNS, nullptr);
+  const bool use_udfv_any =
+    use_udfv || modes.find("udfp") != std::string::npos || modes.find("udfq") != std::string::npos;
+  if (use_udfv_any) {
+    t0 = now_ms();
+    for (size_t c = 0; c < columns.names.size(); c++) {
+      if (!host_offsets[c]) continue;
+      const uint64_t n = host_offsets[c][rows];
+      std::vector<int32_t> all(host_columns[c], host_columns[c] + n);
+      std::sort(all.begin(), all.end());
+      all.erase(std::unique(all.begin(), all.end()), all.end());
+      if (all.size() > 65535) fail(columns.names[c] + ": more than 65,535 distinct values");
+      dict[c] = all;
+      std::vector<uint16_t> ids(n);
+      std::vector<std::thread> pool;
+      unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 2);
+      for (unsigned t = 0; t < nthreads; t++)
+        pool.emplace_back([&, t]() {
+          for (uint64_t i = t; i < n; i += nthreads)
+            ids[i] = uint16_t(std::lower_bound(dict[c].begin(), dict[c].end(), host_columns[c][i]) -
+                              dict[c].begin());
+        });
+      for (auto& th : pool)
+        th.join();
+      void* d;
+      CUDA(cudaMalloc(&d, std::max<uint64_t>(n, 1) * sizeof(uint16_t)));
+      CUDA(cudaMemcpy(d, ids.data(), n * sizeof(uint16_t), cudaMemcpyHostToDevice));
+      udfv_template.dense[c] = static_cast<const uint16_t*>(d);
+      if (all.size() > 65533) fail(columns.names[c] + ": ids 0xfffe and 0xffff are markers");
+      /* udfp: eight ids a row in 16 bytes. */
+      std::vector<uint16_t> packed(size_t(rows) * 8, 0xffff);
+      uint64_t overflow = 0;
+      for (uint64_t r = 0; r < rows; r++) {
+        uint32_t b = host_offsets[c][r], e = host_offsets[c][r + 1];
+        if (e - b > 8) {
+          packed[r * 8] = 0xfffe;
+          overflow++;
+          continue;
+        }
+        for (uint32_t i = b; i < e; i++)
+          packed[r * 8 + (i - b)] = ids[i];
+      }
+      CUDA(cudaMalloc(&d, packed.size() * sizeof(uint16_t)));
+      CUDA(cudaMemcpy(d, packed.data(), packed.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+      packed_columns[c] = d;
+      printf("{\"packed\": \"%s\", \"values\": %zu, \"overflow_rows\": %llu}\n",
+             columns.names[c].c_str(), all.size(), (unsigned long long)overflow);
+    }
+    for (int c = 0; c < ANN_UDF_MAX_COLUMNS; c++) {
+      udfv_template.columns[c] = params_template.columns[c];
+      udfv_template.offsets[c] = params_template.offsets[c];
+    }
+    udfv_template.steps  = dsteps;
+    udfv_template.values = dvalues;
+    dense_ms             = now_ms() - t0;
+  }
+  /* A step's aux for udfv, its value bitset appended to arena (host, per call). */
+  auto udfv_aux = [&](const AnnUdfStep& st, std::vector<uint32_t>& arena) -> UdfvAux {
+    UdfvAux x{0, 0, 0xffffffffu, 0};
+    if (!st.multi) return x;
+    const std::vector<int32_t>& d = dict[st.column];
+    if (!d.empty() && d[0] == ANN_FILTER_NULL_VALUE) x.null_id = 0;
+    if (st.op == ANN_FILTER_RANGE) {
+      int64_t lo = std::max<int64_t>(st.low, int64_t(ANN_FILTER_NULL_VALUE) + 1);
+      x.kind     = 1;
+      x.a = uint32_t(std::lower_bound(d.begin(), d.end(), lo) - d.begin());
+      x.b = uint32_t(std::upper_bound(d.begin(), d.end(), int64_t(st.high)) - d.begin());
+      if (lo > st.high) x.b = x.a;
+      return x;
+    }
+    if (st.op == ANN_FILTER_NULL) return x;
+    const uint32_t words = uint32_t((d.size() + 31) / 32);
+    x.a = uint32_t(arena.size());
+    x.b = words;
+    arena.resize(arena.size() + words, 0);
+    for (uint32_t v = 0; v < st.count; v++) {
+      auto it = std::lower_bound(d.begin(), d.end(), values[st.first + v]);
+      if (it != d.end() && *it == values[st.first + v]) {
+        uint32_t id = uint32_t(it - d.begin());
+        arena[x.a + id / 32] |= 1u << (id % 32);
+      }
+    }
+    return x;
+  };
 
   /* Device postings of every column the programs name, for the build modes. */
   const bool use_postings = modes.find("build") != std::string::npos;
@@ -363,9 +716,15 @@ int main(int argc, char** argv)
     const uint32_t** bitset_ptrs;
     uint32_t* starts;
     AnnUdfParams* params;
+    UdfvParams* vparams;
+    UdfvAux* vaux = nullptr;
+    uint32_t* varena = nullptr;
+    size_t vaux_cap = 0, varena_cap = 0;
     std::vector<uint32_t> out;
     PostingsScratch scratch;
     uint32_t* built = nullptr;  // batch bitsets built for the call
+    uint32_t* cworkspace = nullptr;  // buildc: cuVS postings workspace
+    int64_t cworkspace_words = 0;
   };
   auto make_thread = [&]() {
     auto t = std::make_unique<Thread>();
@@ -374,6 +733,7 @@ int main(int argc, char** argv)
     CUDA(cudaMalloc(&t->bitset_ptrs, size_t(batch) * sizeof(void*)));
     CUDA(cudaMalloc(&t->starts, size_t(batch + 1) * sizeof(uint32_t)));
     CUDA(cudaMalloc(&t->params, sizeof(AnnUdfParams)));
+    CUDA(cudaMalloc(&t->vparams, sizeof(UdfvParams)));
     t->out.resize(size_t(batch) * k);
     if (use_postings) {
       postings_scratch_init(t->scratch, rows);
@@ -391,11 +751,118 @@ int main(int argc, char** argv)
     sp.num_random_samplings = samplings;
     sp.filter_expansion     = cagra::filter_expansion_mode::PASSING_TWO_HOP;
     cudaStream_t stream     = raft::resource::get_cuda_stream(t.res).get();
-    auto queries = raft::make_device_matrix_view<const half, int64_t>(dq + size_t(first) * m.dims,
-                                                                     n, m.dims);
+    auto queries = raft::make_device_matrix_view<const half, int64_t>(dq + size_t(first) * qdim,
+                                                                     n, qdim);
     auto nb      = raft::make_device_matrix_view<uint32_t, int64_t>(t.neighbors, n, k);
     auto ds      = raft::make_device_matrix_view<float, int64_t>(t.distances, n, k);
-    if (mode == "udf" || mode == "udf1") {
+    if (mode == "udfv" || mode == "udfv1" || mode == "udfp") {
+      /* The call's value bitsets and aux, built here as a search with new filters would. */
+      std::vector<uint32_t> hs(n + 1), arena;
+      std::vector<UdfvAux> aux;
+      for (int q = 0; q < n; q++) {
+        const Case& c = cases[first + q];
+        hs[q]         = uint32_t(aux.size());
+        for (uint32_t i = 0; i < c.nsteps; i++)
+          aux.push_back(udfv_aux(steps[c.first_step + i], arena));
+      }
+      hs[n] = uint32_t(aux.size());
+      /* Steps are indexed per call: point steps at the first query's, aux in call order. */
+      if (aux.size() > t.vaux_cap) {
+        if (t.vaux) CUDA(cudaFree(t.vaux));
+        t.vaux_cap = aux.size() * 2;
+        CUDA(cudaMalloc(&t.vaux, t.vaux_cap * sizeof(UdfvAux)));
+      }
+      if (arena.size() + 1 > t.varena_cap) {
+        if (t.varena) CUDA(cudaFree(t.varena));
+        t.varena_cap = (arena.size() + 1) * 2;
+        CUDA(cudaMalloc(&t.varena, t.varena_cap * sizeof(uint32_t)));
+      }
+      UdfvParams p = udfv_template;
+      p.steps      = dsteps + cases[first].first_step;
+      p.starts     = t.starts;
+      p.aux        = t.vaux;
+      p.arena      = t.varena;
+      p.row_base   = 0;
+      for (int c = 0; c < ANN_UDF_MAX_COLUMNS; c++)
+        p.packed[c] = mode == "udfp" ? packed_columns[c] : nullptr;
+      CUDA(cudaMemcpyAsync(t.starts, hs.data(), (n + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice,
+                           stream));
+      CUDA(cudaMemcpyAsync(t.vaux, aux.data(), aux.size() * sizeof(UdfvAux), cudaMemcpyHostToDevice,
+                           stream));
+      if (!arena.empty())
+        CUDA(cudaMemcpyAsync(t.varena, arena.data(), arena.size() * sizeof(uint32_t),
+                             cudaMemcpyHostToDevice, stream));
+      CUDA(cudaMemcpyAsync(t.vparams, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
+      cuvs::neighbors::filtering::udf_filter filter(kUdfvSource, t.vparams, -1.0f, "ann_predicate_udfv");
+      cagra::search(t.res, sp, searched, queries, nb, ds, filter);
+    } else if (mode == "udfq") {
+      static const std::string source = std::string(kUdfvSource) + kUdfqSource + kUdfqPredicate;
+      std::vector<uint32_t> hs(n + 1), arena;
+      std::vector<UdfvAux> aux;
+      std::vector<UdfqDesc> desc(n);
+      std::vector<uint32_t> bit_at(n, 0);
+      for (int q = 0; q < n; q++) {
+        const Case& c = cases[first + q];
+        hs[q]         = uint32_t(aux.size());
+        for (uint32_t i = 0; i < c.nsteps; i++)
+          aux.push_back(udfv_aux(steps[c.first_step + i], arena));
+        const AnnUdfStep& st = steps[c.first_step];
+        desc[q]              = UdfqDesc{};
+        if (c.nsteps == 1 && st.multi && (st.op == ANN_FILTER_VALUES || st.op == ANN_FILTER_OVERLAP)) {
+          desc[q].kind    = 1;
+          desc[q].packed  = packed_columns[st.column];
+          desc[q].offsets = params_template.offsets[st.column];
+          desc[q].ids     = udfv_template.dense[st.column];
+          desc[q].nwords  = aux.back().b;
+          desc[q].negate  = st.negate;
+          desc[q].null_id = aux.back().null_id;
+          bit_at[q]       = aux.back().a;
+        }
+      }
+      hs[n]          = uint32_t(aux.size());
+      const size_t D = (size_t(n) * sizeof(UdfqDesc) + 15) / 16 * 16;
+      if (aux.size() + D / sizeof(UdfvAux) + 1 > t.vaux_cap) {
+        if (t.vaux) CUDA(cudaFree(t.vaux));
+        t.vaux_cap = (aux.size() + D / sizeof(UdfvAux) + 1) * 2;
+        CUDA(cudaMalloc(&t.vaux, t.vaux_cap * sizeof(UdfvAux)));
+      }
+      if (arena.size() + 1 > t.varena_cap) {
+        if (t.varena) CUDA(cudaFree(t.varena));
+        t.varena_cap = (arena.size() + 1) * 2;
+        CUDA(cudaMalloc(&t.varena, t.varena_cap * sizeof(uint32_t)));
+      }
+      UdfvParams p = udfv_template;
+      p.steps      = dsteps + cases[first].first_step;
+      p.starts     = t.starts;
+      p.aux        = t.vaux;
+      p.arena      = t.varena;
+      for (int c = 0; c < ANN_UDF_MAX_COLUMNS; c++)
+        p.packed[c] = packed_columns[c];
+      auto* ddesc = reinterpret_cast<UdfqDesc*>(t.vaux + aux.size() + 1);
+      for (int q = 0; q < n; q++) {
+        desc[q].generic = t.vparams;
+        if (desc[q].kind == 1) desc[q].bits = t.varena + bit_at[q];
+      }
+      CUDA(cudaMemcpyAsync(t.starts, hs.data(), (n + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice,
+                           stream));
+      CUDA(cudaMemcpyAsync(t.vaux, aux.data(), aux.size() * sizeof(UdfvAux), cudaMemcpyHostToDevice,
+                           stream));
+      if (!arena.empty())
+        CUDA(cudaMemcpyAsync(t.varena, arena.data(), arena.size() * sizeof(uint32_t),
+                             cudaMemcpyHostToDevice, stream));
+      CUDA(cudaMemcpyAsync(t.vparams, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
+      CUDA(cudaMemcpyAsync(ddesc, desc.data(), n * sizeof(UdfqDesc), cudaMemcpyHostToDevice, stream));
+      cuvs::neighbors::filtering::udf_filter filter(source, ddesc, -1.0f, "ann_predicate_udfq");
+      cagra::search(t.res, sp, searched, queries, nb, ds, filter);
+    } else if (mode == "udfb") {
+      std::vector<const uint32_t*> hp(n);
+      for (int q = 0; q < n; q++)
+        hp[q] = dbits[first + q];
+      CUDA(cudaMemcpyAsync(t.bitset_ptrs, hp.data(), n * sizeof(void*), cudaMemcpyHostToDevice, stream));
+      cuvs::neighbors::filtering::udf_filter filter(kUdfbSource, (void*)t.bitset_ptrs, -1.0f,
+                                                    "ann_predicate_udfb");
+      cagra::search(t.res, sp, searched, queries, nb, ds, filter);
+    } else if (mode == "udf" || mode == "udf1") {
       /* Cases were compiled in order, so query q's steps end where query q + 1's begin. */
       std::vector<uint32_t> hs(n + 1);
       for (int q = 0; q < n; q++)
@@ -411,26 +878,63 @@ int main(int argc, char** argv)
       CUDA(cudaMemcpyAsync(t.params, &p, sizeof(p), cudaMemcpyHostToDevice, stream));
       cuvs::neighbors::filtering::udf_filter filter(AnnUdfDeviceSource(), t.params, -1.0f,
                                                     "ann_predicate_udf");
-      cagra::search(t.res, sp, index, queries, nb, ds, filter);
+      cagra::search(t.res, sp, searched, queries, nb, ds, filter);
     } else {
       std::vector<const uint32_t*> hp(n);
       const bool build = mode == "build1" || mode == "buildq";
+      if (mode == "buildc") {
+        namespace postings_api = cuvs::core::postings;
+        std::vector<raft::device_vector_view<const uint32_t, int64_t>> lists;
+        for (auto* c : postings_ptrs)
+          lists.push_back(raft::make_device_vector_view<const uint32_t, int64_t>(
+            c->postings, int64_t(c->starts.back())));
+        for (int q = 0; q < n; q++) {
+          const Case& c       = cases[first + q];
+          const AnnUdfStep& st = steps[c.first_step];
+          if (c.nsteps != 1 || !(st.op == ANN_FILTER_VALUES || st.op == ANN_FILTER_OVERLAP) || st.negate)
+            fail("buildc takes programs of one VALUES or OVERLAP leaf");
+          const PostingsColumn& col = *postings_ptrs[st.column];
+          std::vector<postings_api::run> runs;
+          for (uint32_t v = 0; v < st.count; v++) {
+            auto it = std::lower_bound(col.distinct.begin(), col.distinct.end(), values[st.first + v]);
+            if (it == col.distinct.end() || *it != values[st.first + v]) continue;
+            size_t j = size_t(it - col.distinct.begin());
+            runs.push_back(postings_api::run{st.column, int64_t(col.starts[j]),
+                                             int64_t(col.starts[j + 1] - col.starts[j])});
+          }
+          postings_api::step leaf{postings_api::step_kind::LEAF, 0, int64_t(runs.size())};
+          auto prog  = raft::make_host_vector_view<const postings_api::step, int64_t>(&leaf, 1);
+          auto rview = raft::make_host_vector_view<const postings_api::run, int64_t>(runs.data(), int64_t(runs.size()));
+          int64_t need = postings_api::workspace_size(prog, rview.extent(0), int64_t(rows));
+          if (need > t.cworkspace_words) {
+            if (t.cworkspace) CUDA(cudaFree(t.cworkspace));
+            t.cworkspace_words = need * 2;
+            CUDA(cudaMalloc(&t.cworkspace, t.cworkspace_words * sizeof(uint32_t)));
+          }
+          postings_api::evaluate(
+            t.res, prog, rview,
+            raft::make_host_vector_view<const raft::device_vector_view<const uint32_t, int64_t>, int64_t>(
+              lists.data(), int64_t(lists.size())),
+            cuvs::core::bitset_view<uint32_t, int64_t>(t.built + size_t(q) * nwords, int64_t(rows)), 0,
+            raft::make_device_vector_view<uint32_t, int64_t>(t.cworkspace, t.cworkspace_words));
+        }
+      }
       for (int q = 0; q < n; q++) {
         if (build) {
           const Case& c = cases[first + q];
           postings_eval(postings_ptrs, steps.data() + c.first_step, c.nsteps, values.data(), t.scratch,
                         t.built + size_t(q) * nwords, stream);
         }
-        hp[q] = build ? t.built + size_t(q) * nwords : dbits[first + q];
+        hp[q] = (build || mode == "buildc") ? t.built + size_t(q) * nwords : dbits[first + q];
       }
-      if (mode == "bitsetq" || mode == "buildq") {
+      if (mode == "bitsetq" || mode == "buildq" || mode == "buildc") {
         CUDA(cudaMemcpyAsync(t.bitset_ptrs, hp.data(), n * sizeof(void*), cudaMemcpyHostToDevice,
                              stream));
         sp.query_bitsets = t.bitset_ptrs;
       }
       auto view = raft::core::bitset_view<uint32_t, int64_t>(const_cast<uint32_t*>(hp[0]), int64_t(rows));
       cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> filter(view);
-      cagra::search(t.res, sp, index, queries, nb, ds, filter);
+      cagra::search(t.res, sp, searched, queries, nb, ds, filter);
     }
     CUDA(cudaMemcpyAsync(t.out.data(), t.neighbors, size_t(n) * k * sizeof(uint32_t),
                          cudaMemcpyDeviceToHost, stream));
@@ -485,7 +989,8 @@ int main(int argc, char** argv)
     if (!mode.empty()) mode_list.push_back(mode);
   }
   for (const std::string& mode : mode_list) {
-    const int per_call = (mode == "bitset1" || mode == "udf1" || mode == "build1") ? 1 : batch;
+    const int per_call =
+      (mode == "bitset1" || mode == "udf1" || mode == "udfv1" || mode == "build1") ? 1 : batch;
     const int calls    = ncases / per_call;
     if (calls == 0) continue;
     std::vector<std::unique_ptr<Thread>> pool;

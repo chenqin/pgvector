@@ -24,8 +24,9 @@ against the index files:
   with the seed's attributes inherited: different vectors, identical filters.
 - **Filters.** Every search is `pg_ids && [list] AND item_bid = value`. In the
   index all 18 single-valued columns hold one constant (`item_bid` is 83758 on
-  every row), so only the multi-valued `pg_ids` (`m0`: 9,838 values, 4.1 a
-  row, each value on 0.01-0.6% of rows) selects anything. The file holds 70
+  every row), so only the multi-valued `pg_ids` (`m0`, the item's product group ids:
+  9,838 groups, 4.1 an item, each group holding 0.01-0.6% of the items)
+  selects anything; `pg_ids && [list]` passes items in any listed group. The file holds 70
   distinct filters, the same on every field (2,482 field and filter pairs),
   which the worker's filter cache holds after warm-up. Pass rates are 0 (3.4%
   of searches) or 0.3-5%; lists are 1-168 values where the captured request
@@ -288,16 +289,49 @@ so every search builds its own bitset:
 
 | Route, `--device-transient always` | `c1`, 1% new filters | `s1` uniform | `s2` Zipf |
 | --- | ---: | ---: | ---: |
-| Two-hop | 35k req/s | 35k req/s (was 610) | 35k req/s (was 1,940) |
+| Two-hop | 50k req/s | 70k req/s (was 610) | 70k req/s (was 1,940) |
 | FP8 scan | about 7k completed, under 10k | about 7k (was 490) | about 7k (was 1,650) |
 
-Two-hop is now limited by the builds themselves (one a search: a 5.8 MB
-bitset cleared, its filter's rows scattered, every leaf combined), the scan
-by running each search alone, after a count of its rows on the reader thread.
-`on` stays the better setting while filters mostly repeat (150k against 35k
-on `c1` with 1% new filters) and collapses where they don't (`s1`, `s2`:
+Two-hop is limited by the builds themselves (one a search: a 5.8 MB bitset
+cleared, its filter's rows scattered) and by walks whose bitsets miss L2 (see
+the next section), the scan by running each search alone, after a count of
+its rows on the reader thread. `on` stays the better setting while filters
+mostly repeat (150k against 50k on `c1` with 1% new filters) and collapses where they don't (`s1`, `s2`:
 second sightings are evaluated on the host and churn the cache); `always` is
 for filters that rarely repeat.
+
+## Profiling the 5,000-filter path
+
+Two-hop with `--device-transient always` on `s1` and `s2`, highest rate with
+p99 under 30 ms (whole node):
+
+| Step | `s1` | `s2` | What the profile showed |
+| --- | ---: | ---: | --- |
+| Deferred searches built in the lane | 35k | 35k | all 8 GPUs 93-100% busy, 10 searches a batch against 55 with cached filters |
+| Readers no longer wait on each other's misses | 50k | 50k | 64 readers at 75% CPU in the kernel: every miss took `evaluatingMutex` and woke waiters, for a result that is never cached |
+| cuVS' build: a block per 1,024 entries of a run | 65k | 65k | the SASS of the old kernel had each entry binary-search the runs with dependent 64-bit loads |
+| cuVS' build: each thread's loads issued together, one run-table copy | 70k | 70k | Nsight Compute: the build kernel 73% stalled on its global loads, 10% of DRAM bandwidth |
+
+Recall stayed at 0.90 and no returned item failed its filter. At saturation
+(nsys, about 60k) the walk took 62% of GPU time and the build 33%, plus a
+5.8 MB clear a search. With cached filters a walk costs about 14 µs of GPU
+time a search and its bitsets stay in L2; with distinct filters about 23 µs:
+each in-flight query reads its own 5.8 MB bitset from DRAM.
+
+- **The walk is latency-bound.** Nsight Compute on a batch of 64 queries:
+  27% of DRAM bandwidth, 29% of SM throughput, 34% occupancy (63 registers a
+  thread cap it at 50%), 66% of cycles with no eligible warp; stalls on
+  global loads 36%, fixed-latency waits 16%, block barriers 14%, instruction
+  fetch 10%.
+- **cuVS batches a call only when query rows are as wide as the dimension.**
+  At 65 dimensions (FP16 rows padded to 72) every query is its own launch; the
+  worker views the rows as 72-wide vectors (`--cagra-pitch`), the probe now
+  does too (`--no-pitch` restores per-query launches: 2.4k against 50k
+  queries/s on one GPU).
+- **A filter UDF instead of a bitset loses.** Batched, a bitset read through
+  a UDF costs 25% (37.7k against 51.3k queries/s on one GPU), but testing an
+  item's product groups in the walk costs about 80 µs a search against about
+  15 µs to build its bitset (9.7k against 29.4k queries/s).
 
 ## Highest throughput under 30 ms p99
 
@@ -319,7 +353,7 @@ unless marked.
 | `s5` 10-50% | not measured | fails (out of memory) |
 | `s6` 20% unfiltered | 75k, 0.882 | under 10k, 0.999 |
 | `s8` operators | 125k, 0.905 | 25k*, 0.999 |
-| `s1` / `s2` 5,000 filters (`always`) | 35k / 35k, 0.90 | under 10k (about 7k), 0.9997 |
+| `s1` / `s2` 5,000 filters (`always`) | 70k / 70k, 0.90 | under 10k (about 7k), 0.9997 |
 
 \* after other scenarios on the same worker. Two-hop's `s3` figure is from a
 worker with `--predicate-admission all` and no `--device-transient`; `s5` and
