@@ -19,6 +19,10 @@
  *   build1   one query per call, its bitset built on the GPU for this call from device postings
  *            (postings_eval.cu), as a filter-cache miss would, then searched as bitset1
  *   buildq   BATCH queries per call, each bitset built for the call, then searched as bitsetq
+ *   twol     as bitsetq, each query's bitset stored two-level (a bit per 1,024-item block, words of
+ *            occupied blocks only; prototype cuVS flag CUVS_TWO_LEVEL); use with --reorder
+ *   scanc    one query per call, its bitset built by cuVS, searched by cuVS' FP8 filtered scan (codes
+ *            made at load from the FP16 rows; candidates k + k * --scan-slack / 100)
  *   buildc   as buildq, each bitset built by cuVS (cuvs::core::postings::evaluate, the worker's
  *            build) from the same postings; programs of one VALUES or OVERLAP leaf only
  *
@@ -31,7 +35,7 @@
  *
  *   cagra_twohop_udf_probe INDEX_DIR CASES [--k K] [--batch B] [--reps R] [--threads T]
  *                          [--itopk N] [--iterations N] [--samplings N] [--width N] [--block N]
- *                          [--no-pitch] [--modes bitset1,bitsetq,udf,udf1,udfv,udfv1,udfp,udfb,udfq,build1,buildq,buildc] [--no-recall]
+ *                          [--no-pitch] [--reorder] [--modes bitset1,bitsetq,udf,udf1,udfv,udfv1,udfp,udfb,udfq,twol,scanc,build1,buildq,buildc] [--no-recall]
  *
  * CASES (benchmarks/ann/twohop_udf_cases.py): u32 count, u32 dims, then per case u32 k (unused:
  * --k sets k), u32 program length, the predicate program (ann/common/filter.h) and the FP32 query.
@@ -42,6 +46,7 @@
 #include <cuda_runtime.h>
 #include <cuvs/core/postings.hpp>
 #include <cuvs/neighbors/cagra.hpp>
+#include <cuvs/preprocessing/quantize/fp8.hpp>
 #include <cuvs/neighbors/common.hpp>
 #include <raft/core/bitset.hpp>
 #include <raft/core/device_mdspan.hpp>
@@ -59,6 +64,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -400,6 +406,8 @@ int main(int argc, char** argv)
       width = 4, block = 64;
   bool recall = true;
   bool pitch = true;
+  bool reorder = false;
+  int scan_slack = 300;  // scanc: candidates k + k * scan_slack / 100 (the worker's --slack-ratio)  // items renumbered by their smallest multi-valued value (product group)
   std::string modes = "bitset1,bitsetq,udf,udf1";
   for (int i = 3; i < argc; i++) {
     std::string a = argv[i];
@@ -419,6 +427,8 @@ int main(int argc, char** argv)
     else if (a == "--modes" && i + 1 < argc) modes = argv[++i];
     else if (a == "--no-recall") recall = false;
     else if (a == "--no-pitch") pitch = false;
+    else if (a == "--reorder") reorder = true;
+    else if (a == "--scan-slack") scan_slack = std::stoi(argv[++i]);
     else fail("unknown option " + a);
   }
 
@@ -488,6 +498,58 @@ int main(int argc, char** argv)
     }
   }
 
+  /*
+   * --reorder: items renumbered by the smallest value of the first multi-valued column (NULL and empty
+   * arrays last): order[new] = old, inv[old] = new. Columns are permuted here, before any filter is
+   * evaluated; the rows and the graph after the index loads.
+   */
+  std::vector<uint32_t> order, inv;
+  std::vector<std::vector<int32_t>> owned_columns(ANN_UDF_MAX_COLUMNS);
+  std::vector<std::vector<uint32_t>> owned_offsets(ANN_UDF_MAX_COLUMNS);
+  if (reorder) {
+    int mc = -1;
+    for (size_t c = 0; c < columns.names.size() && mc < 0; c++)
+      if (host_offsets[c]) mc = int(c);
+    if (mc < 0) fail("--reorder needs a multi-valued column");
+    std::vector<int64_t> key(rows);
+    for (uint64_t r = 0; r < rows; r++) {
+      int64_t k = INT64_MAX;
+      for (uint32_t i = host_offsets[mc][r]; i < host_offsets[mc][r + 1]; i++)
+        if (host_columns[mc][i] != ANN_FILTER_NULL_VALUE) k = std::min<int64_t>(k, host_columns[mc][i]);
+      key[r] = k;
+    }
+    order.resize(rows);
+    std::iota(order.begin(), order.end(), 0u);
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return key[a] < key[b]; });
+    inv.resize(rows);
+    for (uint64_t i = 0; i < rows; i++)
+      inv[order[i]] = uint32_t(i);
+    for (size_t c = 0; c < columns.names.size(); c++) {
+      if (host_offsets[c]) {
+        auto& o = owned_offsets[c];
+        auto& e = owned_columns[c];
+        o.assign(rows + 1, 0);
+        for (uint64_t i = 0; i < rows; i++)
+          o[i + 1] = o[i] + (host_offsets[c][order[i] + 1] - host_offsets[c][order[i]]);
+        e.resize(o[rows]);
+        for (uint64_t i = 0; i < rows; i++)
+          std::copy(host_columns[c] + host_offsets[c][order[i]], host_columns[c] + host_offsets[c][order[i] + 1],
+                    e.begin() + o[i]);
+        CUDA(cudaMemcpy(const_cast<uint32_t*>(params_template.offsets[c]), o.data(), o.size() * 4,
+                        cudaMemcpyHostToDevice));
+        host_offsets[c] = o.data();
+      } else {
+        auto& e = owned_columns[c];
+        e.resize(rows);
+        for (uint64_t i = 0; i < rows; i++)
+          e[i] = host_columns[c][order[i]];
+      }
+      CUDA(cudaMemcpy(const_cast<int32_t*>(params_template.columns[c]), owned_columns[c].data(),
+                      owned_columns[c].size() * 4, cudaMemcpyHostToDevice));
+      host_columns[c] = owned_columns[c].data();
+    }
+  }
+
   /* Each case's passing rows on the host, from the same interpreter the UDF runs. */
   double t0 = now_ms();
   {
@@ -529,7 +591,7 @@ int main(int argc, char** argv)
           for (size_t w = 0; w < nwords; w++)
             for (uint32_t bits = c.words[w]; bits; bits &= bits - 1) {
               uint32_t r   = uint32_t(w * 32 + __builtin_ctz(bits));
-              const float* x = vectors + size_t(r) * m.dims;
+              const float* x = vectors + size_t(reorder ? order[r] : r) * m.dims;
               float s        = 0;
               for (uint32_t j = 0; j < m.dims; j++) {
                 float t = x[j] - c.query[j];
@@ -578,7 +640,60 @@ int main(int argc, char** argv)
                  raft::make_const_mdspan(index.graph()));
     load_res.sync_stream();
   }
-  auto& searched = wide ? *wide : index;
+  std::optional<cagra::device_padded_index<half>> permuted;
+  half* permuted_rows       = nullptr;
+  uint32_t* permuted_graph  = nullptr;
+  if (reorder) {
+    const auto rv   = dataset->view().data_const_view();
+    const size_t st = size_t(rv.stride(0));
+    std::vector<half> hrows(size_t(rows) * st), prow(size_t(rows) * st);
+    CUDA(cudaMemcpy(hrows.data(), rv.data_handle(), hrows.size() * sizeof(half), cudaMemcpyDeviceToHost));
+    const size_t deg = size_t(index.graph().extent(1));
+    std::vector<uint32_t> hg(size_t(rows) * deg), pg(size_t(rows) * deg);
+    CUDA(cudaMemcpy(hg.data(), index.graph().data_handle(), hg.size() * 4, cudaMemcpyDeviceToHost));
+    std::vector<std::thread> pool;
+    unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 2);
+    for (unsigned t = 0; t < nthreads; t++)
+      pool.emplace_back([&, t]() {
+        for (uint64_t i = t; i < rows; i += nthreads) {
+          std::copy(hrows.begin() + size_t(order[i]) * st, hrows.begin() + size_t(order[i] + 1) * st,
+                    prow.begin() + i * st);
+          for (size_t j = 0; j < deg; j++) {
+            uint32_t nb      = hg[size_t(order[i]) * deg + j];
+            pg[i * deg + j] = nb < rows ? inv[nb] : nb;
+          }
+        }
+      });
+    for (auto& th : pool)
+      th.join();
+    CUDA(cudaMalloc(&permuted_rows, prow.size() * sizeof(half)));
+    CUDA(cudaMemcpy(permuted_rows, prow.data(), prow.size() * sizeof(half), cudaMemcpyHostToDevice));
+    CUDA(cudaMalloc(&permuted_graph, pg.size() * 4));
+    CUDA(cudaMemcpy(permuted_graph, pg.data(), pg.size() * 4, cudaMemcpyHostToDevice));
+    const uint32_t width = pitch ? uint32_t(st) : m.dims;
+    if (pitch && st > m.dims)
+      CUDA(cudaMemset2D(permuted_rows + m.dims, st * sizeof(half), 0, (st - m.dims) * sizeof(half), rows));
+    auto prows = cuvs::neighbors::make_device_padded_dataset_view(
+      load_res, raft::make_device_matrix_view<const half, int64_t>(permuted_rows, int64_t(rows), int64_t(st)));
+    if (width != st) fail("--reorder needs the pitch view (drop --no-pitch)");
+    permuted.emplace(load_res, cuvs::distance::DistanceType::L2Expanded, prows,
+                     raft::make_device_matrix_view<const uint32_t, int64_t>(permuted_graph, int64_t(rows), int64_t(deg)));
+    load_res.sync_stream();
+  }
+  auto& searched = permuted ? *permuted : (wide ? *wide : index);
+  std::optional<cuvs::preprocessing::quantize::fp8::quantizer> scan_codes;
+  if (modes.find("scanc") != std::string::npos) {
+    namespace fp8 = cuvs::preprocessing::quantize::fp8;
+    const auto rv = searched.dataset().data_const_view();
+    const uint32_t d = uint32_t(searched.dim());
+    scan_codes.emplace(load_res, int64_t(rows), d);
+    if (uint32_t(rv.stride(0)) != d) fail("scanc needs dense rows: keep the pitch view");
+    fp8::transform(load_res,
+                   raft::make_device_matrix_view<const half, int64_t>(rv.data_handle(), int64_t(rows), int64_t(d)),
+                   *scan_codes);
+    searched.update_scan_codes(load_res, scan_codes->view());
+    load_res.sync_stream();
+  }
 
   /* Device copies: queries as FP16, bitsets, compiled predicates. */
   std::vector<half> hq(size_t(ncases) * qdim, __float2half(0.0f));
@@ -592,6 +707,49 @@ int main(int argc, char** argv)
   for (int i = 0; i < ncases; i++) {
     CUDA(cudaMalloc(&dbits[i], nwords * sizeof(uint32_t)));
     CUDA(cudaMemcpy(dbits[i], cases[i].words.data(), nwords * 4, cudaMemcpyHostToDevice));
+  }
+  /* twol: each case's bitset as a summary bit per 1,024-item block plus the occupied blocks' words. */
+  struct TwoLevel {
+    const uint32_t* summary;
+    const uint32_t* prefix;
+    const uint32_t* words;
+    const uint32_t* blocks;
+    uint32_t n_blocks;
+  };
+  std::vector<const TwoLevel*> dtwol(ncases, nullptr);
+  double occupied_sum = 0;
+  if (modes.find("twol") != std::string::npos) {
+    const size_t nblocks = (rows + 1023) / 1024, nsum = (nblocks + 31) / 32;
+    for (int i = 0; i < ncases; i++) {
+      const auto& w = cases[i].words;
+      std::vector<uint32_t> summary(nsum, 0), prefix(nsum, 0), words, blocks;
+      for (size_t b = 0; b < nblocks; b++) {
+        bool any = false;
+        for (size_t k = 0; k < 32 && b * 32 + k < w.size() && !any; k++)
+          any = w[b * 32 + k] != 0;
+        if (!any) continue;
+        summary[b / 32] |= 1u << (b % 32);
+        blocks.push_back(uint32_t(b));
+        for (size_t k = 0; k < 32; k++)
+          words.push_back(b * 32 + k < w.size() ? w[b * 32 + k] : 0u);
+      }
+      for (size_t j = 1; j < nsum; j++)
+        prefix[j] = prefix[j - 1] + __builtin_popcount(summary[j - 1]);
+      occupied_sum += double(blocks.size()) / double(nblocks);
+      uint32_t *ds, *dp, *dw, *db;
+      CUDA(cudaMalloc(&ds, nsum * 4)); CUDA(cudaMemcpy(ds, summary.data(), nsum * 4, cudaMemcpyHostToDevice));
+      CUDA(cudaMalloc(&dp, nsum * 4)); CUDA(cudaMemcpy(dp, prefix.data(), nsum * 4, cudaMemcpyHostToDevice));
+      CUDA(cudaMalloc(&dw, std::max<size_t>(words.size(), 1) * 4));
+      CUDA(cudaMemcpy(dw, words.data(), words.size() * 4, cudaMemcpyHostToDevice));
+      CUDA(cudaMalloc(&db, std::max<size_t>(blocks.size(), 1) * 4));
+      CUDA(cudaMemcpy(db, blocks.data(), blocks.size() * 4, cudaMemcpyHostToDevice));
+      TwoLevel h{ds, dp, dw, db, uint32_t(blocks.size())};
+      TwoLevel* d;
+      CUDA(cudaMalloc(&d, sizeof(TwoLevel)));
+      CUDA(cudaMemcpy(d, &h, sizeof(h), cudaMemcpyHostToDevice));
+      dtwol[i] = d;
+    }
+    printf("{\"two_level\": true, \"occupied_blocks_mean\": %.4f}\n", occupied_sum / ncases);
   }
   AnnUdfStep* dsteps;
   int32_t* dvalues;
@@ -692,7 +850,7 @@ int main(int argc, char** argv)
   };
 
   /* Device postings of every column the programs name, for the build modes. */
-  const bool use_postings = modes.find("build") != std::string::npos;
+  const bool use_postings = modes.find("build") != std::string::npos || modes.find("scanc") != std::string::npos;
   std::vector<PostingsColumn> postings(columns.names.size());
   std::vector<PostingsColumn*> postings_ptrs;
   double postings_ms = 0;
@@ -882,7 +1040,7 @@ int main(int argc, char** argv)
     } else {
       std::vector<const uint32_t*> hp(n);
       const bool build = mode == "build1" || mode == "buildq";
-      if (mode == "buildc") {
+      if (mode == "buildc" || mode == "scanc") {
         namespace postings_api = cuvs::core::postings;
         std::vector<raft::device_vector_view<const uint32_t, int64_t>> lists;
         for (auto* c : postings_ptrs)
@@ -925,14 +1083,21 @@ int main(int argc, char** argv)
           postings_eval(postings_ptrs, steps.data() + c.first_step, c.nsteps, values.data(), t.scratch,
                         t.built + size_t(q) * nwords, stream);
         }
-        hp[q] = (build || mode == "buildc") ? t.built + size_t(q) * nwords : dbits[first + q];
+        hp[q] = mode == "twol" ? reinterpret_cast<const uint32_t*>(dtwol[first + q])
+                : (build || mode == "buildc" || mode == "scanc") ? t.built + size_t(q) * nwords : dbits[first + q];
       }
-      if (mode == "bitsetq" || mode == "buildq" || mode == "buildc") {
+      if (mode == "scanc") {
+        sp.filtered_route  = cagra::filtered_route_mode::SCAN;
+        sp.filter_expansion = cagra::filter_expansion_mode::SCORE_ALL;
+        sp.scan_candidates  = uint32_t(std::min(4096, k + k * scan_slack / 100));
+      }
+      if (mode == "bitsetq" || mode == "buildq" || mode == "buildc" || mode == "twol") {
         CUDA(cudaMemcpyAsync(t.bitset_ptrs, hp.data(), n * sizeof(void*), cudaMemcpyHostToDevice,
                              stream));
         sp.query_bitsets = t.bitset_ptrs;
       }
-      auto view = raft::core::bitset_view<uint32_t, int64_t>(const_cast<uint32_t*>(hp[0]), int64_t(rows));
+      auto view = raft::core::bitset_view<uint32_t, int64_t>(
+        const_cast<uint32_t*>(mode == "twol" ? dbits[first] : hp[0]), int64_t(rows));
       cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> filter(view);
       cagra::search(t.res, sp, searched, queries, nb, ds, filter);
     }
@@ -990,9 +1155,10 @@ int main(int argc, char** argv)
   }
   for (const std::string& mode : mode_list) {
     const int per_call =
-      (mode == "bitset1" || mode == "udf1" || mode == "udfv1" || mode == "build1") ? 1 : batch;
+      (mode == "bitset1" || mode == "udf1" || mode == "udfv1" || mode == "build1" || mode == "scanc") ? 1 : batch;
     const int calls    = ncases / per_call;
     if (calls == 0) continue;
+    if (mode == "twol") setenv("CUVS_TWO_LEVEL", "1", 1); else unsetenv("CUVS_TWO_LEVEL");
     std::vector<std::unique_ptr<Thread>> pool;
     for (int t = 0; t < threads; t++)
       pool.push_back(make_thread());
