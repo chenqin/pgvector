@@ -98,6 +98,8 @@ loop higher); compare scenarios with `s0`. The last three rows ran after the
 
 ### cuVS' FP8 scan, cuVS' two-hop walk and cuVS' own filtered search
 
+Measured while the FP8 scan ran in cuVS (2026-11-21; it is back in the worker
+now, and faster: see [the move back](#the-fp8-scan-back-in-the-worker)).
 The cuVS-scan worker, one fresh worker a route; the scan on the scan-only tree
 (on the graph tree its wide-filter runs ran out of GPU memory: graphs, FP16
 rows and FP8 codes leave 42 GB a GPU), the graph routes on the tree with FP16
@@ -289,8 +291,8 @@ so every search builds its own bitset:
 
 | Route, `--device-transient always` | `c1`, 1% new filters | `s1` uniform | `s2` Zipf |
 | --- | ---: | ---: | ---: |
-| Two-hop | 50k req/s | 70k req/s (was 610) | 70k req/s (was 1,940) |
-| FP8 scan | about 7k completed, under 10k | about 7k (was 490) | about 7k (was 1,650) |
+| Two-hop | 50k req/s | 75k req/s (was 610) | 80k req/s (was 1,940) |
+| FP8 scan (in cuVS then) | about 7k completed, under 10k | about 7k (was 490) | about 7k (was 1,650) |
 
 Two-hop is limited by the builds themselves (one a search: a 5.8 MB bitset
 cleared, its filter's rows scattered) and by walks whose bitsets miss L2 (see
@@ -311,6 +313,7 @@ p99 under 30 ms (whole node):
 | Readers no longer wait on each other's misses | 50k | 50k | 64 readers at 75% CPU in the kernel: every miss took `evaluatingMutex` and woke waiters, for a result that is never cached |
 | cuVS' build: a block per 1,024 entries of a run | 65k | 65k | the SASS of the old kernel had each entry binary-search the runs with dependent 64-bit loads |
 | cuVS' build: each thread's loads issued together, one run-table copy | 70k | 70k | Nsight Compute: the build kernel 73% stalled on its global loads, 10% of DRAM bandwidth |
+| cuVS' walk: a kernel for blocks of at most 256 threads | 75k | 80k | the walk at 34% occupancy, capped by 63 registers a thread; `__launch_bounds__(256, 6)` gives 40 and about 55% |
 
 Recall stayed at 0.90 and no returned item failed its filter. At saturation
 (nsys, about 60k) the walk took 62% of GPU time and the build 33%, plus a
@@ -328,6 +331,25 @@ each in-flight query reads its own 5.8 MB bitset from DRAM.
   worker views the rows as 72-wide vectors (`--cagra-pitch`), the probe now
   does too (`--no-pitch` restores per-query launches: 2.4k against 50k
   queries/s on one GPU).
+- **Fewer registers in the walk.** cuVS declared the multi-CTA kernel for
+  1,024-thread blocks, so it took 63 registers a thread whatever the block
+  size. A second entry point for blocks of at most 256 threads, chosen by
+  block size, takes 40: 70k to 75k (`s1`) and 80k (`s2`), and the original
+  load's p99 at 150k from 19.7 to 13 ms. On one GPU, 64 queries a call: 50.3k
+  to 61.7k queries/s with cached bitsets, 29.1k to 32.4k with each built.
+  `(256, 8)` was a little worse; blocks of 128 or 256 threads stay slower than
+  64.
+- **Two-level bitsets do not pay here.** Many bits are 0, so a bitset could
+  keep a summary bit per 1,024 items and words only for occupied blocks. In
+  the index's item order every block is occupied (a product group's items
+  are spread over the whole index), so there is nothing to skip. Items
+  renumbered by product group leave 3.6% of blocks occupied and the bitset
+  27 times smaller, but the walk loses its locality: 45.0k against about 50k
+  queries/s on one GPU (flat bitset, same renumbering: 36.3k). The seed copies
+  the test data is built from make it more clustered than production would
+  be.
+- **Skipping the 5.8 MB clear does not pay.** It costs 1-3 µs; unsetting the
+  previous filter's ~1M bits instead costs about 12 µs.
 - **A filter UDF instead of a bitset loses.** Batched, a bitset read through
   a UDF costs 25% (37.7k against 51.3k queries/s on one GPU), but testing an
   item's product groups in the walk costs about 80 µs a search against about
@@ -341,10 +363,11 @@ requests/s, 30 s a point, the threaded client) that stops at the first point
 over 30 ms or with unsent requests; recall from the scenario's check. Two-hop
 on the graph tree (`--filtered-search graph`), the FP8 scan on the scan-only
 tree (`--filtered-search scan`), both with the worker on cuVS'
-`cuvsPostingsEvaluate`. Each figure is the first scenario on a fresh worker
+`cuvsPostingsEvaluate`; the scan was cuVS' then, and the worker's own scan
+since does better ([below](#the-fp8-scan-back-in-the-worker)). Each figure is the first scenario on a fresh worker
 unless marked.
 
-| Scenario | Two-hop: req/s, recall | FP8 scan: req/s, recall |
+| Scenario | Two-hop: req/s, recall | FP8 scan (in cuVS then): req/s, recall |
 | --- | --- | --- |
 | `c1` (original) | 150k, 0.86 | 35k, 0.998 |
 | `c1`, 1% new filters | 150k, 0.85 | 25k*, 0.998 |
@@ -353,7 +376,7 @@ unless marked.
 | `s5` 10-50% | not measured | fails (out of memory) |
 | `s6` 20% unfiltered | 75k, 0.882 | under 10k, 0.999 |
 | `s8` operators | 125k, 0.905 | 25k*, 0.999 |
-| `s1` / `s2` 5,000 filters (`always`) | 70k / 70k, 0.90 | under 10k (about 7k), 0.9997 |
+| `s1` / `s2` 5,000 filters (`always`) | 75k / 80k, 0.90 | under 10k (about 7k), 0.9997 |
 
 \* after other scenarios on the same worker. Two-hop's `s3` figure is from a
 worker with `--predicate-admission all` and no `--device-transient`; `s5` and
@@ -370,6 +393,40 @@ worker with `--filtered-search graph` or `--filtered-search scan`; see
 A worker that scanned filters of up to 500,000 rows and walked the rest held
 `s3` at only 10k: those filters left two-hop's mixed batches.
 
+## The FP8 scan back in the worker
+
+The FP8 scan had moved into the `chenqin/cuvs` fork (a CAGRA filtered-scan
+route). With two-hop ahead on every load above, it was checked once more on
+the one load where it lost most, distinct filters, against a bar set
+beforehand: half of two-hop's 32k queries/s a GPU when each query's bitset is
+built. One query a call with its own filter (the probe's `scanc`, k 300, one
+B200) reached 2.2k queries/s with one thread and 0.8k with 8-32: its
+selection steps run as single thread blocks and its scoring kernel at 25%
+occupancy, so most of the GPU idles a scan. Far under the bar, so the scan
+went back into the worker and the cuVS route became a pull request on the
+fork ([chenqin/cuvs#1](https://github.com/chenqin/cuvs/pull/1)); the fork's
+`main` keeps the two-hop walk, the postings build and the walk's
+256-thread kernel.
+
+On the same tree after the move (the worker's scan on the scan-only tree,
+`--filtered-search scan`; two-hop on the graph tree against the fork's `main`
+without the scan), highest rate with p99 under 30 ms:
+
+| Load | Two-hop | Worker's FP8 scan | cuVS' FP8 scan (before) |
+| --- | ---: | ---: | ---: |
+| `c1` (original) | 150k, p99 10 ms | 75k, p99 29 ms | 35k |
+| `s3` 0.02-0.3% | not rerun (100k) | 100k or more, p99 23 ms | 75k |
+| `s6` 20% unfiltered | 75k | not rerun | under 10k |
+| `s1` / `s2` 5,000 filters | 75k / 80k (`always`) | under 500 (host evaluation: p99 69 ms at 500) | about 7k |
+
+The worker's scan is faster than the port was on these loads; the earlier
+same-run comparison, at fixed batch sizes, had them within 6% of each other.
+It does not take `--device-transient`: its filters are evaluated on the host,
+so distinct filters still cost it a host evaluation each. The worker's
+ShardHits changes made during the move (cuVS' neighbours already sorted by
+distance: ties slid into key order instead of a sort; their keys gathered on
+the GPU) are kept: without them two-hop's `c1` queued at 140k.
+
 ## Next: FP16 rows in host memory for the FP8 scan's re-score
 
 The FP8 scan reads its FP16 rows only to re-score the candidates it keeps, k
@@ -381,8 +438,8 @@ memory instead, a re-score would bring in only its candidates' rows: about
 1,300 rows of 130 bytes, 170 KB a search, or 4-5 GB/s a GPU at the scan's 35k
 requests/s, far below PCIe's bandwidth, in batches per call; an LRU of rows
 in device memory, evicting as free memory runs low, would keep rows that
-queries share. The change is in cuVS' scan (re-scoring from host-resident rows,
-batched) and a load option in the worker; not started.
+queries share. The change is in the worker's scan (re-scoring from
+host-resident rows, batched) and a load option; not started.
 
 ## Not covered
 

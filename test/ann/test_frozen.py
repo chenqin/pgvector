@@ -1323,36 +1323,6 @@ class FrozenTests(unittest.TestCase):
         self.assertIn('is not empty', self.error('SELECT ann_index_export(%s, %s)', ('docs_ann', path)))
         self.assertIn('absolute path', self.error("SELECT ann_index_export('docs_ann', 'relative')"))
 
-    def test_builder_fp8_copy(self):
-        """cuVS' CAGRA filtered scan re-scores FP8 candidates from FP16 rows: the builder refuses an FP8 copy
-        beside FP32 graphs, takes one without graphs at any dtype, and writes the layout the scan reads."""
-        import numpy as np
-
-        self.create()
-        export = self.export('export')
-        refused = os.path.join(self.directory.name, 'fp32-graphs')
-        result = subprocess.run([sys.executable, BUILD, '--from-export', export, '--out', refused, '--quantize', 'fp8'],
-                                capture_output=True, text=True)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn('--dtype float16', result.stderr)
-        self.assertFalse(os.path.exists(refused))
-        vectors = np.fromfile(os.path.join(export, 'vectors.f32'), dtype='<f4').reshape(ROWS, 4)
-        amax = np.abs(vectors).max(axis=1)
-        for flag, shards in (('--scan-only', [f'shard 0 0 {ROWS} -']), ('--no-cagra', [])):
-            path = os.path.join(self.directory.name, flag.strip('-'))
-            subprocess.run([sys.executable, BUILD, '--from-export', export, '--out', path, flag, '--quantize', 'fp8'],
-                           check=True, capture_output=True)
-            with open(os.path.join(path, 'manifest')) as manifest:
-                lines = manifest.read().splitlines()
-            self.assertIn('quant fp8', lines, flag)
-            self.assertIn('dtype float32', lines, flag)
-            self.assertEqual([line for line in lines if line.startswith('shard ')], shards, flag)
-            # One 16-byte block holds the 4 dimensions, zero padded; a row's scale is its largest magnitude / 448.
-            codes = np.fromfile(os.path.join(path, 'vectors.e4m3'), dtype=np.uint8).reshape(ROWS, 16)
-            scales = np.fromfile(os.path.join(path, 'rowscale.f32'), dtype='<f4')
-            self.assertTrue((codes[:, 4:] == 0).all(), flag)
-            self.assertTrue(np.allclose(scales, np.where(amax > 0, amax / 448, 1)), flag)
-
     def test_export_build_and_load(self):
         subprocess.run(['make', '-C', os.path.join(ROOT, 'ann', 'server'), 'ann-worker'], check=True,
                        stdout=subprocess.DEVNULL)
@@ -1645,8 +1615,7 @@ class FrozenTests(unittest.TestCase):
 
 @unittest.skipUnless(os.environ.get('ANN_CUVS_TEST') and DSN, 'set ANN_CUVS_TEST=1 and ANN_PG_DSN on a cuVS host')
 class FrozenCuvsTests(unittest.TestCase):
-    """A frozen index exported, built into CAGRA shards and an NVFP4 copy (or into shards without graphs and an
-    NVFP4 or FP8 copy), and served by ann-worker-cuvs."""
+    """A frozen index exported, built into CAGRA shards and an NVFP4 copy, and served by ann-worker-cuvs."""
 
     def test_export_cagra_and_search(self):
         import psycopg
@@ -1732,39 +1701,16 @@ class FrozenCuvsTests(unittest.TestCase):
                               worker_args=('--group-gather-limit', '1000', '--bitset-gather-limit', '1000'))
 
     def test_rescore_modes(self):
-        """Large-k candidates re-scored from the FP32 rows, from FP16 rows, or not at all. --rescore fp8-gpu,
-        which re-scored them on the GPU from an FP8 copy, went with the worker's own FP8 scan: refused."""
-        result = subprocess.run([os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'), '--rescore', 'fp8-gpu'],
-                                input=b'', capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 2, result.stderr)
-        self.assertIn(b'fp8-gpu was removed: FP8 scans run in cuVS', result.stderr)
-        # Floors for random 32-dimension rows at half of k as slack: unscored NVFP4 distances reorder close
-        # candidates. The experiments measure recall on real segments.
-        for mode, floor in (('fp32', 0.97), ('fp16', 0.97), ('off', 0.7)):
+        """Large-k candidates re-scored from FP16 rows, on the GPU from FP8 rows, or not at all."""
+        # Floors for random 32-dimension rows at half of k as slack: FP8's 3 mantissa bits reorder close
+        # candidates, unscored NVFP4 more so. The experiments measure recall on real segments.
+        for mode, floor in (('fp16', 0.97), ('fp8-gpu', 0.9), ('off', 0.7)):
             with self.subTest(mode=mode):
                 self.check_scan_route(['--scan-only'], ((500, ''), (1500, 'WHERE tenant < 30')),
                                       worker_args=('--rescore', mode, '--slack-ratio', '50'), floor=floor)
 
-    def test_scan_only_index_fp8(self):
-        """An FP8 index without graphs is served by cuVS' CAGRA filtered scan, through a cuVS index of each
-        shard's rows in FP16 made at load: every k, filtered or not, up to FP16 rounding."""
-        self.check_scan_route(['--scan-only'], ((500, ''), (1500, ''), (500, 'WHERE tenant < 3'),
-                                                (1500, 'WHERE tenant < 30')),
-                              worker_args=('--group-gather-limit', '1000', '--bitset-gather-limit', '1000'),
-                              quant='fp8')
-
-    def test_rescore_modes_fp8(self):
-        """cuVS always re-scores its candidates from the FP16 rows: --rescore off and fp16 keep that re-score,
-        and fp32 (the default) re-scores the final k in FP32 as well with --fp16-exact on."""
-        for mode, extra in (('fp32', ('--fp16-exact', 'on')), ('fp16', ()), ('off', ())):
-            with self.subTest(mode=mode):
-                self.check_scan_route(['--scan-only'], ((500, ''), (1500, 'WHERE tenant < 30')),
-                                      worker_args=('--rescore', mode, *extra, '--slack-ratio', '50'), floor=0.97,
-                                      quant='fp8')
-
-    def check_concurrent_large_k(self, db, table, server, floor=0.99, native=True):
-        """Concurrent k = 500 searches over one filter share grouped passes and stay exact (native: the
-        worker's own tensor-core scans, whose debug log names them)."""
+    def check_concurrent_large_k(self, db, table, server, floor=0.99):
+        """Concurrent k = 500 searches over one filter share grouped tensor-core passes and stay exact."""
         import psycopg
 
         statement = f'SELECT id FROM {table} WHERE tenant < 30 ORDER BY emb <-> %s::vector LIMIT 500'
@@ -1805,13 +1751,12 @@ class FrozenCuvsTests(unittest.TestCase):
         server.process.terminate()
         server.process.wait(5)
         log = server.process.stderr.read().decode(errors='replace')
-        if native:
-            self.assertIn('grouped large-k scan', log, log[-3000:])
-            self.assertIn('bounded candidates', log, log[-3000:])
+        self.assertIn('grouped large-k scan', log, log[-3000:])
+        self.assertIn('bounded candidates', log, log[-3000:])
         self.assertNotIn('failed', log, log[-3000:])
         self.assertNotIn('job by job', log, log[-3000:])
 
-    def check_scan_route(self, build_args, cases, worker_args=(), floor=0.99, quant='nvfp4'):
+    def check_scan_route(self, build_args, cases, worker_args=(), floor=0.99):
         import psycopg
         from psycopg import sql
 
@@ -1837,7 +1782,7 @@ class FrozenCuvsTests(unittest.TestCase):
             db.execute('SELECT ann_index_export(%s, %s)', (f'{table}_ann', export))
             path = os.path.join(directory.name, 'index')
             subprocess.run([sys.executable, BUILD, '--from-export', export, '--out', path, '--shards', '2',
-                            '--quantize', quant] + build_args, check=True, capture_output=True)
+                            '--quantize', 'nvfp4'] + build_args, check=True, capture_output=True)
             db.execute('SET ann.worker_socket = %s' % sql.Literal(server.path).as_string(db))
             db.execute('SET ann.gpu_min_eligible = 0')
             self.assertEqual(db.execute('SELECT ann_index_load(%s, %s)', (table, path)).fetchone()[0], rows)
@@ -1857,21 +1802,8 @@ class FrozenCuvsTests(unittest.TestCase):
                 self.assertEqual(len(found), k)
                 overlap = len(set(found) & set(exact)) / k
                 self.assertGreaterEqual(overlap, floor, f'k={k} {filtered}: overlap {overlap}')
-            if quant == 'fp8':
-                # The routes above end the same way when cuVS cannot scan; only its counter tells them apart.
-                from test_cuvs_index import cuvs_scan_supported
-                with server.connect() as connection:
-                    connection.sendall(frame(31, 1, table.encode()))
-                    _, _, status, data = receive(connection)
-                self.assertEqual(status, 0)
-                stats = json.loads(data)
-                self.assertEqual(stats['matrix_queries'], 0, stats)
-                # Shards of 15,000 rows select from every score: no sampled cutoff to fail.
-                self.assertEqual(stats['cuvs_scan_retries'], 0, stats)
-                if cuvs_scan_supported():
-                    self.assertGreater(stats['cuvs_scan_queries'], 0, stats)
             if '--scan-only' in build_args:
-                self.check_concurrent_large_k(db, table, server, floor, native=quant != 'fp8')
+                self.check_concurrent_large_k(db, table, server, floor)
         except BaseException:
             server.process.terminate()
             server.process.wait(5)

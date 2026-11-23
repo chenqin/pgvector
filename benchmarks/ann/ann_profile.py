@@ -529,8 +529,7 @@ def gpu_fine(d, rep, meta, verdict):
         for l in kt["lines"]:
             rep.line("     " + l.strip())
     else:
-        rep.line("   ANN_KERNEL_TIMING: no 'matrix gather stages' lines in the worker log (export ANN_KERNEL_TIMING=1 before worker.sh;"
-                 " cuVS' FP8 scan prints none: its kernels are in the nsys phase)")
+        rep.line("   ANN_KERNEL_TIMING: no 'matrix gather stages' lines in the worker log (export ANN_KERNEL_TIMING=1 before worker.sh)")
 
 
 # ---------------------------------------------------------------- report: CPU
@@ -737,9 +736,8 @@ def counters_section(d, rep, meta, verdict):
         ia = a["indexes"].get(name)
         if not ia:
             continue
-        for key in ("matrix_queries", "matrix_pruned_queries", "matrix_prune_fallbacks", "cuvs_scan_queries",
-                    "cuvs_scan_retries", "mixed_queries", "gpu_predicates", "cagra_fp32_queries", "cagra_fp16_queries",
-                    "gpu_rerank_candidates"):
+        for key in ("matrix_queries", "matrix_pruned_queries", "matrix_prune_fallbacks", "mixed_queries", "gpu_predicates",
+                    "cagra_fp32_queries", "cagra_fp16_queries", "gpu_rerank_candidates"):
             tot[key] += delta(ia, ib, key) or 0
         copies[ib.get("copies")] += 1
         ra = {r["copy"]: r for r in ia.get("replicas", [])}
@@ -756,13 +754,9 @@ def counters_section(d, rep, meta, verdict):
                 per_device[dev]["reserved_ns"] += delta(prev, r, "reserved_ns") or 0
                 per_device[dev]["copies"] += 1
     mq = tot["matrix_queries"]
-    cq = tot["cuvs_scan_queries"]
-    # matrix_* count the worker's own scans (NVFP4, FP16/FP32 in place); cuvs_scan_* cuVS' FP8 scan, the only FP8 one.
-    rep.line("   routing (%d indexes, copies per index %s): matrix queries %s (%s/s), pruned %s (%.0f%%), prune fallbacks %s,"
-             " cuvs scan queries %s (%s/s), retried %s (%.2f%%), cagra fp16/fp32 %s/%s, mixed %s, gpu predicates %s"
+    rep.line("   routing (%d indexes, copies per index %s): matrix queries %s (%s/s), pruned %s (%.0f%%), prune fallbacks %s, cagra fp16/fp32 %s/%s, mixed %s, gpu predicates %s"
              % (len(b["indexes"]), dict(copies), fmt_num(mq), fmt_num(mq / span), fmt_num(tot["matrix_pruned_queries"]),
-                pct(tot["matrix_pruned_queries"], mq), fmt_num(tot["matrix_prune_fallbacks"]), fmt_num(cq), fmt_num(cq / span),
-                fmt_num(tot["cuvs_scan_retries"]), pct(tot["cuvs_scan_retries"], cq), fmt_num(tot["cagra_fp16_queries"]),
+                pct(tot["matrix_pruned_queries"], mq), fmt_num(tot["matrix_prune_fallbacks"]), fmt_num(tot["cagra_fp16_queries"]),
                 fmt_num(tot["cagra_fp32_queries"]), fmt_num(tot["mixed_queries"]), fmt_num(tot["gpu_predicates"])))
     multi = [m for m in masks if bin(m).count("1") > 1]
     note = " (copies span several GPUs: per-GPU numbers count every GPU a copy touches)" if multi else ""

@@ -263,11 +263,13 @@ static const char *const FilteredGraphPreset[] = {
 };
 
 /*
- * Scan-only indexes: every filtered search is cuVS' FP8 scan, whose
- * candidates are re-scored from FP16 rows; FP16 distances are final.
+ * Scan-only indexes: every filtered search is the worker's FP8 scan, whose
+ * candidates are re-scored on the GPU from FP16 rows; FP16 distances are
+ * final. Filters are evaluated on the host (--device-transient builds
+ * bitsets for graph walks only).
  */
 static const char *const FilteredScanPreset[] = {
-	"--rescore", "fp16", "--predicate-admission", "second", "--device-transient", "on", NULL
+	"--gpu-rerank", "on", "--rescore", "fp16", "--predicate-admission", "second", NULL
 };
 
 /*
@@ -633,13 +635,10 @@ main(int argc, char **argv)
 			else if (strcmp(value, "fp16") == 0)
 				AnnIndexConfig.rescore = ANN_RESCORE_FP16;
 			else if (strcmp(value, "fp8-gpu") == 0)
-			{
-				fprintf(stderr, "ann-worker: --rescore fp8-gpu was removed: FP8 scans run in cuVS\n");
-				return 2;
-			}
+				AnnIndexConfig.rescore = ANN_RESCORE_FP8_GPU;
 			else
 			{
-				fprintf(stderr, "ann-worker: --rescore takes fp32, off or fp16\n");
+				fprintf(stderr, "ann-worker: --rescore takes fp32, off, fp16 or fp8-gpu\n");
 				return 2;
 			}
 		}
@@ -885,17 +884,15 @@ usage:
 			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off] [--device-transient on|always|off]\n"
 			"  [--filtered-search graph|scan]\n"
 			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--residual-masks on|off] [--quantized-scan on|off] [--quant-slack N]\n"
-			"  [--rescore fp32|off|fp16] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--scan-skip-tail on|off] [--rerank-prefetch N] [--predicate-cache N]\n"
+			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--scan-skip-tail on|off] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--scan-routes on|off] [--scan-max-k N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]\n"
 			"  [--delete-patch on|off] [--delete-patch-rows N] [--delete-patch-entries N] [--shared-predicate-mb MB]]\n"
 			"--filtered-search: options for one way of serving filtered searches, which later options override: graph\n"
-			"  (cuVS' two-hop walk; indexes with graphs) or scan (cuVS' FP8 scan; scan-only indexes). See\n"
+			"  (cuVS' two-hop walk; indexes with graphs) or scan (the worker's FP8 scan; scan-only indexes). See\n"
 			"  docs/ann-cuvs-index.md\n"
 			"--delete-patch (on by default): a delete replaces each cached predicate result holding its rows by a copy\n"
 			"  without them; patched entries are re-uploaded to the devices at their next lookup\n"
-			"--rescore: FP8 scans run as cuVS' CAGRA filtered scan, which re-scores its candidates from FP16 rows on\n"
-			"  the GPU (off and fp16 keep those distances; fp32 adds --fp16-exact's FP32 re-score of the final k)\n"
 			"hipvs and fused-nvfp4 require vendor adapters\n");
 #else
 	fprintf(stderr, "usage: ann-worker [--backend cpu-exact|mock-gpu] [--listen PATH] [--listen-tcp HOST:PORT --auth-token-file FILE [--rdma DEVICE[:PORT] [--rdma-lanes N] [--rdma-poll spin|wait]]] "

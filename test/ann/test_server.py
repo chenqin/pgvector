@@ -127,17 +127,6 @@ class ServerTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertIn(option.encode(), result.stderr)
 
-    def test_removed_fp8_scan_options(self):
-        # cuVS scans every FP8 copy, so the worker's own FP8 scan went, and with it --scan-backend (now an
-        # unknown option) and --rescore fp8-gpu (refused, saying why).
-        result = subprocess.run([WORKER, '--scan-backend', 'native'], input=b'', capture_output=True, timeout=5)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b'usage: ann-worker', result.stderr)
-        self.assertNotIn(b'--scan-backend', result.stderr)
-        result = subprocess.run([WORKER, '--rescore', 'fp8-gpu'], input=b'', capture_output=True, timeout=5)
-        self.assertEqual(result.returncode, 2)
-        self.assertIn(b'fp8-gpu was removed: FP8 scans run in cuVS', result.stderr)
-
     def test_pipelined_requests_match_exact_results(self):
         rng = random.Random(7)
         connections = [self.server.connect() for _ in range(3)]

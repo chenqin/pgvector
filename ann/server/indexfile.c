@@ -2564,8 +2564,8 @@ AnnIndexFileOpen(const char *name, const char *directory, AnnIndexFile **result)
 
 		/* What searches and filters read: the files, the inverted columns. */
 		locked += Lock(file->keys, file->rows * sizeof(int64_t), &refused);
-		/* With an FP16 re-score only fallbacks read the FP32 rows. */
-		if (AnnIndexConfig.rescore != ANN_RESCORE_FP16)
+		/* With an FP16 or GPU FP8 re-score only fallbacks read the FP32 rows. */
+		if (AnnIndexConfig.rescore != ANN_RESCORE_FP16 && AnnIndexConfig.rescore != ANN_RESCORE_FP8_GPU)
 			locked += Lock(file->vectors, file->rows * file->dimensions * sizeof(float), &refused);
 		else if (file->halfVectors)
 			locked += Lock(file->halfVectors, (size_t) file->rows * file->dimensions * sizeof(uint16_t), &refused);

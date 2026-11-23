@@ -460,14 +460,3 @@ final worker flags (one shard per group; for 4 × 2 use `--shard-topk-share 40
 --gather-limit 4000000 --bitset-gather-limit 4000000 --group-gather-limit 4000000
 --memory-pool 60 --predicate-cache-mb 8192 --predicate-device-mb 2048 --prewarm off
 ```
-
-The scan results on this page came from the worker's own FP8 kernels,
-since removed: FP8 copies are now scanned by cuVS' CAGRA filtered scan,
-scan-only indexes included ([FP8 filtered scan](ann-cuvs-index.md#fp8-filtered-scan-in-cuvs)),
-and the flags above run that scan. In one run with these flags (but
-`--memory-pool 95`), against the last build with the worker's own scan,
-cuVS' scan reached 98–101% of its throughput at K 300–1000 and 94–96% at
-K 30–182 on the index without graphs, and 103–119% and 96–99% on the index
-with FP16 graphs, where the worker's own scan was slower under load; recall
-was 0.9991 against 0.9993 and 0.9976 against 0.9982. To rerun the scan these
-numbers measured, build the worker from a tree that predates the removal.

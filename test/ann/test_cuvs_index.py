@@ -1,8 +1,7 @@
 """CAGRA shards built by ann/builder/build_cuvs_index.py, served through SQL on GPUs.
 
 Needs a cuVS host: ANN_CUVS_TEST=1, ANN_PG_DSN for a local superuser, the
-ann-worker-cuvs build (against the chenqin/cuvs fork, which has the FP8
-filtered scan), and Python packages cuvs, cupy, numpy, psycopg.
+ann-worker-cuvs build, and Python packages cuvs, cupy, numpy, psycopg.
 """
 
 import os
@@ -18,32 +17,6 @@ from test_server import ROOT, Server, frame, receive  # noqa: E402
 DSN = os.environ.get('ANN_PG_DSN')
 PSQL = os.environ.get('ANN_PSQL', 'psql')
 BUILD = os.path.join(ROOT, 'ann', 'builder', 'build_cuvs_index.py')
-CUVS_WORKER = os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs')
-
-
-def device_attribute(attribute, device=0):
-    """cudaDeviceGetAttribute: 75 and 76 compute capability major and minor, 97 opt-in shared memory a block."""
-    import ctypes
-    value = ctypes.c_int()
-    ctypes.CDLL('libcudart.so').cudaDeviceGetAttribute(ctypes.byref(value), attribute, device)
-    return value.value
-
-
-def cuvs_scan_supported():
-    """Whether device 0 can run cuVS' FP8 filtered scan, which needs compute capability 8.9 or newer."""
-    return (device_attribute(75), device_attribute(76)) >= (8, 9)
-
-
-def check_fp16_hits(test, hits, eligible, k, context):
-    """hits of a scan re-scored from FP16 rows against eligible (key -> exact distance): the top k but for
-    near-ties swapped at the boundary, every hit eligible, distances within FP16 storage error, in order."""
-    want = dict(sorted(eligible.items(), key=lambda item: (item[1], item[0]))[:k])
-    test.assertEqual(len(hits), k, context)
-    test.assertTrue(all(key in eligible for key, _ in hits), context)
-    test.assertGreaterEqual(len({key for key, _ in hits} & set(want)) / k, .99, context)
-    test.assertTrue(all(key in want or d >= max(want.values()) - 1e-2 for key, d in hits), context)
-    test.assertLess(max(abs(d - eligible[key]) for key, d in hits), 1e-2, context)
-    test.assertEqual([d for _, d in hits], sorted(d for _, d in hits), context)
 
 
 @unittest.skipUnless(os.environ.get('ANN_CUVS_TEST') and DSN, 'set ANN_CUVS_TEST=1 and ANN_PG_DSN on a cuVS host')
@@ -88,19 +61,13 @@ class CuvsIndexTests(unittest.TestCase):
                         '--vector', 'emb', '--out', os.path.join(cls.directory.name, 'nvfp4_1shard'),
                         '--shards', '1', '--quantize', 'nvfp4', '--attribute', 'tenant'],
                        check=True, capture_output=True)
-        # An NVFP4 copy beside FP32 graphs, for the Blackwell module's gather scan.
-        path = os.path.join(cls.directory.name, 'nvfp4')
-        subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{cls.table}', '--key', 'id',
-                        '--vector', 'emb', '--out', path, '--shards', '4', '--quantize', 'nvfp4', '--attribute', 'tenant'],
-                       check=True, capture_output=True)
-        cls.loaded['nvfp4'] = cls.psql(f"SELECT ann_index_load('{cls.table}_nvfp4', '{path}')")
-        # FP8 copies for cuVS' CAGRA filtered scan: beside FP16 graphs, and without graphs (the worker
-        # then gives each shard a cuVS index of its rows in FP16, made at load). The tests load them.
-        for name, flags in [('fp8', ['--dtype', 'float16']), ('fp8_scan_only', ['--scan-only'])]:
+        # Quantized copies for the Blackwell module's gather scan.
+        for quant in ['nvfp4', 'fp8']:
+            path = os.path.join(cls.directory.name, quant)
             subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{cls.table}', '--key', 'id',
-                            '--vector', 'emb', '--out', os.path.join(cls.directory.name, name), '--shards', '4',
-                            *flags, '--quantize', 'fp8', '--attribute', 'tenant'],
+                            '--vector', 'emb', '--out', path, '--shards', '4', '--quantize', quant, '--attribute', 'tenant'],
                            check=True, capture_output=True)
+            cls.loaded[quant] = cls.psql(f"SELECT ann_index_load('{cls.table}_{quant}', '{path}')")
 
     @classmethod
     def tearDownClass(cls):
@@ -143,38 +110,6 @@ class CuvsIndexTests(unittest.TestCase):
                            ORDER BY t.emb <-> q.emb, t.id LIMIT 10) b
               FROM {self.table} q WHERE q.id % 1200 = 0) x""", server).split('|')
 
-    def key_list_search(self, index, server=None):
-        """(recall@10, largest distance error, hits outside the filter) with one tenant's keys (2%) as each
-        query's filter."""
-        return self.psql(f"""
-            SELECT round(avg(cardinality(ARRAY(SELECT unnest(a) INTERSECT SELECT unnest(b)))) / 10, 3),
-                   max(e), sum(o) FROM (
-              SELECT ARRAY(SELECT s.id FROM ann_index_search('{index}', q.emb, 10,
-                        ARRAY(SELECT id FROM {self.table} WHERE tenant = q.tenant)) s) a,
-                     ARRAY(SELECT t.id FROM {self.table} t WHERE t.tenant = q.tenant
-                           ORDER BY t.emb <-> q.emb LIMIT 10) b,
-                     (SELECT max(abs(s.distance - (t.emb <-> q.emb))) FROM ann_index_search('{index}', q.emb, 10,
-                        ARRAY(SELECT id FROM {self.table} WHERE tenant = q.tenant)) s JOIN {self.table} t USING (id)) e,
-                     (SELECT count(*) FROM ann_index_search('{index}', q.emb, 10,
-                        ARRAY(SELECT id FROM {self.table} WHERE tenant = q.tenant)) s JOIN {self.table} t USING (id)
-                      WHERE t.tenant <> q.tenant) o
-              FROM {self.table} q WHERE q.id % 1200 = 0) x""", server).split('|')
-
-    def index_info(self, index, server=None):
-        """Operation 15's reply for a loaded index."""
-        with (server or self.server).connect() as connection:
-            connection.sendall(frame(15, 1, index.encode()))
-            return receive(connection)[3]
-
-    def routing_stats(self, index, server=None):
-        """Operation 31's statistics for a loaded index."""
-        import json
-        with (server or self.server).connect() as connection:
-            connection.sendall(frame(31, 1, index.encode()))
-            _, _, status, data = receive(connection)
-        self.assertEqual(status, 0, index)
-        return json.loads(data)
-
     def test_attribute_and_bitmap_gather_route_match_sql(self):
         for function in ['attribute', 'bitmap']:
             mismatches, _, outside = self.filtered(function)
@@ -190,14 +125,13 @@ class CuvsIndexTests(unittest.TestCase):
             self.assertEqual(outside, '0', function)
 
     def test_blackwell_quantized_gather(self):
-        # On compute capability 10.x and 12.x GPUs the gather scan scores the NVFP4
-        # copy and re-scores candidates in FP32: rows stay within the
-        # filter, distances stay exact, and recall holds. FP8 copies are
-        # scanned by cuVS (test_fp8_scan_runs_in_cuvs).
+        # On compute capability 10.x and 12.x GPUs the gather scan scores the NVFP4 or
+        # FP8 copy and re-scores candidates in FP32: rows stay within the
+        # filter, distances stay exact, and recall holds.
         import ctypes
         major = ctypes.c_int()
         ctypes.CDLL('libcudart.so').cudaDeviceGetAttribute(ctypes.byref(major), 75, 0)
-        for quant in ['nvfp4']:
+        for quant in ['nvfp4', 'fp8']:
             index = f'{self.table}_{quant}'
             with self.server.connect() as connection:
                 connection.sendall(frame(15, 1, index.encode()))
@@ -220,134 +154,6 @@ class CuvsIndexTests(unittest.TestCase):
             self.assertGreaterEqual(float(stats[0]), 0.99, quant)
             self.assertLess(float(stats[1]), 1e-4, quant)
             self.assertEqual(stats[2], '0', quant)
-
-    def test_fp8_scan_runs_in_cuvs(self):
-        """FP8 copies are scanned by cuVS' CAGRA filtered scan, the worker's only FP8 scan: on FP16 graph
-        shards, and on scan-only shards through a cuVS index without a graph that holds their rows in FP16.
-        cuVS re-scores its candidates from the FP16 rows: an exact scan's results, up to FP16 rounding."""
-        import json
-        import struct
-        from test_predicate_cache import search_batch_frame
-        supported = cuvs_scan_supported()
-        # No --matrix-gather: the default. 2% filters exceed the exact limit.
-        server = Server('--backend', 'cuvs', '--lanes', '4', '--exact-limit', '500', executable=CUVS_WORKER)
-        query = self.psql(f'SELECT emb::text FROM {self.table} ORDER BY id LIMIT 1')
-        eligible = dict((int(key), float(distance)) for key, distance in
-                        (line.split('|') for line in self.psql(f"""SELECT id, (emb <-> '{query}'::vector)::real
-                            FROM {self.table} WHERE tenant = 7""").splitlines()))
-        try:
-            for fixture in ('fp8', 'fp8_scan_only'):
-                index = f'{self.table}_{fixture}_scan'
-                self.psql(f"SELECT ann_index_load('{index}', '{self.directory.name}/{fixture}')", server)
-                info = self.index_info(index, server)
-                self.assertIn(b'quant fp8 quant_scan ', info, fixture)
-                if supported:
-                    # Every shard's FP8 copy is attached to its cuVS index.
-                    self.assertIn(b'quant fp8 quant_scan on', info, fixture)
-                # Key lists: single searches whose keys the worker maps to shard rows.
-                recall, error, outside = self.key_list_search(index, server)
-                self.assertGreaterEqual(float(recall), 0.99, fixture)
-                self.assertLess(float(error), 1e-2, fixture)
-                self.assertEqual(outside, '0', fixture)
-                # A cached bitmap's rows at k = 500, one search and a same-filter group of 16.
-                self.psql(f"SELECT ann_filter_bitmap_build('{index}', 'tenant = 7')", server)
-                filter_id = int(self.psql(f"SELECT id FROM ann_filter_bitmap WHERE index_name = '{index}' "
-                                          "AND filter = 'tenant = 7'", server))
-                program = struct.pack('<BQ', 4, filter_id & ((1 << 64) - 1))
-                with server.connect() as connection:
-                    for nq in (1, 16):
-                        connection.sendall(search_batch_frame(nq, index, [json.loads(query)] * nq, 500, program))
-                        _, _, status, data = receive(connection)
-                        self.assertEqual(status, 0, (fixture, nq))
-                        self.assertEqual(struct.unpack_from('<I', data)[0], nq)
-                        offset = 4
-                        for q in range(nq):
-                            count, _, rows = struct.unpack_from('<IIQ', data, offset)
-                            self.assertEqual(rows, 800, (fixture, nq))
-                            hits = [struct.unpack_from('<qf', data, offset + 16 + i * 12) for i in range(count)]
-                            check_fp16_hits(self, hits, eligible, 500, (fixture, nq, q))
-                            offset += 16 + count * 12
-                        self.assertEqual(offset, len(data))
-                if fixture == 'fp8_scan_only':
-                    # Without graphs, an unfiltered search scans every row.
-                    self.assertGreaterEqual(self.recall(index, False, server), 0.99)
-                stats = self.routing_stats(index, server)
-                self.assertEqual(stats['matrix_queries'], 0, (fixture, stats))
-                # Shards of fewer than 65,536 listed rows select from every score: no cutoff to fail.
-                self.assertEqual(stats['cuvs_scan_retries'], 0, (fixture, stats))
-                if supported:
-                    self.assertGreater(stats['cuvs_scan_queries'], 0, (fixture, stats))
-        finally:
-            server.close()
-
-    def test_fp8_scan_retry(self):
-        """A query whose sampled cutoff keeps more rows than the scan can hold is searched again with a full
-        selection: 40,000 copies of the query among the 80,000 rows of one scan-only shard."""
-        import struct
-        from test_predicate_cache import search_predicate_frame
-        if not cuvs_scan_supported() or device_attribute(97) < 160 * 1024:
-            self.skipTest("cuVS' sampled cutoff needs compute capability 8.9 or newer and 160 KB of shared memory "
-                          'a block')
-        table = self.table + '_copies'
-        self.psql(f"""
-            CREATE TABLE {table} (id bigint PRIMARY KEY, emb vector(32));
-            SELECT setseed(0.2);
-            INSERT INTO {table} SELECT i, CASE WHEN i % 2 = 0 THEN array_fill(0.5::real, ARRAY[32])::vector
-                ELSE (SELECT array_agg(random()::real) FROM generate_series(1, 32) WHERE i > 0)::vector END
-                FROM generate_series(1, 80000) i;""")
-        server = None
-        try:
-            path = os.path.join(self.directory.name, 'copies')
-            subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{table}', '--key', 'id',
-                            '--vector', 'emb', '--out', path, '--shards', '1', '--scan-only', '--quantize', 'fp8'],
-                           check=True, capture_output=True)
-            server = Server('--backend', 'cuvs', '--lanes', '1', '--exact-limit', '500', executable=CUVS_WORKER)
-            self.psql(f"SELECT ann_index_load('{table}', '{path}')", server)
-            # Every row passes (an all-rows program): the sample's cutoff is the copies' distance.
-            with server.connect() as connection:
-                connection.sendall(search_predicate_frame(1, table, [0.5] * 32, 10, b'\x08'))
-                _, _, status, data = receive(connection)
-            self.assertEqual(status, 0)
-            count = struct.unpack_from('<I', data)[0]
-            hits = [struct.unpack_from('<qf', data, 16 + i * 12) for i in range(count)]
-            # Any 10 of the copies (even keys) answer it, all at distance 0.
-            self.assertEqual(count, 10)
-            self.assertTrue(all(key % 2 == 0 and distance < 1e-4 for key, distance in hits), hits)
-            stats = self.routing_stats(table, server)
-            self.assertGreater(stats['cuvs_scan_queries'], 0, stats)
-            self.assertGreater(stats['cuvs_scan_retries'], 0, stats)
-        finally:
-            if server is not None:
-                server.close()
-            self.psql(f'DROP TABLE {table}')
-
-    def test_fp8_copy_beside_fp32_graphs(self):
-        """An FP8 copy beside FP32 graphs, which the builder now refuses, still loads and answers exactly from
-        the graph or the scans of the FP32 dataset: no scan reads the copy, as cuVS' re-scores from an
-        FP16 dataset and the worker has no FP8 scan of its own."""
-        path = os.path.join(self.directory.name, 'fp8_fp32_graphs')
-        os.makedirs(path)
-        source = os.path.join(self.directory.name, 'float32')
-        for name in os.listdir(source):
-            if name == 'manifest':
-                with open(os.path.join(source, name)) as manifest, open(os.path.join(path, name), 'w') as out:
-                    out.write(manifest.read() + 'quant fp8\n')
-            else:
-                os.symlink(os.path.join(source, name), os.path.join(path, name))
-        for name in ('vectors.e4m3', 'rowscale.f32'):
-            os.symlink(os.path.join(self.directory.name, 'fp8', name), os.path.join(path, name))
-        server = Server('--backend', 'cuvs', '--lanes', '4', '--exact-limit', '500', executable=CUVS_WORKER)
-        index = self.table + '_fp8_fp32_graphs'
-        try:
-            self.psql(f"SELECT ann_index_load('{index}', '{path}')", server)
-            self.assertIn(b'quant fp8 quant_scan off', self.index_info(index, server))
-            recall, error, outside = self.key_list_search(index, server)
-            self.assertGreaterEqual(float(recall), 0.99)
-            self.assertLess(float(error), 1e-4)
-            self.assertEqual(outside, '0')
-            self.assertEqual(self.routing_stats(index, server)['cuvs_scan_queries'], 0)
-        finally:
-            server.close()
 
     def test_generalized_matrix_k500(self):
         """Matrix selection and device/host reranking preserve each top-k."""
@@ -392,9 +198,8 @@ class CuvsIndexTests(unittest.TestCase):
                             env={'ANN_PRUNE_MIN_ROWS': '1000'},
                             executable=os.path.join(ROOT, 'ann', 'server', 'ann-worker-cuvs'))
             try:
-                # The worker's own matrix gather: FP8 copies go to cuVS instead (test_fp8_scan_runs_in_cuvs).
                 dtypes = {'exact': ('float16', 'float16_nvfp4'), 'prune': ('float32', 'float16')}.get(
-                    mode, ('float32', 'float16', 'float16_nvfp4', 'nvfp4'))
+                    mode, ('float32', 'float16', 'float16_nvfp4', 'nvfp4', 'fp8'))
                 for dtype in dtypes:
                     approximate = mode in ('on', 'prune') and dtype.startswith('float16')
                     name = self.table + '_matrix_' + dtype + '_' + mode
@@ -899,103 +704,6 @@ class CuvsIndexTests(unittest.TestCase):
                             f"(ARRAY[{','.join(map(str, ids))}]::bigint[])")
             self.assertEqual(bad, '0')
         self.psql(f'DROP TABLE {table}')
-
-    def test_fp8_excluded_rows_match_full_evaluation(self):
-        """On FP8 indexes a search with excluded rows (--residual-masks serving "range AND tenant <> v" from the
-        range's entry) first drops them from its own rows, and cuVS' scan scans the rest: masks on and off
-        answer alike up to FP16 rounding, on FP16 graphs and without graphs."""
-        import json
-        import struct
-        from test_predicate_cache import search_batch_frame, search_predicate_frame, values_program
-        supported = cuvs_scan_supported()
-        table = self.table + '_fp8_masks'
-        self.psql(f"""
-            CREATE TABLE {table} (id bigint PRIMARY KEY, category int, tenant int, emb vector(32));
-            SELECT setseed(0.4);
-            INSERT INTO {table} SELECT i, i % 20, (i / 20) % 100,
-                (SELECT array_agg(random()::real) FROM generate_series(1, 32) WHERE i > 0)::vector
-                FROM generate_series(1, 40000) i;""")
-
-        def leaf_range(column, low, high):
-            return struct.pack('<BB', 2, len(column)) + column.encode() + struct.pack('<Bii', 0, low, high)
-
-        try:
-            # Query vectors are rows of the excluded tenant: their nearest row is themselves. SQL gives each
-            # query's eligible rows (key -> exact distance), which leave the tenant out, and the range's row
-            # count, which a search served from the range's entry reports (as the NVFP4 residual test checks).
-            cases = []
-            for low, high, tenant in [(2, 3, 7), (0, 1, 55), (10, 13, 99)]:
-                where = f'category BETWEEN {low} AND {high}'
-                rows = self.psql(f"SELECT emb::text FROM {table} WHERE {where} AND tenant = {tenant} "
-                                 "ORDER BY id LIMIT 3").splitlines()
-                program = leaf_range('category', low, high) + values_program('tenant', [tenant], negate=True) + b'\x05'
-                eligible = [dict((int(key), float(distance)) for key, distance in
-                                 (line.split('|') for line in self.psql(f"""SELECT id, (emb <-> '{row}'::vector)::real
-                                     FROM {table} WHERE {where} AND tenant <> {tenant}""").splitlines()))
-                            for row in rows]
-                base = int(self.psql(f"SELECT count(*) FROM {table} WHERE {where}"))
-                cases.append((program, [json.loads(row) for row in rows], eligible, base))
-            for fixture, flags in (('graph', ['--dtype', 'float16']), ('scan_only', ['--scan-only'])):
-                path = os.path.join(self.directory.name, 'fp8_masks_' + fixture)
-                subprocess.run([sys.executable, BUILD, '--dsn', DSN, '--table', f'public.{table}', '--key', 'id',
-                                '--vector', 'emb', '--out', path, '--shards', '2', *flags, '--quantize', 'fp8',
-                                '--attribute', 'category', '--attribute', 'tenant'], check=True, capture_output=True)
-                results = {}
-                for mode in ('off', 'on'):
-                    # Explicitly without the matrix gather, which masks excluded rows itself (it takes no FP8 index).
-                    server = Server('--backend', 'cuvs', '--lanes', '2', '--exact-limit', '0', '--matrix-gather', 'off',
-                                    '--residual-masks', mode, executable=CUVS_WORKER)
-                    name = f'{table}_{fixture}_{mode}'
-                    try:
-                        self.psql(f"SELECT ann_index_load('{name}', '{path}')", server)
-                        answers = []
-                        with server.connect() as connection:
-                            request = 1
-                            for program, vectors, eligible, base in cases:
-                                # Twice through operation 22 (the second finds the base cached), once batched.
-                                for vector, want in zip(vectors[:2], eligible):
-                                    connection.sendall(search_predicate_frame(request, name, vector, 500, program))
-                                    _, _, status, data = receive(connection)
-                                    self.assertEqual(status, 0, (fixture, mode))
-                                    count, _, got = struct.unpack_from('<IIQ', data)
-                                    self.assertEqual(got, base if mode == 'on' else len(want), (fixture, mode))
-                                    answers.append(([struct.unpack_from('<qf', data, 16 + i * 12)
-                                                     for i in range(count)], want))
-                                    request += 1
-                                connection.sendall(search_batch_frame(request, name, vectors, 500, program))
-                                _, _, status, data = receive(connection)
-                                self.assertEqual(status, 0, (fixture, mode))
-                                offset = 4
-                                for want in eligible:
-                                    count, _, got = struct.unpack_from('<IIQ', data, offset)
-                                    self.assertEqual(got, base if mode == 'on' else len(want), (fixture, mode))
-                                    answers.append(([struct.unpack_from('<qf', data, offset + 16 + i * 12)
-                                                     for i in range(count)], want))
-                                    offset += 16 + count * 12
-                                self.assertEqual(offset, len(data))
-                                request += 1
-                            connection.sendall(frame(8, request))
-                            residual = json.loads(receive(connection)[3])['predicate_residual']
-                        stats = self.routing_stats(name, server)
-                    finally:
-                        server.close()
-                    # With masks on, searches were served from their range's entry less the tenant's rows.
-                    self.assertGreater(residual, 0) if mode == 'on' else self.assertEqual(residual, 0)
-                    self.assertEqual(stats['residual_masked'], 0, (fixture, mode, stats))
-                    self.assertEqual(stats['matrix_queries'], 0, (fixture, mode, stats))
-                    if supported:
-                        # Every search, its own rows first with masks on, went to cuVS' scan.
-                        self.assertEqual(stats['cuvs_scan_queries'], len(answers), (fixture, mode, stats))
-                    for at, (hits, want) in enumerate(answers):
-                        check_fp16_hits(self, hits, want, 500, (fixture, mode, at))
-                    results[mode] = [dict(hits) for hits, _ in answers]
-                self.assertEqual(len(results['on']), len(results['off']))
-                for at, (on, off) in enumerate(zip(results['on'], results['off'])):
-                    common = on.keys() & off.keys()
-                    self.assertGreaterEqual(len(common) / 500, .99, (fixture, at))
-                    self.assertLess(max(abs(on[key] - off[key]) for key in common), 1e-2, (fixture, at))
-        finally:
-            self.psql(f'DROP TABLE {table}')
 
     def test_mixed_filter_groups_match_sql(self):
         """Searches over different cached filters share segmented gathers (--mixed-groups) and match SQL."""

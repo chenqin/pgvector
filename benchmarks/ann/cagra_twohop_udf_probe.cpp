@@ -22,7 +22,8 @@
  *   twol     as bitsetq, each query's bitset stored two-level (a bit per 1,024-item block, words of
  *            occupied blocks only; prototype cuVS flag CUVS_TWO_LEVEL); use with --reorder
  *   scanc    one query per call, its bitset built by cuVS, searched by cuVS' FP8 filtered scan (codes
- *            made at load from the FP16 rows; candidates k + k * --scan-slack / 100)
+ *            made at load from the FP16 rows; candidates k + k * --scan-slack / 100); needs a cuVS
+ *            with the filtered scan
  *   buildc   as buildq, each bitset built by cuVS (cuvs::core::postings::evaluate, the worker's
  *            build) from the same postings; programs of one VALUES or OVERLAP leaf only
  *
@@ -46,7 +47,10 @@
 #include <cuda_runtime.h>
 #include <cuvs/core/postings.hpp>
 #include <cuvs/neighbors/cagra.hpp>
+#if __has_include(<cuvs/preprocessing/quantize/fp8.hpp>)
 #include <cuvs/preprocessing/quantize/fp8.hpp>
+#define PROBE_HAS_FP8_SCAN 1  // a cuVS with the FP8 filtered scan (the fork's scan pull request)
+#endif
 #include <cuvs/neighbors/common.hpp>
 #include <raft/core/bitset.hpp>
 #include <raft/core/device_mdspan.hpp>
@@ -406,8 +410,8 @@ int main(int argc, char** argv)
       width = 4, block = 64;
   bool recall = true;
   bool pitch = true;
-  bool reorder = false;
-  int scan_slack = 300;  // scanc: candidates k + k * scan_slack / 100 (the worker's --slack-ratio)  // items renumbered by their smallest multi-valued value (product group)
+  bool reorder = false;  // items renumbered by their smallest multi-valued value (product group)
+  int scan_slack = 300;  // scanc: candidates k + k * scan_slack / 100 (the worker's --slack-ratio)
   std::string modes = "bitset1,bitsetq,udf,udf1";
   for (int i = 3; i < argc; i++) {
     std::string a = argv[i];
@@ -681,6 +685,7 @@ int main(int argc, char** argv)
     load_res.sync_stream();
   }
   auto& searched = permuted ? *permuted : (wide ? *wide : index);
+#ifdef PROBE_HAS_FP8_SCAN
   std::optional<cuvs::preprocessing::quantize::fp8::quantizer> scan_codes;
   if (modes.find("scanc") != std::string::npos) {
     namespace fp8 = cuvs::preprocessing::quantize::fp8;
@@ -694,6 +699,9 @@ int main(int argc, char** argv)
     searched.update_scan_codes(load_res, scan_codes->view());
     load_res.sync_stream();
   }
+#else
+  if (modes.find("scanc") != std::string::npos) fail("scanc needs a cuVS with the FP8 filtered scan");
+#endif
 
   /* Device copies: queries as FP16, bitsets, compiled predicates. */
   std::vector<half> hq(size_t(ncases) * qdim, __float2half(0.0f));
@@ -1086,11 +1094,13 @@ int main(int argc, char** argv)
         hp[q] = mode == "twol" ? reinterpret_cast<const uint32_t*>(dtwol[first + q])
                 : (build || mode == "buildc" || mode == "scanc") ? t.built + size_t(q) * nwords : dbits[first + q];
       }
+#ifdef PROBE_HAS_FP8_SCAN
       if (mode == "scanc") {
         sp.filtered_route  = cagra::filtered_route_mode::SCAN;
         sp.filter_expansion = cagra::filter_expansion_mode::SCORE_ALL;
         sp.scan_candidates  = uint32_t(std::min(4096, k + k * scan_slack / 100));
       }
+#endif
       if (mode == "bitsetq" || mode == "buildq" || mode == "buildc" || mode == "twol") {
         CUDA(cudaMemcpyAsync(t.bitset_ptrs, hp.data(), n * sizeof(void*), cudaMemcpyHostToDevice,
                              stream));

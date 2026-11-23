@@ -76,7 +76,7 @@ Field notation: `name` is a u32 length followed by that many UTF-8 bytes. Distan
 
 | Op | Name | Request | Reply |
 | --- | --- | --- | --- |
-| 11 | Load | `name`, directory path | Text: `rows N dimensions D shards S dtype T source NAME`, plus `quant KIND quant_scan on\|off` for quantized indexes: `on` when every shard copy's quantized rows are on its GPU for a scan (an FP8 copy attached to cuVS' CAGRA filtered scan, or an NVFP4 copy uploaded to the Blackwell module), `off` on CPU workers and where no GPU scan can read the copy (an FP8 copy beside FP32 graphs among them) |
+| 11 | Load | `name`, directory path | Text: `rows N dimensions D shards S dtype T source NAME`, plus `quant KIND quant_scan on\|off` for quantized indexes |
 | 12 | Search by keys | `name`, u32 dimensions, k, key count (UINT32_MAX: no filter); FP32 query; i64 keys | u32 count, u32 route, then (i64 key, f32 distance) per hit |
 | 13 | Authenticate | Token bytes | Empty. TCP only, first frame |
 | 14 | Search by packed keys | `name`, u32 dimensions, k, key count (UINT32_MAX: none), u32 packed bytes; FP32 query; keys as a zigzag varint first key then varint gaps | As operation 12 |
@@ -84,7 +84,7 @@ Field notation: `name` is a u32 length followed by that many UTF-8 bytes. Distan
 | 16 | RDMA hello | The client's 32-byte queue pair address | u32 largest RDMA frame, the server's 32-byte queue pair address, device name |
 | 26 | Unload | `name` | Empty. The name is free at once; the index is freed when its searches finish |
 | 29 | Delete keys | `name`, u32 count, i64 keys | u64 rows newly deleted, u64 rows deleted in all |
-| 31 | Routing statistics | Index name (no length prefix) | JSON: replica bindings, batches, queries, device load estimates, and route counters such as `cuvs_scan_queries` and `cuvs_scan_retries` (searches cuVS' FP8 scan served, and those it searched again with the full selection) beside `matrix_queries` (the worker's own matrix gathers) |
+| 31 | Routing statistics | Index name (no length prefix) | JSON: replica bindings, batches, queries, device load estimates |
 
 ### Filters resolved on the server ([guide](../../docs/ann-gpu-filters.md))
 

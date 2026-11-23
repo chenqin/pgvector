@@ -1,6 +1,6 @@
 # ANN server
 
-The ANN server is the worker PostgreSQL sends vector searches to: `ann-worker` (CPU, no dependencies) and `ann-worker-cuvs` (NVIDIA GPUs through a source build of the `chenqin/cuvs` fork's `main`, cuVS 27.02 with its FP8 filtered scan and two-hop graph walk). It loads index directories built by the [index builder](../builder/README.md) and answers searches over a Unix socket, TCP or RDMA. It can run on the database host or on separate GPU nodes.
+The ANN server is the worker PostgreSQL sends vector searches to: `ann-worker` (CPU, no dependencies) and `ann-worker-cuvs` (NVIDIA GPUs through cuVS 26.10 or 27.02). It loads index directories built by the [index builder](../builder/README.md) and answers searches over a Unix socket, TCP or RDMA. It can run on the database host or on separate GPU nodes.
 
 | Interface | Document |
 | --- | --- |
@@ -17,10 +17,9 @@ A C11 compiler, POSIX threads and Make, on Linux (macOS for development). Window
 ```sh
 make -C ann/server                       # ann-worker and libannbatch.a
 make -C ann/server check
-# GPU hosts: also ann-worker-cuvs, against an install of the chenqin/cuvs fork's main
-# (CUVS_CAGRA_HAS_FILTERED_SCAN 2 or later; see docs/ann-cuvs-index.md#build-flag)
-make -C ann/server USE_CUVS=1 CUVS_PREFIX=/path/to/cuvs-install CUDA_HOME=/path/to/cuda
-make -C ann/server check-cuvs CUVS_PREFIX=/path/to/cuvs-install
+# GPU hosts: also ann-worker-cuvs (pip SDK paths: see docs/ann-cuvs-index.md)
+make -C ann/server USE_CUVS=1 CUVS_PREFIX=/path/to/libcuvs CUDA_HOME=/path/to/cuda
+make -C ann/server check-cuvs CUVS_PREFIX=/path/to/libcuvs
 ```
 
 `USE_RDMA=1` adds RDMA search frames over InfiniBand or RoCE verbs ([guide](../../docs/ann-networked.md#rdma-infiniband-roce)). `USE_CUVS` defaults to 0, so hosts without a GPU SDK build and test every CPU path. Both builds serve loaded indexes: the CPU worker scans them exactly, which makes it the test reference, and the cuVS worker searches CAGRA shards on all GPUs ([guide](../../docs/ann-cuvs-index.md)). `make check` uses Python to drive the protocol and scheduler tests; live PostgreSQL and GPU tests are gated.
@@ -129,13 +128,13 @@ make -C ann/server CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -pedantic -fsan
 
 ## cuVS integration
 
-`cuvs.c` builds only against the `chenqin/cuvs` fork's `main` (cuVS 27.02 plus its CAGRA filtered scan, `CUVS_CAGRA_HAS_FILTERED_SCAN` 2 or later, which the build checks); pip cuVS 26.10 and 27.02 no longer build it. Earlier versions were validated against cuVS 26.10, and against 27.02 from the fork's `main`, on NVIDIA B200 GPUs; `make -C ann/server check-cuvs` runs the GPU tests:
+`cuvs.c` is compiled and validated against cuVS 26.10, and against 27.02 from the `chenqin/cuvs` fork's `main`, on NVIDIA B200 GPUs (`make -C ann/server check-cuvs`):
 
 - **Gathered search** serves the [pipelined CustomScan](../../docs/ann-worker-pipeline.md) with exact GPU brute force.
 - **Loaded indexes** serve sharded CAGRA search across all GPUs, with bitset filters and an exact route for selective filters ([guide](../../docs/ann-cuvs-index.md)).
 - **GPU failures and memory.** A search that fails in the backend makes the worker check every device for a lost context (a sticky CUDA error: illegal address, launch failure, ECC, assert and the like). A lost context fails every later call and keeps the process's device and pinned memory, so the worker logs the device and error and exits with status 70 without running exit handlers: the driver takes the memory back, clients see the connection close and fail over to other replicas, and a supervisor (systemd `Restart=always`) starts it again. `ANN_MOCK_GPU_LOST_AFTER=N` makes the `mock-gpu` backend lose its device after N submissions, for tests. Unloading an index (operation 26) frees its shards once their searches finish; with the default RMM pool the freed device memory stays with the worker for later loads, and `--device-allocator plain` returns it to the device ([trade-off](../../docs/ann-cuvs-index.md#b200-throughput-options)).
 
-The stdin-mode resident CAGRA build (operations 1–4 with `--backend cuvs`) is still the older unvalidated draft. Use loaded indexes instead. A hipVS adapter is not implemented. cuVS CAGRA datasets are FP32, FP16, int8 or uint8; the fork's CAGRA filtered scan adds FP8 codes beside an FP16 dataset, which serves indexes built with `--quantize fp8`, graph-free ones included ([guide](../../docs/ann-cuvs-index.md#fp8-filtered-scan-in-cuvs)). cuVS has no FP4 path: NVFP4 copies are scanned by the worker's own Blackwell module.
+The stdin-mode resident CAGRA build (operations 1–4 with `--backend cuvs`) is still the older unvalidated draft. Use loaded indexes instead. hipVS and NVFP4 adapters are not implemented: cuVS 26.10 CAGRA supports FP32, FP16, int8 and uint8 datasets, and no FP4 or FP8 path.
 
 C PostgreSQL worker integration is implemented: `--listen PATH` serves pipelined gathered searches (operations 7–10) to `AnnFilteredSearch`, with a `mock-gpu` backend standing in for accelerators ([guide](../../docs/ann-worker-pipeline.md)). Sustained-load validation remains. Python remains test/benchmark tooling only.
 
@@ -172,12 +171,9 @@ include paths for another SDK layout. The CPU-only build is unchanged.
 `--matrix-gather on` enables Blackwell tensor-core matrix scoring and cuVS
 batched selection for larger k, including k=500. `--group-gather-limit ROWS`
 sets the largest shared filter it scans; the existing fused top-32 path is
-retained for small k. Scans of an FP8 copy beside FP16 graphs, or without
-graphs, go to cuVS' CAGRA filtered scan instead, with or without
-`--matrix-gather`: the worker has no FP8 scan of its own. `--matrix-max-mb N`
-(default 64, range 1–1024) bounds one lane's input score matrix. Query
-batches split into tiles to respect it. This bound excludes selector
-workspace, output buffers and resident vectors.
+retained for small k. `--matrix-max-mb N` (default 64, range 1–1024) bounds
+one lane's input score matrix. Query batches split into tiles to respect it.
+This bound excludes selector workspace, output buffers and resident vectors.
 
 `--gpu-rerank on` reranks CAGRA candidates using resident original FP32
 vectors. Matrix gathers select extra candidates, rerank on device, then
@@ -191,10 +187,8 @@ both and uses `--group-gather-limit 500000`, `--replica-routing home`,
 64 lanes and batches up to 32. The 500k cutoff sends broader filters to CAGRA.
 
 Routing statistics include `matrix_queries`, `matrix_peak_score_bytes`,
-`gpu_rerank_candidates`, `cuvs_scan_queries` and `cuvs_scan_retries` (cuVS'
-FP8 scan, and its searches again with the full selection), and per-copy
-`rerank_ready`/`rerank_bytes`, so a test can verify which path actually ran
-and how much resident memory was added.
+`gpu_rerank_candidates`, and per-copy `rerank_ready`/`rerank_bytes`, so a test
+can verify which path actually ran and how much resident memory was added.
 The benchmark comparison is documented in
 [the k=500 profile](../../docs/ann-k500-profile.md).
 
