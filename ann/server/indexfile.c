@@ -18,9 +18,12 @@
 #include <time.h>
 #include <unistd.h>
 
-AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 64, 0};
+AnnIndexOptions AnnIndexConfig = {128, 512, 2000, 0, 0, 4000000, 4000000, 2, 4, 0, 1, 80, 500000, 4000000, 1, 1, 256, 0, 0, UINT64_C(8192) << 20, 1, 0, 0, 0, 0, ANN_RESCORE_FP32, 100, 8, 0, 1, 0, 0, UINT64_C(64) << 20, 0, 0, 0, 0, 1, 1, ANN_ADMIT_ALL, 1, 100, 0, 0, 0, 0, 0, 0, 0, 0, 10000, 64, 0, 0};
 int			(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count) = NULL;
+void	   *(*AnnIndexDeviceDefer) (AnnIndexFile *file, const unsigned char *program, size_t size,
+									uint64_t remapGeneration, uint64_t *estimate) = NULL;
+void		(*AnnIndexDeviceDeferFree) (void *plan) = NULL;
 AnnCostProfile *AnnIndexCostProfile = NULL;
 size_t		(*AnnIndexRoutingStats) (const AnnIndexFile *file, char *data, size_t capacity) = NULL;
 AnnIndexBitmapHooks AnnIndexBitmapDevice = {NULL, NULL};
@@ -1164,6 +1167,8 @@ FreeBitmap(AnnIndexFile *file, AnnIndexBitmap *bitmap)
 	free(bitmap->words);
 	free(bitmap->keys);
 	free(bitmap->ordinals);
+	if (bitmap->deferred && AnnIndexDeviceDeferFree)
+		AnnIndexDeviceDeferFree(bitmap->deferred);
 	free(bitmap);
 }
 
@@ -1323,6 +1328,24 @@ BuildBitmap(AnnIndexFile *file, uint64_t id, int kind, const uint32_t *words, si
 
 	bitmap->hostBytes = BitmapBytes(file, bitmap);
 	*out = bitmap;
+	return ANN_OK;
+}
+
+AnnStatus
+AnnIndexBitmapDeferred(AnnIndexFile *file, uint64_t id, int kind, void *plan, uint64_t estimate,
+					   AnnIndexBitmap **result)
+{
+	AnnIndexBitmap *bitmap = calloc(1, sizeof(*bitmap));
+
+	(void) file;
+	if (bitmap == NULL)
+		return ANN_NOMEM;
+	bitmap->id = id;
+	bitmap->kind = kind;
+	bitmap->count = estimate;
+	bitmap->deferred = plan;
+	bitmap->references = 1;
+	*result = bitmap;
 	return ANN_OK;
 }
 

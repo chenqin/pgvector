@@ -19,6 +19,11 @@
 #include <cuda_runtime_api.h>
 #include <cuvs/neighbors/brute_force.h>
 #include <cuvs/neighbors/cagra.h>
+#if defined(__has_include)
+#if __has_include(<cuvs/core/postings.h>)
+#include <cuvs/core/postings.h> /* cuvsPostingsEvaluate */
+#endif
+#endif
 #include <cuvs/selection/select_k.h>
 #include <cuvs/version_config.h>
 #include <dlfcn.h>
@@ -678,6 +683,14 @@ typedef struct AnnCuvsIndex
 	atomic_uint_fast64_t residual_masked;	/* searches whose excluded rows
 											 * were masked in the gather */
 	int32_t    *predicateColumns[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
+
+	/*
+	 * --gpu-predicates over postings: an attribute's ordinals (32-bit) on a
+	 * device, and the host ordinals they were made from, which a remap
+	 * replaces.
+	 */
+	uint32_t   *predicatePostings[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
+	const uint64_t *predicatePostingsFrom[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
 } AnnCuvsIndex;
 
 /* Keep the full lane ordinal: wrapping before modulo copies biases 3/6/7 GPUs. */
@@ -870,6 +883,12 @@ typedef struct AnnCuvsDevice
 	uint32_t   *neighbors;
 	float	   *distances;
 	uint32_t   *bitset;
+	/* --device-transient: DeferredBuild's cuVS workspace */
+	uint32_t   *deferWorkspace;
+	size_t		deferWorkspaceCap;
+	uint32_t   *mixedDeferred;	/* a mixed batch's bitsets built here, one a
+								 * deferred query */
+	size_t		mixedDeferredCap;
 	void	  **bitsetPointers; /* a mixed batch's bitset per query */
 	size_t		bitsetPointerCount;
 	uint32_t   *hostNeighbors;	/* pinned */
@@ -1639,6 +1658,13 @@ DestroyIndexState(AnnCuvsIndex *state)
 				(void) cudaSetDevice(d);
 				(void) cudaFree(state->predicateColumns[d][a]);
 			}
+	for (int d = 0; d < ANN_CUVS_MAX_DEVICES; d++)
+		for (int a = 0; a < ANN_INDEX_MAX_ATTRIBUTES; a++)
+			if (state->predicatePostings[d][a])
+			{
+				(void) cudaSetDevice(d);
+				(void) cudaFree(state->predicatePostings[d][a]);
+			}
 	free(state->shards);
 	free(state);
 }
@@ -2078,6 +2104,16 @@ typedef struct PredicateBuffers
 	uint32_t   *words;
 	size_t		wordCap;
 	unsigned long long *count;
+
+	/*
+	 * PostingsEvaluate: cuVS resources on the stream, the result bitset and
+	 * cuVS' workspace
+	 */
+	cuvsResources_t resources;
+	uint32_t   *result;
+	size_t		resultCap;
+	uint32_t   *workspace;
+	size_t		workspaceCap;
 	struct PredicateBuffers *next;
 } PredicateBuffers;
 
@@ -2126,15 +2162,20 @@ PredicateColumn(void *arg, const char *name)
 
 		if (strcmp(attribute->name, name) != 0)
 			continue;
-		if (attribute->multi || attribute->column == NULL)
+
+		/*
+		 * Multi-valued columns keep only their postings after load: they are
+		 * marked, and their programs go to DevicePostingsPredicate.
+		 */
+		if (!attribute->multi && attribute->column == NULL)
 			return -1;
 		for (int c = 0; c < columns->n; c++)
 			if (columns->attributes[c] == (int) a)
-				return c;
+				return attribute->multi ? (c | ANN_UDF_MULTI) : c;
 		if (columns->n == ANN_UDF_MAX_COLUMNS)
 			return -1;
 		columns->attributes[columns->n] = (int) a;
-		return columns->n++;
+		return attribute->multi ? (columns->n++ | ANN_UDF_MULTI) : columns->n++;
 	}
 	return -1;
 }
@@ -2158,6 +2199,738 @@ PredicateDeviceColumn(const AnnIndexFile *file, AnnCuvsIndex *state, int device,
 	}
 	(void) pthread_mutex_unlock(&predicateMutex);
 	return column;
+}
+
+/* An attribute's ordinals on a device as 32-bit rows, uploaded on first use; NULL on failure. */
+static const uint32_t *
+PredicateDevicePostings(const AnnIndexFile *file, AnnCuvsIndex *state, int device, int attribute)
+{
+	const AnnIndexAttribute *a = &file->attributes[attribute];
+	uint32_t   *postings;
+
+	(void) pthread_mutex_lock(&predicateMutex);
+	postings = state->predicatePostings[device][attribute];
+	if (postings && state->predicatePostingsFrom[device][attribute] != a->ordinals)
+	{
+		(void) cudaSetDevice(device);
+		(void) cudaFree(postings);
+		postings = state->predicatePostings[device][attribute] = NULL;
+	}
+	if (postings == NULL && a->ordinals != NULL)
+	{
+		uint64_t	n = a->npostings ? a->npostings : 1;
+		uint32_t   *staged = malloc(n * sizeof(uint32_t));
+
+		if (staged != NULL)
+		{
+			for (uint64_t i = 0; i < a->npostings; i++)
+				staged[i] = (uint32_t) a->ordinals[i];
+			if (UploadArray(device, (void **) &state->predicatePostings[device][attribute], staged,
+							n * sizeof(uint32_t)))
+			{
+				postings = state->predicatePostings[device][attribute];
+				state->predicatePostingsFrom[device][attribute] = a->ordinals;
+			}
+			else if (state->predicatePostings[device][attribute])
+			{
+				/* UploadArray keeps its allocation when the copy fails. */
+				(void) cudaSetDevice(device);
+				(void) cudaFree(state->predicatePostings[device][attribute]);
+				state->predicatePostings[device][attribute] = NULL;
+			}
+			free(staged);
+		}
+	}
+	(void) pthread_mutex_unlock(&predicateMutex);
+	return postings;
+}
+
+/* The first posting whose value is at least target. */
+static uint32_t
+PostingAtLeast(const AnnIndexAttribute *a, int64_t target)
+{
+	uint32_t	lo = 0,
+				hi = a->nvalues;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if ((int64_t) a->postings[mid].value < target)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
+/* One step of a postings evaluation, planned on the host. */
+typedef struct PostingsStep
+{
+	int			op;				/* a leaf (0) or
+								 * ANN_FILTER_AND/OR/NOT/ALL/NONE */
+	int			depth;			/* the stack slot it writes (AND/OR: and reads
+								 * depth + 1) */
+	int			attribute;		/* leaves: the index attribute */
+	uint32_t	firstRun;		/* runs[firstRun ..] of the plan */
+	uint32_t	nruns;
+	int			invert;			/* the runs are the complement's */
+	int			negate;			/* a negated comparison: without the NULL rows */
+	uint32_t	nullRun;		/* the NULL rows' run, when hasNullRun */
+	int			hasNullRun;
+} PostingsStep;
+
+/*
+ * A program planned over an index's postings: what each step does, and the
+ * runs of ordinals its leaves name, as (offset into the attribute's
+ * postings, count) pairs, with each run's attribute. Independent of the
+ * device: PostingsRun takes it to one.
+ */
+typedef struct PostingsPlan
+{
+	PostingsStep *steps;
+	uint32_t	nsteps;
+	unsigned long long *runs;
+	int		   *runAttributes;
+	size_t		nruns;
+	int			maxDepth;		/* stack slots used; PostingsRun needs one
+								 * more */
+	uint64_t	estimate;		/* rows passing: exact for a leaf on a
+								 * single-valued column, otherwise estimated */
+} PostingsPlan;
+
+static void
+PostingsPlanFree(PostingsPlan *plan)
+{
+	free(plan->steps);
+	free(plan->runs);
+	free(plan->runAttributes);
+	memset(plan, 0, sizeof(*plan));
+}
+
+/*
+ * Plan compiled steps (udf.h) over the postings of the attributes their
+ * columns name (attributes[column]). A leaf's rows are its values' runs of
+ * ordinals; a single-valued leaf selecting more than half the rows takes the
+ * other values' runs (NULL's among them) and is inverted, since such a row
+ * holds no other value; multi-valued rows can hold a chosen and an unchosen
+ * value, so those never invert. A negated comparison then leaves out the
+ * NULL rows (for a multi-valued column the NULL arrays, the rows whose only
+ * element is INT32_MIN), as AnnFilterEvaluate does.
+ */
+static int
+PostingsPlanBuild(const AnnIndexFile *file, const int *attributes, const AnnUdfStep *steps, uint32_t nsteps,
+				  const int32_t *values, PostingsPlan *out)
+{
+	PostingsStep *plan = calloc(nsteps ? nsteps : 1, sizeof(PostingsStep));
+	unsigned long long *runs = NULL;	/* (first, count) pairs while planning */
+	uint64_t   *estimates = malloc(sizeof(uint64_t) * (nsteps ? nsteps : 1));
+	size_t		nruns = 0,
+				capRuns = 0;
+	int			depth = 0,
+				maxDepth = 0;
+	int			ok = plan != NULL && estimates != NULL;
+
+	memset(out, 0, sizeof(*out));
+
+#define ADD_RUN(first, n) do { \
+		if (nruns == capRuns) \
+		{ \
+			size_t		grownCap = capRuns ? capRuns * 2 : 256; \
+			unsigned long long *grown = realloc(runs, grownCap * 2 * sizeof(*runs)); \
+			if (grown == NULL) { ok = 0; break; } \
+			runs = grown; \
+			capRuns = grownCap; \
+		} \
+		runs[2 * nruns] = (first); \
+		runs[2 * nruns + 1] = (n); \
+		nruns++; \
+	} while (0)
+
+	for (uint32_t i = 0; ok && i < nsteps; i++)
+	{
+		const AnnUdfStep *st = &steps[i];
+		PostingsStep *p = &plan[i];
+
+		p->op = st->op;
+		if (st->op == ANN_FILTER_AND || st->op == ANN_FILTER_OR)
+		{
+			uint64_t	a = estimates[depth - 2],
+						b = estimates[depth - 1];
+
+			p->depth = depth - 2;
+			estimates[depth - 2] = st->op == ANN_FILTER_AND ? (a < b ? a : b) :
+				(a + b < file->rows ? a + b : file->rows);
+			depth--;
+			continue;
+		}
+		if (st->op == ANN_FILTER_NOT)
+		{
+			p->depth = depth - 1;
+			estimates[depth - 1] = file->rows - estimates[depth - 1];
+			continue;
+		}
+		p->depth = depth;
+		estimates[depth] = st->op == ANN_FILTER_ALL ? file->rows : 0;
+		depth++;
+		if (depth > maxDepth)
+			maxDepth = depth;
+		if (st->op == ANN_FILTER_ALL || st->op == ANN_FILTER_NONE)
+			continue;
+		{
+			const AnnIndexAttribute *a = &file->attributes[attributes[st->column]];
+			uint32_t	nullAt = PostingAtLeast(a, INT32_MIN);
+			int			hasNull = nullAt < a->nvalues && a->postings[nullAt].value == INT32_MIN;
+			uint64_t	nulls = hasNull ? a->postings[nullAt].count : 0;
+			uint64_t	selected = 0;
+			uint32_t	start = (uint32_t) nruns;
+
+			p->op = 0;
+			p->attribute = attributes[st->column];
+			p->firstRun = start;
+			if (st->op == ANN_FILTER_NULL)
+			{
+				if (hasNull)
+					ADD_RUN(a->postings[nullAt].offset, a->postings[nullAt].count);
+				selected = nulls;
+				p->invert = st->negate; /* negated NULL: its plain complement */
+				estimates[p->depth] = st->negate ? file->rows - nulls : nulls;
+			}
+			else
+			{
+				/* The selected values, as indexes into the sorted postings. */
+				uint32_t   *chosen = malloc(sizeof(uint32_t) * (st->op == ANN_FILTER_RANGE ? 2 : (st->count ? st->count : 1)));
+				uint32_t	nchosen = 0;
+
+				if (chosen == NULL)
+				{
+					ok = 0;
+					break;
+				}
+				if (st->op == ANN_FILTER_RANGE)
+				{
+					int64_t		low = st->low > INT32_MIN ? st->low : (int64_t) INT32_MIN + 1;
+
+					if (low <= st->high)
+					{
+						uint32_t	from = PostingAtLeast(a, low),
+									to = PostingAtLeast(a, (int64_t) st->high + 1);
+
+						for (uint32_t v = from; v < to; v++)
+							selected += a->postings[v].count;
+						chosen[0] = from;
+						chosen[1] = to;
+						nchosen = from < to ? 2 : 0;
+					}
+				}
+				else
+					for (uint32_t v = 0; v < st->count; v++)
+					{
+						uint32_t	at = PostingAtLeast(a, values[st->first + v]);
+
+						if (at < a->nvalues && a->postings[at].value == values[st->first + v])
+						{
+							chosen[nchosen++] = at;
+							selected += a->postings[at].count;
+						}
+					}
+				if (!st->multi && selected > file->rows / 2)
+				{
+					uint32_t	next = 0;
+
+					p->invert = 1;
+					if (st->op == ANN_FILTER_RANGE)
+					{
+						if (nchosen)
+						{
+							if (chosen[0] > 0)
+								ADD_RUN(0, a->postings[chosen[0]].offset);
+							if (ok && chosen[1] < a->nvalues)
+								ADD_RUN(a->postings[chosen[1]].offset, a->npostings - a->postings[chosen[1]].offset);
+						}
+						else
+							ADD_RUN(0, a->npostings);
+					}
+					else
+					{
+						/*
+						 * Values compile sorted and unique, so chosen
+						 * ascends.
+						 */
+						for (uint32_t c = 0; ok && c <= nchosen; c++)
+						{
+							uint32_t	until = c < nchosen ? chosen[c] : a->nvalues;
+
+							if (until > next)
+								ADD_RUN(a->postings[next].offset,
+										a->postings[until - 1].offset + a->postings[until - 1].count - a->postings[next].offset);
+							next = c < nchosen ? chosen[c] + 1 : next;
+						}
+					}
+				}
+				else if (st->op == ANN_FILTER_RANGE)
+				{
+					if (nchosen)
+						ADD_RUN(a->postings[chosen[0]].offset,
+								a->postings[chosen[1] - 1].offset + a->postings[chosen[1] - 1].count -
+								a->postings[chosen[0]].offset);
+				}
+				else
+					for (uint32_t c = 0; ok && c < nchosen; c++)
+						ADD_RUN(a->postings[chosen[c]].offset, a->postings[chosen[c]].count);
+				free(chosen);
+				p->negate = st->negate;
+				if (selected > file->rows)
+					selected = file->rows;	/* multi-valued rows counted once
+											 * a value */
+				estimates[p->depth] = st->negate ? file->rows - selected - (selected + nulls <= file->rows ? nulls : 0) :
+					selected;
+			}
+			p->nruns = (uint32_t) nruns - start;
+			if (ok && p->negate && hasNull)
+			{
+				p->nullRun = (uint32_t) nruns;
+				p->hasNullRun = 1;
+				ADD_RUN(a->postings[nullAt].offset, a->postings[nullAt].count);
+			}
+		}
+	}
+#undef ADD_RUN
+	if (ok && depth == 1)
+	{
+		/* Each run's attribute: its leaf's. */
+		out->runAttributes = malloc(sizeof(int) * (nruns ? nruns : 1));
+		ok = out->runAttributes != NULL;
+		for (uint32_t i = 0; ok && i < nsteps; i++)
+		{
+			PostingsStep *p = &plan[i];
+
+			if (p->op != 0)
+				continue;
+			for (uint32_t r = p->firstRun; r < p->firstRun + p->nruns; r++)
+				out->runAttributes[r] = p->attribute;
+			if (p->hasNullRun)
+				out->runAttributes[p->nullRun] = p->attribute;
+		}
+	}
+	else
+		ok = 0;
+	if (ok)
+	{
+		out->steps = plan;
+		out->runs = runs;
+		runs = NULL;
+		out->nsteps = nsteps;
+		out->nruns = nruns;
+		out->maxDepth = maxDepth;
+		out->estimate = estimates[0];
+	}
+	else
+	{
+		free(plan);
+		free(out->runAttributes);
+		out->runAttributes = NULL;
+	}
+	free(runs);
+	free(estimates);
+	return ok;
+}
+
+#ifdef CUVS_HAS_POSTINGS_EVALUATE
+/* The cuVS program of a plan: steps and runs, and the lists (attributes) its runs are in. */
+typedef struct PostingsProgram
+{
+	cuvsPostingsStep *steps;
+	cuvsPostingsRun *runs;
+	int			attributes[ANN_UDF_MAX_COLUMNS];
+	uint32_t	nlists;
+} PostingsProgram;
+
+static void
+PostingsProgramFree(PostingsProgram *program)
+{
+	free(program->steps);
+	free(program->runs);
+}
+
+/*
+ * A plan as cuVS takes it (cuvsPostingsEvaluate): a leaf is the union of
+ * its runs, complemented when exactly one of invert (its runs are the other
+ * values') and negate holds, less the NULL rows of a negated comparison.
+ */
+static int
+PostingsProgramBuild(const PostingsPlan *plan, PostingsProgram *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->steps = malloc(sizeof(cuvsPostingsStep) * (plan->nsteps ? plan->nsteps : 1));
+	out->runs = malloc(sizeof(cuvsPostingsRun) * (plan->nruns ? plan->nruns : 1));
+	if (out->steps == NULL || out->runs == NULL)
+	{
+		PostingsProgramFree(out);
+		return 0;
+	}
+	for (size_t r = 0; r < plan->nruns; r++)
+	{
+		uint32_t	list = 0;
+
+		while (list < out->nlists && out->attributes[list] != plan->runAttributes[r])
+			list++;
+		if (list == out->nlists)
+		{
+			if (out->nlists == ANN_UDF_MAX_COLUMNS)
+			{
+				PostingsProgramFree(out);
+				return 0;
+			}
+			out->attributes[out->nlists++] = plan->runAttributes[r];
+		}
+		out->runs[r].list = list;
+		out->runs[r].first = (int64_t) plan->runs[2 * r];
+		out->runs[r].count = (int64_t) plan->runs[2 * r + 1];
+	}
+	for (uint32_t i = 0; i < plan->nsteps; i++)
+	{
+		const PostingsStep *p = &plan->steps[i];
+		cuvsPostingsStep *c = &out->steps[i];
+
+		memset(c, 0, sizeof(*c));
+		c->exclude_run = -1;
+		switch (p->op)
+		{
+			case 0:
+				c->kind = CUVS_POSTINGS_LEAF;
+				c->first_run = p->firstRun;
+				c->n_runs = p->nruns;
+				c->complement = (p->invert != 0) != (p->negate != 0);
+				if (p->negate && p->hasNullRun)
+					c->exclude_run = p->nullRun;
+				break;
+			case ANN_FILTER_AND:
+				c->kind = CUVS_POSTINGS_AND;
+				break;
+			case ANN_FILTER_OR:
+				c->kind = CUVS_POSTINGS_OR;
+				break;
+			case ANN_FILTER_NOT:
+				c->kind = CUVS_POSTINGS_NOT;
+				break;
+			case ANN_FILTER_ALL:
+				c->kind = CUVS_POSTINGS_ALL;
+				break;
+			default:
+				c->kind = CUVS_POSTINGS_NONE;
+				break;
+		}
+	}
+	return 1;
+}
+
+/*
+ * Run a plan on device with cuVS over the rows [first, first + rows) of the
+ * index (a shard, or the whole index) into dest, (rows + 31) / 32 words,
+ * with its workspace in *workspace (grown as needed) and the passing rows'
+ * number into count (a device int64) when count is not NULL. Launches only,
+ * on resources' stream.
+ */
+static int
+PostingsRun(const AnnIndexFile *file, AnnCuvsIndex *state, int device, cuvsResources_t resources,
+			const PostingsPlan *plan, uint32_t **workspace, size_t *workspaceCap, uint32_t *dest,
+			uint64_t first, uint64_t rows, int64_t *count)
+{
+	PostingsProgram program;
+	DLManagedTensor listTensors[ANN_UDF_MAX_COLUMNS];
+	DLManagedTensor *lists[ANN_UDF_MAX_COLUMNS];
+	DLManagedTensor bitset,
+				work,
+				counted;
+	int64_t		listShapes[ANN_UDF_MAX_COLUMNS][1];
+	int64_t		bitsetShape[1] = {(int64_t) ((rows + 31) / 32)};
+	int64_t		workShape[1];
+	int64_t		countShape[1] = {1};
+	int64_t		words = 0;
+	cudaStream_t stream;
+	int			ok;
+
+	if (!PostingsProgramBuild(plan, &program))
+		return 0;
+	ok = cuvsStreamGet(resources, &stream) == CUVS_SUCCESS &&
+		cuvsPostingsWorkspaceSize(program.steps, plan->nsteps, (int64_t) plan->nruns, (int64_t) rows, &words) ==
+		CUVS_SUCCESS &&
+		GrowDevice((void **) workspace, workspaceCap, (size_t) words, sizeof(uint32_t), 4096, stream);
+	for (uint32_t l = 0; ok && l < program.nlists; l++)
+	{
+		const uint32_t *postings = PredicateDevicePostings(file, state, device, program.attributes[l]);
+
+		listShapes[l][0] = (int64_t) file->attributes[program.attributes[l]].npostings;
+		listTensors[l] = Tensor((void *) postings, kDLCUDA, device, kDLUInt, 1, listShapes[l]);
+		lists[l] = &listTensors[l];
+		ok = postings != NULL;
+	}
+	if (ok)
+	{
+		workShape[0] = (int64_t) *workspaceCap;
+		bitset = Tensor(dest, kDLCUDA, device, kDLUInt, 1, bitsetShape);
+		work = Tensor(*workspace, kDLCUDA, device, kDLUInt, 1, workShape);
+		if (count)
+		{
+			counted = Tensor(count, kDLCUDA, device, kDLInt, 1, countShape);
+			counted.dl_tensor.dtype.bits = 64;
+		}
+		ok = cuvsPostingsEvaluate(resources, program.steps, plan->nsteps, program.runs, (int64_t) plan->nruns,
+								  lists, program.nlists, &bitset, (int64_t) rows, (int64_t) first, &work,
+								  count ? &counted : NULL) == CUVS_SUCCESS;
+	}
+	PostingsProgramFree(&program);
+	return ok;
+}
+
+/*
+ * Run a plan over the whole index on device with buffers (DevicePredicate's):
+ * the rows it passes into words when words is not NULL, and their number
+ * into *count, after one wait.
+ */
+static int
+PostingsEvaluate(const AnnIndexFile *file, AnnCuvsIndex *state, int device, PredicateBuffers *buffers,
+				 const PostingsPlan *plan, uint32_t *words, uint64_t *count)
+{
+	size_t		nwords = ((size_t) file->rows + 31) / 32;
+	unsigned long long found = 0;
+	cudaStream_t stream = buffers->stream;
+	int			ok;
+
+	ok = (buffers->resources != 0 ||
+		  (cuvsResourcesCreate(&buffers->resources) == CUVS_SUCCESS &&
+		   cuvsStreamSet(buffers->resources, stream) == CUVS_SUCCESS)) &&
+		GrowDevice((void **) &buffers->result, &buffers->resultCap, nwords, sizeof(uint32_t), 0, stream) &&
+		PostingsRun(file, state, device, buffers->resources, plan, &buffers->workspace, &buffers->workspaceCap,
+					buffers->result, 0, file->rows, (int64_t *) buffers->count) &&
+		(words == NULL ||
+		 cudaMemcpyAsync(words, buffers->result, nwords * sizeof(uint32_t), cudaMemcpyDeviceToHost, stream) ==
+		 cudaSuccess) &&
+		cudaMemcpyAsync(&found, buffers->count, sizeof(found), cudaMemcpyDeviceToHost, stream) == cudaSuccess;
+	if (cudaStreamSynchronize(stream) != cudaSuccess)
+		ok = 0;
+	if (ok)
+		*count = found;
+	return ok;
+}
+#else
+/* A cuVS without cuvsPostingsEvaluate: postings predicates run on the host. */
+static int
+PostingsEvaluate(const AnnIndexFile *file, AnnCuvsIndex *state, int device, PredicateBuffers *buffers,
+				 const PostingsPlan *plan, uint32_t *words, uint64_t *count)
+{
+	(void) file;
+	(void) state;
+	(void) device;
+	(void) buffers;
+	(void) plan;
+	(void) words;
+	(void) count;
+	return 0;
+}
+#endif
+
+/*
+ * --gpu-predicates for a program with a multi-valued leaf: those columns
+ * keep only their postings after load, so the per-row interpreter cannot
+ * read them, and the program is evaluated from its leaves' postings on the
+ * device (PostingsPlanBuild, PostingsRun), in time proportional to the rows
+ * its leaves pass; the result comes back with its count after one wait. The
+ * prototype in benchmarks/ann/postings_eval.cu measured 48 us a pg_ids
+ * predicate on a 46.5M-row index, against about 16 ms for the host evaluator.
+ */
+static int
+DevicePostingsPredicate(AnnIndexFile *file, AnnCuvsIndex *state, int device, PredicateModule *module,
+						PredicateBuffers *buffers, const PredicateColumns *columns, const AnnUdfStep *steps,
+						uint32_t nsteps, const int32_t *values, uint32_t *words, uint64_t *count)
+{
+	PostingsPlan plan;
+	int			ok;
+
+	(void) module;				/* the postings run in cuVS */
+	if (!PostingsPlanBuild(file, columns->attributes, steps, nsteps, values, &plan))
+		return 0;
+	ok = PostingsEvaluate(file, state, device, buffers, &plan, words, count);
+	if (ok)
+		(void) atomic_fetch_add_explicit(&state->gpu_predicates, 1, memory_order_relaxed);
+	PostingsPlanFree(&plan);
+	return ok;
+}
+
+/*
+ * --device-transient: a first sighting's program planned over the index's
+ * postings, for the lane to build its bitset on the GPU it searches
+ * (DeferredBuild) instead of evaluating it on the host. Where nothing but
+ * the graph search reads a filter (gather, group gather and exact routes
+ * off), or on a one-shard scan-only index, whose FP8 scan reads rows the
+ * lane makes from the bitset; no measured cost profile. The plan is good for
+ * the remap generation it was made at.
+ */
+typedef struct DeferredPredicate
+{
+	PostingsPlan plan;
+	uint64_t	remapGeneration;
+	int			exact;			/* plan.estimate is the exact count (a
+								 * scan-only index's) */
+} DeferredPredicate;
+
+static void DeviceDeferFree(void *handle);
+
+static void *
+DeviceDefer(AnnIndexFile *file, const unsigned char *program, size_t size, uint64_t remapGeneration,
+			uint64_t *estimate)
+{
+	AnnCuvsIndex *state = file->device;
+	PredicateColumns columns = {file, {0}, 0};
+	AnnUdfStep *steps = NULL;
+	int32_t    *values = NULL;
+	uint32_t	nsteps = 0,
+				nvalues = 0;
+	DeferredPredicate *deferred = NULL;
+
+	int			scan;
+
+#ifndef CUVS_HAS_POSTINGS_EVALUATE
+	/* Lanes build the bitsets with cuVS' cuvsPostingsEvaluate. */
+	return NULL;
+#endif
+	if (state == NULL || state->nshards == 0 || file->rows == 0 || file->rows > UINT32_MAX ||
+		AnnCostMatches(AnnIndexCostProfile, file->rows, file->dimensions, file->generationValue))
+		return NULL;
+
+	/*
+	 * An index with FP8 codes (one shard): the exact count is taken here, and
+	 * routes the search (DeferredScan): cuVS' FP8 scan reads a row list the
+	 * lane makes from the bitset, the graph the bitset itself. Without codes,
+	 * a graph index only where the graph search is the only route.
+	 */
+	scan = state->cuvsScan && state->nshards == 1 &&
+		!atomic_load_explicit(&state->cuvsScanDisabled, memory_order_relaxed);
+	if (state->scanOnly ? !scan :
+		!scan && (AnnIndexConfig.gather_limit || AnnIndexConfig.bitset_gather_limit ||
+				  AnnIndexConfig.group_gather_limit || AnnIndexConfig.exact_limit))
+		return NULL;
+	if ((steps = malloc(sizeof(AnnUdfStep) * ANN_FILTER_MAX_STEPS)) != NULL &&
+		(values = malloc(sizeof(int32_t) * ANN_FILTER_MAX_VALUES)) != NULL &&
+		AnnUdfCompile(program, size, PredicateColumn, &columns, steps, ANN_FILTER_MAX_STEPS, &nsteps,
+					  values, ANN_FILTER_MAX_VALUES, &nvalues) == ANN_FILTER_OK && nsteps > 0 &&
+		(deferred = calloc(1, sizeof(*deferred))) != NULL &&
+		!PostingsPlanBuild(file, columns.attributes, steps, nsteps, values, &deferred->plan))
+	{
+		free(deferred);
+		deferred = NULL;
+	}
+	free(steps);
+	free(values);
+	if (deferred && scan)
+	{
+		uint64_t	count = 0;
+		int			device = state->shards[(size_t) (atomic_fetch_add(&nextPredicateCopy, 1) % state->copies) *
+										   state->nshards].device;
+		PredicateModule *module = PredicateKernels(device);
+		PredicateBuffers *buffers = module ? PredicateBuffersTake(device) : NULL;
+		int			ok = buffers != NULL && cudaSetDevice(device) == cudaSuccess &&
+			(buffers->stream != NULL || cudaStreamCreateWithFlags(&buffers->stream, cudaStreamNonBlocking) == cudaSuccess) &&
+			(buffers->count != NULL || cudaMalloc((void **) &buffers->count, sizeof(*buffers->count)) == cudaSuccess) &&
+			PostingsEvaluate(file, state, device, buffers, &deferred->plan, NULL, &count);
+
+		if (buffers)
+			PredicateBuffersGive(device, buffers);
+
+		/* The small ones run exact on the host, from rows. */
+		if (!ok || count <= AnnIndexConfig.exact_limit)
+		{
+			DeviceDeferFree(deferred);
+			return NULL;
+		}
+		deferred->plan.estimate = count;
+		deferred->exact = 1;
+	}
+	if (deferred)
+	{
+		deferred->remapGeneration = remapGeneration;
+		*estimate = deferred->plan.estimate;
+	}
+	return deferred;
+}
+
+static void
+DeviceDeferFree(void *handle)
+{
+	DeferredPredicate *deferred = handle;
+
+	if (deferred)
+	{
+		PostingsPlanFree(&deferred->plan);
+		free(deferred);
+	}
+}
+
+/*
+ * The lane's half of --device-transient: shard s's bitset of a deferred
+ * predicate, built into dest on the shard's device, on the lane's stream,
+ * ahead of the search that reads it. Fails (the search with it) if the
+ * index was remapped since the plan was made.
+ */
+static int
+DeferredBuild(const AnnIndexFile *file, AnnCuvsIndex *state, const void *handle, uint32_t s, int device,
+			  AnnCuvsDevice *lane, cudaStream_t stream, uint32_t *dest)
+{
+#ifdef CUVS_HAS_POSTINGS_EVALUATE
+	const DeferredPredicate *deferred = handle;
+
+	(void) stream;				/* the lane's resources run on it */
+	return __atomic_load_n(&file->remapGeneration, __ATOMIC_ACQUIRE) == deferred->remapGeneration &&
+		PostingsRun(file, state, device, lane->resources, &deferred->plan, &lane->deferWorkspace,
+					&lane->deferWorkspaceCap, dest, file->shards[s].first, file->shards[s].rows, NULL);
+#else
+	(void) file;
+	(void) state;
+	(void) handle;
+	(void) s;
+	(void) device;
+	(void) lane;
+	(void) stream;
+	(void) dest;
+	return 0;
+#endif
+}
+
+/*
+ * The scan's half of --device-transient: shard s's rows of a deferred
+ * predicate as a sorted u32 list at rows (the plan's exact count of them),
+ * from its bitset built in the lane's expansion buffer, on the lane's
+ * stream.
+ */
+static int
+DeferredRows(const AnnIndexFile *file, AnnCuvsIndex *state, const void *handle, uint32_t s, int device,
+			 AnnCuvsDevice *lane, cudaStream_t stream, uint32_t *rows)
+{
+	const DeferredPredicate *deferred = handle;
+	unsigned long long shardRows = file->shards[s].rows;
+	size_t		nwords = (size_t) ((shardRows + 31) / 32);
+	unsigned	nblocks = (unsigned) ((nwords + 255) / 256);
+	PredicateModule *module;
+
+	if (!deferred->exact || (module = PredicateKernels(device)) == NULL ||
+		!GrowDevice((void **) &lane->expandWords, &lane->expandWordCap, nwords, sizeof(uint32_t), 0, stream) ||
+		!GrowDevice((void **) &lane->expandBlocks, &lane->expandBlockCap, nblocks, sizeof(uint32_t), 0, stream) ||
+		!DeferredBuild(file, state, handle, s, device, lane, stream, lane->expandWords))
+		return 0;
+	{
+		void	   *countArgs[] = {&lane->expandWords, &shardRows, &lane->expandBlocks};
+		void	   *scanArgs[] = {&lane->expandBlocks, &nblocks};
+		void	   *writeArgs[] = {&lane->expandWords, &shardRows, &lane->expandBlocks, &rows};
+
+		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->expandCount, nblocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   countArgs, NULL) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->expandScan, 1, 1, 1, 1024, 1, 1, 0, (CUstream) stream,
+						   scanArgs, NULL) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->expandWrite, nblocks, 1, 1, 256, 1, 1, 0, (CUstream) stream,
+						   writeArgs, NULL) == CUDA_SUCCESS;
+	}
 }
 
 static int
@@ -2193,6 +2966,17 @@ DevicePredicate(AnnIndexFile *file, const unsigned char *program, size_t size, u
 		AnnUdfCompile(program, size, PredicateColumn, &columns, steps, ANN_FILTER_MAX_STEPS, &nsteps,
 					  values, ANN_FILTER_MAX_VALUES, &nvalues) != ANN_FILTER_OK || nsteps == 0)
 		goto done;
+	if ((buffers = PredicateBuffersTake(device)) == NULL || cudaSetDevice(device) != cudaSuccess ||
+		(buffers->stream == NULL && cudaStreamCreateWithFlags(&buffers->stream, cudaStreamNonBlocking) != cudaSuccess) ||
+		(buffers->count == NULL && cudaMalloc((void **) &buffers->count, sizeof(*buffers->count)) != cudaSuccess))
+		goto done;
+	for (uint32_t i = 0; i < nsteps; i++)
+		if (steps[i].multi)
+		{
+			ok = DevicePostingsPredicate(file, state, device, module, buffers, &columns, steps, nsteps, values, words,
+										 count);
+			goto done;
+		}
 	starts[0] = 0;
 	starts[1] = nsteps;
 	startsAt = stepsAt + (size_t) nsteps * sizeof(AnnUdfStep);
@@ -2200,9 +2984,7 @@ DevicePredicate(AnnIndexFile *file, const unsigned char *program, size_t size, u
 	bytes = valuesAt + (size_t) nvalues * sizeof(int32_t) + 4;
 	if ((blob = calloc(1, bytes)) == NULL)
 		goto done;
-	if ((buffers = PredicateBuffersTake(device)) == NULL || cudaSetDevice(device) != cudaSuccess ||
-		(buffers->stream == NULL && cudaStreamCreateWithFlags(&buffers->stream, cudaStreamNonBlocking) != cudaSuccess) ||
-		!GrowDevice(&buffers->program, &buffers->programCap, bytes, 1, 4096, buffers->stream) ||
+	if (!GrowDevice(&buffers->program, &buffers->programCap, bytes, 1, 4096, buffers->stream) ||
 		!GrowDevice((void **) &buffers->words, &buffers->wordCap, nwords, sizeof(uint32_t), 0, buffers->stream) ||
 		(buffers->count == NULL && cudaMalloc((void **) &buffers->count, sizeof(*buffers->count)) != cudaSuccess))
 		goto done;
@@ -2692,6 +3474,8 @@ LoadIndex(const char *name, const char *directory)
 	AnnIndexBitmapDevice.release = ReleaseBitmap;
 	AnnIndexDeviceDestroy = DestroyDevice;
 	AnnIndexDeviceEvaluate = DevicePredicate;
+	AnnIndexDeviceDefer = DeviceDefer;
+	AnnIndexDeviceDeferFree = DeviceDeferFree;
 	if (file->nshards == 0 || cudaGetDeviceCount(&devices) != cudaSuccess || devices <= 0)
 	{
 		/* No CAGRA shards or devices: serve exact results from the files. */
@@ -3246,8 +4030,35 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			 * takes their addresses as an array there, and the filter's
 			 * tensor only says that the search is filtered.
 			 */
+			uint32_t	deferredJobs = 0;
+
+			/*
+			 * --device-transient: a deferred query's bitset is built here, in
+			 * its own slot.
+			 */
 			for (uint32_t j = 0; j < m; j++)
-				pointers[j] = jobs[j]->deviceBitsets[(size_t) copy * state->nshards + s];
+				deferredJobs += jobs[j]->deferred != NULL;
+			if (deferredJobs &&
+				!GrowDevice((void **) &lane->mixedDeferred, &lane->mixedDeferredCap, (size_t) deferredJobs * words,
+							sizeof(uint32_t), 0, stream))
+			{
+				ok = 0;
+				break;
+			}
+			deferredJobs = 0;
+			for (uint32_t j = 0; ok && j < m; j++)
+			{
+				if (jobs[j]->deferred == NULL)
+				{
+					pointers[j] = jobs[j]->deviceBitsets[(size_t) copy * state->nshards + s];
+					continue;
+				}
+				pointers[j] = lane->mixedDeferred + (size_t) deferredJobs++ * words;
+				if (!DeferredBuild(file, state, jobs[j]->deferred, s, shard->device, lane, stream, pointers[j]))
+					ok = 0;
+			}
+			if (!ok)
+				break;
 			if (!GrowDevice((void **) &lane->bitsetPointers, &lane->bitsetPointerCount, m, sizeof(void *),
 							256, stream) ||
 				cudaMemcpyAsync(lane->bitsetPointers, pointers, sizeof(void *) * m, cudaMemcpyHostToDevice,
@@ -3272,6 +4083,19 @@ SearchShards(const AnnIndexFile *file, AnnCuvsIndex *state, const AnnIndexJob *c
 			/* Cached on this shard's device when the bitmap was pushed. */
 			mask = Tensor(deviceBitsets[(size_t) copy * state->nshards + s], kDLCUDA, shard->device,
 						  kDLUInt, 1, bitsetShape);
+			filter.type = BITSET;
+			filter.addr = (uintptr_t) &mask;
+		}
+		else if (bitsets && jobs[0]->deferred)
+		{
+			/* --device-transient: built here, on this GPU, from the postings. */
+			if (!DeferredBuild(file, state, jobs[0]->deferred, s, shard->device, lane, stream,
+							   lane->bitset + bitsetSlot[s]))
+			{
+				ok = 0;
+				break;
+			}
+			mask = Tensor(lane->bitset + bitsetSlot[s], kDLCUDA, shard->device, kDLUInt, 1, bitsetShape);
 			filter.type = BITSET;
 			filter.addr = (uintptr_t) &mask;
 		}
@@ -5000,6 +5824,21 @@ ScanPreferredIndex(const AnnIndexFile *file, uint32_t k)
 static int	SearchScanCuvs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs, uint32_t m);
 static int	SearchScanCuvsJob(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job);
 
+/*
+ * --device-transient: whether a deferred job takes cuVS' FP8 scan (rows
+ * made on the lane) rather than the graph (the bitset built there): always
+ * on a scan-only index; on a graph index with codes where the scan would
+ * take the same filter's rows.
+ */
+static int
+DeferredScan(const AnnCuvsIndex *state, const AnnIndexJob *job)
+{
+	const DeferredPredicate *deferred = job->deferred;
+
+	return deferred && deferred->exact &&
+		(state->scanOnly || (job->nfilter > AnnIndexConfig.exact_limit && ScanPreferred(state, job->k, job->nfilter)));
+}
+
 static void
 SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 {
@@ -5025,6 +5864,23 @@ SearchFiltered(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *job)
 	 * shard, with no per-row work here, whether or not its rows are known.
 	 */
 	scan = (job->filter != NULL || job->ordinals != NULL) && ScanPreferred(state, k, job->nfilter);
+	if (job->deferred && (state->scanOnly || DeferredScan(state, job)))
+	{
+		/*
+		 * --device-transient: the scan reads rows the lane makes; a graph
+		 * index walks the graph when the scan can't.
+		 */
+		AnnIndexJob *one[1] = {job};
+
+		if (DeferredScan(state, job) && SearchScanCuvs(file, state, one, 1))
+			return;
+		if (state->scanOnly)
+		{
+			job->status = ANN_BACKEND_ERROR;
+			return;
+		}
+		scan = 0;
+	}
 	if (state->scanOnly)
 	{
 		if (job->filter == NULL && job->ordinals == NULL)
@@ -5326,8 +6182,10 @@ MixedGraphJob(const AnnIndexFile *file, const AnnCuvsIndex *state, const AnnInde
 
 	(void) file;
 	return AnnIndexConfig.filtered_expansion && state->nshards == 1 && !state->scanOnly &&
-		AnnIndexCostProfile == NULL && job->bitsets != NULL && job->deviceBitsets != NULL &&
-		(copy < 0 || job->deviceBitsets[(size_t) copy * state->nshards] != NULL) && job->nexclude == 0 &&
+		AnnIndexCostProfile == NULL && job->bitsets != NULL &&
+		(job->deferred ? !DeferredScan(state, job) :
+		 job->deviceBitsets != NULL && (copy < 0 || job->deviceBitsets[(size_t) copy * state->nshards] != NULL)) &&
+		job->nexclude == 0 &&
 		n > AnnIndexConfig.exact_limit && n > AnnIndexConfig.gather_limit &&
 		n > AnnIndexConfig.bitset_gather_limit && n > AnnIndexConfig.group_gather_limit &&
 		FilteredCandidates(job->k) <= ANN_CAGRA_MAX_ITOPK &&
@@ -6404,6 +7262,16 @@ SearchGatherMatrix(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **
 				uploaded[shard->device] = 1;
 			}
 			rows = jobs[0]->deviceRows ? jobs[0]->deviceRows[(size_t) laneCopy * state->nshards + s] : NULL;
+
+			/*
+			 * A --device-transient plan has no rows: only the graph route
+			 * takes it.
+			 */
+			if (jobs[0]->deferred)
+			{
+				ok = 0;
+				break;
+			}
 			if (rows == NULL && AnnIndexConfig.gpu_predicates && jobs[0]->bitsets &&
 				ExpandLaneRows(file, s, jobs[0]->bitsets[s], n, lane, shard->device, stream,
 							   lane->gatherRows + start[s]))
@@ -7584,8 +8452,12 @@ SearchScanCuvs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs
 	if (!state->cuvsScan || m == 0 || atomic_load_explicit(&state->cuvsScanDisabled, memory_order_relaxed))
 		return 0;
 
-	/* A filter's rows, or every row of a scan-only index (no filter). */
-	if (ordinals == NULL ? jobs[0]->filtered || !state->scanOnly : jobs[0]->nfilter == 0)
+	/*
+	 * A filter's rows, every row of a scan-only index (no filter), or a
+	 * --device-transient plan's, which the lane makes from its bitset.
+	 */
+	if (jobs[0]->deferred ? state->nshards != 1 || jobs[0]->nfilter == 0 :
+		ordinals == NULL ? jobs[0]->filtered || !state->scanOnly : jobs[0]->nfilter == 0)
 		return 0;
 	for (uint32_t j = 0; j < m; j++)
 	{
@@ -7613,7 +8485,7 @@ SearchScanCuvs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs
 
 	/* Rows are sorted: split them at shard boundaries. */
 	start[0] = 0;
-	start[state->nshards] = ordinals ? jobs[0]->nfilter : file->rows;
+	start[state->nshards] = ordinals || jobs[0]->deferred ? jobs[0]->nfilter : file->rows;
 	for (uint32_t s = 1; s < state->nshards; s++)
 	{
 		uint64_t	low = start[s - 1],
@@ -7662,6 +8534,21 @@ SearchScanCuvs(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob **jobs
 			rows = shards[s].allRows;
 		else if (jobs[0]->deviceRows)
 			rows = jobs[0]->deviceRows[(size_t) laneCopy * state->nshards + s];
+		if (rows == NULL && jobs[0]->deferred)
+		{
+			AnnCuvsDevice *lane = LaneDevice(shards[s].device, 1, 1, 1);
+			cudaStream_t stream;
+
+			if (lane == NULL || cuvsStreamGet(lane->resources, &stream) != CUVS_SUCCESS ||
+				!GatherBuffers(lane, jobs[0]->nfilter, 1) ||
+				!DeferredRows(file, state, jobs[0]->deferred, s, shards[s].device, lane, stream,
+							  lane->gatherRows + start[s]))
+			{
+				ok = 0;
+				break;
+			}
+			rows = lane->gatherRows + start[s];
+		}
 		if (rows == NULL && ordinals == NULL)
 		{
 			ok = 0;
@@ -7831,6 +8718,24 @@ SearchFilteredGroup(const AnnIndexFile *file, AnnCuvsIndex *state, AnnIndexJob *
 		for (uint32_t j = 0; j < m; j++)
 			if (AnnIndexJobDropExcluded(jobs[j]))
 				SearchFiltered(file, state, jobs[j]);
+		return;
+	}
+
+	if (jobs[0]->deferred)
+	{
+		/*
+		 * --device-transient: the scan with rows the lane makes, or the graph
+		 * with the bitset it builds; no other route takes a plan.
+		 */
+		if (DeferredScan(state, jobs[0]) && SearchScanCuvs(file, state, jobs, m))
+			return;
+		if (state->scanOnly)
+			for (uint32_t j = 0; j < m; j++)
+				jobs[j]->status = ANN_BACKEND_ERROR;
+		else if (m > 1)
+			SearchFilteredGroupGraph(file, state, jobs, m);
+		else
+			SearchFiltered(file, state, jobs[0]);
 		return;
 	}
 

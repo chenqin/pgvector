@@ -1,8 +1,9 @@
 /*
  * The row-by-row predicate interpreter (ann/server/udf.c, twin of the CAGRA filter
  * UDF) must select exactly the rows AnnFilterEvaluate puts in its bitset:
- * random columns with NULLs, random programs with negated leaves, NOT,
- * AND/OR, ALL and NONE.
+ * random columns with NULLs, a multi-valued column with NULL and empty
+ * arrays and repeated elements, random programs with negated leaves,
+ * OVERLAP, NOT, AND/OR, ALL and NONE.
  */
 #include "filter.h"
 #include "udf.h"
@@ -13,7 +14,9 @@
 #include <string.h>
 
 #define ROWS 5003
-#define COLUMNS 3
+#define COLUMNS 3				/* single-valued "a", "b", "c" */
+#define MULTI COLUMNS			/* the multi-valued "m", after them */
+#define MAX_ELEMENTS (ROWS * 5)
 
 static int32_t data[COLUMNS][ROWS];
 static const int32_t *columns[COLUMNS];
@@ -23,6 +26,31 @@ static uint64_t starts[COLUMNS][ROWS + 1];
 static uint32_t postings[COLUMNS][ROWS];
 static const char *names[COLUMNS] = {"a", "b", "c"};
 static int	sortColumn;
+
+/* "m": row r's array is elements[offsets[r] .. offsets[r + 1]); a NULL array is one INT32_MIN. */
+static int32_t elements[MAX_ELEMENTS];
+static uint32_t offsets[ROWS + 1];
+static int32_t mDistinct[MAX_ELEMENTS];
+static uint64_t mNdistinct;
+static uint64_t mStarts[MAX_ELEMENTS + 1];
+static uint32_t mPostings[MAX_ELEMENTS];
+
+typedef struct
+{
+	int32_t		value;
+	uint32_t	row;
+} Posting;
+
+static int
+ByPosting(const void *left, const void *right)
+{
+	const Posting *x = left,
+			   *y = right;
+
+	if (x->value != y->value)
+		return (x->value > y->value) - (x->value < y->value);
+	return (x->row > y->row) - (x->row < y->row);
+}
 
 static int
 ByValue(const void *left, const void *right)
@@ -37,6 +65,7 @@ ByValue(const void *left, const void *right)
 	return (l > r) - (l < r);
 }
 
+/* AnnFilterEvaluate's column map: "m" is column MULTI. */
 static int
 Column(void *arg, const char *name)
 {
@@ -44,38 +73,64 @@ Column(void *arg, const char *name)
 	for (int c = 0; c < COLUMNS; c++)
 		if (strcmp(name, names[c]) == 0)
 			return c;
-	return -1;
+	return strcmp(name, "m") == 0 ? MULTI : -1;
+}
+
+/* AnnUdfCompile's: the same, with "m" marked multi-valued. */
+static int
+UdfColumn(void *arg, const char *name)
+{
+	int			c = Column(arg, name);
+
+	return c == MULTI ? (MULTI | ANN_UDF_MULTI) : c;
+}
+
+/* A caller that knows no multi-valued columns: the map before ANN_UDF_MULTI. */
+static int
+SingleColumn(void *arg, const char *name)
+{
+	int			c = Column(arg, name);
+
+	return c == MULTI ? -1 : c;
+}
+
+static int
+Multi(void *arg, int c)
+{
+	(void) arg;
+	return c == MULTI;
 }
 
 static uint64_t
 Count(void *arg, int c)
 {
 	(void) arg;
-	return ndistinct[c];
+	return c == MULTI ? mNdistinct : ndistinct[c];
 }
 
 static int32_t
 Value(void *arg, int c, uint64_t i)
 {
 	(void) arg;
-	return distinct[c][i];
+	return c == MULTI ? mDistinct[i] : distinct[c][i];
 }
 
 static uint64_t
 Start(void *arg, int c, uint64_t i)
 {
 	(void) arg;
-	return starts[c][i];
+	return c == MULTI ? mStarts[i] : starts[c][i];
 }
 
 static int
 Postings(void *arg, int c, uint64_t first, uint64_t n, uint32_t *out)
 {
 	(void) arg;
-	memcpy(out, postings[c] + first, n * sizeof(uint32_t));
+	memcpy(out, (c == MULTI ? mPostings : postings[c]) + first, n * sizeof(uint32_t));
 	return 1;
 }
 
+/* Rows with a value in [low, high]; for "m", rows holding such an element (NULL: NULL arrays). */
 static uint64_t
 Rows(void *arg, int c, int32_t low, int32_t high)
 {
@@ -83,7 +138,16 @@ Rows(void *arg, int c, int32_t low, int32_t high)
 
 	(void) arg;
 	for (uint32_t r = 0; r < ROWS; r++)
-		n += data[c][r] >= low && data[c][r] <= high;
+	{
+		int			hit = 0;
+
+		if (c != MULTI)
+			hit = data[c][r] >= low && data[c][r] <= high;
+		else
+			for (uint32_t i = offsets[r]; i < offsets[r + 1] && !hit; i++)
+				hit = elements[i] >= low && elements[i] <= high;
+		n += (uint64_t) hit;
+	}
 	return n;
 }
 
@@ -115,8 +179,12 @@ Expression(Program *p, int depth)
 	if (kind < 3)
 	{
 		int			op = kind == 0 ? ANN_FILTER_VALUES : kind == 1 ? ANN_FILTER_RANGE : ANN_FILTER_NULL;
-		const char *name = names[rand() % COLUMNS];
+		int			column = rand() % (COLUMNS + 1);
+		const char *name = column == MULTI ? "m" : names[column];
 
+		/* "m" takes OVERLAP and NULL leaves only. */
+		if (column == MULTI && op != ANN_FILTER_NULL)
+			op = ANN_FILTER_OVERLAP;
 		Put(p, op, 1);
 		Put(p, 1, 1);
 		Put(p, (unsigned char) name[0], 1);
@@ -128,7 +196,7 @@ Expression(Program *p, int depth)
 			Put(p, (uint32_t) lo, 4);
 			Put(p, (uint32_t) (rand() % 10 == 0 ? INT32_MAX : lo == INT32_MIN ? 0 : lo + rand() % 20 - 3), 4);
 		}
-		else if (op == ANN_FILTER_VALUES)
+		else if (op == ANN_FILTER_VALUES || op == ANN_FILTER_OVERLAP)
 		{
 			uint32_t	n = rand() % 6;
 
@@ -162,6 +230,9 @@ main(void)
 	AnnUdfStep *steps = malloc(sizeof(AnnUdfStep) * 8192);
 	int32_t    *values = malloc(sizeof(int32_t) * 8192);
 	int			programs = 0;
+	int			multiPrograms = 0;
+	const int32_t *all[COLUMNS + 1];
+	const uint32_t *allOffsets[COLUMNS + 1] = {NULL, NULL, NULL, offsets};
 
 	srand(7);
 	for (int c = 0; c < COLUMNS; c++)
@@ -174,6 +245,7 @@ main(void)
 			order[r] = r;
 		}
 		columns[c] = data[c];
+		all[c] = data[c];
 		sortColumn = c;
 		qsort(order, ROWS, sizeof(uint32_t), ByValue);
 		for (uint32_t r = 0; r < ROWS; r++)
@@ -187,6 +259,46 @@ main(void)
 		}
 		starts[c][ndistinct[c]] = ROWS;
 	}
+	/* "m": NULL arrays, empty arrays, and 1-5 elements that may repeat. */
+	for (uint32_t r = 0, at = 0; r < ROWS; r++)
+	{
+		int			kind = rand() % 10;
+		int			n = kind == 0 ? 0 : 1 + rand() % 5;
+
+		offsets[r] = at;
+		if (kind == 1)
+			elements[at++] = ANN_FILTER_NULL_VALUE;
+		else
+			for (int i = 0; i < n; i++)
+				elements[at++] = rand() % 30 - 15;
+		offsets[r + 1] = at;
+	}
+	{
+		static Posting all[MAX_ELEMENTS];
+		uint64_t	n = 0;
+
+		for (uint32_t r = 0; r < ROWS; r++)
+			for (uint32_t i = offsets[r]; i < offsets[r + 1]; i++)
+			{
+				all[n].value = elements[i];
+				all[n++].row = r;
+			}
+		qsort(all, n, sizeof(Posting), ByPosting);
+		for (uint64_t i = 0, kept = 0; i < n; i++)
+		{
+			/* A row appears once under each distinct element. */
+			if (i > 0 && all[i].value == all[i - 1].value && all[i].row == all[i - 1].row)
+				continue;
+			if (kept == 0 || all[i].value != mDistinct[mNdistinct - 1])
+			{
+				mDistinct[mNdistinct] = all[i].value;
+				mStarts[mNdistinct++] = kept;
+			}
+			mPostings[kept++] = all[i].row;
+			mStarts[mNdistinct] = kept;
+		}
+	}
+	all[MULTI] = elements;
 	memset(&source, 0, sizeof(source));
 	source.rows = ROWS;
 	source.column = Column;
@@ -194,6 +306,7 @@ main(void)
 	source.value = Value;
 	source.start = Start;
 	source.postings = Postings;
+	source.multi = Multi;
 
 	for (int t = 0; t < 3000; t++)
 	{
@@ -207,12 +320,12 @@ main(void)
 		Expression(&p, 1 + rand() % 5);
 		assert(AnnFilterCheck(p.b, p.n));
 		assert(AnnFilterEvaluate(&source, p.b, p.n, words, &count) == ANN_FILTER_OK);
-		assert(AnnUdfCompile(p.b, p.n, Column, NULL, steps, 8192, &nsteps, values, 8192, &nvalues) ==
+		assert(AnnUdfCompile(p.b, p.n, UdfColumn, NULL, steps, 8192, &nsteps, values, 8192, &nvalues) ==
 			   ANN_FILTER_OK);
 		for (uint32_t r = 0; r < ROWS; r++)
 		{
 			int			expected = (words[r / 32] >> (r % 32)) & 1;
-			int			got = AnnUdfMatch(steps, nsteps, values, columns, r);
+			int			got = AnnUdfMatchMulti(steps, nsteps, values, all, allOffsets, r);
 
 			if (expected != got)
 			{
@@ -224,9 +337,16 @@ main(void)
 		assert(matched == count);
 		estimate = AnnUdfEstimate(steps, nsteps, values, Rows, NULL, ROWS);
 		assert(estimate >= 0 && estimate <= ROWS + 1e-6);
-		/* A single leaf's estimate is exact. */
-		if (nsteps == 1)
+
+		/*
+		 * A single leaf's estimate is exact, except OVERLAP's (an upper bound
+		 * unless negated).
+		 */
+		if (nsteps == 1 && !steps[0].multi)
 			assert((uint64_t) (estimate + 0.5) == count);
+		if (nsteps == 1 && steps[0].multi && steps[0].op == ANN_FILTER_OVERLAP && !steps[0].negate)
+			assert(estimate + 1e-6 >= (double) count);
+		multiPrograms += memchr(p.b, 'm', p.n) != NULL;
 		programs++;
 	}
 
@@ -251,8 +371,31 @@ main(void)
 		Put(&p, ANN_FILTER_ALL, 1);
 		assert(AnnUdfCompile(p.b, p.n, Column, NULL, steps, 0, &nsteps, values, 8192, &nvalues) ==
 			   ANN_UDF_TOO_LARGE);
+
+		/*
+		 * OVERLAP needs a multi-valued column the caller marks; VALUES/RANGE
+		 * refuse one.
+		 */
+		p.n = 0;
+		Put(&p, ANN_FILTER_OVERLAP, 1);
+		Put(&p, 1, 1);
+		Put(&p, 'm', 1);
+		Put(&p, 0, 1);
+		Put(&p, 1, 4);
+		Put(&p, 3, 4);
+		assert(AnnUdfCompile(p.b, p.n, SingleColumn, NULL, steps, 8192, &nsteps, values, 8192, &nvalues) ==
+			   ANN_UDF_UNSUPPORTED);
+		assert(AnnUdfCompile(p.b, p.n, Column, NULL, steps, 8192, &nsteps, values, 8192, &nvalues) ==
+			   ANN_UDF_UNSUPPORTED);
+		nsteps = nvalues = 0;
+		assert(AnnUdfCompile(p.b, p.n, UdfColumn, NULL, steps, 8192, &nsteps, values, 8192, &nvalues) ==
+			   ANN_FILTER_OK);
+		p.b[0] = ANN_FILTER_VALUES;
+		assert(AnnUdfCompile(p.b, p.n, UdfColumn, NULL, steps, 8192, &nsteps, values, 8192, &nvalues) ==
+			   ANN_FILTER_COLUMN_KIND);
 	}
-	printf("udf: %d programs match AnnFilterEvaluate\n", programs);
+	assert(multiPrograms > 500);
+	printf("udf: %d programs (%d on the multi-valued column) match AnnFilterEvaluate\n", programs, multiPrograms);
 	free(words);
 	free(steps);
 	free(values);

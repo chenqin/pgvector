@@ -250,6 +250,8 @@ typedef struct Service
 									 * their entries */
 	uint64_t	predicate_canonical;	/* lookups under a rewritten program */
 	uint64_t	predicate_transient;	/* first sightings served uncached */
+	uint64_t	predicate_deferred; /* of those, built on the searching GPU
+									 * (--device-transient) */
 	uint64_t	predicate_residual; /* searches over a base entry with masked
 									 * rows (--residual-masks) */
 	uint64_t	predicate_resolved; /* frames handed to a resolver */
@@ -2583,6 +2585,15 @@ SubmitBitmapJob(Service *service, Connection *connection, int rdma, uint64_t req
 		/* Published late by AnnIndexBitmapUploadDeferred; NULL is valid too. */
 		job->index.deviceBitsets = __atomic_load_n(&bitmap->device, __ATOMIC_ACQUIRE);
 	}
+	else if (bitmap && file->nshards && bitmap->deferred)
+	{
+		/*
+		 * --device-transient: no shard's bitset here; the backend builds
+		 * them.
+		 */
+		job->index.bitsets = bitmap->bitsets;
+		job->index.deferred = bitmap->deferred;
+	}
 	if (bitmap && file->nshards)
 		job->index.deviceRows = __atomic_load_n(&bitmap->deviceRows, __ATOMIC_ACQUIRE);
 	if (bitmap && job->index.filter == NULL && job->index.ordinals == NULL && job->index.bitsets == NULL)
@@ -2670,7 +2681,7 @@ MicrosecondsSince(const struct timespec *start)
  */
 static AnnStatus PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program,
 								   uint32_t size, uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot,
-								   int transient, uint64_t remapGeneration);
+								   int transient, int defer, uint64_t remapGeneration);
 
 /*
  * --predicate-resolvers: a search whose predicate misses the cache is not
@@ -2922,6 +2933,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 		evaluatedInline = 1;
 	transient = admit && AnnIndexConfig.predicate_admission == ANN_ADMIT_SECOND && !SeenBefore(file, id);
 	status = PredicateEvaluate(service, file, program, size, id, nwords, result, snapshot, transient,
+							   transient || (admit && AnnIndexConfig.device_transient == ANN_DEFER_ALWAYS),
 							   remapGeneration);
 	if (slot >= 0)
 	{
@@ -2936,7 +2948,7 @@ PredicateBitmap(Service *service, AnnIndexFile *file, int admit, int mode, const
 
 static AnnStatus
 PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *program, uint32_t size,
-				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot, int transient,
+				  uint64_t id, size_t nwords, AnnIndexBitmap **result, int snapshot, int transient, int defer,
 				  uint64_t remapGeneration)
 {
 	uint32_t   *words;
@@ -2947,6 +2959,33 @@ PredicateEvaluate(Service *service, AnnIndexFile *file, const unsigned char *pro
 	struct timespec start;
 	struct timespec built;
 
+	/*
+	 * --device-transient: a first sighting the cache won't keep (with
+	 * "always", any search's miss, which is then not cached) is not evaluated
+	 * here. The backend plans it over the index's postings, and the search
+	 * builds its bitset on the GPU it runs on, so its rows never pass through
+	 * host memory (indexes without tombstones; the backend says which indexes
+	 * and programs it takes: DeviceDefer in cuvs.c).
+	 */
+	if (defer && !snapshot && AnnIndexConfig.device_transient && AnnIndexDeviceDefer &&
+		__atomic_load_n(&file->ndeleted, __ATOMIC_ACQUIRE) == 0 && !AnnIndexRemappedSince(file, remapGeneration))
+	{
+		uint64_t	estimate = 0;
+		void	   *plan = AnnIndexDeviceDefer(file, program, size, remapGeneration, &estimate);
+
+		if (plan)
+		{
+			status = AnnIndexBitmapDeferred(file, id, ANN_BITMAP_PREDICATE, plan, estimate, result);
+			if (status != ANN_OK)
+			{
+				AnnIndexDeviceDeferFree(plan);
+				return status;
+			}
+			(void) __atomic_fetch_add(&service->predicate_transient, 1, __ATOMIC_RELAXED);
+			(void) __atomic_fetch_add(&service->predicate_deferred, 1, __ATOMIC_RELAXED);
+			return ANN_OK;
+		}
+	}
 	if ((words = malloc(nwords * 4 + 4)) == NULL)
 		return ANN_NOMEM;
 	(void) clock_gettime(CLOCK_MONOTONIC, &start);
@@ -4309,7 +4348,7 @@ ServeFrame(Service *service, Connection *connection)
 							"\"predicate_evaluations\":%llu,\"predicate_eval_us\":%llu,"
 							"\"predicate_entries\":%llu,\"predicate_bytes\":%llu,"
 							"\"predicate_device_bytes\":%llu,\"predicate_evictions\":%llu,"
-							"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_residual\":%llu,"
+							"\"predicate_canonical\":%llu,\"predicate_transient\":%llu,\"predicate_deferred\":%llu,\"predicate_residual\":%llu,"
 							"\"predicate_build_us\":%llu,\"predicate_patched\":%llu,\"predicate_dropped\":%llu,"
 							"\"predicate_raced\":%llu,\"predicate_resolved\":%llu,\"predicate_inline\":%llu,"
 							"\"predicate_shared\":%llu,\"predicate_shared_entries\":%llu,"
@@ -4335,6 +4374,7 @@ ServeFrame(Service *service, Connection *connection)
 							(unsigned long long) predicates.evictions,
 							(unsigned long long) __atomic_load_n(&service->predicate_canonical, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->predicate_transient, __ATOMIC_RELAXED),
+							(unsigned long long) __atomic_load_n(&service->predicate_deferred, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->predicate_residual, __ATOMIC_RELAXED),
 							(unsigned long long) __atomic_load_n(&service->predicate_build_us, __ATOMIC_RELAXED),
 							(unsigned long long) predicates.patched, (unsigned long long) predicates.dropped,

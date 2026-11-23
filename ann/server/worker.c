@@ -246,6 +246,75 @@ Reply(uint16_t operation, uint64_t request, uint64_t generation,
 		(size == 0 || fwrite(data, 1, size, stdout) == size) && fflush(stdout) == 0;
 }
 
+/*
+ * --filtered-search: a preset of the options one way of serving filtered
+ * searches needs, put in place of the option so that options after it still
+ * override any of them. The index layouts they take are in
+ * docs/ann-cuvs-index.md ("Choosing the filtered search").
+ */
+static const char *const FilteredGraphPreset[] = {
+	"--quantized-scan", "off", "--matrix-gather", "off", "--gpu-rerank", "off", "--exact-limit", "0",
+	"--gather-limit", "0", "--bitset-gather-limit", "0", "--group-gather-limit", "0", "--scan-routes", "off",
+	"--itopk", "512", "--filtered-algo", "multi", "--filtered-width", "4", "--cagra-pitch", "on",
+	"--lanes", "128", "--max-batch", "64", "--filtered-expansion", "two-hop", "--filtered-itopk", "1536",
+	"--filtered-iterations", "18", "--filtered-samplings", "2", "--filtered-block-size", "64",
+	"--mixed-groups", "on", "--mixed-graph", "on", "--predicate-admission", "second",
+	"--device-transient", "on", NULL
+};
+
+/*
+ * Scan-only indexes: every filtered search is cuVS' FP8 scan, whose
+ * candidates are re-scored from FP16 rows; FP16 distances are final.
+ */
+static const char *const FilteredScanPreset[] = {
+	"--rescore", "fp16", "--predicate-admission", "second", "--device-transient", "on", NULL
+};
+
+/*
+ * argv with each --filtered-search graph|scan replaced by its preset;
+ * NULL (and a message) for an unknown preset or no memory.
+ */
+static char **
+ExpandPresets(int argc, char **argv, int *nargc)
+{
+	size_t		capacity = (size_t) argc + 1;
+	char	  **out;
+	int			n = 0;
+
+	for (int i = 1; i < argc; i++)
+		if (strcmp(argv[i], "--filtered-search") == 0)
+			capacity += sizeof(FilteredGraphPreset) / sizeof(FilteredGraphPreset[0]);
+	if ((out = malloc(capacity * sizeof(char *))) == NULL)
+		return NULL;
+	out[n++] = argv[0];
+	for (int i = 1; i < argc; i++)
+	{
+		const char *const *preset = NULL;
+
+		if (strcmp(argv[i], "--filtered-search") != 0 || i + 1 >= argc)
+		{
+			out[n++] = argv[i];
+			continue;
+		}
+		if (strcmp(argv[i + 1], "graph") == 0)
+			preset = FilteredGraphPreset;
+		else if (strcmp(argv[i + 1], "scan") == 0)
+			preset = FilteredScanPreset;
+		else
+		{
+			fprintf(stderr, "--filtered-search takes graph or scan\n");
+			free(out);
+			return NULL;
+		}
+		for (; *preset; preset++)
+			out[n++] = (char *) *preset;
+		i++;
+	}
+	out[n] = NULL;
+	*nargc = n;
+	return out;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -258,6 +327,8 @@ main(int argc, char **argv)
 	int			exitCode = 0;
 
 	AnnServeDefaultOptions(&serveOptions);
+	if ((argv = ExpandPresets(argc, argv, &argc)) == NULL)
+		return 2;
 	for (int i = 1; i < argc; i += 2)
 	{
 		const char *value = i + 1 < argc ? argv[i + 1] : NULL;
@@ -460,6 +531,16 @@ main(int argc, char **argv)
 				return 2;
 			}
 			AnnIndexConfig.predicate_admission = strcmp(value, "second") == 0 ? ANN_ADMIT_SECOND : ANN_ADMIT_ALL;
+		}
+		else if (strcmp(argv[i], "--device-transient") == 0)
+		{
+			if (strcmp(value, "on") != 0 && strcmp(value, "off") != 0 && strcmp(value, "always") != 0)
+			{
+				fprintf(stderr, "--device-transient takes on, always or off\n");
+				return 2;
+			}
+			AnnIndexConfig.device_transient = strcmp(value, "on") == 0 ? ANN_DEFER_FIRST :
+				strcmp(value, "always") == 0 ? ANN_DEFER_ALWAYS : 0;
 		}
 		else if (strcmp(argv[i], "--gpu-predicates") == 0)
 		{
@@ -801,12 +882,16 @@ usage:
 			"  [--itopk N] [--filtered-itopk N] [--exact-limit ROWS] [--cagra-persistent on|off] [--replicate on|off|COPIES] [--replica-routing home|load] [--replica-load-slack N] [--gather-limit ROWS] [--bitset-min ROWS]\n"
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--filtered-block-size N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
-			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off]\n"
+			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off] [--device-transient on|always|off]\n"
+			"  [--filtered-search graph|scan]\n"
 			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--residual-masks on|off] [--quantized-scan on|off] [--quant-slack N]\n"
 			"  [--rescore fp32|off|fp16] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--scan-skip-tail on|off] [--rerank-prefetch N] [--predicate-cache N]\n"
 			"  [--scan-routes on|off] [--scan-max-k N]\n"
 			"  [--predicate-cache-mb MB] [--predicate-device-mb MB] [--prewarm on|off] [--lock-memory on|off]\n"
 			"  [--delete-patch on|off] [--delete-patch-rows N] [--delete-patch-entries N] [--shared-predicate-mb MB]]\n"
+			"--filtered-search: options for one way of serving filtered searches, which later options override: graph\n"
+			"  (cuVS' two-hop walk; indexes with graphs) or scan (cuVS' FP8 scan; scan-only indexes). See\n"
+			"  docs/ann-cuvs-index.md\n"
 			"--delete-patch (on by default): a delete replaces each cached predicate result holding its rows by a copy\n"
 			"  without them; patched entries are re-uploaded to the devices at their next lookup\n"
 			"--rescore: FP8 scans run as cuVS' CAGRA filtered scan, which re-scores its candidates from FP16 rows on\n"

@@ -108,6 +108,13 @@ typedef struct AnnIndexJob
 	const uint64_t *exclude;
 	uint32_t	nexclude;
 	uint64_t   *ownedOrdinals;
+
+	/*
+	 * --device-transient: the filter as a backend plan instead of rows
+	 * (bitsets then holds no shard's bitset); the backend builds the bitset
+	 * on the device it searches. nfilter is the plan's estimate.
+	 */
+	const void *deferred;
 } AnnIndexJob;
 
 /* Vendor-specific objects and precision/layout conversion stay behind this API. */
@@ -144,8 +151,8 @@ typedef struct AnnBackend
 
 	/*
 	 * Whether a search for k results over every row of a loaded index runs as
-	 * an exact scan of a cached row list rather than a graph search; NULL when
-	 * a backend always searches its graph.
+	 * an exact scan of a cached row list rather than a graph search; NULL
+	 * when a backend always searches its graph.
 	 */
 	int			(*scan_preferred) (const struct AnnIndexFile *file, uint32_t k);
 } AnnBackend;

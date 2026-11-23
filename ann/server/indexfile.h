@@ -141,6 +141,8 @@ typedef struct AnnIndexBitmap
 								 * same forms */
 	int			columnsOnly;	/* a predicate result read from attribute
 								 * columns alone (no BITMAP leaf) */
+	void	   *deferred;		/* --device-transient: the backend's plan
+								 * (AnnIndexDeviceDefer), no rows or words */
 } AnnIndexBitmap;
 
 /*
@@ -363,7 +365,16 @@ typedef struct AnnIndexOptions
 	uint64_t	shared_predicate_bytes; /* --shared-predicate-mb: host memory
 										 * for the results a row set shares; 0
 										 * forms no row sets */
+	int			device_transient;	/* --device-transient: 0 off,
+									 * ANN_DEFER_FIRST, ANN_DEFER_ALWAYS */
 } AnnIndexOptions;
+
+/*
+ * --device-transient: first sightings (on) or every search's miss (always)
+ * built on the searching GPU.
+ */
+#define ANN_DEFER_FIRST 1
+#define ANN_DEFER_ALWAYS 2
 
 /* --residual-masks: most rows an AND's narrow operands may remove. */
 #define ANN_RESIDUAL_MAX_ROWS (UINT64_C(1) << 18)
@@ -466,6 +477,21 @@ void		AnnIndexBitmapUploadDeferred(AnnIndexFile *file, AnnIndexBitmap *bitmap);
  */
 extern int	(*AnnIndexDeviceEvaluate) (AnnIndexFile *file, const unsigned char *program, size_t size,
 									   uint32_t *words, uint64_t *count);
+
+/*
+ * --device-transient: a backend's plan of a first sighting (with
+ * --predicate-admission second) that its search builds on the device it
+ * runs on, never evaluated on the host. Returns NULL for programs or indexes
+ * it can't take; *estimate gets the rows it passes, estimated. The plan is
+ * freed with AnnIndexDeviceDeferFree.
+ */
+extern void *(*AnnIndexDeviceDefer) (AnnIndexFile *file, const unsigned char *program, size_t size,
+									 uint64_t remapGeneration, uint64_t *estimate);
+extern void (*AnnIndexDeviceDeferFree) (void *plan);
+
+/* A transient result holding a backend plan instead of rows: one reference, never cached. */
+AnnStatus	AnnIndexBitmapDeferred(AnnIndexFile *file, uint64_t id, int kind, void *plan, uint64_t estimate,
+								   AnnIndexBitmap **result);
 
 /*
  * Evaluate a predicate program (ann/common/filter.h) over the index's attribute

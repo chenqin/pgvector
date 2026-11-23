@@ -55,20 +55,34 @@ AnnUdfCompile(const unsigned char *program, size_t size,
 				offset++;
 				break;
 			case ANN_FILTER_BITMAP:
-			case ANN_FILTER_OVERLAP:
 				return ANN_UDF_UNSUPPORTED;
 			default:
 				{
 					uint32_t	nameLength = program[offset + 1];
 					char		name[64];
 					int			c;
+					int			multi;
 					const unsigned char *at = program + offset + 3 + nameLength;
 
 					memcpy(name, program + offset + 2, nameLength);
 					name[nameLength] = '\0';
-					if ((c = column(arg, name)) < 0 || c >= ANN_UDF_MAX_COLUMNS)
+					c = column(arg, name);
+					multi = c >= 0 && (c & ANN_UDF_MULTI) != 0;
+					if (c >= 0)
+						c &= ~ANN_UDF_MULTI;
+
+					/*
+					 * A caller that marks no column multi-valued keeps the
+					 * old answer for OVERLAP, whatever the column.
+					 */
+					if (op == ANN_FILTER_OVERLAP && !multi)
+						return ANN_UDF_UNSUPPORTED;
+					if (c < 0 || c >= ANN_UDF_MAX_COLUMNS)
 						return ANN_FILTER_UNKNOWN_COLUMN;
+					if (multi && (op == ANN_FILTER_VALUES || op == ANN_FILTER_RANGE))
+						return ANN_FILTER_COLUMN_KIND;
 					step.column = (uint8_t) c;
+					step.multi = (uint8_t) multi;
 					step.negate = program[offset + 2 + nameLength];
 					offset += 3 + nameLength;
 					if (op == ANN_FILTER_RANGE)
@@ -77,7 +91,7 @@ AnnUdfCompile(const unsigned char *program, size_t size,
 						step.high = (int32_t) (uint32_t) Read(at + 4, 4);
 						offset += 8;
 					}
-					else if (op == ANN_FILTER_VALUES)
+					else if (op == ANN_FILTER_VALUES || op == ANN_FILTER_OVERLAP)
 					{
 						uint32_t	n = (uint32_t) Read(at, 4);
 						uint32_t	kept = 0;
@@ -107,6 +121,46 @@ AnnUdfCompile(const unsigned char *program, size_t size,
 	return ANN_FILTER_OK;
 }
 
+/* Whether value is among the step's sorted unique values. */
+static int
+Among(const AnnUdfStep *step, const int32_t *values, int32_t value)
+{
+	uint32_t	lo = step->first,
+				hi = step->first + step->count;
+
+	while (lo < hi)
+	{
+		uint32_t	mid = lo + (hi - lo) / 2;
+
+		if (values[mid] < value)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo < step->first + step->count && values[lo] == value;
+}
+
+/*
+ * A leaf on a multi-valued column: elements[begin..end) is the row's array,
+ * a NULL array being one INT32_MIN element.
+ */
+static int
+MultiLeafMatch(const AnnUdfStep *step, const int32_t *values, const int32_t *elements, uint32_t begin,
+			   uint32_t end)
+{
+	int			isNull = end - begin == 1 && elements[begin] == ANN_FILTER_NULL_VALUE;
+	int			match = 0;
+
+	if (step->op == ANN_FILTER_NULL)
+		match = isNull;
+	else if (isNull)
+		return 0;				/* negated or not, OVERLAP skips NULL arrays */
+	else
+		for (uint32_t i = begin; i < end && !match; i++)
+			match = Among(step, values, elements[i]);
+	return step->negate ? !match : match;
+}
+
 static int
 LeafMatch(const AnnUdfStep *step, const int32_t *values, int32_t value)
 {
@@ -119,27 +173,20 @@ LeafMatch(const AnnUdfStep *step, const int32_t *values, int32_t value)
 	else if (step->op == ANN_FILTER_RANGE)
 		match = step->low <= value && value <= step->high;
 	else
-	{
-		uint32_t	lo = step->first,
-					hi = step->first + step->count;
-
-		while (lo < hi)
-		{
-			uint32_t	mid = lo + (hi - lo) / 2;
-
-			if (values[mid] < value)
-				lo = mid + 1;
-			else
-				hi = mid;
-		}
-		match = lo < step->first + step->count && values[lo] == value;
-	}
+		match = Among(step, values, value);
 	return step->negate ? !match : match;
 }
 
 int
 AnnUdfMatch(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
 			const int32_t *const *columns, uint64_t row)
+{
+	return AnnUdfMatchMulti(steps, nsteps, values, columns, NULL, row);
+}
+
+int
+AnnUdfMatchMulti(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
+				 const int32_t *const *columns, const uint32_t *const *offsets, uint64_t row)
 {
 	uint64_t	stack = 0;
 	int			depth = 0;
@@ -172,7 +219,11 @@ AnnUdfMatch(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
 				bit = 0;
 				break;
 			default:
-				bit = (uint64_t) LeafMatch(step, values, columns[step->column][row]);
+				if (step->multi)
+					bit = (uint64_t) MultiLeafMatch(step, values, columns[step->column],
+													offsets[step->column][row], offsets[step->column][row + 1]);
+				else
+					bit = (uint64_t) LeafMatch(step, values, columns[step->column][row]);
 				break;
 		}
 		stack = (stack & ~(UINT64_C(1) << depth)) | (bit << depth);
@@ -235,6 +286,8 @@ AnnUdfEstimate(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
 						for (uint32_t v = 0; v < step->count; v++)
 							match += (double) rows(arg, step->column, values[step->first + v],
 												   values[step->first + v]);
+					if (match > (double) total)
+						match = (double) total;
 					if (step->negate)
 						match = (double) total - match - (step->op == ANN_FILTER_NULL ? 0 : nulls);
 					p = match / (double) total;
@@ -253,7 +306,7 @@ AnnUdfEstimate(const AnnUdfStep *steps, uint32_t nsteps, const int32_t *values,
  */
 static const char deviceSource[] =
 "struct ann_udf_step {\n"
-"  unsigned char op, column, negate, pad;\n"
+"  unsigned char op, column, negate, multi;\n"
 "  int low, high;\n"
 "  unsigned int first, count;\n"
 "};\n"
@@ -263,7 +316,18 @@ static const char deviceSource[] =
 "  const int* values;\n"
 "  const unsigned int* starts;\n"
 "  unsigned long long row_base;\n"
+"  const unsigned int* offsets[8];\n"
 "};\n"
+"\n"
+"__device__ bool ann_udf_among(const ann_udf_step& s, const int* values, int v)\n"
+"{\n"
+"  unsigned int lo = s.first, hi = s.first + s.count;\n"
+"  while (lo < hi) {\n"
+"    unsigned int mid = lo + (hi - lo) / 2;\n"
+"    if (values[mid] < v) lo = mid + 1; else hi = mid;\n"
+"  }\n"
+"  return lo < s.first + s.count && values[lo] == v;\n"
+"}\n"
 "\n"
 "__device__ bool ann_udf_leaf(const ann_udf_step& s, const int* values, int v)\n"
 "{\n"
@@ -276,12 +340,25 @@ static const char deviceSource[] =
 "  } else if (s.op == 2) {\n"
 "    match = s.low <= v && v <= s.high;\n"
 "  } else {\n"
-"    unsigned int lo = s.first, hi = s.first + s.count;\n"
-"    while (lo < hi) {\n"
-"      unsigned int mid = lo + (hi - lo) / 2;\n"
-"      if (values[mid] < v) lo = mid + 1; else hi = mid;\n"
-"    }\n"
-"    match = lo < s.first + s.count && values[lo] == v;\n"
+"    match = ann_udf_among(s, values, v);\n"
+"  }\n"
+"  return s.negate ? !match : match;\n"
+"}\n"
+"\n"
+"/* A leaf on a multi-valued column: elements[begin, end) is the row's array, a NULL array one */\n"
+"/* INT32_MIN element. */\n"
+"__device__ bool ann_udf_multi_leaf(const ann_udf_step& s, const int* values, const int* elements,\n"
+"                                   unsigned int begin, unsigned int end)\n"
+"{\n"
+"  const int null_value = (int)0x80000000;\n"
+"  const bool is_null = end - begin == 1 && elements[begin] == null_value;\n"
+"  bool match = false;\n"
+"  if (s.op == 3) {\n"
+"    match = is_null;\n"
+"  } else if (is_null) {\n"
+"    return false;\n"
+"  } else {\n"
+"    for (unsigned int i = begin; i < end && !match; i++) match = ann_udf_among(s, values, elements[i]);\n"
 "  }\n"
 "  return s.negate ? !match : match;\n"
 "}\n"
@@ -309,7 +386,10 @@ static const char deviceSource[] =
 "    } else if (s.op == 9) {\n"
 "      bit = 0;\n"
 "    } else {\n"
-"      bit = ann_udf_leaf(s, p->values, p->columns[s.column][row]) ? 1ull : 0ull;\n"
+"      const bool hit = s.multi ? ann_udf_multi_leaf(s, p->values, p->columns[s.column],\n"
+"                                                    p->offsets[s.column][row], p->offsets[s.column][row + 1])\n"
+"                               : ann_udf_leaf(s, p->values, p->columns[s.column][row]);\n"
+"      bit = hit ? 1ull : 0ull;\n"
 "    }\n"
 "    stack = (stack & ~(1ull << depth)) | (bit << depth);\n"
 "    depth++;\n"
