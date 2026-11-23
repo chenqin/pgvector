@@ -382,10 +382,13 @@ unless marked.
 worker with `--predicate-admission all` and no `--device-transient`; `s5` and
 `s7` were not measured on fresh workers.
 
-No clear winner: two-hop holds several times the scan's rate on every load
-the scan can serve, and the only one under 30 ms when filters are wide or
-some searches unfiltered; the scan returns near-exact results where two-hop
-returns 86-91% of them, and only on narrow filters is the gap in rate small.
+No clear winner: with the scan in cuVS, two-hop held several times its rate
+on every load it could serve, and was the only one under 30 ms when filters
+are wide or some searches unfiltered; the scan returns near-exact results
+where two-hop returns 86-91% of them. The worker's own scan narrows that
+([below](#the-fp8-scan-back-in-the-worker)): half of two-hop's rate on the
+original load, and level with it on narrow filters (100k), at 0.9998 recall
+against 0.989.
 So the choice is exposed rather than made: build the index for one
 (`--dtype float16` graphs, or `--scan-only --quantize fp8`) and start the
 worker with `--filtered-search graph` or `--filtered-search scan`; see
