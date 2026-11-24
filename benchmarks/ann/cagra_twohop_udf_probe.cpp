@@ -26,6 +26,18 @@
  *            with the filtered scan
  *   buildc   as buildq, each bitset built by cuVS (cuvs::core::postings::evaluate, the worker's
  *            build) from the same postings; programs of one VALUES or OVERLAP leaf only
+ *   stock1   control: cuVS' own filtered walk (filter_expansion SCORE_ALL, algo AUTO), one query per
+ *            call with its device bitset, the filtering rate left for cuVS to count
+ *   stockr1  as stock1, the filtering rate given (no count of the bitset per call)
+ *   stockb   BATCH queries per call that share one filter (the first query's), as cuVS' own filtered
+ *            search takes them: SCORE_ALL, algo AUTO, the filtering rate given
+ *   bitsetb  the same shared-filter batches with the two-hop walk (a plain bitset_filter, no
+ *            query_bitsets)
+ *   linked1  as bitset1, the bitset declared as a bitset of bytes, so the kernel calls the linked
+ *            sample_filter for every test instead of reading the words itself
+ *   linkedb  as bitsetb, through the linked sample_filter
+ *   nofilter BATCH queries per call with no filter at all (MULTI_CTA, the same settings); use with
+ *            --random-pass 1 so that recall is measured against every row
  *
  * With a build mode, a check pass first builds every case's bitset on the GPU, compares it with the
  * host interpreter's bit for bit and reports the build time.
@@ -36,7 +48,7 @@
  *
  *   cagra_twohop_udf_probe INDEX_DIR CASES [--k K] [--batch B] [--reps R] [--threads T]
  *                          [--itopk N] [--iterations N] [--samplings N] [--width N] [--block N]
- *                          [--no-pitch] [--reorder] [--modes bitset1,bitsetq,udf,udf1,udfv,udfv1,udfp,udfb,udfq,twol,scanc,build1,buildq,buildc] [--no-recall]
+ *                          [--no-pitch] [--reorder] [--random-pass RATE] [--modes bitset1,bitsetq,udf,udf1,udfv,udfv1,udfp,udfb,udfq,twol,scanc,build1,buildq,buildc,stock1,stockr1,stockb,bitsetb,linked1,linkedb,nofilter] [--no-recall]
  *
  * CASES (benchmarks/ann/twohop_udf_cases.py): u32 count, u32 dims, then per case u32 k (unused:
  * --k sets k), u32 program length, the predicate program (ann/common/filter.h) and the FP32 query.
@@ -382,6 +394,7 @@ struct Case {
   std::vector<uint32_t> words;  // host bitset over the shard's rows
   uint64_t count = 0;
   std::vector<uint32_t> truth;  // exact k nearest passing rows
+  std::vector<uint32_t> truth_shared;  // the same under the filter of the first case of its batch
 };
 
 /* AnnUdfCompile's column map: the columns programs name, in slots as first used. */
@@ -412,6 +425,9 @@ int main(int argc, char** argv)
   bool pitch = true;
   bool reorder = false;  // items renumbered by their smallest multi-valued value (product group)
   int scan_slack = 300;  // scanc: candidates k + k * scan_slack / 100 (the worker's --slack-ratio)
+  // Above 0: each case's filter is replaced by rows drawn independently at this rate (the bitset
+  // modes only: the programs no longer describe the filters).
+  double random_pass = 0;
   std::string modes = "bitset1,bitsetq,udf,udf1";
   for (int i = 3; i < argc; i++) {
     std::string a = argv[i];
@@ -433,6 +449,7 @@ int main(int argc, char** argv)
     else if (a == "--no-pitch") pitch = false;
     else if (a == "--reorder") reorder = true;
     else if (a == "--scan-slack") scan_slack = std::stoi(argv[++i]);
+    else if (a == "--random-pass" && i + 1 < argc) random_pass = std::stod(argv[++i]);
     else fail("unknown option " + a);
   }
 
@@ -554,6 +571,14 @@ int main(int argc, char** argv)
     }
   }
 
+  /* Modes whose batches share their first case's filter need exact answers under that filter. */
+  auto is_shared = [](const std::string& mode) {
+    return mode == "stockb" || mode == "bitsetb" || mode == "linkedb";
+  };
+  const bool shared_truth = modes.find("stockb") != std::string::npos ||
+                            modes.find("bitsetb") != std::string::npos ||
+                            modes.find("linkedb") != std::string::npos;
+
   /* Each case's passing rows on the host, from the same interpreter the UDF runs. */
   double t0 = now_ms();
   {
@@ -565,6 +590,23 @@ int main(int argc, char** argv)
         for (int i; (i = next++) < ncases;) {
           Case& c = cases[i];
           c.words.assign(nwords, 0);
+          if (random_pass > 0) {
+            // xorshift64, one stream a case.
+            uint64_t state           = 0x9E3779B97F4A7C15ull * uint64_t(i + 1);
+            // 2^64 does not fit: a rate of 1 or more passes every row.
+            const uint64_t threshold =
+              random_pass >= 1.0 ? ~uint64_t(0) : uint64_t(random_pass * 18446744073709551615.0);
+            for (uint64_t r = 0; r < rows; r++) {
+              state ^= state << 13;
+              state ^= state >> 7;
+              state ^= state << 17;
+              if (state <= threshold) {
+                c.words[r / 32] |= 1u << (r % 32);
+                c.count++;
+              }
+            }
+            continue;
+          }
           for (uint64_t r = 0; r < rows; r++)
             if (AnnUdfMatchMulti(steps.data() + c.first_step, c.nsteps, values.data(),
                                  host_columns.data(), host_offsets.data(), r)) {
@@ -591,23 +633,28 @@ int main(int argc, char** argv)
         std::vector<std::pair<float, uint32_t>> d;
         for (int i; (i = next++) < ncases;) {
           Case& c = cases[i];
-          d.clear();
-          for (size_t w = 0; w < nwords; w++)
-            for (uint32_t bits = c.words[w]; bits; bits &= bits - 1) {
-              uint32_t r   = uint32_t(w * 32 + __builtin_ctz(bits));
-              const float* x = vectors + size_t(reorder ? order[r] : r) * m.dims;
-              float s        = 0;
-              for (uint32_t j = 0; j < m.dims; j++) {
-                float t = x[j] - c.query[j];
-                s += t * t;
+          // The case's own filter, then (for the shared-filter modes) its batch's first filter.
+          for (int shared = 0; shared < (shared_truth ? 2 : 1); shared++) {
+            const std::vector<uint32_t>& words = shared ? cases[(i / batch) * batch].words : c.words;
+            d.clear();
+            for (size_t w = 0; w < nwords; w++)
+              for (uint32_t bits = words[w]; bits; bits &= bits - 1) {
+                uint32_t r   = uint32_t(w * 32 + __builtin_ctz(bits));
+                const float* x = vectors + size_t(reorder ? order[r] : r) * m.dims;
+                float s        = 0;
+                for (uint32_t j = 0; j < m.dims; j++) {
+                  float t = x[j] - c.query[j];
+                  s += t * t;
+                }
+                d.emplace_back(s, r);
               }
-              d.emplace_back(s, r);
-            }
-          size_t keep = std::min<size_t>(k, d.size());
-          std::partial_sort(d.begin(), d.begin() + keep, d.end());
-          c.truth.resize(keep);
-          for (size_t j = 0; j < keep; j++)
-            c.truth[j] = d[j].second;
+            size_t keep = std::min<size_t>(k, d.size());
+            std::partial_sort(d.begin(), d.begin() + keep, d.end());
+            auto& out = shared ? c.truth_shared : c.truth;
+            out.resize(keep);
+            for (size_t j = 0; j < keep; j++)
+              out[j] = d[j].second;
+          }
         }
       });
     for (auto& t : pool)
@@ -1092,7 +1139,8 @@ int main(int argc, char** argv)
                         t.built + size_t(q) * nwords, stream);
         }
         hp[q] = mode == "twol" ? reinterpret_cast<const uint32_t*>(dtwol[first + q])
-                : (build || mode == "buildc" || mode == "scanc") ? t.built + size_t(q) * nwords : dbits[first + q];
+                : (build || mode == "buildc" || mode == "scanc") ? t.built + size_t(q) * nwords
+                : is_shared(mode) ? dbits[first] : dbits[first + q];
       }
 #ifdef PROBE_HAS_FP8_SCAN
       if (mode == "scanc") {
@@ -1106,8 +1154,27 @@ int main(int argc, char** argv)
                              stream));
         sp.query_bitsets = t.bitset_ptrs;
       }
-      auto view = raft::core::bitset_view<uint32_t, int64_t>(
-        const_cast<uint32_t*>(mode == "twol" ? dbits[first] : hp[0]), int64_t(rows));
+      if (mode == "stock1" || mode == "stockr1" || mode == "stockb") {
+        // cuVS' own filtered walk: every neighbour scored, the list lengthened by the filtering rate.
+        sp.algo             = cagra::search_algo::AUTO;
+        sp.filter_expansion = cagra::filter_expansion_mode::SCORE_ALL;
+        if (mode != "stock1")
+          sp.filtering_rate = float(std::min(0.999, 1.0 - double(cases[first].count) / double(rows)));
+      }
+      if (mode == "nofilter") {
+        sp.filter_expansion = cagra::filter_expansion_mode::SCORE_ALL;
+        cagra::search(t.res, sp, searched, queries, nb, ds);
+        CUDA(cudaMemcpyAsync(t.out.data(), t.neighbors, size_t(n) * k * sizeof(uint32_t),
+                             cudaMemcpyDeviceToHost, stream));
+        t.res.sync_stream();
+        return;
+      }
+      // Declared as a bitset of bytes, the same words pass the same rows through the linked filter.
+      const bool linked = mode == "linked1" || mode == "linkedb";
+      auto view = linked ? raft::core::bitset_view<uint32_t, int64_t>(const_cast<uint32_t*>(hp[0]),
+                                                                    int64_t(rows), 8)
+                         : raft::core::bitset_view<uint32_t, int64_t>(
+                             const_cast<uint32_t*>(mode == "twol" ? dbits[first] : hp[0]), int64_t(rows));
       cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> filter(view);
       cagra::search(t.res, sp, searched, queries, nb, ds, filter);
     }
@@ -1165,7 +1232,10 @@ int main(int argc, char** argv)
   }
   for (const std::string& mode : mode_list) {
     const int per_call =
-      (mode == "bitset1" || mode == "udf1" || mode == "udfv1" || mode == "build1" || mode == "scanc") ? 1 : batch;
+      (mode == "bitset1" || mode == "udf1" || mode == "udfv1" || mode == "build1" || mode == "scanc" ||
+       mode == "stock1" || mode == "stockr1" || mode == "linked1")
+        ? 1
+        : batch;
     const int calls    = ncases / per_call;
     if (calls == 0) continue;
     if (mode == "twol") setenv("CUVS_TWO_LEVEL", "1", 1); else unsetenv("CUVS_TWO_LEVEL");
@@ -1184,10 +1254,12 @@ int main(int argc, char** argv)
     for (int call = 0; call < calls; call++) {
       run_call(*pool[0], mode, call * per_call, per_call);
       for (int q = 0; q < per_call; q++) {
-        const Case& c = cases[call * per_call + q];
+        const Case& own = cases[call * per_call + q];
+        // The filter this query was searched under: its own, or its batch's first.
+        const Case& c   = is_shared(mode) ? cases[call * per_call] : own;
         const uint32_t* got = pool[0]->out.data() + size_t(q) * k;
         uint64_t valid = 0, hit = 0;
-        std::vector<uint32_t> truth = c.truth;
+        std::vector<uint32_t> truth = is_shared(mode) ? own.truth_shared : own.truth;
         std::sort(truth.begin(), truth.end());
         for (int j = 0; j < k; j++) {
           uint32_t r = got[j];
