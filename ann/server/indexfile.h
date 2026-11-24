@@ -365,6 +365,10 @@ typedef struct AnnIndexOptions
 										 * forms no row sets */
 	int			device_transient;	/* --device-transient: 0 off,
 									 * ANN_DEFER_FIRST, ANN_DEFER_ALWAYS */
+	int			rerank_host;	/* --rerank-host: scan-only shards' FP16
+								 * rerank rows in pinned host memory */
+	uint64_t	rerank_cache_bytes; /* --rerank-cache-mb: device memory per
+									 * GPU for the most used of those rows */
 } AnnIndexOptions;
 
 /*

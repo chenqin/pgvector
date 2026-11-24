@@ -699,6 +699,17 @@ main(int argc, char **argv)
 			AnnIndexConfig.predicate_cache = (uint32_t) strtoul(value, NULL, 10);
 		else if (strcmp(argv[i], "--predicate-cache-mb") == 0)
 			AnnIndexConfig.predicate_cache_bytes = (uint64_t) strtoull(value, NULL, 10) << 20;
+		else if (strcmp(argv[i], "--rerank-host") == 0)
+		{
+			if (strcmp(value, "on") && strcmp(value, "off"))
+			{
+				fprintf(stderr, "--rerank-host takes on or off\n");
+				return 2;
+			}
+			AnnIndexConfig.rerank_host = strcmp(value, "on") == 0;
+		}
+		else if (strcmp(argv[i], "--rerank-cache-mb") == 0)
+			AnnIndexConfig.rerank_cache_bytes = (uint64_t) strtoull(value, NULL, 10) << 20;
 		else if (strcmp(argv[i], "--predicate-device-mb") == 0)
 			AnnIndexConfig.predicate_device_bytes = (uint64_t) strtoull(value, NULL, 10) << 20;
 		else if (strcmp(argv[i], "--prewarm") == 0)
@@ -882,6 +893,7 @@ usage:
 			"  [--filtered-algo auto|single|multi] [--filtered-width N] [--filtered-iterations N] [--filtered-expansion score-all|two-hop] [--filtered-samplings N] [--filtered-block-size N] [--mixed-graph on|off] [--cagra-pitch on|off] [--widen-short on|off] [--device-bitmaps on|off] [--memory-pool PERCENT] [--device-allocator async|plain] [--bitset-gather-limit ROWS] [--group-gather-limit ROWS]\n"
 			"  [--cost-profile PATH] [--filtered-slack N] [--matrix-gather on|off] [--gpu-rerank on|off] [--matrix-max-mb N]\n"
 			"  [--fp16-exact on|off] [--matrix-prune on|off] [--mixed-groups on|off] [--gpu-predicates on|off] [--device-transient on|always|off]\n"
+			"  [--rerank-host on|off] [--rerank-cache-mb MB]\n"
 			"  [--filtered-search graph|scan]\n"
 			"  [--canonical-predicates on|off] [--predicate-admission all|second] [--residual-masks on|off] [--quantized-scan on|off] [--quant-slack N]\n"
 			"  [--rescore fp32|off|fp16|fp8-gpu] [--slack-ratio PERCENT] [--shard-topk-share PERCENT] [--scan-skip-tail on|off] [--rerank-prefetch N] [--predicate-cache N]\n"

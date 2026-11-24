@@ -430,19 +430,43 @@ ShardHits changes made during the move (cuVS' neighbours already sorted by
 distance: ties slid into key order instead of a sort; their keys gathered on
 the GPU) are kept: without them two-hop's `c1` queued at 140k.
 
-## Next: FP16 rows in host memory for the FP8 scan's re-score
+## FP16 rows in host memory for the FP8 scan's re-score
 
 The FP8 scan reads its FP16 rows only to re-score the candidates it keeps, k
-plus the slack a query, yet a scan-only index holds every row on the GPU: 6.7
-GB a copy of a 46.5M-row, 65-dimension index, about 60 GB of each GPU for the
-37 indexes at two copies. That is what ran out of room when graphs, FP16 rows
-and codes shared a GPU, and what a third copy would need. Kept in pinned host
-memory instead, a re-score would bring in only its candidates' rows: about
-1,300 rows of 130 bytes, 170 KB a search, or 4-5 GB/s a GPU at the scan's 35k
-requests/s, far below PCIe's bandwidth, in batches per call; an LRU of rows
-in device memory, evicting as free memory runs low, would keep rows that
-queries share. The change is in the worker's scan (re-scoring from
-host-resident rows, batched) and a load option; not started.
+plus the slack a query, yet a scan-only index held every row on each GPU: 6.7
+GB a copy of a 46.5M-row, 65-dimension index, about 62 GB of each GPU for the
+37 indexes at two copies. `--rerank-host on` keeps those rows in pinned,
+mapped host memory instead (one copy a shard for both of its GPU copies, 248
+GB for the 37 indexes), so the GPUs hold only the FP8 codes of every field;
+`--rerank-cache-mb` gives each GPU a budget of device memory for copies of its
+most re-scored shards' rows, an LRU over reranks counted each second.
+
+`c1` on the scan-only tree, highest rate with p99 under 30 ms:
+
+| FP16 re-score rows | `c1` | Copies brought in / dropped |
+| --- | ---: | --- |
+| On each GPU (default) | 65k-75k | - |
+| Host memory only | about 27k (50k offered: p99 16-18 s) | - |
+| Host, 40 GB a GPU of cache | 35k, p99 25 ms (50k: 34.6 ms) | 72 / 8 |
+| Host, 64 GB a GPU of cache (all of a GPU's shards) | 75k, p99 29.8 ms | 74 / 0 |
+
+- **Host rows alone are too slow under load.** At 10k requests/s a batch's
+  re-score took 133 µs against 34 µs from device rows; at saturation the
+  GPUs read about 30 GB/s of scattered 144-byte rows from host memory, and
+  copying each batch's candidate rows to the GPU in one pass before
+  re-scoring (all reads in flight together) did not change the ceiling, so
+  the limit is the host side (memory and PCIe for small scattered reads),
+  not the kernel. IOMMU is in pass-through mode here.
+- **The cache is what makes it work.** With room for every shard a GPU
+  serves, it matches device rows; with less, the GPU keeps the FP8 codes of
+  every field and spends its budget on the FP16 rows of the busiest. On this
+  load every field gets the same share of searches, the worst case for a
+  partial cache: each search of an uncached field pays the host re-score, so
+  40 GB (5 of a GPU's 9-10 shards) holds 35k. Skewed traffic, where a few
+  fields take most searches, is what a partial budget is for.
+- **Hysteresis.** Under even traffic shards of equal heat traded places (39
+  drops at 40 GB with a cached shard counted a quarter hotter); cached shards
+  now count double, and the same run dropped 8.
 
 ## Not covered
 

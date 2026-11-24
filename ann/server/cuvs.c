@@ -593,6 +593,13 @@ typedef struct AnnCuvsShard
 	int64_t		rerankStride;
 	size_t		rerankBytes;	/* owned bytes, zero when reusing FP32 CAGRA
 								 * rows */
+	const void *rerankHost;		/* --rerank-host: the shard's FP16 rows in
+								 * pinned host memory, shared by its copies;
+								 * rerank is these or rerankCached */
+	void	   *rerankCached;	/* --rerank-cache-mb: their device copy */
+	size_t		rerankHostBytes;
+	atomic_uint_fast64_t rerankUses;	/* reranks since the cache's last pass */
+	uint64_t	rerankHeat;		/* decayed reranks, for the cache */
 	AnnBlackwellShard quant;	/* quantized rows for Blackwell scans */
 	AnnBlackwellShard rescore;	/* FP8 rows for --rescore fp8-gpu */
 } AnnCuvsShard;
@@ -655,6 +662,8 @@ typedef struct AnnCuvsIndex
 	 */
 	uint32_t   *predicatePostings[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
 	const uint64_t *predicatePostingsFrom[ANN_CUVS_MAX_DEVICES][ANN_INDEX_MAX_ATTRIBUTES];
+	uint16_t  **hostRerank;		/* --rerank-host: FP16 rows per manifest
+								 * shard, pinned and mapped */
 } AnnCuvsIndex;
 
 /* Keep the full lane ordinal: wrapping before modulo copies biases 3/6/7 GPUs. */
@@ -793,7 +802,8 @@ ReplicaStats(const AnnIndexFile *file, char *data, size_t capacity)
 			const AnnCuvsShard *shard = &state->shards[(size_t) c * state->nshards + s];
 
 			deviceMask |= UINT32_C(1) << shard->device;
-			rerankBytes += shard->rerankBytes;
+			rerankBytes += shard->rerankBytes +
+				(__atomic_load_n(&shard->rerankCached, __ATOMIC_RELAXED) ? shard->rerankHostBytes : 0);
 			rerankReady &= shard->rerank != NULL;
 		}
 
@@ -1064,6 +1074,322 @@ LaneDevice(int device, size_t queryBytes, size_t results, size_t bitsetWords)
 	return lane;
 }
 
+/*
+ * --rerank-host: scan-only shards keep the FP16 rows their candidates are
+ * re-scored from in pinned, mapped host memory, one copy a manifest shard
+ * for all its device copies, and the rerank kernels read the candidates'
+ * rows from it over PCIe: a scan reads FP8 codes for every listed row but
+ * FP16 rows only for its k plus slack candidates. --rerank-cache-mb gives
+ * each GPU that much device memory for device copies of the most used
+ * shards' rows (RerankCachePass), so that the hottest indexes re-score from
+ * HBM and the rest from the host.
+ */
+typedef struct HalfRowsJob
+{
+	const float *from;
+	uint16_t   *to;
+	uint64_t	first;
+	uint64_t	last;
+	uint32_t	dims;
+	uint32_t	pad;
+} HalfRowsJob;
+
+static void *
+HalfRows(void *argument)
+{
+	HalfRowsJob *job = argument;
+
+	for (uint64_t r = job->first; r < job->last; r++)
+	{
+		for (uint32_t d = 0; d < job->dims; d++)
+			job->to[r * job->pad + d] = AnnIndexHalf(job->from[r * job->dims + d]);
+		for (uint32_t d = job->dims; d < job->pad; d++)
+			job->to[r * job->pad + d] = 0;
+	}
+	return NULL;
+}
+
+#define ANN_HALF_ROWS_THREADS 16
+
+/* A manifest shard's FP16 rows, padded to 8 dimensions, in pinned mapped host memory. */
+static uint16_t *
+HostRerankRows(const AnnIndexFile *file, uint32_t shard, size_t *bytes)
+{
+	uint64_t	rows = file->shards[shard].rows;
+	uint32_t	dims = file->dimensions;
+	uint32_t	pad = (dims + 7) & ~7u;
+	uint16_t   *to = NULL;
+	pthread_t	threads[ANN_HALF_ROWS_THREADS];
+	HalfRowsJob jobs[ANN_HALF_ROWS_THREADS];
+	int			started[ANN_HALF_ROWS_THREADS] = {0};
+
+	*bytes = (size_t) rows * pad * sizeof(uint16_t);
+	if (*bytes == 0 ||
+		cudaHostAlloc((void **) &to, *bytes, cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess)
+	{
+		(void) cudaGetLastError();
+		return NULL;
+	}
+	for (int t = 0; t < ANN_HALF_ROWS_THREADS; t++)
+	{
+		jobs[t] = (HalfRowsJob)
+		{
+			file->vectors + file->shards[shard].first * dims, to, rows * t / ANN_HALF_ROWS_THREADS,
+				rows * (t + 1) / ANN_HALF_ROWS_THREADS, dims, pad
+		};
+		started[t] = pthread_create(&threads[t], NULL, HalfRows, &jobs[t]) == 0;
+		if (!started[t])
+			HalfRows(&jobs[t]);
+	}
+	for (int t = 0; t < ANN_HALF_ROWS_THREADS; t++)
+		if (started[t])
+			(void) pthread_join(threads[t], NULL);
+	return to;
+}
+
+/* The shards whose rows the cache may hold, and device copies waiting to be freed. */
+typedef struct RerankRetired
+{
+	void	   *rows;
+	int			device;
+	uint64_t	due;			/* the pass that frees it */
+} RerankRetired;
+
+static pthread_mutex_t rerankCacheMutex = PTHREAD_MUTEX_INITIALIZER;
+static AnnCuvsShard **rerankCacheShards;
+static size_t rerankCacheCount;
+static size_t rerankCacheCapacity;
+static RerankRetired *rerankRetired;
+static size_t rerankRetiredCount;
+static size_t rerankRetiredCapacity;
+static uint64_t rerankCacheTick;
+static int	rerankCacheStarted;
+
+#define ANN_RERANK_CACHE_PERIOD_MS 1000
+#define ANN_RERANK_RETIRE_PASSES 5	/* a demoted copy outlives any search that
+									 * could still read it */
+#define ANN_RERANK_FREE_MARGIN ((size_t) 2 << 30)	/* device memory left free
+													 * by a promotion */
+
+static int
+RerankHeatOrder(const void *a, const void *b)
+{
+	const AnnCuvsShard *x = *(AnnCuvsShard *const *) a;
+	const AnnCuvsShard *y = *(AnnCuvsShard *const *) b;
+
+	/*
+	 * Cached shards count double: under even traffic shards of equal heat
+	 * would otherwise trade places, each trade a copy of their rows.
+	 */
+	uint64_t	hx = x->rerankHeat * (x->rerankCached ? 2 : 1);
+	uint64_t	hy = y->rerankHeat * (y->rerankCached ? 2 : 1);
+
+	return hx < hy ? 1 : hx > hy ? -1 : 0;
+}
+
+/*
+ * One pass of the cache, under rerankCacheMutex: each device's registered
+ * shards ranked by decayed reranks; the hottest that fit the device's budget
+ * get a device copy of their rows (one new copy a device a pass), the ones
+ * they displace read the host rows again, and their device copies are freed
+ * some passes later.
+ */
+static void
+RerankCachePass(void)
+{
+	AnnCuvsShard **order = rerankCacheCount ? malloc(rerankCacheCount * sizeof(*order)) : NULL;
+
+	rerankCacheTick++;
+	for (size_t i = 0; i < rerankCacheCount; i++)
+	{
+		AnnCuvsShard *shard = rerankCacheShards[i];
+
+		shard->rerankHeat = shard->rerankHeat / 2 +
+			atomic_exchange_explicit(&shard->rerankUses, 0, memory_order_relaxed);
+	}
+	for (int d = 0; order && d < ANN_CUVS_MAX_DEVICES; d++)
+	{
+		size_t		n = 0;
+		size_t		used = 0;
+		int			promoted = 0;
+
+		for (size_t i = 0; i < rerankCacheCount; i++)
+			if (rerankCacheShards[i]->device == d)
+				order[n++] = rerankCacheShards[i];
+		if (n == 0)
+			continue;
+		qsort(order, n, sizeof(*order), RerankHeatOrder);
+		for (size_t i = 0; i < n; i++)
+		{
+			AnnCuvsShard *shard = order[i];
+
+			/*
+			 * A cached shard stays until hotter ones need its room; an idle
+			 * one is not brought in.
+			 */
+			int			keep = (shard->rerankHeat > 0 || shard->rerankCached) &&
+				used + shard->rerankHostBytes <= AnnIndexConfig.rerank_cache_bytes;
+
+			if (keep && shard->rerankCached == NULL && !promoted)
+			{
+				void	   *copy = NULL;
+				size_t		freeBytes = 0,
+							totalBytes = 0;
+				cudaStream_t stream = NULL;
+
+				promoted = 1;
+				if (cudaSetDevice(d) == cudaSuccess &&
+					cudaMemGetInfo(&freeBytes, &totalBytes) == cudaSuccess &&
+					freeBytes > shard->rerankHostBytes + ANN_RERANK_FREE_MARGIN &&
+					cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking) == cudaSuccess &&
+					cudaMalloc(&copy, shard->rerankHostBytes) == cudaSuccess &&
+					cudaMemcpyAsync(copy, shard->rerankHost, shard->rerankHostBytes, cudaMemcpyHostToDevice,
+									stream) == cudaSuccess &&
+					cudaStreamSynchronize(stream) == cudaSuccess)
+				{
+					shard->rerankCached = copy;
+					__atomic_store_n(&shard->rerank, (const void *) copy, __ATOMIC_RELEASE);
+					fprintf(stderr, "cuVS: rerank cache: device %d holds %.2f GB of FP16 rows (heat %llu)\n", d,
+							shard->rerankHostBytes / 1e9, (unsigned long long) shard->rerankHeat);
+				}
+				else
+				{
+					if (copy)
+						(void) cudaFree(copy);
+					(void) cudaGetLastError();
+				}
+				if (stream)
+					(void) cudaStreamDestroy(stream);
+			}
+			else if (!keep && shard->rerankCached)
+			{
+				__atomic_store_n(&shard->rerank, shard->rerankHost, __ATOMIC_RELEASE);
+				if (rerankRetiredCount == rerankRetiredCapacity)
+				{
+					size_t		capacity = rerankRetiredCapacity ? rerankRetiredCapacity * 2 : 16;
+					RerankRetired *grown = realloc(rerankRetired, capacity * sizeof(*grown));
+
+					if (grown == NULL)
+					{
+						/* Keep the copy rather than free it under a search. */
+						__atomic_store_n(&shard->rerank, (const void *) shard->rerankCached, __ATOMIC_RELEASE);
+						continue;
+					}
+					rerankRetired = grown;
+					rerankRetiredCapacity = capacity;
+				}
+				rerankRetired[rerankRetiredCount++] = (RerankRetired)
+				{
+					shard->rerankCached, d, rerankCacheTick + ANN_RERANK_RETIRE_PASSES
+				};
+				shard->rerankCached = NULL;
+				fprintf(stderr, "cuVS: rerank cache: device %d drops %.2f GB of FP16 rows (heat %llu)\n", d,
+						shard->rerankHostBytes / 1e9, (unsigned long long) shard->rerankHeat);
+			}
+			if (shard->rerankCached)
+				used += shard->rerankHostBytes;
+		}
+	}
+	free(order);
+	for (size_t i = 0; i < rerankRetiredCount;)
+		if (rerankRetired[i].due <= rerankCacheTick)
+		{
+			(void) cudaSetDevice(rerankRetired[i].device);
+			(void) cudaFree(rerankRetired[i].rows);
+			rerankRetired[i] = rerankRetired[--rerankRetiredCount];
+		}
+		else
+			i++;
+}
+
+static void *
+RerankCacheMain(void *argument)
+{
+	(void) argument;
+	for (;;)
+	{
+		struct timespec pause = {ANN_RERANK_CACHE_PERIOD_MS / 1000, (ANN_RERANK_CACHE_PERIOD_MS % 1000) * 1000000L};
+
+		(void) nanosleep(&pause, NULL);
+		(void) pthread_mutex_lock(&rerankCacheMutex);
+		RerankCachePass();
+		(void) pthread_mutex_unlock(&rerankCacheMutex);
+	}
+	return NULL;
+}
+
+/* Lets the cache hold a device copy of shard's host rows; starts the cache's thread once. */
+static void
+RerankCacheAdd(AnnCuvsShard *shard)
+{
+	if (AnnIndexConfig.rerank_cache_bytes == 0)
+		return;
+	(void) pthread_mutex_lock(&rerankCacheMutex);
+	if (rerankCacheCount == rerankCacheCapacity)
+	{
+		size_t		capacity = rerankCacheCapacity ? rerankCacheCapacity * 2 : 64;
+		AnnCuvsShard **grown = realloc(rerankCacheShards, capacity * sizeof(*grown));
+
+		if (grown == NULL)
+		{
+			(void) pthread_mutex_unlock(&rerankCacheMutex);
+			return;
+		}
+		rerankCacheShards = grown;
+		rerankCacheCapacity = capacity;
+	}
+	rerankCacheShards[rerankCacheCount++] = shard;
+	if (!rerankCacheStarted)
+	{
+		pthread_t	thread;
+
+		if (pthread_create(&thread, NULL, RerankCacheMain, NULL) == 0)
+		{
+			(void) pthread_detach(thread);
+			rerankCacheStarted = 1;
+		}
+	}
+	(void) pthread_mutex_unlock(&rerankCacheMutex);
+}
+
+/* Takes an index's shards out of the cache and frees their device copies; no search runs on them. */
+static void
+RerankCacheRemove(AnnCuvsIndex *state)
+{
+	(void) pthread_mutex_lock(&rerankCacheMutex);
+	for (size_t i = 0; i < rerankCacheCount;)
+		if (rerankCacheShards[i] >= state->shards &&
+			rerankCacheShards[i] < state->shards + (size_t) state->nshards * state->copies)
+		{
+			AnnCuvsShard *shard = rerankCacheShards[i];
+
+			if (shard->rerankCached)
+			{
+				(void) cudaSetDevice(shard->device);
+				(void) cudaFree(shard->rerankCached);
+				shard->rerankCached = NULL;
+			}
+			rerankCacheShards[i] = rerankCacheShards[--rerankCacheCount];
+		}
+		else
+			i++;
+	(void) pthread_mutex_unlock(&rerankCacheMutex);
+}
+
+/* --rerank-host: a lane's staged candidate rows and their indexes, per device. */
+static _Thread_local void *laneStaged[ANN_CUVS_MAX_DEVICES];
+static _Thread_local size_t laneStagedCap[ANN_CUVS_MAX_DEVICES];
+static _Thread_local void *laneStagedIdent[ANN_CUVS_MAX_DEVICES];
+static _Thread_local size_t laneStagedIdentCap[ANN_CUVS_MAX_DEVICES];
+
+/* A rerank of shard's rows, counted for the cache. */
+static inline void
+RerankUsed(const AnnCuvsShard *shard)
+{
+	if (shard->rerankHost)
+		(void) atomic_fetch_add_explicit(&((AnnCuvsShard *) shard)->rerankUses, 1, memory_order_relaxed);
+}
+
 typedef struct LoadArgs
 {
 	AnnIndexFile *file;
@@ -1234,6 +1560,19 @@ keys:
 			shard->rerankHalf = 1;
 			shard->rerankStride = shard->stride;
 		}
+		else if (!AnnIndexConfig.fp16_exact && args->state->hostRerank &&
+				 args->state->hostRerank[args->shard])
+		{
+			/* --rerank-host: the manifest shard's pinned FP16 rows, mapped. */
+			uint32_t	pad = (args->file->dimensions + 7) & ~7u;
+
+			shard->rerankHost = args->state->hostRerank[args->shard];
+			shard->rerankHostBytes = (size_t) args->file->shards[args->shard].rows * pad * sizeof(uint16_t);
+			shard->rerank = shard->rerankHost;
+			shard->rerankHalf = 1;
+			shard->rerankStride = pad;
+			RerankCacheAdd(shard);
+		}
 		else if (!AnnIndexConfig.fp16_exact)
 		{
 			/*
@@ -1310,6 +1649,8 @@ DestroyIndexState(AnnCuvsIndex *state)
 {
 	if (state == NULL)
 		return;
+	if (state->shards)
+		RerankCacheRemove(state);
 	for (uint32_t s = 0; state->shards && s < state->nshards * state->copies; s++)
 	{
 		AnnCuvsShard *shard = &state->shards[s];
@@ -1346,6 +1687,10 @@ DestroyIndexState(AnnCuvsIndex *state)
 				(void) cudaSetDevice(d);
 				(void) cudaFree(state->predicatePostings[d][a]);
 			}
+	for (uint32_t s = 0; state->hostRerank && s < state->nshards; s++)
+		if (state->hostRerank[s])
+			(void) cudaFreeHost(state->hostRerank[s]);
+	free(state->hostRerank);
 	free(state->shards);
 	free(state);
 }
@@ -3082,6 +3427,23 @@ LoadIndex(const char *name, const char *directory)
 	 */
 	if (AnnIndexConfig.replicate > 1 && copies < (uint32_t) devices)
 		base = atomic_fetch_add(&nextPlacement, 1) * total % (uint32_t) devices;
+	if (AnnIndexConfig.rerank_host && AnnIndexConfig.gpu_rerank && !AnnIndexConfig.fp16_exact &&
+		state->scanOnly && (state->hostRerank = calloc(file->nshards, sizeof(*state->hostRerank))) != NULL)
+	{
+		size_t		hostBytes = 0;
+
+		for (uint32_t shard = 0; shard < file->nshards; shard++)
+		{
+			size_t		bytes = 0;
+
+			state->hostRerank[shard] = HostRerankRows(file, shard, &bytes);
+			if (state->hostRerank[shard])
+				hostBytes += bytes;
+			else
+				fprintf(stderr, "cuVS: %s shard %u: no pinned FP16 rerank rows; a device copy instead\n", name, shard);
+		}
+		fprintf(stderr, "cuVS: %s: %.1f MB of FP16 rerank rows in pinned host memory\n", name, hostBytes / 1e6);
+	}
 	for (uint32_t s = 0; s < total; s++)
 	{
 		uint32_t	copy = s / file->nshards;
@@ -4496,7 +4858,21 @@ static const char RerankSource[] =
 "  { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
 "extern \"C\" __global__ void rerank_h_u32(const unsigned short *v, long long st, const unsigned *r, unsigned ne,\n"
 "  unsigned nr, unsigned *p, unsigned top, unsigned nq, const float *q, int d, float *o)\n"
-"  { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n";
+"  { rerank(v, st, r, ne, nr, p, top, nq, q, d, o); }\n"
+"extern \"C\" __global__ void stage_rows_h(const unsigned short *v, long long st, const unsigned *r, unsigned ne,\n"
+"  unsigned nr, long long *p, unsigned total, unsigned short *staged, long long *ident)\n"
+"{\n"
+"  unsigned i = (blockIdx.x * blockDim.x + threadIdx.x) >> 4; unsigned l = threadIdx.x & 15;\n"
+"  if (i >= total) return;\n"
+"  long long pp = p[i];\n"
+"  unsigned row = pp < 0 || (unsigned long long) pp >= ne ? 0xffffffffu : r ? r[pp] : (unsigned) pp;\n"
+"  bool ok = row < nr;\n"
+"  unsigned chunks = (unsigned) (st / 8);\n"
+"  if (ok) { const uint4 *from = (const uint4 *) (v + (long long) row * st); uint4 *to = (uint4 *) (staged + (long long) i * st);\n"
+"    for (unsigned c = l; c < chunks; c += 16) to[c] = from[c]; }\n"
+"  __syncwarp(0xffffu << (threadIdx.x & 16));\n"
+"  if (!l) { p[i] = ok ? (long long) row : -1; ident[i] = ok ? (long long) i : -1; }\n"
+"}\n";
 
 #define ANN_GATHER_BLOCK 256
 #define ANN_GATHER_SLACK 32		/* extra FP16 candidates re-scored in FP32 */
@@ -4534,6 +4910,8 @@ typedef struct GatherModule
 	CUfunction	rerank32;
 	CUfunction	rerankHalf64;	/* the same from FP16 rows */
 	CUfunction	rerankHalf32;
+	CUfunction	stageRowsHalf;	/* --rerank-host: candidates' rows to the
+								 * device */
 	CUfunction	pruneSample;
 	CUfunction	pruneFill;
 	CUfunction	pruneCompact;
@@ -4640,6 +5018,7 @@ GatherKernels(int device)
 		cuModuleGetFunction(&module->rerank64, module->module, "rerank_i64") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->rerank32, module->module, "rerank_u32") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->rerankHalf64, module->module, "rerank_h_i64") != CUDA_SUCCESS ||
+		cuModuleGetFunction(&module->stageRowsHalf, module->module, "stage_rows_h") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->rerankHalf32, module->module, "rerank_h_u32") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneSample, module->module, "matrix_sample") != CUDA_SUCCESS ||
 		cuModuleGetFunction(&module->pruneFill, module->module, "matrix_fill") != CUDA_SUCCESS ||
@@ -4757,14 +5136,67 @@ RerankDevice(const AnnCuvsShard *shard, uint32_t dims, const uint32_t *rows,
 	int			dimensions = (int) dims;
 	long long	stride = shard->rerankStride;
 	unsigned	blocks = (unsigned) (((uint64_t) nq * top * 32 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
-	void	   *args[] = {(void *) &shard->rerank, &stride, (void *) &rows, &eligible, &nrows,
+	const void *data = __atomic_load_n(&shard->rerank, __ATOMIC_ACQUIRE);
+	void	   *args[] = {(void *) &data, &stride, (void *) &rows, &eligible, &nrows,
 	&positions, &top, &nq, (void *) &queries, &dimensions, &out};
 
+	RerankUsed(shard);
+	if (module && wide && shard->rerankHost && data == shard->rerankHost && shard->rerankHalf &&
+		stride % 8 == 0 && ((uintptr_t) queries) % 16 == 0)
+	{
+		/*
+		 * --rerank-host: every candidate's row comes to the device in one
+		 * pass, its reads all in flight together, and the rerank reads the
+		 * copies; positions become shard rows as the rerank would make them.
+		 */
+		int			device = shard->device;
+		uint32_t	total = nq * top;
+		unsigned	stageBlocks = (unsigned) (((uint64_t) total * 16 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
+		unsigned	blocks8 = (unsigned) (((uint64_t) total * 8 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
+		const void *stagedData;
+		void	   *stagedIdent;
+		const uint32_t *noRows = NULL;
+		void	   *stageArgs[5 + 4];
+		void	   *rerankArgs[11];
+
+		if (!GrowDevice(&laneStaged[device], &laneStagedCap[device], (size_t) total * stride, sizeof(uint16_t),
+						0, stream) ||
+			!GrowDevice(&laneStagedIdent[device], &laneStagedIdentCap[device], total, sizeof(int64_t), 0, stream))
+			return 0;
+		stagedData = laneStaged[device];
+		stagedIdent = laneStagedIdent[device];
+		stageArgs[0] = (void *) &data;
+		stageArgs[1] = &stride;
+		stageArgs[2] = (void *) &rows;
+		stageArgs[3] = &eligible;
+		stageArgs[4] = &nrows;
+		stageArgs[5] = &positions;
+		stageArgs[6] = &total;
+		stageArgs[7] = (void *) &stagedData;
+		stageArgs[8] = &stagedIdent;
+		rerankArgs[0] = (void *) &stagedData;
+		rerankArgs[1] = &stride;
+		rerankArgs[2] = (void *) &noRows;
+		rerankArgs[3] = &total;
+		rerankArgs[4] = &total;
+		rerankArgs[5] = &stagedIdent;
+		rerankArgs[6] = &top;
+		rerankArgs[7] = &nq;
+		rerankArgs[8] = (void *) &queries;
+		rerankArgs[9] = &dimensions;
+		rerankArgs[10] = &out;
+		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
+			cuLaunchKernel(module->stageRowsHalf, stageBlocks, 1, 1, ANN_GATHER_BLOCK, 1, 1, 0, (CUstream) stream,
+						   stageArgs, NULL) == CUDA_SUCCESS &&
+			cuLaunchKernel(stride >= (long long) ((dims + 7) & ~7u) ? module->postRerankHalf : module->rerankHalf64,
+						   stride >= (long long) ((dims + 7) & ~7u) ? blocks8 : blocks, 1, 1,
+						   ANN_GATHER_BLOCK, 1, 1, 0, (CUstream) stream, rerankArgs, NULL) == CUDA_SUCCESS;
+	}
 	if (module && wide)
 	{
 		size_t		element = shard->rerankHalf ? 2 : 4;
 
-		if (stride >= (long long) ((dims + 7) & ~7u) && stride % 8 == 0 && ((uintptr_t) shard->rerank) % 16 == 0 &&
+		if (stride >= (long long) ((dims + 7) & ~7u) && stride % 8 == 0 && ((uintptr_t) data) % 16 == 0 &&
 			((uintptr_t) queries) % 16 == 0 && element * 8 >= 16)
 		{
 			unsigned	blocks8 = (unsigned) (((uint64_t) nq * top * 8 + ANN_GATHER_BLOCK - 1) / ANN_GATHER_BLOCK);
@@ -6196,6 +6628,9 @@ RerankFinal(const AnnCuvsShard *shard, AnnCuvsDevice *lane, uint32_t dims, const
 	unsigned	n = candidates,
 				k = outk;
 
+	/* Host-backed rows rerank through RerankDevice's staged copies. */
+	if (shard->rerankHost && __atomic_load_n(&shard->rerank, __ATOMIC_ACQUIRE) == shard->rerankHost)
+		return -1;
 	if (candidates > 1024 || outk > candidates || stride < (long long) ((dims + 7) & ~7u) ||
 		stride % 8 != 0 || ((uintptr_t) shard->rerank) % 16 != 0 || ((uintptr_t) lane->queries) % 16 != 0 ||
 		(module = GatherKernels(shard->device)) == NULL)
@@ -6204,6 +6639,7 @@ RerankFinal(const AnnCuvsShard *shard, AnnCuvsDevice *lane, uint32_t dims, const
 		void	   *args[] = {(void *) &shard->rerank, &stride, (void *) &rows, &eligible, &nrows,
 		&lane->matrixIndices, &n, &k, &lane->queries, &dimensions, &lane->matrixValues, &lane->matrixRows};
 
+		RerankUsed(shard);
 		return cuCtxSetCurrent(module->context) == CUDA_SUCCESS &&
 			cuLaunchKernel(shard->rerankHalf ? module->postFusedH : module->postFusedF, q, 1, 1, 1024, 1, 1, 0,
 						   (CUstream) stream, args, NULL) == CUDA_SUCCESS;

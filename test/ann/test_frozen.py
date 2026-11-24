@@ -1709,6 +1709,31 @@ class FrozenCuvsTests(unittest.TestCase):
                 self.check_scan_route(['--scan-only'], ((500, ''), (1500, 'WHERE tenant < 30')),
                                       worker_args=('--rescore', mode, '--slack-ratio', '50'), floor=floor)
 
+    def test_rerank_host(self):
+        """Scan candidates re-scored from FP16 rows kept in host memory, staged to the GPU, alone and with a cache."""
+        # FP8 scan-only shards searched by the matrix gather, whose candidates are re-scored on the GPU.
+        def host_only(fetch):
+            # No device copy of the rows: every replica re-scores from host memory.
+            stats = fetch()
+            self.assertGreater(stats['gpu_rerank_candidates'], 0, stats)
+            self.assertTrue(all(r['rerank_ready'] and r['rerank_bytes'] == 0 for r in stats['replicas']), stats)
+
+        def cached(fetch):
+            # The cache's pass (each second) brings searched shards' rows to their GPUs.
+            time.sleep(3)
+            stats = fetch()
+            self.assertGreater(stats['gpu_rerank_candidates'], 0, stats)
+            self.assertTrue(any(r['rerank_bytes'] > 0 for r in stats['replicas']), stats)
+
+        gather = ('--matrix-gather', 'on', '--gather-limit', '4000000', '--bitset-gather-limit', '4000000',
+                  '--group-gather-limit', '4000000', '--slack-ratio', '300')
+        for extra, check in (((), host_only), (('--rerank-cache-mb', '1024'), cached)):
+            with self.subTest(cache=bool(extra)):
+                self.check_scan_route(['--scan-only', '--quantize', 'fp8'],
+                                      ((10, 'WHERE tenant < 3'), (300, 'WHERE tenant < 3'), (500, 'WHERE tenant < 30')),
+                                      worker_args=('--gpu-rerank', 'on', '--rescore', 'fp16', '--rerank-host', 'on',
+                                                   *gather, *extra), floor=0.97, check_stats=check, route=None)
+
     def check_concurrent_large_k(self, db, table, server, floor=0.99):
         """Concurrent k = 500 searches over one filter share grouped tensor-core passes and stay exact."""
         import psycopg
@@ -1756,7 +1781,8 @@ class FrozenCuvsTests(unittest.TestCase):
         self.assertNotIn('failed', log, log[-3000:])
         self.assertNotIn('job by job', log, log[-3000:])
 
-    def check_scan_route(self, build_args, cases, worker_args=(), floor=0.99):
+    def check_scan_route(self, build_args, cases, worker_args=(), floor=0.99, check_stats=None,
+                         route='Worker Route: exact scan'):
         import psycopg
         from psycopg import sql
 
@@ -1791,7 +1817,8 @@ class FrozenCuvsTests(unittest.TestCase):
                 statement = f"SELECT id FROM {table} {filtered} ORDER BY emb <-> %s::vector LIMIT {k}"
                 plan = '\n'.join(row[0] for row in db.execute('EXPLAIN (ANALYZE, COSTS OFF) ' + statement,
                                                               (query,)).fetchall())
-                self.assertIn('Worker Route: exact scan', plan, plan)
+                if route:
+                    self.assertIn(route, plan, plan)
                 self.assertIn('Local Evaluations: 0', plan, plan)
                 found = [row[0] for row in db.execute(statement, (query,)).fetchall()]
                 db.execute('SET ann.enable_frozen_search = off')
@@ -1802,7 +1829,16 @@ class FrozenCuvsTests(unittest.TestCase):
                 self.assertEqual(len(found), k)
                 overlap = len(set(found) & set(exact)) / k
                 self.assertGreaterEqual(overlap, floor, f'k={k} {filtered}: overlap {overlap}')
-            if '--scan-only' in build_args:
+            if check_stats:
+                def fetch():
+                    with server.connect() as connection:
+                        connection.sendall(frame(31, 1, table.encode()))
+                        _, _, status, data = receive(connection)
+                    self.assertEqual(status, 0)
+                    return json.loads(data)
+
+                check_stats(fetch)
+            if '--scan-only' in build_args and route:
                 self.check_concurrent_large_k(db, table, server, floor)
         except BaseException:
             server.process.terminate()
