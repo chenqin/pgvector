@@ -38,6 +38,13 @@
  *   linkedb  as bitsetb, through the linked sample_filter
  *   nofilter BATCH queries per call with no filter at all (MULTI_CTA, the same settings); use with
  *            --random-pass 1 so that recall is measured against every row
+ *   ivfpqb   control: an IVF-PQ index over the same rows (built from vectors.f32, or loaded from
+ *            --ivf-index), searched with cuVS' bitset filter in batches that share one filter, as
+ *            stockb; --ivf-probes lists a query, k * --ivf-refine candidates re-scored exactly
+ *            from the FP32 rows on the device (cuvs::neighbors::refine)
+ *   ivfpq1   the same, one query per call with its own filter; --ivf-lut 32|16|8 and --ivf-internal 32|16 set the
+ *            precision of the search's lookup tables and internal distances (default 32: cuVS' defaults);
+ *            --ivf-refine-host re-scores on the host (cuVS' device refine only takes k <= 256)
  *
  * With a build mode, a check pass first builds every case's bitset on the GPU, compares it with the
  * host interpreter's bit for bit and reports the build time.
@@ -64,12 +71,22 @@
 #define PROBE_HAS_FP8_SCAN 1  // a cuVS with the FP8 filtered scan (the fork's scan pull request)
 #endif
 #include <cuvs/neighbors/common.hpp>
+#include <cuvs/neighbors/ivf_pq.hpp>
+#include <cuvs/neighbors/refine.hpp>
 #include <raft/core/bitset.hpp>
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/device_resources.hpp>
+#include <raft/core/resource/device_memory_resource.hpp>
+#include <rmm/mr/cuda_memory_resource.hpp>
+#include <rmm/mr/per_device_resource.hpp>
+#include <rmm/mr/pool_memory_resource.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
 
 #include <algorithm>
+#include <array>
+#include <set>
+#include <unordered_map>
+#include <fstream>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -415,6 +432,174 @@ static int column_slot(void* arg, const char* name)
   return c->manifest->multivalued.count(name) ? (slot | ANN_UDF_MULTI) : slot;
 }
 
+/*
+ * --analyze-h: structure of H, the graph PASSING_TWO_HOP searches, for each case's own filter (no search).
+ * H's vertices are the passing rows P; u -> x when x passes and x is a graph neighbour of u, or a graph
+ * neighbour of a filtered-out graph neighbour of u. Per case, one JSON line:
+ *   s          pass rate
+ *   p_in       fraction of the graph edges of sampled passing rows that land in P (homophily)
+ *   deg1       mean number of passing graph neighbours of a passing row
+ *   degH       mean out-degree in H; degH0 = fraction of passing rows with none; degH_med = median
+ *   b2         mean number of distinct rows within two graph hops (E|B2|, a property of the graph)
+ *   dead_H / dead_P / dead_G: among the 100 passing rows nearest to the query after its 10 nearest, the
+ *              fraction with no closer out-neighbour in H, in the one-hop graph on P, and in the graph
+ *   comp_*     (cases 0, 64, 128, ...): weak components of H, the largest one's share of P, rows in
+ *              components of size 1, and how many of the query's 10 nearest passing rows lie in the largest.
+ */
+static void analyze_two_hop(const std::vector<uint32_t>& g, size_t deg, const float* vec, uint32_t dims, uint64_t rows,
+                            const std::vector<Case>& cases, int samples)
+{
+  auto l2 = [&](const std::vector<float>& q, uint32_t r) {
+    const float* x = vec + size_t(r) * dims;
+    float d        = 0;
+    for (uint32_t j = 0; j < dims; j++) {
+      const float t = x[j] - q[j];
+      d += t * t;
+    }
+    return d;
+  };
+  std::atomic<int> next{0};
+  std::mutex out_mu;
+  unsigned nthreads = std::max(1u, std::thread::hardware_concurrency() / 2);
+  std::vector<std::thread> pool;
+  for (unsigned t = 0; t < nthreads; t++)
+    pool.emplace_back([&]() {
+      std::vector<uint32_t> cand, ball;
+      for (int i; (i = next++) < int(cases.size());) {
+        const Case& c = cases[i];
+        auto passes = [&](uint32_t r) { return r < rows && ((c.words[r >> 5] >> (r & 31)) & 1u); };
+        if (c.count == 0) continue;
+        // H out-neighbours of u (distinct, without u), and optionally the two-hop ball of the graph.
+        auto h_out = [&](uint32_t u, std::vector<uint32_t>& out, std::vector<uint32_t>* b2) {
+          out.clear();
+          if (b2) b2->clear();
+          for (size_t j = 0; j < deg; j++) {
+            const uint32_t v = g[size_t(u) * deg + j];
+            if (v >= rows || v == u) continue;
+            if (b2) b2->push_back(v);
+            if (passes(v)) { out.push_back(v); continue; }
+            for (size_t l = 0; l < deg; l++) {
+              const uint32_t x = g[size_t(v) * deg + l];
+              if (x >= rows || x == u) continue;
+              if (b2) b2->push_back(x);
+              if (passes(x)) out.push_back(x);
+            }
+          }
+          if (b2 && !b2->empty()) {
+            for (size_t j = 0; j < deg; j++) {  // the ball also holds the passing neighbours' neighbours
+              const uint32_t v = g[size_t(u) * deg + j];
+              if (v >= rows || v == u || !passes(v)) continue;
+              for (size_t l = 0; l < deg; l++) {
+                const uint32_t x = g[size_t(v) * deg + l];
+                if (x < rows && x != u) b2->push_back(x);
+              }
+            }
+            std::sort(b2->begin(), b2->end());
+            b2->erase(std::unique(b2->begin(), b2->end()), b2->end());
+          }
+          std::sort(out.begin(), out.end());
+          out.erase(std::unique(out.begin(), out.end()), out.end());
+        };
+        // 1. Degrees over sampled passing rows.
+        uint64_t rng = 0x9e3779b97f4a7c15ull ^ uint64_t(i) * 0x2545f4914f6cdd1dull;
+        auto next_rand = [&]() { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; return rng; };
+        double sum_deg1 = 0, sum_degh = 0, sum_b2 = 0, edges = 0, in_edges = 0;
+        int zero = 0, n = 0;
+        std::vector<uint32_t> degs;
+        for (int tries = 0; n < samples && tries < samples * 200000; tries++) {
+          const uint32_t u = uint32_t(next_rand() % rows);
+          if (!passes(u)) continue;
+          n++;
+          int d1 = 0;
+          for (size_t j = 0; j < deg; j++) {
+            const uint32_t v = g[size_t(u) * deg + j];
+            if (v >= rows) continue;
+            edges++;
+            if (passes(v)) { d1++; in_edges++; }
+          }
+          h_out(u, cand, &ball);
+          sum_deg1 += d1; sum_degh += cand.size(); sum_b2 += ball.size(); zero += cand.empty();
+          degs.push_back(uint32_t(cand.size()));
+        }
+        std::sort(degs.begin(), degs.end());
+        // 2. Dead ends near the query: the passing rows ranked 11..110 by distance to the query.
+        std::vector<std::pair<float, uint32_t>> near;
+        near.reserve(size_t(std::min<uint64_t>(c.count, 1u << 24)));
+        for (size_t w = 0; w < c.words.size(); w++)
+          for (uint32_t bits = c.words[w]; bits; bits &= bits - 1) {
+            const uint32_t r = uint32_t(w * 32 + __builtin_ctz(bits));
+            if (r < rows) near.emplace_back(l2(c.query, r), r);
+          }
+        const size_t keep = std::min<size_t>(110, near.size());
+        std::partial_sort(near.begin(), near.begin() + keep, near.end());
+        int dead_h = 0, dead_p = 0, dead_g = 0, checked = 0;
+        for (size_t a = 10; a < keep; a++) {
+          const uint32_t u = near[a].second;
+          const float du   = near[a].first;
+          checked++;
+          h_out(u, cand, nullptr);
+          bool h = false, pp = false, gg = false;
+          for (uint32_t x : cand) if (l2(c.query, x) < du) { h = true; break; }
+          for (size_t j = 0; j < deg; j++) {
+            const uint32_t v = g[size_t(u) * deg + j];
+            if (v >= rows) continue;
+            const bool closer = l2(c.query, v) < du;
+            gg |= closer;
+            pp |= closer && passes(v);
+          }
+          dead_h += !h; dead_p += !pp; dead_g += !gg;
+        }
+        // 3. Components of H (one case per batch of 64).
+        std::string comp;
+        if (i % 64 == 0) {
+          std::vector<uint32_t> parent;
+          std::vector<uint32_t> members;
+          members.reserve(size_t(c.count));
+          for (size_t w = 0; w < c.words.size(); w++)
+            for (uint32_t bits = c.words[w]; bits; bits &= bits - 1) {
+              const uint32_t r = uint32_t(w * 32 + __builtin_ctz(bits));
+              if (r < rows) members.push_back(r);
+            }
+          std::unordered_map<uint32_t, uint32_t> slot;
+          slot.reserve(members.size() * 2);
+          for (uint32_t k2 = 0; k2 < members.size(); k2++) slot[members[k2]] = k2;
+          parent.resize(members.size());
+          for (uint32_t k2 = 0; k2 < parent.size(); k2++) parent[k2] = k2;
+          auto find = [&](uint32_t a) { while (parent[a] != a) { parent[a] = parent[parent[a]]; a = parent[a]; } return a; };
+          for (uint32_t k2 = 0; k2 < members.size(); k2++) {
+            h_out(members[k2], cand, nullptr);
+            for (uint32_t x : cand) {
+              const uint32_t a = find(k2), b = find(slot[x]);
+              if (a != b) parent[a] = b;
+            }
+          }
+          std::unordered_map<uint32_t, uint32_t> size;
+          for (uint32_t k2 = 0; k2 < members.size(); k2++) size[find(k2)]++;
+          uint32_t best = 0, best_root = 0, singles = 0;
+          for (auto& kv : size) {
+            if (kv.second > best) { best = kv.second; best_root = kv.first; }
+            singles += kv.second == 1;
+          }
+          int top_in = 0;
+          for (size_t a = 0; a < std::min<size_t>(10, keep); a++) top_in += find(slot[near[a].second]) == best_root;
+          char buf[256];
+          snprintf(buf, sizeof(buf), ", \"comp_count\": %zu, \"comp_largest\": %.4f, \"comp_singletons\": %.4f, \"top10_in_largest\": %d",
+                   size.size(), double(best) / members.size(), double(singles) / members.size(), top_in);
+          comp = buf;
+        }
+        std::lock_guard<std::mutex> lk(out_mu);
+        printf("{\"analyze_h\": %d, \"s\": %.6f, \"count\": %llu, \"p_in\": %.4f, \"deg1\": %.2f, \"degH\": %.2f, \"degH0\": %.4f, "
+               "\"degH_med\": %u, \"b2\": %.1f, \"dead_H\": %.3f, \"dead_P\": %.3f, \"dead_G\": %.3f, \"samples\": %d%s}\n",
+               i, double(c.count) / rows, (unsigned long long)c.count, edges ? in_edges / edges : 0.0, n ? sum_deg1 / n : 0.0,
+               n ? sum_degh / n : 0.0, n ? double(zero) / n : 0.0, degs.empty() ? 0u : degs[degs.size() / 2],
+               n ? sum_b2 / n : 0.0, checked ? double(dead_h) / checked : 0.0, checked ? double(dead_p) / checked : 0.0,
+               checked ? double(dead_g) / checked : 0.0, n, comp.c_str());
+        fflush(stdout);
+      }
+    });
+  for (auto& th : pool) th.join();
+}
+
 int main(int argc, char** argv)
 {
   if (argc < 3) fail("usage: cagra_twohop_udf_probe INDEX_DIR CASES [options]");
@@ -428,6 +613,47 @@ int main(int argc, char** argv)
   // Above 0: each case's filter is replaced by rows drawn independently at this rate (the bitset
   // modes only: the programs no longer describe the filters).
   double random_pass = 0;
+  // ivfpq modes: lists, probed lists, PQ dimension, candidates per result re-scored exactly, and
+  // a file the built index is saved to and loaded from.
+  int ivf_lists = 8192, ivf_probes = 50, ivf_pq_dim = 32, ivf_refine = 4;
+  // ivfpq modes: bits of the search's lookup tables (32, 16 or 8) and of its internal distances (32 or 16).
+  int ivf_lut = 32, ivf_internal = 32;
+  // ivfpq modes: re-score on the host (cuvs::neighbors::refine with host views; the device refine
+  // only takes k <= 256).
+  bool ivf_refine_host = false;
+  int analyze_h = 0;
+  // --pool-gb N: give each thread's resources a pooled workspace of N GiB, so that the search's temporary
+  // buffers do not go through cudaMalloc / cudaFree on every call (default 0: the library default).
+  int pool_gb = 0;
+  // --workspace-pool-gb N: only the pooled workspace (RAFT's recommended setting), not the device resource.
+  int workspace_pool_gb = 0;
+  bool auto_expansion   = false;
+  // --ivf-int8: the ivfpq modes build, search and re-score on int8 rows and queries (one affine map
+  // from the 0.5%..99.5% value range to [-128, 127]); recall is still against the exact FP32 answers.
+  bool ivf_int8 = false;
+  // --analyze-ivf: for each case's own filter, how its passing rows spread over the IVF lists and how
+  // many lists / rows IVF-PQ must scan to cover the exact top-k, nearest-centroid order against
+  // skipping lists without passing rows (exact coverage, no PQ error); then exit.
+  bool analyze_ivf = false;
+  // --analyze-ivf-order: reorder the rows inside each list by the filters of half the cases (rows that
+  // passed the same filters become adjacent), then count, for the other half, the 32-row groups that
+  // hold a passing row in the lists each query needs: today's order, the learned order, a perfect order.
+  bool analyze_ivf_order = false;
+  // --dump-cases DIR: write each case's query (queries.f32, [cases, dims]) and filter bitset over the
+  // rows (words.u32, [cases, words]) for offline analysis, then exit.
+  std::string dump_cases;
+  // --ivf-sort-lists: after the IVF-PQ index is ready, sort the rows inside each list by their smallest
+  // value of the first multi-valued column (codes and ids move together; ids and lists are unchanged),
+  // so that rows sharing the filter attribute fill the same 32-row code groups.
+  bool ivf_sort_lists = false;
+  // --ivf-renumber: give every row of the IVF-PQ index the id of its position, list by list, each list
+  // starting at a multiple of 32, and search with each case's bitset permuted to those ids, so that
+  // the 32 rows of a code group read one bitset word (results are mapped back before the re-score).
+  bool ivf_renumber = false;
+  // --rand-xor-mask X: cagra::search_params::rand_xor_mask (the seed of the random entry points).
+  uint64_t rand_xor_mask = 0;
+  bool rand_xor_mask_set = false;  // --auto-expansion: the two-hop modes search with filter_expansion_mode::AUTO  // --analyze-h N: report the structure of the two-hop graph (N sampled rows a case) and exit
+  std::string ivf_index_path;
   std::string modes = "bitset1,bitsetq,udf,udf1";
   for (int i = 3; i < argc; i++) {
     std::string a = argv[i];
@@ -450,6 +676,25 @@ int main(int argc, char** argv)
     else if (a == "--reorder") reorder = true;
     else if (a == "--scan-slack") scan_slack = std::stoi(argv[++i]);
     else if (a == "--random-pass" && i + 1 < argc) random_pass = std::stod(argv[++i]);
+    else if (a == "--ivf-lists") ivf_lists = next();
+    else if (a == "--ivf-probes") ivf_probes = next();
+    else if (a == "--ivf-pq-dim") ivf_pq_dim = next();
+    else if (a == "--ivf-refine") ivf_refine = next();
+    else if (a == "--ivf-lut") ivf_lut = next();
+    else if (a == "--ivf-internal") ivf_internal = next();
+    else if (a == "--ivf-refine-host") ivf_refine_host = true;
+    else if (a == "--analyze-h") analyze_h = next();
+    else if (a == "--pool-gb") pool_gb = next();
+    else if (a == "--workspace-pool-gb") workspace_pool_gb = next();
+    else if (a == "--auto-expansion") auto_expansion = true;
+    else if (a == "--ivf-int8") ivf_int8 = true;
+    else if (a == "--analyze-ivf") analyze_ivf = true;
+    else if (a == "--analyze-ivf-order") analyze_ivf = analyze_ivf_order = true;
+    else if (a == "--dump-cases" && i + 1 < argc) dump_cases = argv[++i];
+    else if (a == "--ivf-sort-lists") ivf_sort_lists = true;
+    else if (a == "--ivf-renumber") ivf_renumber = true;
+    else if (a == "--rand-xor-mask" && i + 1 < argc) { rand_xor_mask = std::stoull(argv[++i], nullptr, 0); rand_xor_mask_set = true; }
+    else if (a == "--ivf-index" && i + 1 < argc) ivf_index_path = argv[++i];
     else fail("unknown option " + a);
   }
 
@@ -573,11 +818,12 @@ int main(int argc, char** argv)
 
   /* Modes whose batches share their first case's filter need exact answers under that filter. */
   auto is_shared = [](const std::string& mode) {
-    return mode == "stockb" || mode == "bitsetb" || mode == "linkedb";
+    return mode == "stockb" || mode == "bitsetb" || mode == "linkedb" || mode == "ivfpqb";
   };
   const bool shared_truth = modes.find("stockb") != std::string::npos ||
                             modes.find("bitsetb") != std::string::npos ||
-                            modes.find("linkedb") != std::string::npos;
+                            modes.find("linkedb") != std::string::npos ||
+                            modes.find("ivfpqb") != std::string::npos;
 
   /* Each case's passing rows on the host, from the same interpreter the UDF runs. */
   double t0 = now_ms();
@@ -661,6 +907,21 @@ int main(int argc, char** argv)
       t.join();
   }
   double truth_ms = now_ms() - t0 - eval_ms;
+  if (!dump_cases.empty()) {
+    std::ofstream qf(dump_cases + "/queries.f32", std::ios::binary), wf(dump_cases + "/words.u32", std::ios::binary);
+    for (const Case& c : cases) {
+      qf.write(reinterpret_cast<const char*>(c.query.data()), m.dims * sizeof(float));
+      wf.write(reinterpret_cast<const char*>(c.words.data()), c.words.size() * sizeof(uint32_t));
+    }
+    printf("{\"dumped_cases\": %d, \"dims\": %u, \"words\": %zu}\n", ncases, m.dims, cases.empty() ? 0 : cases[0].words.size());
+    return 0;
+  }
+  {
+    // How many of the cases' filters are distinct (the workload's unique filters among these queries).
+    std::set<std::vector<uint32_t>> distinct;
+    for (const Case& c : cases) distinct.insert(c.words);
+    printf("{\"distinct_filters\": %zu, \"cases\": %d}\n", distinct.size(), ncases);
+  }
 
   /* The index, its FP16 dataset kept alive beside it. */
   raft::device_resources load_res;
@@ -671,6 +932,17 @@ int main(int argc, char** argv)
   load_res.sync_stream();
   double load_ms = now_ms() - t0;
   if (uint64_t(index.size()) != rows || uint32_t(index.dim()) != m.dims) fail("index shape");
+  if (analyze_h > 0) {
+    if (reorder) fail("--analyze-h does not take --reorder");
+    const size_t deg = size_t(index.graph().extent(1));
+    std::vector<uint32_t> hg(size_t(rows) * deg);
+    CUDA(cudaMemcpy(hg.data(), index.graph().data_handle(), hg.size() * 4, cudaMemcpyDeviceToHost));
+    size_t vsz;
+    const auto* vec = static_cast<const float*>(map_file(dir + "/vectors.f32", &vsz));
+    if (vsz != rows * m.dims * sizeof(float)) fail("vectors.f32 size");
+    analyze_two_hop(hg, deg, vec, m.dims, rows, cases, analyze_h);
+    return 0;
+  }
 
   /*
    * cuVS searches one query per launch when the dataset's row pitch exceeds its dimensions (65
@@ -762,6 +1034,387 @@ int main(int argc, char** argv)
   for (int i = 0; i < ncases; i++) {
     CUDA(cudaMalloc(&dbits[i], nwords * sizeof(uint32_t)));
     CUDA(cudaMemcpy(dbits[i], cases[i].words.data(), nwords * 4, cudaMemcpyHostToDevice));
+  }
+  /* ivfpq modes: the IVF-PQ index, the queries and (for the exact re-score) the rows as FP32. */
+  namespace ivf_pq = cuvs::neighbors::ivf_pq;
+  std::optional<ivf_pq::index<int64_t>> ivf;
+  uint64_t ivf_new_rows = 0;            // --ivf-renumber: size of the new id space,
+  std::vector<int64_t> ivf_new2old;     // the row of each new id (-1 for the padding of a list),
+  std::vector<uint32_t*> ivf_dbits;     // and each case's bitset over the new ids
+  float* dqf  = nullptr;
+  float* dvec = nullptr;
+  const float* hvec = nullptr;  // the rows and the queries as FP32 on the host (--ivf-refine-host)
+  std::vector<float> hqf;
+  std::vector<int8_t> h8, hq8;  // --ivf-int8: rows and queries as int8 on the host
+  int8_t* dvec8 = nullptr;      // and on the device
+  int8_t* dq8   = nullptr;
+  // Candidates ivf_pq::search returned that do not pass the filter, and the queries all of whose
+  // candidates are such rows.
+  std::atomic<uint64_t> ivf_filtered_out_candidates{0};
+  std::vector<char> ivf_no_candidate(size_t(ncases), 0);
+  double ivf_build_ms = 0;
+  if (modes.find("ivfpq") != std::string::npos || analyze_ivf) {
+    if (reorder) fail("the ivfpq modes do not take --reorder");
+    raft::device_resources ivf_res;
+    size_t vsize;
+    auto* vectors = static_cast<const float*>(map_file(dir + "/vectors.f32", &vsize));
+    if (vsize != rows * m.dims * sizeof(float)) fail("vectors.f32 size");
+    hvec = vectors;
+    hqf.assign(size_t(ncases) * m.dims, 0.0f);
+    for (int i = 0; i < ncases; i++)
+      std::copy(cases[i].query.begin(), cases[i].query.begin() + m.dims, hqf.begin() + size_t(i) * m.dims);
+    CUDA(cudaMalloc(&dqf, hqf.size() * sizeof(float)));
+    CUDA(cudaMemcpy(dqf, hqf.data(), hqf.size() * sizeof(float), cudaMemcpyHostToDevice));
+    if (ivf_int8) {
+      // One affine map for rows and queries, from a sample of the values: L2 distances keep their order
+      // up to rounding.
+      std::vector<float> sample;
+      const uint64_t step = std::max<uint64_t>(1, rows / 100000);
+      for (uint64_t r = 0; r < rows; r += step)
+        sample.insert(sample.end(), vectors + r * m.dims, vectors + (r + 1) * m.dims);
+      auto at = [&](double q) {
+        std::nth_element(sample.begin(), sample.begin() + size_t(q * (sample.size() - 1)), sample.end());
+        return sample[size_t(q * (sample.size() - 1))];
+      };
+      const float lo = at(0.005), hi = at(0.995);
+      auto q8 = [&](float x) {
+        const float v = std::nearbyint((x - lo) / (hi - lo) * 255.0f - 128.0f);
+        return int8_t(std::min(127.0f, std::max(-128.0f, v)));
+      };
+      h8.resize(size_t(rows) * m.dims);
+      {
+        std::vector<std::thread> pool;
+        const unsigned nt = std::max(1u, std::thread::hardware_concurrency() / 2);
+        for (unsigned t = 0; t < nt; t++)
+          pool.emplace_back([&, t]() {
+            for (size_t i = t; i < h8.size(); i += nt) h8[i] = q8(vectors[i]);
+          });
+        for (auto& th : pool) th.join();
+      }
+      hq8.resize(hqf.size());
+      for (size_t i = 0; i < hqf.size(); i++) hq8[i] = q8(hqf[i]);
+      CUDA(cudaMalloc(&dvec8, h8.size()));
+      CUDA(cudaMemcpy(dvec8, h8.data(), h8.size(), cudaMemcpyHostToDevice));
+      CUDA(cudaMalloc(&dq8, hq8.size()));
+      CUDA(cudaMemcpy(dq8, hq8.data(), hq8.size(), cudaMemcpyHostToDevice));
+      printf("{\"ivf_int8\": true, \"lo\": %.5f, \"hi\": %.5f}\n", lo, hi);
+    }
+    if (ivf_refine > 1 && !ivf_refine_host && !ivf_int8) {
+      CUDA(cudaMalloc(&dvec, vsize));
+      CUDA(cudaMemcpy(dvec, vectors, vsize, cudaMemcpyHostToDevice));
+    }
+    double b0 = now_ms();
+    std::ifstream saved(ivf_index_path);
+    if (!ivf_index_path.empty() && saved.good()) {
+      ivf.emplace(ivf_res);
+      ivf_pq::deserialize(ivf_res, ivf_index_path, &*ivf);
+    } else {
+      ivf_pq::index_params ip;
+      ip.metric                   = cuvs::distance::DistanceType::L2Expanded;
+      ip.n_lists                  = uint32_t(ivf_lists);
+      ip.pq_dim                   = uint32_t(ivf_pq_dim);
+      ip.pq_bits                  = 8;
+      ip.kmeans_trainset_fraction = 0.1;
+      if (ivf_int8)
+        ivf.emplace(ivf_pq::build(
+          ivf_res, ip, raft::make_device_matrix_view<const int8_t, int64_t>(dvec8, int64_t(rows), int64_t(m.dims))));
+      else
+        ivf.emplace(ivf_pq::build(
+          ivf_res, ip, raft::make_host_matrix_view<const float, int64_t>(vectors, int64_t(rows), int64_t(m.dims))));
+      ivf_res.sync_stream();
+      ivf_build_ms = now_ms() - b0;
+      if (!ivf_index_path.empty()) ivf_pq::serialize(ivf_res, ivf_index_path, *ivf);
+    }
+    ivf_res.sync_stream();
+    if (ivf_sort_lists) {
+      const double s0 = now_ms();
+      int mc = -1;
+      for (size_t cc = 0; cc < columns.names.size() && mc < 0; cc++)
+        if (host_offsets[cc]) mc = int(cc);
+      if (mc < 0) fail("--ivf-sort-lists needs a multi-valued column");
+      std::vector<int64_t> key(rows);
+      for (uint64_t r = 0; r < rows; r++) {
+        int64_t kk = INT64_MAX;
+        for (uint32_t a = host_offsets[mc][r]; a < host_offsets[mc][r + 1]; a++)
+          if (host_columns[mc][a] != ANN_FILTER_NULL_VALUE) kk = std::min<int64_t>(kk, host_columns[mc][a]);
+        key[r] = kk;
+      }
+      const uint32_t nl = ivf->n_lists(), pqd = ivf->pq_dim();
+      std::vector<uint32_t> sizes(nl);
+      std::vector<int64_t*> ptrs(nl);
+      CUDA(cudaMemcpy(sizes.data(), ivf->list_sizes().data_handle(), nl * 4, cudaMemcpyDeviceToHost));
+      CUDA(cudaMemcpy(ptrs.data(), ivf->inds_ptrs().data_handle(), nl * sizeof(int64_t*), cudaMemcpyDeviceToHost));
+      const uint32_t maxn = *std::max_element(sizes.begin(), sizes.end());
+      auto dcodes = raft::make_device_matrix<uint8_t, uint32_t>(ivf_res, maxn, pqd);
+      std::vector<uint8_t> hc(size_t(maxn) * pqd), pc(size_t(maxn) * pqd);
+      std::vector<int64_t> ids(maxn), pids(maxn);
+      std::vector<uint32_t> perm(maxn);
+      uint64_t moved = 0;
+      for (uint32_t l = 0; l < nl; l++) {
+        const uint32_t n = sizes[l];
+        if (n < 2) continue;
+        CUDA(cudaMemcpy(ids.data(), ptrs[l], n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        perm.resize(n);
+        std::iota(perm.begin(), perm.end(), 0u);
+        std::stable_sort(perm.begin(), perm.end(), [&](uint32_t a, uint32_t b) { return key[ids[a]] < key[ids[b]]; });
+        auto view = raft::make_device_matrix_view<uint8_t, uint32_t>(dcodes.data_handle(), n, pqd);
+        ivf_pq::helpers::codepacker::unpack_list_data(ivf_res, *ivf, view, l, 0);
+        CUDA(cudaMemcpyAsync(hc.data(), dcodes.data_handle(), size_t(n) * pqd, cudaMemcpyDeviceToHost,
+                             raft::resource::get_cuda_stream(ivf_res).get()));
+        ivf_res.sync_stream();
+        for (uint32_t a = 0; a < n; a++) {
+          std::copy(hc.begin() + size_t(perm[a]) * pqd, hc.begin() + size_t(perm[a] + 1) * pqd, pc.begin() + size_t(a) * pqd);
+          pids[a] = ids[perm[a]];
+          moved += perm[a] != a;
+        }
+        CUDA(cudaMemcpy(dcodes.data_handle(), pc.data(), size_t(n) * pqd, cudaMemcpyHostToDevice));
+        ivf_pq::helpers::codepacker::pack_list_data(
+          ivf_res, &*ivf, raft::make_device_matrix_view<const uint8_t, uint32_t>(dcodes.data_handle(), n, pqd), l, 0);
+        ivf_res.sync_stream();
+        CUDA(cudaMemcpy(ptrs[l], pids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice));
+      }
+      printf("{\"ivf_sort_lists\": true, \"rows_moved\": %llu, \"ms\": %.0f}\n", (unsigned long long)moved, now_ms() - s0);
+    }
+    if (ivf_renumber) {
+      if (ivf_refine < 2) fail("--ivf-renumber needs --ivf-refine 2 or more (ids are mapped back on the host)");
+      const double s0 = now_ms();
+      const uint32_t nl = ivf->n_lists();
+      std::vector<uint32_t> sizes(nl);
+      std::vector<int64_t*> ptrs(nl);
+      CUDA(cudaMemcpy(sizes.data(), ivf->list_sizes().data_handle(), nl * 4, cudaMemcpyDeviceToHost));
+      CUDA(cudaMemcpy(ptrs.data(), ivf->inds_ptrs().data_handle(), nl * sizeof(int64_t*), cudaMemcpyDeviceToHost));
+      uint64_t total = 0;
+      for (uint32_t l = 0; l < nl; l++) total += (uint64_t(sizes[l]) + 31) / 32 * 32;
+      ivf_new_rows = total;
+      ivf_new2old.assign(total, -1);
+      std::vector<int64_t> ids;
+      uint64_t base = 0;
+      for (uint32_t l = 0; l < nl; l++) {
+        const uint32_t n = sizes[l];
+        ids.resize(n);
+        if (n) CUDA(cudaMemcpy(ids.data(), ptrs[l], n * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        for (uint32_t a = 0; a < n; a++) {
+          ivf_new2old[base + a] = ids[a];
+          ids[a]                = int64_t(base + a);
+        }
+        if (n) CUDA(cudaMemcpy(ptrs[l], ids.data(), n * sizeof(int64_t), cudaMemcpyHostToDevice));
+        base += (uint64_t(n) + 31) / 32 * 32;
+      }
+      const size_t nw = (total + 31) / 32;
+      ivf_dbits.assign(size_t(ncases), nullptr);
+      std::vector<std::thread> workers;
+      const int nth = 32;
+      std::vector<std::vector<uint32_t>> scratch(nth, std::vector<uint32_t>(nw));
+      for (int w = 0; w < nth; w++)
+        workers.emplace_back([&, w] {
+          for (int c = w; c < ncases; c += nth) {
+            auto& out = scratch[w];
+            std::fill(out.begin(), out.end(), 0u);
+            const uint32_t* in = cases[c].words.data();
+            for (uint64_t x = 0; x < total; x++) {
+              const int64_t o = ivf_new2old[x];
+              if (o >= 0 && ((in[o >> 5] >> (o & 31)) & 1u)) out[x >> 5] |= 1u << (x & 31);
+            }
+            CUDA(cudaMalloc(&ivf_dbits[c], nw * 4));
+            CUDA(cudaMemcpy(ivf_dbits[c], out.data(), nw * 4, cudaMemcpyHostToDevice));
+          }
+        });
+      for (auto& w : workers) w.join();
+      printf("{\"ivf_renumber\": true, \"id_space\": %llu, \"ms\": %.0f}\n", (unsigned long long)total, now_ms() - s0);
+    }
+    printf("{\"ivfpq_index\": true, \"lists\": %d, \"pq_dim\": %d, \"build_ms\": %.0f, \"ready_ms\": %.0f}\n",
+           ivf_lists, ivf_pq_dim, ivf_build_ms, now_ms() - b0);
+    fflush(stdout);
+    if (analyze_ivf) {
+      // List membership (row -> list) and centroids on the host.
+      const uint32_t nl = ivf->n_lists();
+      std::vector<uint32_t> sizes(nl);
+      std::vector<int64_t*> ptrs(nl);
+      CUDA(cudaMemcpy(sizes.data(), ivf->list_sizes().data_handle(), nl * 4, cudaMemcpyDeviceToHost));
+      CUDA(cudaMemcpy(ptrs.data(), ivf->inds_ptrs().data_handle(), nl * sizeof(int64_t*), cudaMemcpyDeviceToHost));
+      std::vector<uint16_t> list_of(rows, 0xffff);
+      std::vector<int64_t> ids;
+      for (uint32_t l = 0; l < nl; l++) {
+        ids.resize(sizes[l]);
+        if (sizes[l]) CUDA(cudaMemcpy(ids.data(), ptrs[l], sizes[l] * 8, cudaMemcpyDeviceToHost));
+        for (int64_t r : ids) if (r >= 0 && uint64_t(r) < rows) list_of[r] = uint16_t(l);
+      }
+      // Rows of each list in today's order, and each row's position in its list.
+      std::vector<std::vector<uint32_t>> list_rows(nl);
+      std::vector<uint32_t> pos_now(rows, 0);
+      for (uint32_t l = 0; l < nl; l++) {
+        ids.resize(sizes[l]);
+        if (sizes[l]) CUDA(cudaMemcpy(ids.data(), ptrs[l], sizes[l] * 8, cudaMemcpyDeviceToHost));
+        for (uint32_t a = 0; a < sizes[l]; a++)
+          if (ids[a] >= 0 && uint64_t(ids[a]) < rows) { list_rows[l].push_back(uint32_t(ids[a])); pos_now[ids[a]] = a; }
+      }
+      // Learned order: the distinct filters of the even-numbered cases (up to 128) are the past traffic.
+      std::vector<uint32_t> pos_learn, pos_attr;
+      std::vector<const std::vector<uint32_t>*> train;
+      if (analyze_ivf_order) {
+        for (int i = 0; i < ncases && train.size() < 128; i += 2) {
+          bool dup = false;
+          for (auto* t : train) dup |= (*t == cases[i].words);
+          if (!dup && cases[i].count) train.push_back(&cases[i].words);
+        }
+        std::vector<std::array<uint64_t, 2>> sig(rows, {0, 0});
+        for (size_t t = 0; t < train.size(); t++)
+          for (size_t w = 0; w < train[t]->size(); w++)
+            for (uint32_t bits = (*train[t])[w]; bits; bits &= bits - 1) {
+              const uint32_t r = uint32_t(w * 32 + __builtin_ctz(bits));
+              if (r < rows) sig[r][t / 64] |= 1ull << (63 - t % 64);  // filter 0 most significant
+            }
+        pos_learn.assign(rows, 0);
+        for (uint32_t l = 0; l < nl; l++) {
+          std::vector<uint32_t> v = list_rows[l];
+          // Rows that passed the same past filters together (lexicographic on the signature, filters
+          // seen first lead), rows that passed none last; ties keep today's order.
+          std::stable_sort(v.begin(), v.end(), [&](uint32_t a, uint32_t b) {
+            const bool za = !(sig[a][0] | sig[a][1]), zb = !(sig[b][0] | sig[b][1]);
+            if (za != zb) return zb;
+            if (sig[a][0] != sig[b][0]) return sig[a][0] > sig[b][0];
+            return sig[a][1] > sig[b][1];
+          });
+          for (uint32_t a = 0; a < v.size(); a++) pos_learn[v[a]] = a;
+        }
+        // Learning-free comparison: each list sorted by the row's smallest value of the first
+        // multi-valued column (the attribute the filters read).
+        int mc = -1;
+        for (size_t cc = 0; cc < columns.names.size() && mc < 0; cc++)
+          if (host_offsets[cc]) mc = int(cc);
+        pos_attr.assign(rows, 0);
+        if (mc >= 0) {
+          std::vector<int64_t> key(rows);
+          for (uint64_t r = 0; r < rows; r++) {
+            int64_t kk = INT64_MAX;
+            for (uint32_t a = host_offsets[mc][r]; a < host_offsets[mc][r + 1]; a++)
+              if (host_columns[mc][a] != ANN_FILTER_NULL_VALUE) kk = std::min<int64_t>(kk, host_columns[mc][a]);
+            key[r] = kk;
+          }
+          for (uint32_t l = 0; l < nl; l++) {
+            std::vector<uint32_t> v = list_rows[l];
+            std::stable_sort(v.begin(), v.end(), [&](uint32_t a, uint32_t b) { return key[a] < key[b]; });
+            for (uint32_t a = 0; a < v.size(); a++) pos_attr[v[a]] = a;
+          }
+        }
+        printf("{\"ivf_order_train_filters\": %zu, \"attribute_column\": %d}\n", train.size(), mc);
+        fflush(stdout);
+      }
+      const uint32_t dext = ivf->centers().extent(1);
+      std::vector<float> cen(size_t(nl) * dext);
+      CUDA(cudaMemcpy(cen.data(), ivf->centers().data_handle(), cen.size() * 4, cudaMemcpyDeviceToHost));
+      std::atomic<int> next{0};
+      std::mutex mu;
+      std::vector<std::thread> pool;
+      const unsigned nt = std::max(1u, std::thread::hardware_concurrency() / 2);
+      for (unsigned t = 0; t < nt; t++)
+        pool.emplace_back([&]() {
+          for (int i; (i = next++) < ncases;) {
+            const Case& c = cases[i];
+            if (c.count < uint64_t(k)) continue;
+            const float* q = hqf.data() + size_t(i) * m.dims;
+            // Passing rows per list, and the exact top-k passing rows.
+            std::vector<uint32_t> pass(nl, 0);
+            std::vector<std::pair<float, uint32_t>> near;
+            for (size_t w = 0; w < c.words.size(); w++)
+              for (uint32_t bits = c.words[w]; bits; bits &= bits - 1) {
+                const uint32_t r = uint32_t(w * 32 + __builtin_ctz(bits));
+                if (r >= rows) continue;
+                pass[list_of[r]]++;
+                const float* x = vectors + size_t(r) * m.dims;
+                float d = 0;
+                for (uint32_t j = 0; j < m.dims; j++) { const float e = x[j] - q[j]; d += e * e; }
+                near.emplace_back(d, r);
+              }
+            std::partial_sort(near.begin(), near.begin() + k, near.end());
+            // Lists in nearest-centroid order.
+            std::vector<std::pair<float, uint32_t>> order(nl);
+            for (uint32_t l = 0; l < nl; l++) {
+              float d = 0;
+              for (uint32_t j = 0; j < m.dims; j++) { const float e = cen[size_t(l) * dext + j] - q[j]; d += e * e; }
+              order[l] = {d, l};
+            }
+            std::sort(order.begin(), order.end());
+            std::vector<uint32_t> rank(nl);
+            for (uint32_t a = 0; a < nl; a++) rank[order[a].second] = a;
+            std::vector<uint32_t> top_rank;
+            for (int a = 0; a < k; a++) top_rank.push_back(rank[list_of[near[a].second]]);
+            std::sort(top_rank.begin(), top_rank.end());
+            // Concentration of the passing rows over the lists.
+            std::vector<uint32_t> sorted_pass = pass;
+            std::sort(sorted_pass.rbegin(), sorted_pass.rend());
+            uint64_t tot = 0, top1 = 0, top10 = 0;
+            uint32_t nonempty = 0;
+            for (uint32_t a = 0; a < nl; a++) {
+              tot += sorted_pass[a]; nonempty += sorted_pass[a] > 0;
+              if (a < nl / 100) top1 += sorted_pass[a];
+              if (a < nl / 10) top10 += sorted_pass[a];
+            }
+            // Cost of covering `need` of the top-k: all lists up to the needed rank (nearest-centroid
+            // order), the non-empty ones among them (skip empty lists), and their passing rows.
+            auto cost = [&](int need) {
+              const uint32_t last = top_rank[need - 1];
+              uint64_t lists_std = last + 1, lists_skip = 0, rows_std = 0, rows_skip = 0, rows_pass = 0;
+              for (uint32_t a = 0; a <= last; a++) {
+                const uint32_t l = order[a].second;
+                rows_std += sizes[l];
+                if (pass[l]) { lists_skip++; rows_skip += sizes[l]; rows_pass += pass[l]; }
+              }
+              char b[256];
+              snprintf(b, sizeof(b), "{\"lists\": %llu, \"lists_nonempty\": %llu, \"rows\": %llu, \"rows_nonempty\": %llu, \"passing_rows\": %llu}",
+                       (unsigned long long)lists_std, (unsigned long long)lists_skip, (unsigned long long)rows_std,
+                       (unsigned long long)rows_skip, (unsigned long long)rows_pass);
+              return std::string(b);
+            };
+            if (analyze_ivf_order) {
+              if (i % 2 == 0) continue;  // the even cases trained the order
+              bool seen = false;
+              for (auto* t : train) seen |= (*t == c.words);
+              // Rows read when the scan skips 32-row groups without a passing row, over the lists the
+              // query needs to cover its exact top-k (nearest-centroid order), and over 400 lists.
+              auto groups = [&](uint32_t last) {
+                uint64_t full = 0, now = 0, learn = 0, attr = 0, perfect = 0, passing = 0;
+                std::vector<char> g_now, g_learn, g_attr;
+                for (uint32_t a = 0; a <= last; a++) {
+                  const uint32_t l = order[a].second;
+                  full += sizes[l];
+                  if (!pass[l]) continue;
+                  const uint32_t ng = (sizes[l] + 31) / 32;
+                  g_now.assign(ng, 0); g_learn.assign(ng, 0); g_attr.assign(ng, 0);
+                  for (uint32_t r : list_rows[l])
+                    if ((c.words[r >> 5] >> (r & 31)) & 1u) {
+                      g_now[pos_now[r] / 32] = 1; g_learn[pos_learn[r] / 32] = 1; g_attr[pos_attr[r] / 32] = 1;
+                    }
+                  for (uint32_t g = 0; g < ng; g++) {
+                    const uint32_t len = std::min<uint32_t>(32, sizes[l] - g * 32);
+                    now += g_now[g] ? len : 0; learn += g_learn[g] ? len : 0; attr += g_attr[g] ? len : 0;
+                  }
+                  perfect += std::min<uint64_t>(sizes[l], uint64_t((pass[l] + 31) / 32) * 32);
+                  passing += pass[l];
+                }
+                char b[256];
+                snprintf(b, sizeof(b), "{\"lists\": %u, \"full\": %llu, \"now\": %llu, \"learned\": %llu, \"attribute\": %llu, \"perfect\": %llu, \"passing\": %llu}",
+                         last + 1, (unsigned long long)full, (unsigned long long)now, (unsigned long long)learn,
+                         (unsigned long long)attr, (unsigned long long)perfect, (unsigned long long)passing);
+                return std::string(b);
+              };
+              std::lock_guard<std::mutex> lk(mu);
+              printf("{\"ivf_order\": %d, \"seen\": %d, \"s\": %.5f, \"cover\": %s, \"probes400\": %s}\n", i, int(seen),
+                     double(c.count) / rows, groups(top_rank[k - 1]).c_str(), groups(399).c_str());
+              fflush(stdout);
+              continue;
+            }
+            std::lock_guard<std::mutex> lk(mu);
+            printf("{\"analyze_ivf\": %d, \"s\": %.5f, \"lists_with_passing\": %u, \"top1pct_share\": %.4f, \"top10pct_share\": %.4f, "
+                   "\"cover_9\": %s, \"cover_10\": %s}\n",
+                   i, double(c.count) / rows, nonempty, double(top1) / std::max<uint64_t>(tot, 1),
+                   double(top10) / std::max<uint64_t>(tot, 1), cost(std::max(1, k - k / 10)).c_str(), cost(k).c_str());
+            fflush(stdout);
+          }
+        });
+      for (auto& th : pool) th.join();
+      return 0;
+    }
   }
   /* twol: each case's bitset as a summary bit per 1,024-item block plus the occupied blocks' words. */
   struct TwoLevel {
@@ -938,9 +1591,20 @@ int main(int argc, char** argv)
     uint32_t* built = nullptr;  // batch bitsets built for the call
     uint32_t* cworkspace = nullptr;  // buildc: cuVS postings workspace
     int64_t cworkspace_words = 0;
+    int64_t* ivf_cand = nullptr;  // ivfpq: k * refine candidates a query, their PQ distances,
+    float* ivf_cand_d = nullptr;  // and the k re-scored results
+    int64_t* ivf_nb   = nullptr;
+    std::vector<int64_t> ivf_host;
   };
+  // --pool-gb: the current device resource becomes a pool as well (the search also allocates from it).
+  if (pool_gb > 0)
+    rmm::mr::set_current_device_resource(
+      rmm::mr::pool_memory_resource(rmm::mr::cuda_memory_resource{}, size_t(pool_gb) << 30));
   auto make_thread = [&]() {
     auto t = std::make_unique<Thread>();
+    if (pool_gb > 0) raft::resource::set_workspace_to_pool_resource(t->res, size_t(pool_gb) << 30);
+    if (workspace_pool_gb > 0)
+      raft::resource::set_workspace_to_pool_resource(t->res, size_t(workspace_pool_gb) << 30);
     CUDA(cudaMalloc(&t->neighbors, size_t(batch) * k * sizeof(uint32_t)));
     CUDA(cudaMalloc(&t->distances, size_t(batch) * k * sizeof(float)));
     CUDA(cudaMalloc(&t->bitset_ptrs, size_t(batch) * sizeof(void*)));
@@ -948,6 +1612,13 @@ int main(int argc, char** argv)
     CUDA(cudaMalloc(&t->params, sizeof(AnnUdfParams)));
     CUDA(cudaMalloc(&t->vparams, sizeof(UdfvParams)));
     t->out.resize(size_t(batch) * k);
+    if (ivf) {
+      const size_t kc = size_t(k) * ivf_refine;
+      CUDA(cudaMalloc(&t->ivf_cand, size_t(batch) * kc * sizeof(int64_t)));
+      CUDA(cudaMalloc(&t->ivf_cand_d, size_t(batch) * kc * sizeof(float)));
+      CUDA(cudaMalloc(&t->ivf_nb, size_t(batch) * k * sizeof(int64_t)));
+      t->ivf_host.resize(size_t(batch) * kc);
+    }
     if (use_postings) {
       postings_scratch_init(t->scratch, rows);
       CUDA(cudaMalloc(&t->built, size_t(batch) * nwords * sizeof(uint32_t)));
@@ -962,12 +1633,138 @@ int main(int argc, char** argv)
     sp.search_width         = width;
     sp.thread_block_size    = block;
     sp.num_random_samplings = samplings;
+    if (rand_xor_mask_set) sp.rand_xor_mask = rand_xor_mask;
     sp.filter_expansion     = cagra::filter_expansion_mode::PASSING_TWO_HOP;
+    // --auto-expansion: filter_expansion_mode::AUTO (value 100; needs a cuVS that has it).
+    if (auto_expansion) sp.filter_expansion = static_cast<cagra::filter_expansion_mode>(100);
     cudaStream_t stream     = raft::resource::get_cuda_stream(t.res).get();
     auto queries = raft::make_device_matrix_view<const half, int64_t>(dq + size_t(first) * qdim,
                                                                      n, qdim);
     auto nb      = raft::make_device_matrix_view<uint32_t, int64_t>(t.neighbors, n, k);
     auto ds      = raft::make_device_matrix_view<float, int64_t>(t.distances, n, k);
+    if (mode == "ivfpqb" || mode == "ivfpq1") {
+      ivf_pq::search_params isp;
+      isp.n_probes     = uint32_t(ivf_probes);
+      isp.lut_dtype    = ivf_lut == 16 ? CUDA_R_16F : ivf_lut == 8 ? CUDA_R_8U : CUDA_R_32F;
+      isp.internal_distance_dtype = ivf_internal == 16 ? CUDA_R_16F : CUDA_R_32F;
+      const int64_t kc = int64_t(k) * ivf_refine;
+      auto fq = raft::make_device_matrix_view<const float, int64_t>(dqf + size_t(first) * m.dims, n, m.dims);
+      // One bitset a call: the batch's first filter (ivfpqb), or the single query's own (ivfpq1).
+      cuvs::neighbors::filtering::bitset_filter<uint32_t, int64_t> filter(
+        ivf_renumber ? raft::core::bitset_view<uint32_t, int64_t>(ivf_dbits[first], int64_t(ivf_new_rows))
+                     : raft::core::bitset_view<uint32_t, int64_t>(dbits[first], int64_t(rows)));
+      auto q8v = raft::make_device_matrix_view<const int8_t, int64_t>(dq8 + size_t(first) * m.dims, n, m.dims);
+      if (ivf_int8)
+        ivf_pq::search(t.res, isp, *ivf, q8v,
+                       raft::make_device_matrix_view<int64_t, int64_t>(t.ivf_cand, n, kc),
+                       raft::make_device_matrix_view<float, int64_t>(t.ivf_cand_d, n, kc), filter);
+      else
+        ivf_pq::search(t.res, isp, *ivf, fq,
+                       raft::make_device_matrix_view<int64_t, int64_t>(t.ivf_cand, n, kc),
+                       raft::make_device_matrix_view<float, int64_t>(t.ivf_cand_d, n, kc), filter);
+      const int64_t* result = t.ivf_cand;
+      int64_t width_out     = kc;
+      if (ivf_refine > 1) {
+        // A query with fewer passing rows in its probed lists than kc leaves slots without a
+        // passing row (ivf_pq::search fills them with ids of filtered-out rows of those lists,
+        // which the exact re-score would otherwise rank among the results): give those the
+        // query's first passing candidate (duplicates are dropped below), since the re-score
+        // reads every candidate's row.
+        CUDA(cudaMemcpyAsync(t.ivf_host.data(), t.ivf_cand, size_t(n) * kc * sizeof(int64_t),
+                             cudaMemcpyDeviceToHost, stream));
+        t.res.sync_stream();
+        bool patched = false;
+        if (ivf_renumber) {
+          for (size_t j = 0; j < size_t(n) * kc; j++) {
+            int64_t& c = t.ivf_host[j];
+            c          = (c >= 0 && uint64_t(c) < ivf_new_rows) ? ivf_new2old[c] : -1;
+          }
+          patched = true;
+        }
+        const std::vector<uint32_t>& words = cases[first].words;
+        auto usable = [&](int64_t r) {
+          return r >= 0 && uint64_t(r) < rows && ((words[size_t(r) / 32] >> (r % 32)) & 1);
+        };
+        for (int q = 0; q < n; q++) {
+          int64_t* c     = t.ivf_host.data() + size_t(q) * kc;
+          int64_t filler = -1;
+          for (int64_t j = 0; j < kc && filler < 0; j++)
+            if (usable(c[j])) filler = c[j];
+          ivf_no_candidate[size_t(first) + q] = filler < 0;
+          for (int64_t j = 0; j < kc; j++)
+            if (!usable(c[j])) {
+              if (c[j] >= 0 && uint64_t(c[j]) < rows) ivf_filtered_out_candidates++;
+              c[j]    = filler < 0 ? 0 : filler;
+              patched = true;
+            }
+        }
+        if (ivf_refine_host) {
+          // Exact re-score on the host from the mapped rows; the results land in ivf_host.
+          std::vector<int64_t> nb(size_t(n) * k);
+          std::vector<float> dist(size_t(n) * k);
+          if (ivf_int8)
+            cuvs::neighbors::refine(
+              t.res, raft::make_host_matrix_view<const int8_t, int64_t>(h8.data(), int64_t(rows), int64_t(m.dims)),
+              raft::make_host_matrix_view<const int8_t, int64_t>(hq8.data() + size_t(first) * m.dims, n, m.dims),
+              raft::make_host_matrix_view<const int64_t, int64_t>(t.ivf_host.data(), n, kc),
+              raft::make_host_matrix_view<int64_t, int64_t>(nb.data(), n, k),
+              raft::make_host_matrix_view<float, int64_t>(dist.data(), n, k), cuvs::distance::DistanceType::L2Expanded);
+          else
+            cuvs::neighbors::refine(
+              t.res, raft::make_host_matrix_view<const float, int64_t>(hvec, int64_t(rows), int64_t(m.dims)),
+              raft::make_host_matrix_view<const float, int64_t>(hqf.data() + size_t(first) * m.dims, n, m.dims),
+              raft::make_host_matrix_view<const int64_t, int64_t>(t.ivf_host.data(), n, kc),
+              raft::make_host_matrix_view<int64_t, int64_t>(nb.data(), n, k),
+              raft::make_host_matrix_view<float, int64_t>(dist.data(), n, k), cuvs::distance::DistanceType::L2Expanded);
+          std::copy(nb.begin(), nb.end(), t.ivf_host.begin());
+          for (int q = 0; q < n; q++) {
+            const int64_t* c = t.ivf_host.data() + size_t(q) * k;
+            uint32_t* o      = t.out.data() + size_t(q) * k;
+            int filled       = 0;
+            for (int j = 0; j < k && filled < k; j++) {
+              if (c[j] < 0 || uint64_t(c[j]) >= rows || ivf_no_candidate[size_t(first) + q]) continue;
+              const uint32_t r = uint32_t(c[j]);
+              if (std::find(o, o + filled, r) == o + filled) o[filled++] = r;
+            }
+            std::fill(o + filled, o + k, 0xffffffffu);
+          }
+          return;
+        }
+        if (patched)
+          CUDA(cudaMemcpyAsync(t.ivf_cand, t.ivf_host.data(), size_t(n) * kc * sizeof(int64_t),
+                               cudaMemcpyHostToDevice, stream));
+        if (ivf_int8)
+          cuvs::neighbors::refine(
+            t.res, raft::make_device_matrix_view<const int8_t, int64_t>(dvec8, int64_t(rows), int64_t(m.dims)),
+            q8v, raft::make_device_matrix_view<const int64_t, int64_t>(t.ivf_cand, n, kc),
+            raft::make_device_matrix_view<int64_t, int64_t>(t.ivf_nb, n, k), ds,
+            cuvs::distance::DistanceType::L2Expanded);
+        else
+          cuvs::neighbors::refine(
+            t.res, raft::make_device_matrix_view<const float, int64_t>(dvec, int64_t(rows), int64_t(m.dims)),
+            fq, raft::make_device_matrix_view<const int64_t, int64_t>(t.ivf_cand, n, kc),
+            raft::make_device_matrix_view<int64_t, int64_t>(t.ivf_nb, n, k), ds,
+            cuvs::distance::DistanceType::L2Expanded);
+        result    = t.ivf_nb;
+        width_out = k;
+      }
+      CUDA(cudaMemcpyAsync(t.ivf_host.data(), result, size_t(n) * width_out * sizeof(int64_t),
+                           cudaMemcpyDeviceToHost, stream));
+      t.res.sync_stream();
+      for (int q = 0; q < n; q++) {
+        const int64_t* c = t.ivf_host.data() + size_t(q) * width_out;
+        uint32_t* o      = t.out.data() + size_t(q) * k;
+        int filled       = 0;
+        for (int64_t j = 0; j < width_out && filled < k; j++) {
+          if (c[j] < 0 || uint64_t(c[j]) >= rows) continue;
+          if (ivf_refine > 1 && ivf_no_candidate[size_t(first) + q]) continue;
+          const uint32_t r = uint32_t(c[j]);
+          if (std::find(o, o + filled, r) == o + filled) o[filled++] = r;
+        }
+        std::fill(o + filled, o + k, 0xffffffffu);
+      }
+      return;
+    }
     if (mode == "udfv" || mode == "udfv1" || mode == "udfp") {
       /* The call's value bitsets and aux, built here as a search with new filters would. */
       std::vector<uint32_t> hs(n + 1), arena;
@@ -1233,7 +2030,7 @@ int main(int argc, char** argv)
   for (const std::string& mode : mode_list) {
     const int per_call =
       (mode == "bitset1" || mode == "udf1" || mode == "udfv1" || mode == "build1" || mode == "scanc" ||
-       mode == "stock1" || mode == "stockr1" || mode == "linked1")
+       mode == "stock1" || mode == "stockr1" || mode == "linked1" || mode == "ivfpq1")
         ? 1
         : batch;
     const int calls    = ncases / per_call;
@@ -1315,6 +2112,13 @@ int main(int argc, char** argv)
            recall && checked ? recall_sum / checked : -1.0, recall ? recall_min : -1.0,
            (unsigned long long)failing, (unsigned long long)short_results,
            (unsigned long long)checked, std::max(itopk, k), iterations, samplings);
+    if (mode.rfind("ivfpq", 0) == 0) {
+      // Over every call of the mode (the timed repetitions included). int8 = --ivf-int8.
+      printf("{\"ivfpq_note\": \"%s\", \"filtered_out_candidates_returned\": %llu, \"probes\": %d, \"refine\": %d, "
+             "\"lut_bits\": %d, \"internal_bits\": %d}\n",
+             mode.c_str(), (unsigned long long)ivf_filtered_out_candidates.exchange(0), ivf_probes, ivf_refine,
+             ivf_lut, ivf_internal);
+    }
     fflush(stdout);
   }
   return 0;
