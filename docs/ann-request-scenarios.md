@@ -1,16 +1,16 @@
 # Request scenarios on the production-size test
 
-What the Muse benchmark's requests covered, the tools that now generate the
+What the benchmark's requests covered, the tools that now generate the
 filters it left out, and how the three filtered routes (the FP8 scan, the
 two-hop graph walk and cuVS' own filtered search) and the worker's filter
 cache did on them. Measured on the 1/8 shard of
-[the production-size test](ann-muse-production-scale.md) (37 groups x 46.5M
+[the production-size test](ann-production-scale.md) (37 groups x 46.5M
 rows, 8 B200s, two copies of each group), 2026-11-21.
 
 ## What the benchmark requests covered
 
-`scale4715/c1.frames` (200,000 requests, written by `muse_frames.py emit` from
-one captured ads request) was read back with `muse_frames.py describe` and
+`scale4715/c1.frames` (200,000 requests, written by `request_frames.py emit` from
+one captured ads request) was read back with `request_frames.py describe` and
 against the index files:
 
 - **Shape.** Six ANN searches a request, sent together, at k 300, 1000, 1000,
@@ -43,10 +43,10 @@ not repeat.
 
 | Tool | What it does |
 | --- | --- |
-| `benchmarks/ann/muse_frames.py emit --filter-spec SPEC` | Draws the filters from templates instead of the capture: any expression of VALUES, OVERLAP, RANGE and NULL leaves (negated or not) under AND, OR and NOT; a leaf can target a pass rate (values added until the rows they hold reach a share drawn log-uniformly from a range), take N values, or be padded to a list length with values no row holds; a pool of `distinct` filters drawn uniformly or by Zipf rank. The request shape, fields, vectors and duplicates stay those of the capture. Default `emit` output is unchanged. |
-| `muse_frames.py describe` | One JSON summary of a frames file: fields, k, leaves by column and operator, operators, values per leaf, duplicates and distinct filters per request, unfiltered share, and the pass-rate histogram with the share of scanned rows per bin. |
-| `muse_frames.py verify` | Sends each distinct (field, filter) of a file to a running worker as operation 23 and compares the bitmap with the generator's evaluator bit for bit. |
-| `muse_frames.py check` | Recall against exact answers, now through the same evaluator. |
+| `benchmarks/ann/request_frames.py emit --filter-spec SPEC` | Draws the filters from templates instead of the capture: any expression of VALUES, OVERLAP, RANGE and NULL leaves (negated or not) under AND, OR and NOT; a leaf can target a pass rate (values added until the rows they hold reach a share drawn log-uniformly from a range), take N values, or be padded to a list length with values no row holds; a pool of `distinct` filters drawn uniformly or by Zipf rank. The request shape, fields, vectors and duplicates stay those of the capture. Default `emit` output is unchanged. |
+| `request_frames.py describe` | One JSON summary of a frames file: fields, k, leaves by column and operator, operators, values per leaf, duplicates and distinct filters per request, unfiltered share, and the pass-rate histogram with the share of scanned rows per bin. |
+| `request_frames.py verify` | Sends each distinct (field, filter) of a file to a running worker as operation 23 and compares the bitmap with the generator's evaluator bit for bit. |
+| `request_frames.py check` | Recall against exact answers, now through the same evaluator. |
 | `benchmarks/ann/synth_attributes.py` | Writes synthetic attribute columns (flags, Zipf categoricals, log-normal values, NULL shares, by seed document or by row) into a hard-linked copy of an index tree, for filters on columns the test data lacks. Not used in the runs below. |
 | `benchmarks/ann/cagra_twohop_udf_probe.cpp` | One field, one GPU: two-hop search with cached bitsets, per-query bitsets, the JIT filter UDF, or bitsets built on the GPU per call (`postings_eval.cu`). |
 
@@ -66,7 +66,7 @@ limit); 20% unfiltered searches (`s6`); production-length lists padded to
 
 ## How the load was measured
 
-Open loop with `agentB/muse_direct` (one thread per client): it reproduced the
+Open loop with `agentB/request_direct` (one thread per client): it reproduced the
 published FP8-scan figure (p99 23.4 ms at 150k requests/s at K 30-182). The
 epoll client (`--epoll`) adds its own queueing at these rates: the same run gave
 p99 99 ms with 48 processes, 75 with 96 and 44 with 192, so the open-loop p99s
@@ -274,7 +274,7 @@ With 1% of searches carrying a never-seen filter (`c1`, `--unique-share
 | Two-hop | 10k req/s (p99 54 ms at 25k) | 150k req/s (p99 under 20 ms) |
 | FP8 scan | 10k req/s (p99 929 ms at 25k) | 25k req/s (p99 23.7 ms)* |
 
-Every returned key passed its filter (`muse_frames.py check` now counts the
+Every returned key passed its filter (`request_frames.py check` now counts the
 ones that do not), recall was unchanged, and every first sighting was built in
 the lane (`predicate_deferred` equals `predicate_transient`). A deferred
 search joins two-hop's mixed batches like a cached one, its bitset built in

@@ -1,22 +1,22 @@
-# Muse fan-out at production size on one 8× B200 host
+# Request fan-out at production size on one 8× B200 host
 
-How many Muse requests per second one GPU host serves over TCP when it
-holds a production-size slice of the ads index, and what it took to get
+How many production-shape requests per second one GPU host serves over TCP
+when it holds a production-size slice of the ads index, and what it took to get
 there. Measured 2026-11-09 on 8× NVIDIA B200 (183 GB each), 224 CPUs, 2 TB
 RAM, with three other workers of other test trees resident on the GPUs
 (28–46 GB per GPU), the load generator on the same host over loopback.
 
 ## Workload
 
-A Muse request fans out to 6 ANN sub-queries (operation 22, search by
+A production request fans out to 6 ANN sub-queries (operation 22, search by
 predicate program): the captured sample's shapes, k = 300/600/1000, `pg_ids`
 OVERLAP filters matching 4% (one shape 0.53%) of the rows, one duplicate
 pair per request (the CPC and CPM rankers ask the same group the same
 question). The captured sample has no unfiltered sub-query, so neither does
-the test. Requests come from `benchmarks/ann/muse_frames.py emit`
+the test. Requests come from `benchmarks/ann/request_frames.py emit`
 (`--unfiltered-share 0`, 64 filter variants per shape, 200,000 distinct
-requests) and `benchmarks/ann/muse_direct.c` (`--processes`, open-loop
-`--rate`). Recall is exact, from the index files (`muse_frames.py check`,
+requests) and `benchmarks/ann/request_direct.c` (`--processes`, open-loop
+`--rate`). Recall is exact, from the index files (`request_frames.py check`,
 180 sub-queries): the gate was 0.95.
 
 A 20,000-request file inflated every number by 20–30%: with more clients
@@ -44,7 +44,7 @@ route never reads.
 
 Honest request file, recall ≥ 0.98 unless noted, closed loop unless noted.
 
-| Layout | Worker settings | Clients | Muse req/s | ANN q/s | p99 |
+| Layout | Worker settings | Clients | req/s | ANN q/s | p99 |
 | --- | --- | ---: | ---: | ---: | ---: |
 | 8 shards × 1 copy, fp16 + graphs (first run) | lanes 48, slack 50% | 8192 | 35.5k | 213k | 382 ms |
 | same | lanes 96 | 16384 | 63.1k | 379k | 457 ms |
@@ -82,7 +82,7 @@ gave 0.977 mean / 0.752 worst, 100% 0.988 / 0.855, 300% (4,000 candidates
 at k = 1000, `ANN_PRUNE_CAP` raised to 32,768 for it) 0.998 / 0.986. The
 rows below use 300%.
 
-| Build | Peak Muse req/s | p99 at 120k/s | 140k/s | 160k/s |
+| Build | Peak req/s | p99 at 120k/s | 140k/s | 160k/s |
 | --- | ---: | ---: | ---: | ---: |
 | One scheduler queue, 16 driver calls a batch | 176k | – | 68 ms | 118 ms |
 | 12 scheduler queues, 11 driver calls | 210k | 45 ms | 50 ms | 59 ms |
@@ -90,7 +90,7 @@ rows below use 300%.
 | 64 lanes, 8 queues | 170k | 65 ms | 84 ms | 125 ms |
 | 48 lanes, 6 queues | 154k | 82 ms | 179 ms | – |
 
-The rate held under a 50 ms p99 is about 150k Muse requests/s, against
+The rate held under a 50 ms p99 is about 150k requests/s, against
 65k for 4 × 2. With one queue the GPUs were 60–67% busy and lanes waited
 on the scheduler mutex (45% of samples); with the queues split the GPUs
 run at 98–100% and batches are 16 searches instead of 40.
@@ -113,7 +113,7 @@ needs the root's survival and depth-used statistics.
 
 ### Load generator
 
-`muse_direct --epoll` drives all of a process's clients from one thread.
+`request_direct --epoll` drives all of a process's clients from one thread.
 It matches the thread mode against a mock server and lifted the peak where
 the client was the limit (small K); at k = 1000 one thread a process
 drains 8 GB/s of replies and reads about 7 ms higher at p99, so latency
@@ -185,7 +185,7 @@ sub-queries.
 
 | | Scan, K 300–1000 | Scan, K 30–182 | Graph, K 30–182 |
 | --- | ---: | ---: | ---: |
-| Peak Muse req/s | 214k | 424k | 10.9k |
+| Peak req/s | 214k | 424k | 10.9k |
 | ANN searches/s at the peak | 1.29M | 2.5M | 65.5k |
 | Rate held under a 50 ms p99 | ~150k | ~250k | > 8k |
 | Recall mean / lowest | 0.998 / 0.986 | not checked | 0.72 / 0.34 |
@@ -206,7 +206,7 @@ lanes spent 59% of samples in `cudaStreamSynchronize` and readers sat in
 
 The allocator set the first limit:
 
-| Allocator | Peak Muse req/s | p99 at 2k/s | p99 at 8k/s |
+| Allocator | Peak req/s | p99 at 2k/s | p99 at 8k/s |
 | --- | ---: | ---: | ---: |
 | `--device-allocator plain` | 3.0k | 843 ms | saturated |
 | `--memory-pool 0` (stream-ordered) | 10.9k | 80 ms | 308 ms |
@@ -235,7 +235,7 @@ Iterations times searches/s stays at 1.6–1.7M. The shortfall from full
 recall roughly halves per doubling (0.33, 0.19, 0.10 from 32 to 128), so
 0.95 would take about 256 iterations: about 6.7k searches/s on this
 worker and, scaled by the full worker's ratio at the automatic setting
-(65.5k against about 41.6k), about 1.75k Muse requests/s on the shard.
+(65.5k against about 41.6k), about 1.75k requests/s on the shard.
 That is an extrapolation, not a measurement.
 
 At the automatic setting, `--filtered-itopk` 256 or 512 and
@@ -290,14 +290,14 @@ The 1/8 shard on 8 GPUs, 2 copies, K 30-182, 200,000 requests, the
 released worker (60 s closed loop, 30 s per rate, all 37 groups, no errors,
 GPUs 85-100% busy at the peak):
 
-| Search | Peak Muse req/s | ANN queries/s | Recall mean / lowest | p99 at 105k/s | 135k | 150k |
+| Search | Peak req/s | ANN queries/s | Recall mean / lowest | p99 at 105k/s | 135k | 150k |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | **two-hop graph search** | **170k** | 1.02M | 0.953 / 0.14 | 4.5 ms | 8.4 ms | 23.8 ms |
 | FP8 scan | 388k | 2.33M | 0.998 / 0.97 | 21 ms (100k) | 24 ms (150k) | 47 ms (350k) |
 | cuVS' own filtered search | 21.4k | 128k | 0.72 / 0.34 | saturated | | |
 
 The last row is the earlier result on the bandwidth-4 tree, after the worker began searching padded FP16 rows as one launch per batch (`--cagra-pitch`, which doubled the 10.9k reported above). On the tangent
-tree it was measured on two groups only (g0 and g19, 4 GPUs): 10.6k Muse
+tree it was measured on two groups only (g0 and g19, 4 GPUs): 10.6k
 requests/s at recall 0.53, against 283k at 0.999 for the scan.
 
 ```
@@ -326,7 +326,7 @@ point): 64 settings from 24 to 96 walkers, 8 to 39 iterations and 2 to 8
 samplings, then all 108 combinations of 1 to 3 samplings, 40 to 64 walkers
 and 14 to 24 iterations with 10 points in between.
 
-| itopk, iterations, samplings | Recall | Peak Muse req/s | p99 at 105k/s | 120k |
+| itopk, iterations, samplings | Recall | Peak req/s | p99 at 105k/s | 120k |
 | --- | ---: | ---: | ---: | ---: |
 | 1024, 10, 4 | 0.873 | 275k | 4.1 ms | 5.8 ms |
 | 1280, 14, 4 | 0.932 | 197k | 4.1 ms | 5.5 ms |
@@ -350,7 +350,7 @@ a little above the tuning runs (170k against 160k for the chosen setting;
 
 Lanes, batch and block size at the chosen setting, released worker:
 
-| Lanes, batch | Peak Muse req/s | p99 at 105k/s | 135k | 150k |
+| Lanes, batch | Peak req/s | p99 at 105k/s | 135k | 150k |
 | --- | ---: | ---: | ---: | ---: |
 | **128, 64** | **170k** | 4.5 ms | 8.4 ms | 23.8 ms |
 | 160, 64 | 167k | 6.2 ms | 9.0 ms | 23.2 ms |
@@ -408,36 +408,9 @@ The fork's `main` has changed since these measurements (2026-11-12: the
 parameters in its Python, Rust, Go and Java bindings, documentation, tests,
 and fixes from review; with the default walk a filtered search runs cuVS'
 own device code again). The released worker binary with that library on g0
-and g19 (4 GPUs, 2 copies) peaks at 78.5k Muse requests/s against 76.5k
+and g19 (4 GPUs, 2 copies) peaks at 78.5k requests/s against 76.5k
 with the library the table was measured with, at the same recall on g0
 (0.97-0.98). The full shard was not measured again.
-
-## Related reading
-
-Pinterest Engineering posts on the serving stack this test stands in for.
-They were located by search and read in summary only; none describes Muse,
-the 8-leaf fan-out or `pg_ids` filtering.
-
-- [Beyond Two Towers: Re-architecting the Serving Stack for Next-Gen Ads Lightweight Ranking Models (Part 1)](https://medium.com/pinterest-engineering/beyond-two-towers-re-architecting-the-serving-stack-for-next-gen-ads-lightweight-ranking-models-1992f2b76cbb):
-  the earlier stack streamed scores for about 100K documents from the GPU
-  to the CPU, which dropped 99% of them after filtering; filtering and
-  top-k moved onto the GPU. The same idea as the scan and the two-hop
-  search here: apply the filter before paying for the row.
-- [GPU-Serving Two-Tower Models for Lightweight Ads Engagement Prediction](https://medium.com/pinterest-engineering/gpu-serving-two-tower-models-for-lightweight-ads-engagement-prediction-5a0ffb442f3b):
-  GPU serving for the lightweight ranking stage the test's rankers belong
-  to.
-- [Unlocking Efficient Ad Retrieval: Offline Approximate Nearest Neighbors in Pinterest Ads](https://medium.com/pinterest-engineering/unlocking-efficient-ad-retrieval-offline-approximate-nearest-neighbors-in-pinterest-ads-6fccc131ac14):
-  online ANN growing expensive with the ad inventory, and the move from
-  HNSW to IVF for a larger index. The captured request asks for IVF indexes
-  throughout.
-- [Ads Candidate Generation using Behavioral Sequence Modeling](https://medium.com/pinterest-engineering/ads-candidate-generation-using-behavioral-sequence-modeling-f9077ee1325d):
-  candidate generators fetch a top-K by ANN, are capped to a quota and
-  blended, the over-fetch behind K 300-1000 here.
-- [How we scaled the size of Pinterest's ad corpus by 60x](https://medium.com/pinterest-engineering/how-we-scaled-the-size-of-pinterests-ad-corpus-by-60x-d6d5bfa6bf16)
-  and [Redesigning Pinterest's Ad Serving Systems with Zero Downtime (part 2)](https://medium.com/pinterest-engineering/redesigning-pinterests-ad-serving-systems-with-zero-downtime-part-2-3e607bbba9f0):
-  corpus size and the ad serving stack around retrieval.
-- [Manas: A high performing customized search system](https://medium.com/pinterest-engineering/manas-a-high-performing-customized-search-system-cf189f6ca40f):
-  the search platform's leaf and root serving.
 
 ## Reproducing
 
@@ -445,7 +418,7 @@ Build: `BUILDER_ARGS=--scan-only benchmarks/ann/scale_pipeline.sh OUT 4715 4 fp8
 (the seed index directories and the group catalog as its environment
 describes). The tangent tree of the graph results adds
 `EXPORTER_ARGS="--kernel tangent --k 16 --bandwidth 1"` and leaves out
-`--scan-only`. Load: `benchmarks/ann/muse_direct.c` compiled with
+`--scan-only`. Load: `benchmarks/ann/request_direct.c` compiled with
 `cc -O2 -std=c11 -pthread`; `benchmarks/ann/ann_profile.sh LABEL SECONDS`
 profiles a window (GPU utilisation, kernel stage times, gdb stack
 sampling, lock waits, server counters). The host's `~/b200dev/wk.sh NAME

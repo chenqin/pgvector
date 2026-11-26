@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
-"""Muse-shaped ANN requests for a GPU node, without PostgreSQL.
+"""Production-shaped ANN requests for a GPU node, without PostgreSQL.
 
-Mocks what PostgreSQL would send for a Muse request's ANN sub-requests: one
-worker operation 22 (search by predicate program) per sub-request, built from
-an ANN capture (each sub-request's tag, k, group, vector and pg_ids filter),
-the group catalog and term codes (JSON, dumped once from the segment), and the
-index directories themselves (dimensions, row vectors to draw queries from).
+Mocks what PostgreSQL would send for a production request's ANN sub-requests:
+one worker operation 22 (search by predicate program) per sub-request, built
+from an ANN capture (each sub-request's tag, k, group, vector and pg_ids
+filter), the group catalog and term codes (JSON, dumped once from the
+segment), and the index directories themselves (dimensions, row vectors to
+draw queries from).
 
-    # requests for benchmarks/ann/muse_direct.c
-    muse_frames.py emit --capture C.json --groups groups.json --terms terms.json \\
-        --index-root /data/scale100/i8 --out muse.frames --requests 20000
+    # requests for benchmarks/ann/request_direct.c
+    request_frames.py emit --capture C.json --groups groups.json --terms terms.json \\
+        --index-root /data/scale100/i8 --out requests.frames --requests 20000
     # exact recall of the first requests' answers, from the index files
-    muse_frames.py check --frames muse.frames --index-root /data/scale100/i8 \\
+    request_frames.py check --frames requests.frames --index-root /data/scale100/i8 \\
         --host 127.0.0.1 --port 7700 --token-file token
     # what a frames file asks for: request shape, filters, pass rates
-    muse_frames.py describe --frames muse.frames --index-root /data/scale100/i8
+    request_frames.py describe --frames requests.frames --index-root /data/scale100/i8
     # the worker's rows for the file's filters against this file's evaluator
-    muse_frames.py verify --frames muse.frames --index-root /data/scale100/i8 \\
+    request_frames.py verify --frames requests.frames --index-root /data/scale100/i8 \\
         --host 127.0.0.1 --port 7700 --token-file token
 
 Mixed requests (the default) keep each sub-request's tag, k and filter shape:
@@ -62,7 +63,7 @@ leaves may be generators instead of explicit operands:
 
 "pad": N extends a generated list to N values with values no row of any table of --groups holds (never
 INT32_MIN), so the same rows pass, on every table. A generated overlap list has at most 65,535 values
-("pad" and "count" too), one under the worker's limit: muse_direct --unique-share adds a value to the
+("pad" and "count" too), one under the worker's limit: request_direct --unique-share adds a value to the
 overlap leaf a program starts with (programs that start otherwise it sends as they are). A template's own
 "pass": [lo, hi] redraws the whole expression until its share of rows is inside, and emit fails after 200
 draws, with the shares it saw. Shares and the values to choose from are those of the reference table
@@ -95,7 +96,7 @@ NULL = -2 ** 31             # ANN_FILTER_NULL_VALUE
 INT32_MAX = 2 ** 31 - 1
 MAX_VALUES, MAX_STEPS, MAX_DEPTH, MAX_PROGRAM = 65536, 1024, 64, 1 << 20
 
-MAX_DRAWN_OVERLAP = MAX_VALUES - 1  # a generated overlap list: muse_direct --unique-share adds a value to it
+MAX_DRAWN_OVERLAP = MAX_VALUES - 1  # a generated overlap list: request_direct --unique-share adds a value to it
 REDRAWS = 200               # draws of a template for its own "pass" before emit gives up
 DUPLICATE_REDRAWS = 20      # draws for a pool entry that is not an earlier one's program
 RANGE_LOWS = 32             # random lows tried for a range leaf before every low is looked at
@@ -783,7 +784,7 @@ def emit(args):
                            {name: held_values(directories, name) for name in padded})
         if spec['popularity'] == 'zipf':
             popularity = np.cumsum(np.arange(1, len(pool) + 1, dtype=np.float64) ** -spec['zipf_s']).tolist()
-        frng = random.Random(f'muse_frames filters {args.seed}')
+        frng = random.Random(f'request_frames filters {args.seed}')
         quantiles = np.quantile([entry['share'] for entry in pool], [0, 0.1, 0.5, 0.9, 1]).tolist()
         counts = collections.Counter(entry['template'] for entry in pool)
         summary = {'filters': len(pool), 'distinct_programs': len({entry['program'] for entry in pool}),
@@ -1123,7 +1124,7 @@ def main(argv=None):
     e.add_argument('--independent', action='store_true',
                    help='draw every sub-request on its own (no duplicates within a request)')
     e.add_argument('--filter-spec',
-                   help='JSON: draw the filters from templates instead of the capture\'s (muse_frames.py --help)')
+                   help='JSON: draw the filters from templates instead of the capture\'s (request_frames.py --help)')
     e.add_argument('--seed', type=int, default=7)
     c = commands.add_parser('check')
     c.add_argument('--frames', required=True)

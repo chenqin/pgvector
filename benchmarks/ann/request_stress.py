@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Stress PostgreSQL ANN serving with Muse-shaped requests: several filtered ANN
-sub-requests per request, run in parallel, from an ANN capture.
+"""Stress PostgreSQL ANN serving with production-shaped requests: several
+filtered ANN sub-requests per request, run in parallel, from an ANN capture.
 
-A Muse SCORE_BLEND request runs its corpus sub-requests in parallel (one per
-ranker: L1 CPC/CPM, high utility, conversion, ...), each an ANN search with its
-own index, k and filter; the request takes as long as its slowest sub-request.
-The capture (ann-capture-*.json, written by the Matcha capture tool) holds that
-translation: per sub-request the ANN group served, k, the query vector and the
-filter as SQL over the frozen index's attributes with its terms.
+A production SCORE_BLEND request runs its corpus sub-requests in parallel (one
+per ranker: L1 CPC/CPM, high utility, conversion, ...), each an ANN search with
+its own index, k and filter; the request takes as long as its slowest
+sub-request. The capture (ann-capture-*.json, written by the Matcha capture
+tool) holds that translation: per sub-request the ANN group served, k, the
+query vector and the filter as SQL over the frozen index's attributes with its
+terms.
 
-    python3 benchmarks/ann/muse_stress.py --dsn "$DSN" --capture capture.json \\
+    python3 benchmarks/ann/request_stress.py --dsn "$DSN" --capture capture.json \\
         --mode mixed --clients 1,8,32,64 --seconds 20 --output results.jsonl
 
 Modes:
@@ -142,7 +143,7 @@ class Workload:
         return sql, params
 
     def request(self):
-        """One Muse-shaped request: a (tag, sql, params) per sub-request."""
+        """One production-shaped request: a (tag, sql, params) per sub-request."""
         out = []
         self.last_ann = []
         for i, sub in enumerate(self.subs):
@@ -187,7 +188,7 @@ VALUES, AND, ALL, OVERLAP = 1, 5, 8, 10
 
 
 def emit(args, workload):
-    """Write --emit-requests Muse requests as operation-22 frames for benchmarks/ann/muse_direct.c:
+    """Write --emit-requests production-shaped requests as operation-22 frames for benchmarks/ann/request_direct.c:
     u32 requests, u32 sub-requests, then per sub-request u32 frame size and the frame. A sidecar
     FILE.check.jsonl keeps the first requests' SQL, to check the direct answers against."""
     with open(args.emit_ann, 'wb') as out, open(args.emit_ann + '.check.jsonl', 'w') as check:
@@ -210,7 +211,7 @@ async def session(dsn, settings):
 
 
 async def collect(args, workload, clients):
-    """Run `clients` Muse clients in this process; raw measurements."""
+    """Run `clients` clients in this process; raw measurements."""
     settings = ['SET ann.enable_frozen_search = on']
     if args.force_worker:
         settings.append('SET ann.frozen_setup_cost = 0')
@@ -348,7 +349,7 @@ def main():
     parser.add_argument('--seed', type=int, default=7)
     parser.add_argument('--output', help='append one JSON line per level')
     parser.add_argument('--emit-ann', metavar='FILE',
-                        help='write the requests as worker frames for muse_direct.c instead of running')
+                        help='write the requests as worker frames for request_direct.c instead of running')
     parser.add_argument('--emit-requests', type=int, default=20000)
     args = parser.parse_args()
     with psycopg.connect(args.dsn, autocommit=True) as conn:

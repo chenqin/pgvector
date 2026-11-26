@@ -1,6 +1,6 @@
-"""benchmarks/ann/muse_frames.py on tiny index directories: filters, their evaluator, emit, describe, verify.
+"""benchmarks/ann/request_frames.py on tiny index directories: filters, their evaluator, emit, describe, verify.
 
-Needs numpy only: no worker (a thread stands in for one), no PostgreSQL. python3 test/ann/test_muse_frames.py
+Needs numpy only: no worker (a thread stands in for one), no PostgreSQL. python3 test/ann/test_request_frames.py
 """
 
 import contextlib
@@ -24,14 +24,14 @@ from unittest import mock
 import numpy as np
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-TOOL = os.path.join(ROOT, 'benchmarks', 'ann', 'muse_frames.py')
+TOOL = os.path.join(ROOT, 'benchmarks', 'ann', 'request_frames.py')
 sys.path.insert(0, os.path.dirname(TOOL))
-import muse_frames as mf  # noqa: E402
+import request_frames as mf  # noqa: E402
 
 NULL = -2 ** 31
-# The tool as it was before filter specs, whose emit the default mode must still write byte for byte: by
-# its commit, so the comparison keeps its meaning once the new file is HEAD, else HEAD.
-BASELINES = ('8b3fbdf0a974ba49f01084032c42f2635b854510', 'HEAD')
+# The tool as it was before filter specs, whose emit the default mode must still write byte for byte: its
+# file at commit 8b3fbdf, by blob id (the file had another name then), else the committed tool.
+BASELINES = ('ca181acaabb31d47493f62b679ce9cb233f062b5', 'HEAD:benchmarks/ann/request_frames.py')
 TOKEN = 'a-token-of-sixteen-bytes'
 # describe's pass-rate bins as the spec lists them, not as the tool has them.
 EDGES = [0, 1e-6, 1e-4, 1e-3, 3e-3, 1e-2, 2e-2, 3e-2, 5e-2, 1e-1, 0.25, 0.5, 1]
@@ -208,7 +208,7 @@ def words(hits):
 
 
 def unique_variant(program):
-    """A program as benchmarks/ann/muse_direct.c --unique-share sends it: the overlap leaf it starts with has one
+    """A program as benchmarks/ann/request_direct.c --unique-share sends it: the overlap leaf it starts with has one
     more value (BuildUnique)."""
     at = 3 + program[1]
     count = struct.unpack_from('<I', program, at)[0]
@@ -217,15 +217,15 @@ def unique_variant(program):
 
 
 def baseline():
-    """muse_frames.py as it was before filter specs, as a module; None without git or that history."""
+    """request_frames.py as it was before filter specs, as a module; None without git or that history."""
     for revision in BASELINES:
         try:
-            source = subprocess.run(['git', '-C', ROOT, 'show', f'{revision}:benchmarks/ann/muse_frames.py'],
+            source = subprocess.run(['git', '-C', ROOT, 'show', revision],
                                     capture_output=True, check=True, timeout=60).stdout
         except (OSError, subprocess.SubprocessError):
             continue
-        module = types.ModuleType('muse_frames_baseline')
-        exec(compile(source, f'{revision}:muse_frames.py', 'exec'), module.__dict__)
+        module = types.ModuleType('request_frames_baseline')
+        exec(compile(source, f'{revision[:12]}:request_frames.py', 'exec'), module.__dict__)
         return module
     return None
 
@@ -295,7 +295,7 @@ class FakeWorker(threading.Thread):
                 connection.sendall(b'PVAN' + struct.pack('<HHQQII', 1, operation, request, 0, len(body), status) + body)
 
 
-class MuseFramesTests(unittest.TestCase):
+class RequestFramesTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory()
@@ -346,7 +346,7 @@ class MuseFramesTests(unittest.TestCase):
             if module is mf:
                 mf.main(argv)
             else:
-                with mock.patch.object(sys, 'argv', ['muse_frames.py'] + argv):
+                with mock.patch.object(sys, 'argv', ['request_frames.py'] + argv):
                     module.main()
         return stdout.getvalue(), stderr.getvalue()
 
@@ -558,7 +558,7 @@ class MuseFramesTests(unittest.TestCase):
         """Without --filter-spec, emit writes what the tool wrote before it had one."""
         old = baseline()
         if old is None:
-            self.skipTest('git, or the history of benchmarks/ann/muse_frames.py, is not available')
+            self.skipTest('git, or the history of benchmarks/ann/request_frames.py, is not available')
         for name, extra in (('mixed', ()), ('replay', ('--mode', 'replay')), ('independent', ('--independent',)),
                             ('options', ('--seed', '3', '--unfiltered-share', '0.5', '--distinct-filters', '5',
                                          '--noise', '0.2', '--check-requests', '4'))):
@@ -940,7 +940,7 @@ class MuseFramesTests(unittest.TestCase):
         self.assertIn('has 8 values', str(raised.exception))
 
     def test_generated_overlap_leaves_room(self):
-        """A generated overlap list is at most 65,535 values: muse_direct --unique-share adds one to the leaf a
+        """A generated overlap list is at most 65,535 values: request_direct --unique-share adds one to the leaf a
         program starts with, and the worker refuses 65,537."""
         full = self.pool([{'expr': {'op': 'overlap', 'column': 'm0', 'count': 2, 'pad': 65535}}], 1)[0]
         self.assertEqual(len(full['expr']['values']), 65535)

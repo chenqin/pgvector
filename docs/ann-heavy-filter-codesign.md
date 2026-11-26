@@ -14,9 +14,9 @@ internals is a guess and is marked as one.
 - **Heavy filter** here means: every search carries a filter; it passes a few
   percent of the rows or less; the predicate is a long id list; results must
   be exactly filtered; and filters need not repeat.
-- **The bar: 150k Muse requests/s sustained** (900k ANN searches/s at six a
-  request) with p99 under 50 ms. The plan keeps only routes measured at that
-  rate or estimated to reach it. Everything else is listed under
+- **The bar: 150k production-shape requests/s sustained** (900k ANN searches/s
+  at six a request) with p99 under 50 ms. The plan keeps only routes measured
+  at that rate or estimated to reach it. Everything else is listed under
   [Dropped: below 150k](#dropped-below-150k).
 - **Andromeda looks built for filters that never repeat.** It puts matching,
   scoring and top-K on one GPU, makes the matcher ten times faster than the
@@ -41,15 +41,15 @@ internals is a guess and is marked as one.
   eligible set on the GPU from the moment it is computed; let searches with
   different filters share launches; then raise rows per second for one
   query.
-- **Measured at 150k on the Muse shard (2026-11-16):** with moves 1, 2, 3
-  and 11 in, a 0.1% miss share holds p99 at 26.5 ms (219 ms before), and
-  deletes at up to 48 a second leave p99 at 23.7 ms (8.8 s and 109k before).
-  A 0.5% miss share or more still collapses throughput. See
+- **Measured at 150k on the production-size shard (2026-11-16):** with
+  moves 1, 2, 3 and 11 in, a 0.1% miss share holds p99 at 26.5 ms (219 ms
+  before), and deletes at up to 48 a second leave p99 at 23.7 ms (8.8 s and
+  109k before). A 0.5% miss share or more still collapses throughput. See
   [Measured on the GPU host](#measured-on-the-gpu-host).
 
 ## Two regimes
 
-| | Recurring filters (what the Muse test measures) | Non-recurring filters |
+| | Recurring filters (what the request benchmark measures) | Non-recurring filters |
 | --- | --- | --- |
 | Filter evaluation | Once per filter, then a cache hit | On the host for every search |
 | Result on the GPU | Cached row list or bitset | Copied or uploaded per search |
@@ -116,7 +116,7 @@ Requests per second per host. Only the first row is measured.
 
 | Case | Requests/s | Binding step | Basis |
 | --- | --- | --- | --- |
-| Recurring filters | 388k (K 30 to 182) | GPU | Measured (`docs/ann-muse-production-scale.md:296`) |
+| Recurring filters | 388k (K 30 to 182) | GPU | Measured (`docs/ann-production-scale.md:296`) |
 | Every filter new, as the code stands | 270 to 640 | Host evaluation on 64 reader threads | Arithmetic on 20 to 40 ms per evaluation, which is one comment in an untracked script |
 | Every filter new, evaluation free | at least 10k to 14k; perhaps 33k | One launch chain per search | A floor from the 214k peak; the upper figure is a weak fit |
 | 1% of searches miss | 27k to 64k | Host evaluation | Same arithmetic |
@@ -124,9 +124,9 @@ Requests per second per host. Only the first row is measured.
 | Ceiling, lone scans at 2.8% | about 133k | Memory bandwidth | 85% of an assumed 8 TB/s on 52-byte rows |
 | Ceiling, lone scans at 0.4% | about 930k | Memory bandwidth | Same |
 
-### What a Muse request carries
+### What a captured request carries
 
-From the request generator (`benchmarks/ann/muse_frames.py:100-116`); the
+From the request generator (`benchmarks/ann/request_frames.py:100-116`); the
 capture itself is not in the repo.
 
 - **Within a request**, searches that shared a filter in the capture share
@@ -151,22 +151,23 @@ in the docs.
 
 ### What a search pays when its filter is new
 
-1. **Host evaluation on a reader thread.** The GPU evaluator refuses the Muse
-   leaf (`ann/server/udf.c:57-59`), so `OVERLAP` lists are evaluated from host
-   postings in `PredicateBitmap` (`ann/server/server.c:2697-2757`). A reader
-   serves many connections, and they all wait.
+1. **Host evaluation on a reader thread.** The GPU evaluator refuses the
+   captured request's filter leaf (`ann/server/udf.c:57-59`), so `OVERLAP`
+   lists are evaluated from host postings in `PredicateBitmap`
+   (`ann/server/server.c:2697-2757`). A reader serves many connections, and
+   they all wait.
 2. **The hand-off.** The result is uploaded at the filter's second sighting,
    on the reader (`ann/server/server.c:2720-2721`). Until then a lane copies
    it per search.
-3. **A launch chain of its own.** A lone Muse search runs the 16-column
-   tensor-core tile with one query, in 8 or 9 kernel launches
+3. **A launch chain of its own.** A lone search from a captured request runs
+   the 16-column tensor-core tile with one query, in 8 or 9 kernel launches
    (`ann/server/cuvs.c:5466-5477`, `:7034-7037`).
 4. **Its own row reads.** Nothing is shared.
 
 Two things in the code make it worse than it need be:
-- **The identical pair.** A Muse request carries two identical searches. The
-  second is a cache hit, so it counts as a second sighting and uploads the
-  result to every copy on the reader. The duplicate merge then compares
+- **The identical pair.** A captured request carries two identical searches.
+  The second is a cache hit, so it counts as a second sighting and uploads
+  the result to every copy on the reader. The duplicate merge then compares
   device pointers and does not merge the pair (`ann/server/server.c:1205`).
   This is a reading of the code, not a run.
 - **A delete turns recurring filters into new ones.** It drops every cached
@@ -232,7 +233,7 @@ real labels.
 | --- | --- | --- |
 | FP8 scan, filter in the request, filters recurring | Measured. K 30 to 182: peak 388k, p99 under 50 ms to about 250k, recall 0.998. K 300 to 1000: peak 214k, p99 44 ms at 140k and 59 ms at 160k, so about 150k sustained | Searches that miss the filter cache stay rare (below) |
 | Two-hop graph walk, filter in the request, filters recurring | Measured at K 30 to 182: peak 170k, p99 23.8 ms at 150k, recall 0.953 with a lowest query at 0.14 | As above; recall accepted; graph and FP16 rows fit; not measured at K 300 to 1000 |
-| Unfiltered graph search with Muse's join kept (Option 1 below) | Not measured. Inferred to be the same order as two-hop (170k at a list of 1,536), and unaffected by filter repeats | Keep only if a run at K 300 to 1000 holds 150k |
+| Unfiltered graph search with the caller's join kept (Option 1 below) | Not measured. Inferred to be the same order as two-hop (170k at a list of 1,536), and unaffected by filter repeats | Keep only if a run at K 300 to 1000 holds 150k |
 | Two-hop with a class bitmap, for filters that never repeat | Estimated 107k to 170k, unchecked | Few distinct `pg_ids` sets in production |
 
 **The miss budget.** At 150k requests/s the worker sees 900k searches/s. A
@@ -249,7 +250,7 @@ not depend on filter repeats can hold 150k.
 | --- | --- | --- | --- | --- |
 | 1 | Deletes without the cache flush | `AnnIndexDelete` (`ann/server/indexfile.c:1288-1308`); reply path (`ann/server/server.c:756-767`, `:806`) | Every delete makes a group's filters misses; one delete per group per second exceeds the miss budget | Deletes per group per second. No host for the host half |
 | 2 | Misses off the reader threads; a request's identical searches merged before the lookup | `PredicateBitmap` (`ann/server/server.c:2697-2757`); `AnnIndexBitmapUploadDeferred` (`ann/server/indexfile.c:1122-1156`); `SameSearch` (`ann/server/server.c:1199-1209`) | Raises the miss budget about threefold and stops a miss from stalling a reader's other connections | None for the pool. No host |
-| 3 | A host evaluator whose work follows the result | `FromRuns` (`ann/common/filter.c:178-244`); `AnnIndexEvaluate` and `BuildBitmap` (`ann/server/indexfile.c:1317-1352`, `:971-1074`) | Raises the miss budget in proportion to the speed-up | `predicate_eval_us` per miss on Muse programs. No host |
+| 3 | A host evaluator whose work follows the result | `FromRuns` (`ann/common/filter.c:178-244`); `AnnIndexEvaluate` and `BuildBitmap` (`ann/server/indexfile.c:1317-1352`, `:971-1074`) | Raises the miss budget in proportion to the speed-up | `predicate_eval_us` per miss on the captured request's filter programs. No host |
 | 4 | Fix the wide end of the fused selection: it fails above 9.0% of a group, and in bands from 6.9% at K 1000 | `FusedEligible` (`ann/server/cuvs.c:5423`); `PrunedSelect` (`:5161-5162`) | Searches there fall to a slower path | Share of production filters above about 7% |
 | 11 | One filter result for every group that holds the same documents | The cache key (`ann/server/indexfile.c:1102-1112`); `PredicateBitmap` | Cuts a request's evaluations from five to two, which raises the miss budget 2.5 times | Whether production groups hold the same documents in the same key order. No host for the host half |
 
@@ -270,7 +271,7 @@ limit of 4,096.
 | --- | --- | --- | --- |
 | 8 | Two-hop for filters that never repeat, with a class bitmap per query | `MixedGraphJob` (`ann/server/cuvs.c:4713-4725`); `SearchShards` (`:2697-2737`); a class-word mode and start draw in the cuVS fork | Move 9's statistics pass; recall on real labels |
 | 9 | Class statistics now | The loader's multi-valued log line (`ann/server/indexfile.c:669-671`) | Mean class of at least 16 rows on real data |
-| 12 | A post-filter route, Muse's join done inside the server: an unfiltered search over-fetches, then each candidate's `pg_ids` is checked exactly | Keep each row's `pg_ids` after load (`ann/server/indexfile.c:662-667`); a candidate check before the final top-K; routing in `SearchFilteredGroup` (`ann/server/cuvs.c:7002-7050`) | The unfiltered graph run at K 300 to 1000 holds 150k |
+| 12 | A post-filter route, the caller's join done inside the server: an unfiltered search over-fetches, then each candidate's `pg_ids` is checked exactly | Keep each row's `pg_ids` after load (`ann/server/indexfile.c:662-667`); a candidate check before the final top-K; routing in `SearchFilteredGroup` (`ann/server/cuvs.c:7002-7050`) | The unfiltered graph run at K 300 to 1000 holds 150k |
 
 ### Dropped: below 150k
 
@@ -282,7 +283,7 @@ limit of 4,096.
 | Move 5: postings on the GPU, scattered into a mask per search | 13k to 73k (estimate, for two-hop) | One scatter per passing row per search |
 | Move 6: one launch chain for many (filter, query) segments | Serves lone scans, capped as above | Same cap as the scans it serves |
 | Move 7: a kernel for one query per row read | Same | Same |
-| Move 10: a dense pass with each query's bit tested at emit | 2.8 useful queries per row at 4% (arithmetic) | Gains too little at Muse filter widths |
+| Move 10: a dense pass with each query's bit tested at emit | 2.8 useful queries per row at 4% (arithmetic) | Gains too little at the captured request's filter widths |
 | First sighting joins a mixed batch with its host words uploaded | 4k to 11.5k (estimate) | Host evaluation and a 5.81 MB upload per search |
 | Filter tested inside the walk from each row's values | 85k to 115k (estimate) | The walk is 1.5 to 2 times slower |
 | cuVS's own filtered CAGRA | 21.4k (measured) | Recall 0.72; walks rejected rows |
@@ -294,17 +295,17 @@ limit of 4,096.
    `predicate_evaluations` and p99. It replaces the 20 to 40 ms and gives the
    real budget. No code.
 2. **Option 1.** An unfiltered graph search at K 300, 600 and 1000 on the
-   Muse shard, at 150k requests/s. No code.
+   production-size shard, at 150k requests/s. No code.
 3. **Two-hop at the K the root keeps,** with recall on real embeddings and
    labels if they can be loaded.
 
 ### Measured on the GPU host
 
 2026-11-16, the 1/8 shard scan view (37 groups of 46.5M rows), K 30 to 182,
-the documented Muse scan flags, `muse_direct` at 150,000 requests/s. Misses
-come from `muse_direct --unique-share F`, which adds an absent id to the
-filter of a share F of searches; deletes are single keys spread over the
-groups. p99 in ms, with the throughput where it fell short:
+the documented production-scale scan flags, `request_direct` at 150,000
+requests/s. Misses come from `request_direct --unique-share F`, which adds an
+absent id to the filter of a share F of searches; deletes are single keys
+spread over the groups. p99 in ms, with the throughput where it fell short:
 
 | Run | `aa6276e` (before) | Moves 1, 2, 3, 11 | Same, `--predicate-resolvers 64` | Same, deletes off the readers (`2830df1`) |
 | --- | --- | --- | --- | --- |
@@ -337,25 +338,25 @@ groups. p99 in ms, with the throughput where it fell short:
 3. **Deletes per group per second, the K the root keeps, and whether recall
    0.95 with a low tail is acceptable for any traffic.**
 
-## Integrating with Muse's join
+## Integrating with the caller's join
 
-How Muse filters, as described by the team (not from code): a leaf runs an
-ANN top-K with no filter and a lookup of the request's `pg_ids` in its
+How the caller filters, as described by the team (not from code): a leaf runs
+an ANN top-K with no filter and a lookup of the request's `pg_ids` in its
 inverted index, then keeps the overlap. The test in this repo does something
 else: it sends the filter inside the ANN request (operation 22), so it
-measures pre-filtering. Muse's own recall against the exact filtered answer
-is unknown.
+measures pre-filtering. The caller's own recall against the exact filtered
+answer is unknown.
 
 The root keeps 60 to 552 of K = 300 to 1000 per ranker
-(`docs/ann-muse-production-scale.md:107-109`), 20% to 55%. If those are the
+(`docs/ann-production-scale.md:107-109`), 20% to 55%. If those are the
 survivors of the join, that fits the seed-row figure that a passing row's
 nearest neighbour passes 26% to 58% of the time. Not confirmed.
 
-| | Option 1: the server replaces Muse's ANN | Option 2: the filter moves into the server | Option 3: both, routed per search |
+| | Option 1: the server replaces the caller's ANN | Option 2: the filter moves into the server | Option 3: both, routed per search |
 | --- | --- | --- | --- |
 | Call | Operation 22 with the match-all program, same K (`ann/server/server.c:2905-2920`) | Operation 22 with a `pg_ids OVERLAP` program, K = what the root keeps | Either |
-| Muse's join | Kept | Not needed | Kept for one route |
-| Index files | Keys = Muse document ids, vectors | Plus `pg_ids` as a multi-valued column | Plus `pg_ids` kept per row (move 12) |
+| The caller's join | Kept | Not needed | Kept for one route |
+| Index files | Keys = the caller's document ids, vectors | Plus `pg_ids` as a multi-valued column | Plus `pg_ids` kept per row (move 12) |
 | At 150k | Not measured; unfiltered search at K 300 to 1000 must take the graph route, whose candidates stop at 1,024 | Scan 388k to 424k requests/s at K 30 to 182, recall 0.998; two-hop 170k at 0.953 with p99 4.5 ms at 105k; filters cached | Nothing; not built |
 | If filters don't repeat | Unaffected: every search batches with every other | Holds 150k only while misses stay within the budget above | Unaffected |
 | Results | Today's overlap | The true top-K among passing rows | Either |
@@ -370,11 +371,11 @@ Which is likely fastest:
   production has few distinct `pg_ids` sets.
 
 Rollout: export one group; run Option 1 in shadow and compare survivors per
-ranker with today's ANN (`benchmarks/ann/muse_compare.py` compares two
-workers and would need a Muse-side adapter); run Option 2 in shadow at the K
+ranker with today's ANN (`benchmarks/ann/request_compare.py` compares two
+workers and would need a caller-side adapter); run Option 2 in shadow at the K
 the root keeps; then choose or route by repeat rate and pass rate.
 
-Open questions for the Muse side: where its ANN runs today; whether the join
+Open questions for the caller: where its ANN runs today; whether the join
 runs per leaf or at the root; how `pg_ids` and documents are updated; whether
 document ids fit an i64.
 
@@ -384,7 +385,7 @@ document ids fit an i64.
 | --- | --- |
 | Bloom signatures | Results must be exact; over a long `OVERLAP` list the false passes exceed the true ones, and under NOT a false positive drops a true row |
 | A matcher that examines every row | 465 us per search at Andromeda's own stated rate |
-| Cluster probing in place of the scan | Recall 0.987 needed 13% of the eligible rows on SIFT1M; unmeasured on Muse rows |
+| Cluster probing in place of the scan | Recall 0.987 needed 13% of the eligible rows on SIFT1M; unmeasured on the production-size shard |
 | Rows reordered so a filter's rows form runs | Not pursued until class statistics exist. The earlier evidence against it was taken at 64 queries a pass and does not speak to a lone scan |
 | Int8 for speed | An 8-bit tensor-core form saved nothing in the kernel |
 | Upload a new result at its first sighting, for recurring filters | Reverses a measured fix (`docs/ann-10pct-throughput.md:286-300`) |

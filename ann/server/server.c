@@ -1210,7 +1210,7 @@ ReleaseFilters(Service *service, Scheduler *scheduler, FilterEntry *owned, Filte
 /*
  * Identical index searches: same index, filter (the same shared arrays, or
  * unfiltered; job-owned key lists never compare equal), excluded rows and
- * query. A Muse request's rankers often ask
+ * query. A production request's rankers often ask
  * one group the same question with the same filter (CPC and CPM rankers at
  * k 300); arriving together, they land in one filter group, so one search at
  * the larger k answers both.
@@ -1435,7 +1435,7 @@ Lane(void *argument)
 			 * The whole group, not the idle lanes' share: the filter's rows
 			 * are scored once however many queries ride along, and a group
 			 * split over lanes costs a scan per piece (measured neutral on
-			 * the Muse mix, where groups are short).
+			 * the production mix, where groups are short).
 			 */
 			while (count < service->options.max_batch_jobs && owns->head)
 			{
@@ -4148,7 +4148,7 @@ DictionaryOperation(uint16_t operation, const unsigned char *payload, uint32_t l
  * Deletes (operation 29) run on these threads, not on the reader that read
  * them: patching the cached filters a delete touches takes tens of
  * milliseconds and up to most of a second, and every connection the reader
- * serves would wait that long. Measured on the Muse shard at 150,000
+ * serves would wait that long. Measured on a production-size shard at 150,000
  * requests a second with 24 deletes a second: p99 409 ms with deletes on
  * the readers, all of it before the searches were read. The reply goes out
  * when the delete is done, so a client that waits for it, as every client
@@ -4732,8 +4732,8 @@ AnnServe(const char *path, const AnnBackend *backend, const AnnServeOptions *opt
 	 * Scheduler shards: one per 24 lanes unless told. With one, every reader
 	 * and lane met on one mutex (see Scheduler: 45% of lane samples waited
 	 * for it at a million searches a second); with many, lanes take work
-	 * sooner and batches shrink. 96 lanes on the Muse mix held a 50 ms p99 to
-	 * 110k requests/s with 1 shard, 150k with 4 and 140k with 12.
+	 * sooner and batches shrink. 96 lanes on the production mix held a 50 ms
+	 * p99 to 110k requests/s with 1 shard, 150k with 4 and 140k with 12.
 	 */
 	service.nschedulers = options->scheduler_shards ? options->scheduler_shards : options->lanes / 24;
 	if (service.nschedulers > options->lanes)

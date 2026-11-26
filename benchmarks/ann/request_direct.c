@@ -1,16 +1,18 @@
 /*
- * Muse-shaped load straight to an ANN server over TCP, without PostgreSQL.
+ * Production-shaped load straight to an ANN server over TCP, without
+ * PostgreSQL.
  *
- *   muse_direct HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP]
+ *   request_direct HOST PORT TOKEN_FILE FRAMES SECONDS CLIENTS [WARMUP]
  *               [--processes N] [--rate R] [--epoll] [--unique-share F]
  *
- * FRAMES is written by benchmarks/ann/muse_stress.py --emit-ann: u32
+ * FRAMES is written by benchmarks/ann/request_stress.py --emit-ann: u32
  * requests, u32 sub-requests per request, then per sub-request a u32 size
  * and a ready protocol frame (operation 22, search by predicate program).
  * Each client (a thread, unless --epoll) holds one authenticated connection
  * per sub-request, sends a request's sub-requests together and waits for
- * every reply, as a Muse SCORE_BLEND request runs its rankers in parallel;
- * the request's latency is its slowest sub-request's. Prints one JSON line.
+ * every reply, as a production SCORE_BLEND request runs its rankers in
+ * parallel; the request's latency is its slowest sub-request's. Prints one
+ * JSON line.
  *
  * WARMUP (seconds, default 3) runs load before the SECONDS that are
  * measured. A request is counted when its last reply arrives inside the
@@ -322,7 +324,7 @@ Fatal(int code, const char *format,...)
 		va_list		arguments;
 
 		va_start(arguments, format);
-		fprintf(stderr, "muse_direct: ");
+		fprintf(stderr, "request_direct: ");
 		vfprintf(stderr, format, arguments);
 		fprintf(stderr, "\n");
 		va_end(arguments);
@@ -1314,9 +1316,9 @@ Reaped(pid_t pid, int status, int running)
 	while (waitpid(-1, NULL, 0) > 0 || errno == EINTR)
 		;
 	if (WIFSIGNALED(status))
-		fprintf(stderr, "muse_direct: process %ld was killed by signal %d; no result\n", (long) pid, WTERMSIG(status));
+		fprintf(stderr, "request_direct: process %ld was killed by signal %d; no result\n", (long) pid, WTERMSIG(status));
 	else
-		fprintf(stderr, "muse_direct: process %ld ended with status %d; no result\n", (long) pid, code);
+		fprintf(stderr, "request_direct: process %ld ended with status %d; no result\n", (long) pid, code);
 	exit(code ? code : 1);
 }
 
@@ -1374,12 +1376,12 @@ main(int argc, char **argv)
 	}
 #ifndef __linux__
 	if (useEpoll)
-		return fprintf(stderr, "muse_direct: --epoll needs Linux (epoll and timerfd); "
+		return fprintf(stderr, "request_direct: --epoll needs Linux (epoll and timerfd); "
 					   "run without it for a thread per client\n"), 1;
 #endif
 	if (seconds == 0 || clients == 0 || processes == 0 || processes > clients || rate < 0 || uniqueShare < 0 ||
 		uniqueShare > 1)
-		return fprintf(stderr, "muse_direct: SECONDS, CLIENTS and --processes must be positive, "
+		return fprintf(stderr, "request_direct: SECONDS, CLIENTS and --processes must be positive, "
 					   "--processes at most CLIENTS, --rate not negative\n"), 1;
 	if (rate > 0)
 		interval = (double) clients * 1e9 / rate;
@@ -1431,14 +1433,14 @@ main(int argc, char **argv)
 			built += uniqueFrames[i] != NULL;
 		}
 		if (built == 0)
-			return fprintf(stderr, "muse_direct: --unique-share: no frame starts with an OVERLAP leaf\n"), 1;
+			return fprintf(stderr, "request_direct: --unique-share: no frame starts with an OVERLAP leaf\n"), 1;
 	}
 
 	/* Resolve once; every connection of every process uses the address. */
 	hints.ai_family = AF_UNSPEC;
 	hints.ai_socktype = SOCK_STREAM;
 	if (getaddrinfo(host, port, &hints, &result) != 0)
-		return fprintf(stderr, "muse_direct: cannot resolve %s:%s\n", host, port), 1;
+		return fprintf(stderr, "request_direct: cannot resolve %s:%s\n", host, port), 1;
 	memcpy(&server, result->ai_addr, result->ai_addrlen);
 	serverSize = result->ai_addrlen;
 	serverFamily = result->ai_family;
@@ -1467,7 +1469,7 @@ main(int argc, char **argv)
 			}
 		}
 		if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY && limit.rlim_cur < need)
-			return fprintf(stderr, "muse_direct: %llu descriptors needed per process, the limit is %llu: "
+			return fprintf(stderr, "request_direct: %llu descriptors needed per process, the limit is %llu: "
 						   "use more --processes or raise ulimit -n\n",
 						   (unsigned long long) need, (unsigned long long) limit.rlim_cur), 1;
 	}
@@ -1475,7 +1477,7 @@ main(int argc, char **argv)
 	sharedSize = sizeof(Shared) + ((size_t) (1 + nsubs) * BINS + seconds) * sizeof(atomic_uint_fast64_t);
 	shared = mmap(NULL, sharedSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
 	if (shared == MAP_FAILED)
-		return fprintf(stderr, "muse_direct: cannot map %zu shared bytes: %s\n", sharedSize, strerror(errno)), 1;
+		return fprintf(stderr, "request_direct: cannot map %zu shared bytes: %s\n", sharedSize, strerror(errno)), 1;
 	if (pthread_mutexattr_init(&mutexAttributes) != 0 ||
 		pthread_mutexattr_setpshared(&mutexAttributes, PTHREAD_PROCESS_SHARED) != 0 ||
 		pthread_mutex_init(&shared->lock, &mutexAttributes) != 0 ||
@@ -1483,7 +1485,7 @@ main(int argc, char **argv)
 		pthread_condattr_setpshared(&condAttributes, PTHREAD_PROCESS_SHARED) != 0 ||
 		pthread_cond_init(&shared->slotFree, &condAttributes) != 0 ||
 		pthread_cond_init(&shared->started, &condAttributes) != 0)
-		return fprintf(stderr, "muse_direct: cannot create process-shared locks\n"), 1;
+		return fprintf(stderr, "request_direct: cannot create process-shared locks\n"), 1;
 	shared->slots = MAX_CONNECTING;
 
 	/* Fork before any thread exists. The parent only coordinates. */
@@ -1516,7 +1518,7 @@ main(int argc, char **argv)
 		}
 		if (pid < 0)
 		{
-			fprintf(stderr, "muse_direct: fork: %s\n", strerror(errno));
+			fprintf(stderr, "request_direct: fork: %s\n", strerror(errno));
 			StopChildren();
 			return 1;
 		}
@@ -1539,7 +1541,7 @@ main(int argc, char **argv)
 		if (Now() - reported >= 5 * SECOND)
 		{
 			reported = Now();
-			fprintf(stderr, "muse_direct: %u of %u clients connected after %.0f s (%llu retries)\n",
+			fprintf(stderr, "request_direct: %u of %u clients connected after %.0f s (%llu retries)\n",
 					atomic_load(&shared->connected), clients, (double) (reported - connectFrom) / 1e9,
 					(unsigned long long) atomic_load(&shared->retries));
 		}

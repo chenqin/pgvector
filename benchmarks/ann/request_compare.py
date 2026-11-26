@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-"""Compare two ANN workers on the same Muse requests: latency, recall, overlap.
+"""Compare two ANN workers on the same production-shaped requests: latency,
+recall, overlap.
 
-Sends each checked sub-request of a muse_frames.py frames file (operation 22,
+Sends each checked sub-request of a request_frames.py frames file (operation 22,
 the frame as written) to worker A and to worker B, one at a time on an idle
 worker, and computes the exact answer from the index files (keys.i64,
 vectors.f32, attr-*.i32, multi-valued offsets), so the two routes are judged
 on the same queries, filters and k:
 
-    muse_compare.py --frames F --index-root ROOT --capture C.json \\
+    request_compare.py --frames F --index-root ROOT --capture C.json \\
         --a 127.0.0.1:7821:cagra-fp16 --b 127.0.0.1:7822:fp8-scan \\
         --token-file token --requests 6
 
-Prints one table for the first request (one line per Muse ranker), then the
+Prints one table for the first request (one line per ranker), then the
 same columns averaged per ranker over --requests requests, as text and, with
 --json, as one JSON line. Each sub-request is sent once to warm the filter
 cache (a new filter is evaluated on the host first) and then timed
@@ -166,7 +167,7 @@ def main():
     head = f"{'ranker':34s} {'group':5s} {'k':>4s} {'eligible':>9s} | {la + ' ms':>12s} {'recall':>6s} | {lb + ' ms':>12s} {'recall':>6s} | overlap"
     def line(name, table, k, elig, a_ms, a_rc, b_ms, b_rc, ov):
         return f'{name[:34]:34s} {table:5s} {k:4d} {elig:9d} | {a_ms:12.2f} {a_rc:6.3f} | {b_ms:12.2f} {b_rc:6.3f} | {ov:.3f}'
-    print(f'Request 0 (one Muse request, {nsub} rankers), single searches on idle workers:')
+    print(f'Request 0 (one production-shaped request, {nsub} rankers), single searches on idle workers:')
     print(head)
     for row in rows:
         if row['request'] == 0:
@@ -187,7 +188,7 @@ def main():
         summary.append(entry)
         print(line(entry['tag'], '*', entry['k'], entry['eligible'], entry[la]['ms'], entry[la]['recall'],
                    entry[lb]['ms'], entry[lb]['recall'], entry['overlap']))
-    # A Muse request waits for its slowest ranker.
+    # A production request waits for its slowest ranker.
     for w in (la, lb):
         per = [max(row[w]['ms'] for row in rows if row['request'] == r) for r in range(args.requests)]
         rec = statistics.mean(row[w]['recall'] for row in rows)

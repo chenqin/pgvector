@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """twohop_udf_cases.py FRAMES TABLE OUT [--count N] [--distinct]: cases for cagra_twohop_udf_probe.
 
-Takes the sub-requests of a muse_direct frames file (benchmarks/ann/muse_frames.py emit) that search
+Takes the sub-requests of a request_direct frames file (benchmarks/ann/request_frames.py emit) that search
 TABLE, in file order, and writes their predicate programs and query vectors: u32 count, u32 dims,
 then per case u32 k, u32 program length, the program, dims FP32. --distinct keeps the first
 sub-request of each program only. --first-leaf keeps only the first operand of a top-level AND, as the
@@ -25,7 +25,7 @@ def main():
     args = parser.parse_args()
     if args.first_leaf:
         sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-        import muse_frames
+        import request_frames
     cases, seen, dims = [], set(), None
     with open(args.frames, 'rb') as stream:
         nreq, nsub = struct.unpack('<II', stream.read(8))
@@ -40,9 +40,9 @@ def main():
             prog = payload[4 + namelen + 16:4 + namelen + 16 + proglen]
             vector = payload[4 + namelen + 16 + proglen:4 + namelen + 16 + proglen + 4 * d]
             if args.first_leaf:
-                expr = muse_frames.decode(prog)
+                expr = request_frames.decode(prog)
                 if expr.get('op') == 'and':
-                    prog = muse_frames.encode(expr['args'][0])
+                    prog = request_frames.encode(expr['args'][0])
             if args.distinct and prog in seen:
                 continue
             seen.add(prog)
